@@ -1,0 +1,11 @@
+[workspace]
+resolver = "2"
+members = [
+    "apps/llm-proxy",
+    "crates/llm-proxy-core",
+    "crates/llm-proxy-protocol",
+    "crates/llm-proxy-provider",
+    "crates/llm-proxy-storage",
+    "crates/llm-proxy-api",
+    "crates/llm-proxy-server",
+]
