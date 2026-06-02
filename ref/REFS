@@ -1,4 +1,4 @@
 oc-go-cc           99d756c7148f2688dea965f7b9af9b850e53c50a  2026-06-02 08:21:43 +0200 feat: add qwen3.7-max to Anthropic endpoint routing (#63)
 llm-proxy          fb588f614adfd1cb96f467f9f40f60f31fc5a47f  2024-05-24 12:55:43 -0400 Merge pull request #229 from llm-proxy/fix/228/update-tiktoken
-litellm            d76950dfb656471d1a7e0418fd700cfad01f911b  2026-06-02 06:42:38 -0700 fix(docs): remove fixed dimensions from README hero image (#29496)
+litellm            b84f7f82f7313c25435d4af45618473f3361ef65  2026-06-02 08:48:10 -0700 Litellm oss staging (#29492)
 llm-api-key-proxy  af40b91d97643c01d69108ce9f170ab4b2c33b4f  2026-05-27 19:23:10 +0200 Merge dev into main

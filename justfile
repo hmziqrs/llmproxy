@@ -3,17 +3,20 @@ set shell := ["bash", "-uc"]
 ref_dir := "ref"
 repos   := "oc-go-cc=https://github.com/samueltuyizere/oc-go-cc llm-proxy=https://github.com/llm-proxy/llm-proxy litellm=https://github.com/BerriAI/litellm llm-api-key-proxy=https://github.com/Mirrowel/LLM-API-Key-Proxy"
 
-[doc("Reference repo commands. Usage: just ref <check|update>")]
+[doc("Show available recipes")]
+default:
+    @just --list
+
+[doc("Reference repo commands. Usage: just ref <check|pull>")]
 ref subcommand:
     @case "{{subcommand}}" in \
-        check)  just _ref-check ;; \
-        update) just _ref-update ;; \
-        *) echo "usage: just ref {check|update}" >&2; exit 1 ;; \
+        check) just _ref-check ;; \
+        pull)  just _ref-pull ;; \
+        *) echo "usage: just ref {check|pull}" >&2; exit 1 ;; \
     esac
 
 [group('ref')]
 [doc("Fetch each reference repo and report whether it is up to date with origin")]
-[private]
 _ref-check:
     #!/usr/bin/env bash
     set -uo pipefail
@@ -44,8 +47,7 @@ _ref-check:
 
 [group('ref')]
 [doc("Pull latest for each reference repo, continuing past failures, then rewrite ref/REFS")]
-[private]
-_ref-update:
+_ref-pull:
     #!/usr/bin/env bash
     set -uo pipefail
     failures=0
