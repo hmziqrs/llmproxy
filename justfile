@@ -7,12 +7,13 @@ repos   := "oc-go-cc=https://github.com/samueltuyizere/oc-go-cc llm-proxy=https:
 default:
     @just --list
 
-[doc("Reference repo commands. Usage: just ref <check|pull>")]
+[doc("Reference repo commands. Usage: just ref <check|pull|setup>")]
 ref subcommand:
     @case "{{subcommand}}" in \
         check) just _ref-check ;; \
         pull)  just _ref-pull ;; \
-        *) echo "usage: just ref {check|pull}" >&2; exit 1 ;; \
+        setup) just _ref-setup ;; \
+        *) echo "usage: just ref {check|pull|setup}" >&2; exit 1 ;; \
     esac
 
 [group('ref')]
@@ -83,6 +84,55 @@ _ref-pull:
     done
     echo "---"
     cat "{{ref_dir}}/REFS"
+    if [ "${failures}" -gt 0 ]; then
+        echo "${failures} repo(s) failed" >&2
+        exit 1
+    fi
+
+[group('ref')]
+[doc("Clone each reference repo (if missing) and check it out at the commit locked in ref/REFS; for new-machine setup")]
+_ref-setup:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    refs_file="{{ref_dir}}/REFS"
+    if [ ! -f "${refs_file}" ]; then
+        echo "missing ${refs_file}; nothing to lock to" >&2
+        exit 1
+    fi
+    declare -A urls=()
+    for pair in {{repos}}; do
+        name="${pair%%=*}"
+        url="${pair#*=}"
+        urls["${name}"]="${url}"
+    done
+    failures=0
+    while IFS= read -r line; do
+        read -r name hash _ <<<"${line}"
+        [ -z "${name:-}" ] && continue
+        [[ "${name}" == \#* ]] && continue
+        url="${urls[${name}]:-}"
+        dest="{{ref_dir}}/${name}"
+        if [ -z "${url}" ]; then
+            printf '%-18s UNKNOWN  no URL mapped for this name\n' "${name}"
+            failures=$((failures + 1))
+            continue
+        fi
+        if [ ! -d "${dest}" ]; then
+            printf '%-18s cloning  %s\n' "${name}" "${url}"
+            if ! git clone --depth=1 "${url}" "${dest}" >/dev/null 2>&1; then
+                printf '  %s clone FAILED\n' "${name}" >&2
+                failures=$((failures + 1))
+                continue
+            fi
+        fi
+        if ! ( git -C "${dest}" fetch --depth=1 origin "${hash}" >/dev/null 2>&1 \
+               && git -C "${dest}" reset --hard "${hash}" >/dev/null 2>&1 ); then
+            printf '  %s checkout FAILED for %s\n' "${name}" "${hash:0:12}" >&2
+            failures=$((failures + 1))
+            continue
+        fi
+        printf '%-18s locked   %s\n' "${name}" "${hash:0:12}"
+    done < "${refs_file}"
     if [ "${failures}" -gt 0 ]; then
         echo "${failures} repo(s) failed" >&2
         exit 1
