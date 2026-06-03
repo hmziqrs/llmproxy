@@ -4,8 +4,7 @@
 
 The OpenAI-like chat wrapper converts `max_completion_tokens` into
 `max_tokens` before dispatch because most OpenAI-compatible providers only
-understand the older field name. That means the outward request shape is
-preserved only at the API boundary, not on the wire to the upstream model.
+understand the older field name.
 
 Design rule:
 
@@ -73,8 +72,7 @@ databricks_responses_delegate_to_openai_transformer
 Volcengine's Responses stream is not fully self-describing. The adapter first
 patches any `response.*` chunk that lacks `response.output` by inserting an
 empty list, then fills any other missing fields with the event model defaults
-before pydantic validation. That makes the stream tolerant of incomplete
-provider frames instead of failing immediately on schema mismatch.
+before pydantic validation.
 
 Design rule:
 
@@ -121,9 +119,7 @@ The Mistral chat adapter does more than strip schema noise on the way in. On
 the way back, it rewrites empty assistant content from `""` to `null`, and if
 the provider returns a content list it collapses that list into plain text.
 `thinking` blocks are extracted into `reasoning_content`, while `text` blocks
-become the visible assistant message. That means the adapter is not preserving
-the provider response shape verbatim; it is synthesizing the OpenAI-shaped
-output the rest of the stack expects.
+become the visible assistant message.
 
 Design rule:
 
@@ -169,8 +165,7 @@ vercel_ai_gateway_oidc_token_fallback
 Baseten does not treat every model string the same way. If the model ID is an
 8-character alphanumeric deployment token, the adapter rewrites the request
 to the dedicated deployment host under `model-{id}.api.baseten.co`. Otherwise
-it stays on the shared `inference.baseten.co/v1` API. That means the model
-string is both a selector and a routing signal.
+it stays on the shared `inference.baseten.co/v1` API.
 
 Design rule:
 
@@ -257,8 +252,6 @@ The Heroku inference adapter accepts OpenAI-shaped input, but it still needs
 adapter-side normalization. It collapses list-shaped message content into
 strings because Heroku does not support array content, and it appends
 `/v1/chat/completions` to the base URL when the caller omits the full path.
-That makes both the message format and the endpoint path part of the adapter
-contract.
 
 Design rule:
 
@@ -326,8 +319,7 @@ gigachat_tool_choice_to_function_call
 Together AI's text-completion adapter does not accept the OpenAI prompt list
 shape blindly. It collapses the conversation into one string, rejects integer
 token inputs outright, and raises if the caller tries to send multiple prompt
-strings. That means prompt aggregation itself is part of the adapter
-contract.
+strings.
 
 Design rule:
 

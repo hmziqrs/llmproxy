@@ -180,8 +180,7 @@ This matters for:
 
 The beta-header path is backed by a fetched-and-cached provider mapping.
 Unknown headers are dropped, unsupported headers are dropped, and provider
-aliases are resolved before filtering. That means the proxy is consulting a
-capability registry, not forwarding raw headers.
+aliases are resolved before filtering.
 
 Anthropic computer-tool versions are also normalized into beta-header names:
 `computer_20250124` becomes `computer-use-2025-01-24`, `computer_20241022`

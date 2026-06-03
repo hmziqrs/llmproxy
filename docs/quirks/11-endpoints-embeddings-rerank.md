@@ -71,9 +71,7 @@ bedrock_rerank_sigv4_target
 
 The SambaNova embedding adapter does not synthesize its own base URL. It
 requires `api_base` from the caller, then normalizes that value by stripping
-trailing slashes and appending `/embeddings` if needed. That means the caller
-has to supply the deployment location up front, and the adapter owns the final
-endpoint shape.
+trailing slashes and appending `/embeddings` if needed.
 
 Design rule:
 
@@ -119,9 +117,7 @@ hosted_vllm_embedding_fake_api_key
 The DeepInfra rerank adapter also changes the failure contract. If the upstream
 error payload is JSON and contains `{"detail": {"error": "..."}}`, the
 adapter unwraps that nested field and surfaces the inner error text instead of
-the raw wrapper. It does the same for a string `detail` field. That means the
-caller sees a normalized error message even when the provider returns a nested
-error envelope.
+the raw wrapper. It does the same for a string `detail` field.
 
 Design rule:
 
@@ -244,8 +240,7 @@ path rewrites OpenAI `input` into `inputs`, then accepts either a raw list of
 embedding vectors or a dict with an `embedding` field on the response side.
 The Cohere path is different again: it converts the request into `texts`
 and `input_type`, preserves `input_type` when provided, and reuses Cohere’s
-response population logic instead of the HF shape. That makes the adapter a
-small factory, not a single embedding codec.
+response population logic instead of the HF shape.
 
 Design rule:
 

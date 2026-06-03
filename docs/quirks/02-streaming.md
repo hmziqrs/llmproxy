@@ -81,9 +81,8 @@ It maps `response.created`, `response.output_item.added`, and
 `finish_reason = None`, then waits for `response.completed` to emit the final
 terminal state.
 
-That means the stream protocol is event-driven, not token-chunk-driven.
-If you translate it like a plain chat stream, you end the stream too early and
-lose later tool calls or reasoning items.
+Translate it like a plain chat stream and you end the stream too early, losing
+later tool calls or reasoning items.
 
 Design rule:
 
@@ -103,10 +102,8 @@ intermediate_finish_reason = none
 
 Google GenAI streaming tool calls are not independent self-contained chunks.
 The adapter accumulates name and arguments by `tool_call.index`, skips empty
-chunks, and only emits a function call once the JSON arguments parse.
-
-That means tool-call assembly is stateful per index, and the ordering of name
-versus argument fragments matters.
+chunks, and only emits a function call once the JSON arguments parse. The
+ordering of name versus argument fragments matters.
 
 Design rule:
 
@@ -150,8 +147,7 @@ non_openai_stream_contract
 
 The Responses API handler deliberately keeps the pre-transform request context
 around so post-call hooks and metadata see the original params rather than the
-provider-shaped body. That means hook semantics depend on the unmodified
-request graph, not just the upstream payload.
+provider-shaped body.
 
 Design rule:
 
@@ -171,9 +167,8 @@ hook_visibility_scope
 
 The ChatGPT backend API emits non-spec tool-call chunks: all indices come back
 as `0`, `id`/`name` get repeated in closing chunks, and the normalizer has to
-assign stable indices while skipping duplicate closing chunks.
-
-That makes the stream a repair job, not a direct decode.
+assign stable indices while skipping duplicate closing chunks. The stream is a
+repair job, not a direct decode.
 
 Design rule:
 
@@ -199,9 +194,6 @@ Redis-backed `ResponsesAPIResponse`, and flushes partial state on a timer.
 Terminal state is also event-driven here: `response.completed`, `failed`,
 `incomplete`, and `cancelled` each map to different OpenAI status values, and
 the final state is assembled from the stream plus the terminal event payload.
-
-That means polling is not “store the final object later.” It is “continuously
-rebuild the object while the stream is still live.”
 
 Design rule:
 
@@ -428,8 +420,8 @@ SageMaker Nova is not identical to the generic SageMaker chat bridge. The
 adapter marks `stream` as a real request-body field, exposes Nova-specific
 parameters such as `top_k`, `reasoning_effort`, `allowed_token_ids`, and
 `truncate_prompt_tokens`, and then explicitly strips `model` from the payload
-before dispatch. That means the model name is used for routing, not for the
-upstream JSON body.
+before dispatch, so the model name is used for routing, not for the upstream
+JSON body.
 
 Design rule:
 

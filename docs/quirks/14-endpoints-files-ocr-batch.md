@@ -343,8 +343,6 @@ The OpenAI container create response is not just an object store record. After
 parsing the returned container, the adapter injects a hidden response cost
 derived from one code-interpreter session into
 `_hidden_params["additional_headers"]["llm_provider-x-litellm-response-cost"]`.
-That means container creation participates in cost accounting even though the
-API surface itself looks like a plain resource create call.
 
 Design rule:
 

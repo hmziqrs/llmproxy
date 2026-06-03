@@ -104,8 +104,7 @@ openai_whisper_response_format_upgrade
 ## OpenRouter Responses stays HTTP, not native WebSocket
 
 OpenRouter's Responses API is exposed as a normal HTTP endpoint and explicitly
-does not advertise native WebSocket support. That means the transport layer
-must treat it as a request/response route, not as a realtime socket family.
+does not advertise native WebSocket support.
 
 Design rule:
 
@@ -165,8 +164,7 @@ bedrock_nova_sonic_audio_format_mapping
 ## WebSocket responses need the model injected into the URL
 
 The OpenAI responses websocket path requires `model` in the query string, and
-the handler preserves pre-existing query parameters when adding it. That makes
-the URL itself part of the protocol contract.
+the handler preserves pre-existing query parameters when adding it.
 
 Design rule:
 
@@ -237,9 +235,8 @@ Azure realtime does not expose a single websocket URL. The adapter splits the
 flow into a `client_secrets` bootstrap call and a separate `calls` URL, both
 with an `api-version` query string. The first step uses the configured Azure
 API key, while the live call path switches to an ephemeral `api-key` header.
-
-That means realtime auth is staged: the proxy has to obtain a client secret
-before it can talk to the live session endpoint.
+Realtime auth is staged: the proxy has to obtain a client secret before it can
+talk to the live session endpoint.
 
 Design rule:
 
@@ -305,9 +302,8 @@ openai_realtime_bootstrap_split
 
 xAI's Grok Voice Agent API reuses the OpenAI realtime websocket protocol, but
 its handler deliberately sends only the `Authorization` header and skips the
-`OpenAI-Beta: realtime=v1` header entirely. In other words, the wire shape is
-OpenAI-like, but the protocol version negotiation is not the same as OpenAI's
-beta path.
+`OpenAI-Beta: realtime=v1` header entirely. The wire shape is OpenAI-like, but
+the protocol version negotiation is not.
 
 Design rule:
 

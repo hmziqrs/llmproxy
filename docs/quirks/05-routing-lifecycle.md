@@ -302,8 +302,6 @@ The audited code splits side effects into different durability tiers:
 - stateful writes keep an in-memory truth even when disk is unhealthy
 - stream cleanup is attempted in `finally`, but client disconnect or shutdown can still cut it short
 
-That means the proxy needs an explicit policy for each side effect instead of a single generic “background task” bucket.
-
 Design rule:
 
 ```text

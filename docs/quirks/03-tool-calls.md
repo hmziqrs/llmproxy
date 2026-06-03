@@ -191,8 +191,7 @@ azure_chat_drop_unsupported_params
 
 Prompt utilities attempt to repair truncated tool-call JSON, add warnings
 when repair succeeds, and sanitize Anthropic `tool_use_id` values to match
-the provider regex. That means some “prompt” bugs are really serialization
-and repair bugs.
+the provider regex.
 
 Design rule:
 
@@ -204,9 +203,7 @@ Tool-call repair is part of prompt rendering, not just response parsing.
 
 The Cohere v2 chat adapter rewrites `tool_results` into the current request,
 but if the last entry in `chat_history` is a `USER` message it also injects
-`force_single_step=True` because the upstream API fails otherwise. That means
-the request shape depends on the history tail, not just the visible current
-turn.
+`force_single_step=True` because the upstream API fails otherwise.
 
 Design rule:
 
@@ -278,9 +275,7 @@ The Hosted vLLM chat adapter is not a direct pass-through. It strips tool
 schemas down to OpenAI function tools when the caller sends `type: "custom"`,
 so the upstream validation path only sees a function-style tool call. It also
 rewrites assistant `thinking_blocks` into structured content blocks and can
-convert video-bearing file items into `video_url` blocks. That means both the
-tool surface and the multimodal content surface are actively normalized before
-dispatch.
+convert video-bearing file items into `video_url` blocks.
 
 Design rule:
 
@@ -328,8 +323,7 @@ is in JSON mode, it inspects the returned `response` text and branches on the
 content: a dict with `name` and `arguments` becomes a synthetic tool call
 with `finish_reason="tool_calls"`, while any other valid JSON is re-emitted as
 the assistant message content. If the payload is not valid JSON, the adapter
-falls back to the plain text/`reasoning_content` path instead. That makes JSON
-mode a response-shape negotiation, not just a sampling flag.
+falls back to the plain text/`reasoning_content` path instead.
 
 Design rule:
 

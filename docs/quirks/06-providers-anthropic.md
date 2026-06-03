@@ -129,8 +129,6 @@ opinionated:
 - the most recent completed `tool_result` is never cleared
 - cleared tool results are replaced with placeholder content instead of being deleted
 
-That means context management is a real state-editing protocol, not a generic message filter.
-
 Design rule:
 
 ```text
@@ -231,9 +229,6 @@ Azure auth bolted on. The adapter converts Azure `api-key` headers into
 `x-api-key` when needed, keeps `anthropic-version` and `anthropic-beta`
 headers in the request, and then walks both the `system` blocks and the
 message content blocks to remove `scope` from every `cache_control` object.
-That means Azure Anthropic keeps prompt-caching semantics only in the subset
-that the backend accepts, while the broader cache-control shape still looks like
-Anthropic on the wire.
 
 Design rule:
 

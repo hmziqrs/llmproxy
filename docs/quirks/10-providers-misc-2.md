@@ -298,8 +298,7 @@ If a DeepSeek request has assistant history but no thinking blocks, it sends
 and prevent the next turn from requiring `reasoning_content`.
 
 It also treats inline `thinking` attached to a `tool_use` block as real
-thinking history, not as an optional annotation. That means the proxy has to
-detect multiple shapes of the same semantic state.
+thinking history, not as an optional annotation.
 
 Design rule:
 
@@ -322,10 +321,8 @@ thinking_budget_tokens_normalized
 The custom HTTPX handler does not wait until the provider request is fully
 built before removing unsupported fields. It strips nested paths from
 `anthropic_messages_optional_request_params` up front, before the provider
-transform runs.
-
-That makes `additional_drop_params` a pre-transform policy knob, not a generic
-JSON cleanup after serialization.
+transform runs. `additional_drop_params` is a pre-transform policy knob, not a
+generic JSON cleanup after serialization.
 
 Design rule:
 
@@ -346,10 +343,8 @@ pre_transform_sanitization
 The ChatGPT provider adapter does not simply forward Responses API knobs.
 It forces `store = False`, forces `stream = True`, injects
 `reasoning.encrypted_content` into `include`, and then drops every request key
-outside a small allowlist.
-
-That means the caller’s request is being translated into the provider’s
-internal contract, not merely normalized.
+outside a small allowlist. The caller's request is translated into the
+provider's internal contract, not merely normalized.
 
 Design rule:
 

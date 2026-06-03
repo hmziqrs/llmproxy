@@ -296,8 +296,7 @@ deployment. The adapter strips the `model_router/` prefix before sending the
 request to Azure so the deployment name reaches the API without the routing
 wrapper. On the response side it preserves the actual model returned by Azure
 for display and cost tracking, then applies an extra flat infrastructure charge
-based on prompt tokens via the Azure model-router cost calculator. That means
-the request model and the billed model are intentionally not identical.
+based on prompt tokens via the Azure model-router cost calculator.
 
 Design rule:
 
