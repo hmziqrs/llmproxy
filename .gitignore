@@ -25,3 +25,5 @@
 
 /ref/*/
 !/ref/REFS
+
+.playwright-mcp
