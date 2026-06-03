@@ -417,7 +417,7 @@ azure_ai_cohere_header_model_remap
 
 ## Azure AI Foundry FLUX image edit rewrites auth, deployment routing, and api-version handling
 
-Azure AI Foundry FLUX image edit is not a direct OpenAI upload. The adapter
+The Azure AI Foundry FLUX image-edit adapter
 switches authentication to `Api-Key`, resolves the Azure AI base URL through
 the Foundry helper, and requires an explicit API version. On the URL side it
 either appends `/images/edits` to an existing deployment route or constructs

@@ -436,7 +436,7 @@ azure_tts_ssml_passthrough
 
 ## ElevenLabs transcription and TTS both translate OpenAI fields into provider-specific file and URL contracts
 
-ElevenLabs is not a plain OpenAI audio backend. The transcription adapter
+The ElevenLabs transcription adapter
 rewrites `language` into `language_code`, sends multipart form-data with the
 audio file, and preserves the provider response in hidden params while
 collapsing only `word` items into OpenAI-style words. The TTS adapter is even

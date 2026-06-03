@@ -208,7 +208,7 @@ watsonx_embedding_response_object_rewrite
 
 ## GitHub Copilot Responses and embeddings synthesize headers and preserve encrypted reasoning state
 
-GitHub Copilot is not a plain OpenAI-compatible passthrough. The Responses
+The GitHub Copilot Responses
 adapter authenticates through OAuth device flow, injects a fixed Copilot header
 set, derives `X-Initiator` from the request content, and adds a vision header
 when the input contains images. On the response path, reasoning items keep

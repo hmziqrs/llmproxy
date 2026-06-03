@@ -156,7 +156,7 @@ brave_timestamp_to_iso_date
 
 ## Exa AI search rewrites unified filters and forces text content on by default
 
-Exa AI search is not a naive search passthrough. The adapter collapses list
+The Exa AI search adapter collapses list
 queries into one string, remaps `max_results` to `numResults`, turns unified
 domain and country filters into `includeDomains` and `userLocation`, and
 injects `contents={"text": true}` unless the caller already asked for a

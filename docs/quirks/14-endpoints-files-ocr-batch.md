@@ -407,7 +407,7 @@ dashscope_rerank_string_document_normalization
 
 ## HuggingFace rerank renames documents to texts and reconstructs document echoes on the way back
 
-HuggingFace rerank is not a direct Cohere-shaped pass-through. The request
+The HuggingFace rerank request
 side renames `documents` to `texts`, renames `return_documents` to
 `return_text`, and injects `raw_scores=False`, `truncate=False`, and
 `truncation_direction="Right"` so the upstream rerank endpoint gets the shape

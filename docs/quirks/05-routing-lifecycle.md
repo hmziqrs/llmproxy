@@ -250,7 +250,7 @@ gcs_content_type_normalization
 
 ## Claude Platform on AWS is a routed Bedrock variant
 
-The Claude Platform path is not a plain Bedrock alias. It strips the
+The Claude Platform path strips the
 `claude_platform/` route prefix before handing the model to the Anthropic
 transformer, requires a workspace ID, and injects `anthropic-workspace-id`
 plus a fallback `x-api-key` when needed.

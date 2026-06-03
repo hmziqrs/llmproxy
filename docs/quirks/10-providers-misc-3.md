@@ -338,7 +338,7 @@ together_ai_reject_integer_prompt_input
 
 ## IBM WatsonX converts chat messages into model-family prompt templates and switches endpoints for deployments
 
-WatsonX chat is not a direct chat-completions passthrough. The adapter turns
+The WatsonX chat adapter turns
 chat messages into a single prompt string using model-family-specific
 templates, then builds either the shared chat endpoint or a deployment-
 specific endpoint depending on whether the model name starts with

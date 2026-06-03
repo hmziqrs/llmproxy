@@ -244,7 +244,7 @@ vertex_anthropic_original_model_restore
 
 ## xAI Responses strips unsupported top-level fields and rewrites tool definitions
 
-The xAI Responses adapter is not a blind OpenAI passthrough. It drops
+The xAI Responses adapter drops
 `instructions` and `metadata` entirely, removes the `container` field from
 `code_interpreter` tools, rewrites `web_search` into xAI's `filters` shape,
 and maps `x_search` into xAI's native tool schema. The endpoint also does not
@@ -271,7 +271,7 @@ xai_responses_http_only
 
 ## Hosted vLLM rewrites custom tools and assistant thinking blocks into OpenAI-shaped content
 
-The Hosted vLLM chat adapter is not a direct pass-through. It strips tool
+The Hosted vLLM chat adapter strips tool
 schemas down to OpenAI function tools when the caller sends `type: "custom"`,
 so the upstream validation path only sees a function-style tool call. It also
 rewrites assistant `thinking_blocks` into structured content blocks and can
@@ -294,7 +294,7 @@ hosted_vllm_video_file_to_video_url
 
 ## DeepInfra chat flattens tool messages and enforces a narrow `tool_choice` contract
 
-The DeepInfra chat adapter is not a plain OpenAI passthrough. Tool messages
+In the DeepInfra chat adapter, tool messages
 must be strings, so any array-shaped tool content is flattened or serialized
 before dispatch. It also refuses `tool_choice` values other than `auto` and
 `none` unless `drop_params` is enabled, in which case the unsupported value is
@@ -342,8 +342,8 @@ ollama_json_mode_reasoning_fallback
 
 ## Snowflake rewrites tool definitions and response content lists into its own schema
 
-The Snowflake adapter is not a direct OpenAI passthrough. On the request path,
-it converts OpenAI function tools into Snowflake `tool_spec` objects and
+On the request path, the Snowflake adapter converts OpenAI function tools into
+Snowflake `tool_spec` objects and
 rewrites `tool_choice` from OpenAI's string/dict shapes into Snowflake's
 object format. On the response path, it collapses Snowflake `content_list`
 items back into OpenAI `content` plus `tool_calls`, then strips the provider
