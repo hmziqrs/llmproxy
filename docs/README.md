@@ -22,12 +22,10 @@ The docs in this directory map onto those crates.
 
 | File | Scope |
 |---|---|
-| [architecture.md](architecture.md) | Engine shape, canonical IR, provider layer, streaming, extensibility story |
 | [protocol-normalization.md](protocol-normalization.md) | Focused rules for `A -> Core -> B` protocol normalization |
 | [protocol-mini.md](protocol-mini.md) | Short reference-project findings on protocol families and response shapes |
-| [mini-quirks.md](mini-quirks.md) | Quirks and hacks found in reference proxy implementations |
-| [operations.md](operations.md) | Cross-cutting concerns: auth, rate limits, retries, fallbacks, caching, observability, multi-tenancy |
-| [strategy.md](strategy.md) | Open strategic questions, scope discipline, real risk |
+| [quirks.md](quirks.md) | Flat catalogue of gotchas and broken things in the reference projects |
+| [mini-quirks.md](mini-quirks.md) | Practical hacks and design rules distilled from the reference projects |
 
 ## Status of the reference projects
 
