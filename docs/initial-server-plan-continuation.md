@@ -530,6 +530,7 @@ crates/llm-proxy-protocol/src/client/openai_chat.rs
 Update:
 
 ```text
+crates/llm-proxy-protocol/src/anthropic.rs
 crates/llm-proxy-protocol/src/lib.rs
 ```
 
@@ -562,6 +563,40 @@ pub enum ProtocolError {
 
 This requires adding `thiserror = { workspace = true }` to
 `crates/llm-proxy-protocol/Cargo.toml`.
+
+### Wire DTO updates
+
+Before writing adapters, make sure the existing wire DTOs can represent the
+client fields the core contract preserves. In `anthropic.rs`, add missing fields
+instead of dropping them during decode/encode:
+
+```rust
+pub struct MessageRequest {
+    // existing fields...
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<serde_json::Value>,
+}
+
+pub struct ContentBlock {
+    // existing fields...
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<CacheControl>,
+}
+
+pub struct Delta {
+    // existing fields...
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_sequence: Option<String>,
+}
+```
+
+`Delta.stop_sequence` is needed for Anthropic `message_delta` stream events.
+`MessageRequest.tool_choice` and text/cache controls are needed because the
+core request contract preserves tool choice and cache hints.
+
+`ContentBlock` currently has a custom `Serialize` implementation. Update it so
+text blocks emit `cache_control` when present; otherwise the field will decode
+but disappear on encode.
 
 ### Client adapter functions
 
@@ -596,7 +631,9 @@ Message.content[].type=image               -> CoreContent::Image
 Message.content[].type=tool_use            -> CoreContent::ToolUse
 Message.content[].type=tool_result         -> CoreContent::ToolResult
 Message.content[].type=thinking            -> CoreContent::Thinking
+Text cache_control                         -> CoreContent::Text.cache
 MessageRequest.tools                       -> CoreTool
+MessageRequest.tool_choice                 -> CoreToolChoice or Raw
 MessageRequest.temperature                 -> SamplingOptions.temperature
 MessageRequest.top_p                       -> SamplingOptions.top_p
 MessageRequest.max_tokens                  -> SamplingOptions.max_tokens
@@ -643,11 +680,13 @@ role=assistant with content                 -> CoreContent::Text
 role=assistant with reasoning_content       -> CoreContent::Thinking
 role=assistant with tool_calls              -> CoreContent::ToolUse
 role=tool with tool_call_id                 -> CoreContent::ToolResult
+ChatMessage.cache_control                  -> CoreContent::Text.cache where applicable
 tools[].function                            -> CoreTool
 tool_choice                                 -> CoreToolChoice or Raw
 temperature/top_p/max_tokens/stop           -> SamplingOptions
 reasoning_effort/thinking                   -> SamplingOptions
 stream.unwrap_or(false)                     -> CoreRequest.stream
+stream_options                             -> ProviderHints.raw["stream_options"]
 ```
 
 ### OpenAI Chat encode rules
@@ -680,6 +719,8 @@ Minimum tests:
 - tool call decodes to core
 - tool result decodes to core
 - thinking decodes to core
+- tool choice decodes to core
+- cache control decodes to core
 - core text response encodes to route response
 - core tool use response encodes to route response
 - stop reason mapping
@@ -705,6 +746,8 @@ Each client adapter must have fixture cases for:
 - tool call decode
 - tool result decode
 - thinking decode where supported
+- tool choice decode
+- cache control decode
 - core response encode
 - stop reason and stop sequence encode
 - usage encode
@@ -1003,13 +1046,19 @@ pub struct ProviderTarget {
     pub upstream_model: String,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum ModelRouteError {
+    #[error("unknown model: {0}")]
+    UnknownModel(String),
+}
+
 pub fn resolve_model_route(
     routes: &std::collections::HashMap<String, ModelRoute>,
     requested_model: &str,
-) -> Result<ProviderTarget, RouteError> {
+) -> Result<ProviderTarget, ModelRouteError> {
     let route = routes
         .get(requested_model)
-        .ok_or_else(|| RouteError::UnknownModel(requested_model.to_owned()))?;
+        .ok_or_else(|| ModelRouteError::UnknownModel(requested_model.to_owned()))?;
 
     Ok(ProviderTarget {
         provider: route.provider.clone(),
@@ -1020,6 +1069,16 @@ pub fn resolve_model_route(
             .unwrap_or_else(|| requested_model.to_owned()),
     })
 }
+```
+
+Export the new config/routing types from `llm-proxy-core/src/lib.rs`:
+
+```rust
+pub use provider_config::{
+    AppConfig, AuthStyle, ModelRoute, ProviderAdapterConfig, ProviderConfig,
+    ProviderFile, ProviderModelConfig, ServerConfig,
+};
+pub use model_route::{ModelRouteError, ProviderTarget, resolve_model_route};
 ```
 
 ### Validation
@@ -1060,7 +1119,7 @@ Add tests for:
 - known protocol passes validation when supplied by caller
 - unknown protocol fails validation when not supplied by caller
 - upstream model alias resolves correctly
-- unknown model returns route error
+- unknown model returns `ModelRouteError::UnknownModel`
 
 ### Gate
 
@@ -1390,10 +1449,13 @@ Each provider adapter needs tests for:
 - core text request to provider request
 - core system prompt to provider request
 - core tool declaration to provider request
+- core tool choice to provider request where supported
+- core cache control to provider request where supported
 - core tool result to provider request
 - provider text response to core response
 - provider tool call response to core response
 - stop reason mapping
+- stop sequence mapping where supported
 - usage mapping
 - streaming text
 - streaming tool call
@@ -1421,6 +1483,8 @@ Each provider protocol must include at least:
 - core text request to provider request
 - provider text response to core response
 - tool request/response mapping where supported
+- tool choice mapping where supported
+- cache control mapping where supported
 - stop reason and stop sequence mapping
 - usage mapping
 - streaming text events
@@ -1687,14 +1751,25 @@ pub async fn handle_messages(
     State(state): State<AppState>,
     headers: HeaderMap,
     body: axum::body::Bytes,
-) -> Result<Response<Body>, ApiError> {
+) -> Response<Body> {
+    match handle_messages_inner(state, headers, body).await {
+        Ok(response) => response,
+        Err(error) => route_error_response(ClientProtocol::Anthropic, error),
+    }
+}
+
+async fn handle_messages_inner(
+    state: AppState,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<Response<Body>, RouteError> {
     let ctx = prepare_request(&state, &headers, &body)?;
     let req: MessageRequest = serde_json::from_slice(&body)
-        .map_err(|e| ApiError::BadRequest(format!("invalid JSON: {e}")))?;
-    req.validate().map_err(ApiError::BadRequest)?;
+        .map_err(|e| RouteError::InvalidRequest(format!("invalid JSON: {e}")))?;
+    req.validate().map_err(RouteError::InvalidRequest)?;
 
     let core = llm_proxy_protocol::client::anthropic::decode_request(req)
-        .map_err(protocol_error_to_api)?;
+        .map_err(protocol_error_to_route)?;
 
     if core.stream {
         handle_core_stream(state, ctx, core, ClientProtocol::Anthropic).await
@@ -1709,6 +1784,7 @@ Shared `handle_core_once`:
 ```text
 CoreRequest
   -> resolve_model_route(state.app_config.models, core.model.requested)
+  -> map ModelRouteError::UnknownModel to RouteError::UnknownModel
   -> state.providers.resolve_adapter_target(...)
   -> ProviderProtocol::parse(...)
   -> state.provider_adapters.get(...)
@@ -1724,6 +1800,7 @@ Shared `handle_core_stream`:
 ```text
 CoreRequest
   -> resolve_model_route(state.app_config.models, core.model.requested)
+  -> map ModelRouteError::UnknownModel to RouteError::UnknownModel
   -> state.providers.resolve_adapter_target(...)
   -> ProviderProtocol::parse(...)
   -> state.provider_adapters.get(...)
@@ -2152,11 +2229,13 @@ For every adapter:
 - system prompt
 - multiple messages
 - tool definition
+- tool choice
 - assistant tool call
 - user tool result
 - reasoning/thinking
 - cache marker where supported
 - stop reason mapping
+- stop sequence mapping where supported
 - usage mapping
 - streaming text
 - streaming tool call
