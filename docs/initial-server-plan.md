@@ -24,6 +24,11 @@ In scope:
 - `Cargo.lock` committed (binary-led workspace).
 - Clippy clean, no `unwrap` in production paths, unit + integration
   tests for handlers.
+- Build metadata (target triple, git SHA) via `vergen-gix`, reported
+  by `/version`.
+- Config path resolved by `clap` (`--config` flag with
+  `$LLM_PROXY_CONFIG` fallback).
+- `rust-toolchain.toml` pinning the edition-2024 toolchain.
 
 Out of scope (deferred):
 
@@ -56,11 +61,14 @@ on 1.96.
 .
 ├── Cargo.toml                       # workspace + lints + workspace.dependencies
 ├── Cargo.lock                       # generated, committed
+├── rust-toolchain.toml              # pins channel for edition 2024
 ├── rustfmt.toml                     # max_width = 100
+├── config.toml.example              # documented config template
 ├── justfile                         # extended with build/test/lint/fmt/run
 ├── apps/
 │   └── llm-proxy/
 │       ├── Cargo.toml
+│       ├── build.rs                 # vergen-gix build metadata
 │       └── src/
 │           └── main.rs              # binary entry
 └── crates/
@@ -160,6 +168,10 @@ tower-http = { version = "0.5", features = ["trace", "timeout"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
+humantime-serde = "1"
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
 
 # Errors
 thiserror = "2"
@@ -168,6 +180,9 @@ anyhow = "1"
 # Observability
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+# Build metadata
+vergen-gix = "1"
 
 # Misc
 uuid = { version = "1", features = ["v4"] }
@@ -181,13 +196,13 @@ rust_2018_idioms = { level = "warn", priority = -1 }
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
-redundant_clone = "warn"
-needless_collect = "warn"
-large_enum_variant = "warn"
 
-# Pedantic is intentionally NOT enabled for v1. It produces too many
-# false positives on day one. Re-enable per-crate once each crate
-# stabilizes.
+# `all` already covers the perf group (e.g. `large_enum_variant`), so it
+# is not re-listed. Nursery lints (`redundant_clone`, `needless_collect`)
+# are intentionally NOT enabled: they are allow-by-default precisely
+# because they emit false positives — the same reason `pedantic` is
+# omitted. Pedantic is deferred and can be re-enabled per-crate once each
+# crate stabilizes.
 
 [profile.release]
 lto = "thin"
@@ -205,6 +220,19 @@ code).
 ```toml
 max_width = 100
 edition = "2024"
+```
+
+## `rust-toolchain.toml`
+
+Edition 2024 requires rustc ≥ 1.85. Pinning the channel makes the
+plan's toolchain assumption enforceable rather than just documented, so
+a contributor on an older Rust gets a clear rustup message instead of a
+cryptic edition error.
+
+```toml
+[toolchain]
+channel = "1.85"
+components = ["rustfmt", "clippy"]
 ```
 
 ## `justfile` extensions
@@ -257,6 +285,7 @@ workspace = true
 serde = { workspace = true }
 thiserror = { workspace = true }
 toml = { workspace = true }
+humantime-serde = { workspace = true }
 ```
 
 ### `src/lib.rs`
@@ -285,7 +314,9 @@ use serde::{Deserialize, Serialize};
 pub struct Config {
     /// Address the HTTP server binds to.
     pub bind: SocketAddr,
-    /// Maximum request duration before timeout.
+    /// Maximum request duration before timeout. Accepts humantime
+    /// strings in TOML, e.g. `request_timeout = "60s"`.
+    #[serde(with = "humantime_serde")]
     pub request_timeout: Duration,
     /// Public server name reported by `/version`.
     pub server_name: String,
@@ -352,6 +383,21 @@ pub enum CoreError {
 }
 ```
 
+### `config.toml.example`
+
+Committed at the repo root so the on-disk format is documented (the
+`Duration` field is the one that bites people — `humantime-serde` makes
+it a plain string). Every field mirrors a `Config::default()` value.
+
+```toml
+# Address the HTTP server binds to.
+bind = "0.0.0.0:8080"
+# Maximum request duration before timeout (humantime string).
+request_timeout = "60s"
+# Public server name reported by /version.
+server_name = "llm-proxy"
+```
+
 ## `crates/llm-proxy-server`
 
 Purpose: the axum wiring. `build_router(state) -> Router` is the public
@@ -383,6 +429,12 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
+
+[dev-dependencies]
+# `ServiceExt::oneshot` in the integration test needs tower's `util`
+# feature. Scoped to dev so the library build stays lean; cargo's
+# feature unification enables it only when compiling tests.
+tower = { workspace = true, features = ["util"] }
 ```
 
 ### `src/lib.rs`
@@ -396,6 +448,7 @@ pub mod shutdown;
 pub mod state;
 
 pub use error::ApiError;
+pub use shutdown::shutdown_signal;
 pub use state::{AppState, BuildInfo};
 
 use axum::Router;
@@ -417,8 +470,9 @@ use llm_proxy_core::Config;
 /// Application state shared with every handler.
 ///
 /// Cheap to clone: `Config` is small and `Arc`-wrapped fields share
-/// allocation. Required by axum's `State` extractor.
-#[derive(Clone)]
+/// allocation. Required by axum's `State` extractor. `Debug` is
+/// mandatory under the `missing_debug_implementations` lint.
+#[derive(Clone, Debug)]
 pub struct AppState {
     /// Server configuration.
     pub config: Arc<Config>,
@@ -435,6 +489,8 @@ pub struct BuildInfo {
     pub version: &'static str,
     /// Target triple the binary was compiled for.
     pub target: &'static str,
+    /// Git commit SHA the binary was built from.
+    pub git_sha: &'static str,
 }
 
 impl AppState {
@@ -504,8 +560,6 @@ Notes (Ch. 4): `thiserror` enum, no `unwrap`, no `panic`. The
 ### `src/routes/mod.rs`
 
 ```rust
-use std::time::Duration;
-
 use axum::{
     Router,
     extract::DefaultBodyLimit,
@@ -520,23 +574,28 @@ use crate::state::AppState;
 mod chat;
 mod health;
 
-pub(self) use chat::echo_chat;
-pub(self) use health::{health, ready, version};
+use chat::echo_chat;
+use health::{health, ready, version};
 
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_BODY_BYTES: usize = 32 * 1024 * 1024; // 32 MiB
 
 /// Build the full router.
 ///
 /// Middleware order, from outermost to innermost:
 /// 1. `TraceLayer`  — logs every request and response, measures latency.
-/// 2. `TimeoutLayer` — cancels requests exceeding `REQUEST_TIMEOUT`.
+/// 2. `TimeoutLayer` — cancels requests exceeding `config.request_timeout`.
 /// 3. `DefaultBodyLimit` — caps the request body for JSON extractors.
+///
+/// `ServiceBuilder` makes the *first* `.layer()` the outermost, so the
+/// layers are listed here in the same outer-to-inner order. `TraceLayer`
+/// must be outermost for it to observe requests later layers reject
+/// (timeouts, oversized bodies).
 pub fn router(state: AppState) -> Router {
+    let timeout = state.config.request_timeout;
     let middleware = ServiceBuilder::new()
-        .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
-        .layer(TimeoutLayer::new(REQUEST_TIMEOUT))
-        .layer(TraceLayer::new_for_http());
+        .layer(TraceLayer::new_for_http())
+        .layer(TimeoutLayer::new(timeout))
+        .layer(DefaultBodyLimit::max(MAX_BODY_BYTES));
 
     Router::new()
         .route("/health", get(health))
@@ -589,17 +648,22 @@ pub async fn ready() -> (StatusCode, Json<ReadyBody>) {
 
 #[derive(Serialize)]
 struct VersionBody {
-    name: &'static str,
+    /// Public server name, from `config.server_name`.
+    name: String,
     version: &'static str,
     target: &'static str,
+    git_sha: &'static str,
 }
 
-/// Build metadata for ops/debugging.
+/// Build metadata for ops/debugging. `name` comes from config so
+/// operators can distinguish deployments; the rest is compile-time
+/// build info.
 pub async fn version(State(state): State<AppState>) -> Json<VersionBody> {
     Json(VersionBody {
-        name: state.build.name,
+        name: state.config.server_name.clone(),
         version: state.build.version,
         target: state.build.target,
+        git_sha: state.build.git_sha,
     })
 }
 ```
@@ -613,9 +677,9 @@ pub async fn version(State(state): State<AppState>) -> Json<VersionBody> {
 > Non-string user content is logged and coerced to its JSON form.
 
 ```rust
-use axum::{Json, extract::State, http::StatusCode};
+use axum::{Json, extract::State};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::Value;
 use tracing::warn;
 use uuid::Uuid;
 
@@ -708,9 +772,11 @@ pub async fn echo_chat(
 }
 
 /// Current Unix time in seconds. The `unwrap_or(0)` is a documented
-/// exception to the no-`unwrap` rule (Ch. 4.2): `SystemTime` is a
-/// monotonic clock on the supported targets and the fallback path
-/// is not exercised in practice.
+/// exception to the no-`unwrap` rule (Ch. 4.2): `duration_since`
+/// only errors if the wall clock is set before 1970, which we treat
+/// as a benign `0` rather than panicking. (Note: `SystemTime` is the
+/// wall clock and can move backwards — that is exactly why this
+/// returns a `Result` we must handle.)
 fn now_unix() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -760,7 +826,7 @@ use tower::ServiceExt;
 fn state() -> AppState {
     AppState::new(
         Config::default(),
-        BuildInfo { name: "test", version: "0.0.0", target: "test" },
+        BuildInfo { name: "test", version: "0.0.0", target: "test", git_sha: "test" },
     )
 }
 
@@ -842,9 +908,39 @@ llm-proxy-server = { workspace = true }
 llm-proxy-core = { workspace = true }
 
 anyhow = { workspace = true }
+clap = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+
+[build-dependencies]
+vergen-gix = { workspace = true }
+```
+
+### `build.rs`
+
+Replaces the broken `env!("TARGET")` (cargo never sets `TARGET` for the
+crate being compiled — only for build scripts). `vergen-gix` emits the
+target triple and git SHA as compile-time env vars that `main.rs` reads
+with `env!`. This repo is a git checkout, so the SHA resolves; for a
+source build without git metadata, omitting `.fail_on_error()` lets
+`vergen` substitute an idempotent placeholder instead of failing.
+Confirm the exact builder API against the pinned `vergen-gix` 1.x docs.
+
+```rust
+use vergen_gix::{CargoBuilder, Emitter, GixBuilder};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // VERGEN_CARGO_TARGET_TRIPLE
+    let cargo = CargoBuilder::default().target_triple(true).build()?;
+    // VERGEN_GIT_SHA (short)
+    let gix = GixBuilder::default().sha(true).build()?;
+    Emitter::default()
+        .add_instructions(&cargo)?
+        .add_instructions(&gix)?
+        .emit()?;
+    Ok(())
+}
 ```
 
 ### `src/main.rs`
@@ -853,29 +949,41 @@ tracing-subscriber = { workspace = true }
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
+use clap::Parser;
 use llm_proxy_core::Config;
 use llm_proxy_server::{AppState, BuildInfo, build_router, shutdown_signal};
 use tokio::net::TcpListener;
 use tracing::info;
 
+/// Command-line arguments.
+#[derive(Parser, Debug)]
+#[command(name = "llm-proxy", version, about)]
+struct Cli {
+    /// Path to a TOML config file. Falls back to `$LLM_PROXY_CONFIG`,
+    /// then to built-in defaults.
+    #[arg(long, env = "LLM_PROXY_CONFIG")]
+    config: Option<PathBuf>,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     init_tracing();
 
-    let config_path: Option<PathBuf> = std::env::var("LLM_PROXY_CONFIG")
-        .ok()
-        .map(PathBuf::from);
-    let config = match config_path {
-        Some(p) => Config::load(&p).with_context(|| format!("loading config from {p:?}"))?,
+    let cli = Cli::parse();
+    let config = match cli.config {
+        Some(p) => {
+            Config::load(&p).with_context(|| format!("loading config from {}", p.display()))?
+        }
         None => Config::default(),
     };
 
-    let state = AppState::new(config.clone(), build_info());
+    let bind = config.bind;
+    let state = AppState::new(config, build_info());
     let app = build_router(state);
 
-    let listener = TcpListener::bind(config.bind)
+    let listener = TcpListener::bind(bind)
         .await
-        .with_context(|| format!("binding to {}", config.bind))?;
+        .with_context(|| format!("binding to {bind}"))?;
     info!(addr = %listener.local_addr()?, "llm-proxy listening");
 
     axum::serve(listener, app)
@@ -890,7 +998,8 @@ fn build_info() -> BuildInfo {
     BuildInfo {
         name: env!("CARGO_PKG_NAME"),
         version: env!("CARGO_PKG_VERSION"),
-        target: env!("TARGET"),
+        target: env!("VERGEN_CARGO_TARGET_TRIPLE"),
+        git_sha: env!("VERGEN_GIT_SHA"),
     }
 }
 
@@ -953,9 +1062,10 @@ fails.
 3. Edit root `Cargo.toml`: add `[workspace.package]`,
    `[workspace.dependencies]`, `[workspace.lints.rust]`,
    `[workspace.lints.clippy]`, `[profile.release]`.
-4. `cargo build --workspace` to generate `Cargo.lock`.
-5. `git add Cargo.lock` and commit (binary-led workspace).
-6. `cargo build --workspace --locked` to confirm the lock is
+4. Add root `rust-toolchain.toml` and `config.toml.example`.
+5. `cargo build --workspace` to generate `Cargo.lock`.
+6. `git add Cargo.lock` and commit (binary-led workspace).
+7. `cargo build --workspace --locked` to confirm the lock is
    consistent.
 
 ### Phase 1 — `core`
@@ -976,9 +1086,11 @@ fails.
 
 ### Phase 3 — `apps/llm-proxy` binary
 
-1. Add `apps/llm-proxy/Cargo.toml` and `src/main.rs`.
-2. `just build` green.
+1. Add `apps/llm-proxy/Cargo.toml`, `build.rs`, and `src/main.rs`.
+2. `just build` green (confirms `vergen-gix` emits the env vars
+   `main.rs` reads).
 3. `just run` boots; `Ctrl-C` exits cleanly.
+4. `cargo run -p llm-proxy -- --help` shows the `--config` flag.
 
 ### Phase 4 — Verification (full gate)
 
@@ -1018,10 +1130,10 @@ Expected `/health` body:
 { "status": "ok" }
 ```
 
-Expected `/version` body (example):
+Expected `/version` body (example; `name` comes from `config.server_name`):
 
 ```json
-{ "name": "llm-proxy", "version": "0.1.0", "target": "aarch64-apple-darwin" }
+{ "name": "llm-proxy", "version": "0.1.0", "target": "aarch64-apple-darwin", "git_sha": "5c82a41" }
 ```
 
 Expected chat echo body (shape, not values):
@@ -1039,10 +1151,39 @@ Expected chat echo body (shape, not values):
 }
 ```
 
+## Dependency choices (build-it vs. use-a-crate)
+
+The bias is toward small, well-maintained crates for anything fiddly or
+spec-shaped, and hand-rolling only where a crate would be heavier than
+the std code it replaces. Decisions for v1:
+
+| Concern | v1 decision | Rationale |
+|---|---|---|
+| Build metadata (target, git SHA) | **`vergen-gix`** | `env!("TARGET")` does not compile; a build script is required anyway, and `vergen` gives the SHA for free, enriching `/version`. |
+| Config path / CLI parsing | **`clap`** (`derive`, `env`) | One attribute handles both `--config` and `$LLM_PROXY_CONFIG`, reconciling the README (flag) with the env-var approach. Hand-rolling arg parsing scales poorly. |
+| `Duration` in TOML | **`humantime-serde`** | Raw serde `Duration` deserializes from `{ secs, nanos }` — a usability trap. `"60s"` strings are obvious and self-documenting. |
+| Graceful shutdown | **hand-rolled** (`tokio::signal` + `select!`) | This *is* the idiomatic axum-documented pattern. `tokio-graceful-shutdown` adds subsystem orchestration that v1 does not need. |
+| Unix timestamp for `created` | **hand-rolled** | A 5-line `SystemTime` calc. Pulling in `time`/`jiff`/`chrono` is not justified until a date dependency exists for another reason. |
+| Error response envelope | **hand-rolled** (custom shape) | Must mirror OpenAI, not a generic problem-details crate. See open question 8 — the current `{message, kind}` shape should converge on OpenAI's `{message, type, code}`. |
+
+Deferred (adopt when the need lands, not in v1):
+
+- **`async-openai-types`** for the real `llm-proxy-protocol` schema —
+  do not hand-roll the full OpenAI request/response/streaming types
+  (content-part arrays, tool calls, logprobs) once past the echo stub.
+- **`figment`** for layered config (defaults → file → env overrides)
+  when per-field env overrides are wanted; replaces `Config::load`.
+- **`tower-http::request_id`** (`SetRequestId` + `PropagateRequestId`)
+  for request correlation once there is more than one route worth
+  tracing across.
+- **`axum-test`** (`TestServer`) if the `oneshot` boilerplate in the
+  integration tests becomes a drag.
+
 ## Open questions / next steps after this plan
 
 1. Real `CoreRequest`/`CoreEvent` types in `llm-proxy-protocol` —
-   copy from `docs/protocol-mini.md` §4–5.
+   copy from `docs/protocol-mini.md` §4–5. Strongly consider
+   `async-openai-types` rather than re-deriving the OpenAI schema.
 2. SSE streaming. axum-skill section on `axum::response::sse::Sse`
    + `futures::stream`. Replace the `stream: true` rejection with
    a real event stream adapter.
@@ -1053,3 +1194,10 @@ Expected chat echo body (shape, not values):
 5. Per-route auth middleware (extractor over a placeholder
    `Authorization` header) before exposing anything beyond ops.
 6. Re-enable `pedantic` per-crate once each crate stabilizes.
+7. Layered config via `figment` (defaults → file → env) when
+   per-field env overrides are wanted.
+8. Error-envelope compatibility: axum's `Json` extractor rejects
+   malformed bodies with its own plain-text 400 *before* `ApiError`
+   runs, so bad JSON does not get the `{error: …}` shape. Add a
+   custom `Json` extractor (or `JsonRejection` handler) and converge
+   the envelope on OpenAI's `{message, type, param, code}`.
