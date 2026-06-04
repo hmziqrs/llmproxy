@@ -1189,6 +1189,7 @@ the README already names ("pool keys, log usage, fail over").
 | `backon` (or `backoff`) | retry + exponential backoff for failover |
 | `reqwest-middleware` + `reqwest-retry` + `reqwest-tracing` | outbound HTTP middleware stack: retry policy and tracing spans on provider calls (cleaner than wrapping `backon` by hand) |
 | `failsafe` | circuit breaker — stop hammering a provider that is failing, trip to the next one |
+| `aws-sigv4` (Bedrock) / `yup-oauth2` or `gcp_auth` (Vertex) | provider-specific request signing / OAuth2 token minting — only for cloud providers that don't use a static API key |
 | `async-trait` / `trait-variant` | `dyn Provider` dispatch (edition 2024 has async-fn-in-trait, but `dyn` still needs boxing) |
 
 **`llm-proxy-protocol` — schema & normalization**
@@ -1227,6 +1228,8 @@ the README already names ("pool keys, log usage, fail over").
 | `dotenvy` | load `.env` in dev — `.gitignore` already expects it |
 | `blake3` / `xxhash-rust` | fast cache-key hashing for the response cache |
 | `rand` | generate proxy-issued API keys |
+| `tower` (`load-shed`, `limit`) | shed load / cap concurrency under overload — already a dep, just enable the layers |
+| `tokio-cron-scheduler` | scheduled background jobs: usage rollups, key-health polling, cache eviction |
 
 **Observability & testing**
 
@@ -1259,6 +1262,7 @@ the README already names ("pool keys, log usage, fail over").
 |---|---|
 | `utoipa` + `utoipa-swagger-ui` | publish the OpenAI-compatible OpenAPI schema + docs UI |
 | `axum` (`multipart`) / `axum-extra` | multipart endpoints beyond chat (`/v1/audio/*`, `/v1/files`) |
+| `axum` (`ws`) + `tokio-tungstenite` | WebSocket for the OpenAI Realtime API (`/v1/realtime`) — only if voice/realtime is in scope |
 | `axum-server` (rustls) | in-process TLS termination if not behind a TLS-terminating reverse proxy |
 
 **Binary / throughput**
