@@ -89,6 +89,26 @@ _ref-pull:
         exit 1
     fi
 
+[doc("Build the workspace")]
+build *args:
+    cargo build {{args}}
+
+[doc("Run all tests")]
+test *args:
+    cargo test --workspace {{args}}
+
+[doc("Lint the workspace; treats warnings as errors")]
+lint:
+    cargo clippy --all-targets --all-features --locked -- -D warnings
+
+[doc("Format the workspace")]
+fmt:
+    cargo fmt --all
+
+[doc("Run the server binary")]
+run *args:
+    cargo run -p llm-proxy -- {{args}}
+
 [group('ref')]
 [doc("Clone each reference repo (if missing) and check it out at the commit locked in ref/REFS; for new-machine setup")]
 _ref-setup:

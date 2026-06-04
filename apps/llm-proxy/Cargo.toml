@@ -1,0 +1,27 @@
+[package]
+name = "llm-proxy"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "llm-proxy"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+llm-proxy-server = { workspace = true }
+llm-proxy-core = { workspace = true }
+
+anyhow = { workspace = true }
+axum = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[build-dependencies]
+vergen-gix = { workspace = true }

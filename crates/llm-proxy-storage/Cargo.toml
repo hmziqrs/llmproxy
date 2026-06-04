@@ -1,0 +1,12 @@
+[package]
+name = "llm-proxy-storage"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+llm-proxy-core = { workspace = true }

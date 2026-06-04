@@ -9,3 +9,62 @@ members = [
     "crates/llm-proxy-api",
     "crates/llm-proxy-server",
 ]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+# Internal
+llm-proxy-core = { path = "crates/llm-proxy-core" }
+llm-proxy-server = { path = "crates/llm-proxy-server" }
+
+# Async / runtime
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time"] }
+
+# Web
+axum = { version = "0.8", features = ["macros", "json"] }
+axum-serde = { version = "0.9", features = ["sonic"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace", "timeout"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+humantime-serde = "1"
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+
+# Errors
+thiserror = "2"
+anyhow = "1"
+
+# Observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+# Build metadata
+vergen-gix = "1"
+
+# Misc
+uuid = { version = "1", features = ["v4"] }
+
+[workspace.lints.rust]
+# Lint groups need strictly lower priority (more negative) than
+# individual lints so they don't shadow per-lint overrides.
+rust_2018_idioms = { level = "warn", priority = -3 }
+future-incompatible = { level = "warn", priority = -2 }
+nonstandard_style = { level = "deny", priority = -1 }
+missing_debug_implementations = "warn"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

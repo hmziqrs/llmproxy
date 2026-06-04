@@ -1,0 +1,6 @@
+# Address the HTTP server binds to.
+bind = "0.0.0.0:8080"
+# Maximum request duration before timeout (humantime string).
+request_timeout = "60s"
+# Public server name reported by /version.
+server_name = "llm-proxy"
