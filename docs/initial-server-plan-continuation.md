@@ -424,6 +424,7 @@ pub struct CoreResponse {
     pub model: ModelRef,
     pub content: Vec<CoreContent>,
     pub stop_reason: StopReason,
+    pub stop_sequence: Option<String>,
     pub usage: Usage,
     pub provider_meta: serde_json::Value,
 }
@@ -457,7 +458,7 @@ pub enum CoreEvent {
     ToolCallDelta { index: usize, args_delta: String },
     ToolCallStop { index: usize },
     UsageDelta { usage: Usage },
-    MessageStop { stop_reason: StopReason },
+    MessageStop { stop_reason: StopReason, stop_sequence: Option<String> },
     Error { error: CoreError },
     Ping,
 }
@@ -501,6 +502,8 @@ Add unit tests in `core.rs`:
 - `sampling_options_default_has_no_overrides`
 - `usage_default_is_zero`
 - `core_content_tool_result_can_nest_text`
+- `core_response_can_preserve_stop_sequence`
+- `message_stop_event_can_preserve_stop_sequence`
 
 ### Gate
 
@@ -619,6 +622,8 @@ CoreContent::Thinking                       -> ContentBlock type=thinking
 StopReason::EndTurn                         -> "end_turn"
 StopReason::MaxTokens                       -> "max_tokens"
 StopReason::ToolUse                         -> "tool_use"
+CoreResponse.stop_sequence                  -> MessageResponse.stop_sequence
+CoreEvent::MessageStop.stop_sequence        -> final Anthropic stop_sequence delta
 Usage                                       -> anthropic::Usage
 ```
 
@@ -679,8 +684,32 @@ Minimum tests:
 - core tool use response encodes to route response
 - stop reason mapping
 - usage mapping
+- stop sequence mapping
 - streaming text event mapping
 - streaming tool event mapping
+
+### Fixture requirement
+
+Add protocol adapter fixtures in this phase. Do not wait until Phase 12 for
+basic golden coverage.
+
+```text
+crates/llm-proxy-protocol/tests/fixtures/anthropic/
+crates/llm-proxy-protocol/tests/fixtures/openai_chat/
+```
+
+Each client adapter must have fixture cases for:
+
+- plain text request decode
+- system prompt decode
+- tool call decode
+- tool result decode
+- thinking decode where supported
+- core response encode
+- stop reason and stop sequence encode
+- usage encode
+- streaming text event encode
+- streaming tool event encode
 
 ### Gate
 
@@ -759,9 +788,8 @@ endpoint = "https://opencode.ai/zen/v1/models/{model}:generateContent"
 
 ### Provider config examples
 
-These examples are the reusable provider-config part of the superseded
-provider-agnostic refactor draft. They belong here because Phase 3 is where the
-config shape becomes real.
+These examples preserve the reusable provider-config detail from the earlier
+audit. They belong here because Phase 3 is where the config shape becomes real.
 
 #### Mixed OpenCode Go provider
 
@@ -898,7 +926,7 @@ enough. Add code first:
 2. Add a provider adapter that converts CoreRequest into provider JSON.
 3. Add response and stream decoders back into CoreResponse/CoreEvent.
 4. Register the provider protocol name in ProviderAdapterRegistry::builtin().
-5. Add golden fixtures.
+5. Add provider golden fixtures in the same phase as the new adapter.
 6. Add the provider TOML.
 ```
 
@@ -996,15 +1024,28 @@ pub fn resolve_model_route(
 
 ### Validation
 
-Provider registry validation must check:
+Core config validation must check only config shape and references it owns:
 
 - every `[models]` provider exists
 - every provider-local model points to an existing adapter
-- every provider adapter protocol exists in the compiled provider adapter
-  registry
 - every endpoint is non-empty
 - every `${ENV_VAR}` in `api_key` resolves to a non-empty value
 - no `ModelRoute` contains endpoint/protocol fields
+
+Do not make `llm-proxy-core` depend on `llm-proxy-provider`. Core may expose a
+validation function that accepts a caller-provided list of known protocol names,
+but the compiled adapter registry lives in the provider/server composition
+layer. The ownership split is:
+
+```text
+llm-proxy-core      -> parses TOML, resolves env vars, validates references
+llm-proxy-provider  -> owns compiled provider protocol enum/adapters
+llm-proxy-server    -> passes provider registry protocol names into core validation
+```
+
+Provider protocol validation must therefore happen when the server composes
+`ProviderRegistry` with `ProviderAdapterRegistry::builtin()`, not while core is
+parsing TOML in isolation.
 
 ### Tests
 
@@ -1016,8 +1057,8 @@ Add tests for:
 - unknown env var fails validation
 - unknown provider in route fails validation
 - provider-local unknown adapter fails validation
-- registered protocol passes validation
-- unregistered protocol fails validation
+- known protocol passes validation when supplied by caller
+- unknown protocol fails validation when not supplied by caller
 - upstream model alias resolves correctly
 - unknown model returns route error
 
@@ -1038,6 +1079,7 @@ Add:
 
 ```text
 crates/llm-proxy-provider/src/transport.rs
+crates/llm-proxy-provider/src/sse.rs
 ```
 
 Update:
@@ -1102,6 +1144,43 @@ Transport rules:
 - The transport does not know protocol names.
 - The transport does not serialize typed request structs. It sends bytes.
 
+### SSE framing helper
+
+Add a small buffered SSE parser in `sse.rs`. Do not split raw HTTP byte chunks
+with `str::lines()` in route handlers or adapters. Provider streams can split a
+single SSE frame across multiple TCP chunks, and some providers emit comments,
+event names, ids, or multi-line `data:` fields.
+
+```rust
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SseFrame {
+    pub event: Option<String>,
+    pub id: Option<String>,
+    pub data: String,
+}
+
+#[derive(Debug, Default)]
+pub struct SseFramer {
+    // buffered bytes and partially parsed frame state
+}
+
+impl SseFramer {
+    pub fn push_chunk(&mut self, chunk: &[u8]) -> Result<Vec<SseFrame>, ProviderError>;
+    pub fn finish(&mut self) -> Result<Vec<SseFrame>, ProviderError>;
+}
+```
+
+Framing rules:
+
+- preserve partial frames across byte chunks
+- support `\n` and `\r\n`
+- ignore comment lines beginning with `:`
+- collect repeated `data:` lines with newline separators
+- preserve optional `event:` and `id:` fields
+- emit a frame only after a blank line or final `finish()`
+- treat `data: [DONE]` as a normal terminal frame for adapters to interpret
+- return a provider error for invalid UTF-8
+
 ### Tests
 
 Use a local axum test server or `wiremock` if added. If avoiding a new
@@ -1114,6 +1193,9 @@ Test:
 - both headers set
 - error status returns `ProviderError::Api`
 - stream request sets `Accept: text/event-stream`
+- SSE framer handles partial frames split across chunks
+- SSE framer handles multi-line data fields
+- SSE framer preserves `[DONE]`
 
 ### Gate
 
@@ -1125,7 +1207,7 @@ cargo test --workspace
 ## Phase 5 - Add Provider Protocol Adapters
 
 Goal: provider adapters convert `CoreRequest` to provider request bytes and
-provider response bytes/stream lines back to core.
+provider response bytes/SSE frames back to core.
 
 ### Files
 
@@ -1204,10 +1286,14 @@ impl ProviderAdapter {
 }
 
 pub trait ProviderStreamDecoder: std::fmt::Debug {
-    fn decode_line(&mut self, line: &str) -> Result<Vec<CoreEvent>, ProviderError>;
+    fn decode_frame(&mut self, frame: &SseFrame) -> Result<Vec<CoreEvent>, ProviderError>;
     fn finish(&mut self) -> Result<Vec<CoreEvent>, ProviderError>;
 }
 ```
+
+The decoder receives already-framed SSE events from `SseFramer`. It must not
+parse raw network chunks. Provider-specific adapters decide how to interpret
+`event`, `id`, `data`, and `[DONE]`.
 
 ### Registry
 
@@ -1311,10 +1397,35 @@ Each provider adapter needs tests for:
 - usage mapping
 - streaming text
 - streaming tool call
+- streaming terminal frame handling
+- malformed stream frame behavior
 - provider-specific unsupported field behavior
 
 Use the existing transformer tests as a source of expected behavior, but assert
 against core values in the middle.
+
+### Fixture requirement
+
+Add provider adapter fixtures in this phase. Phase 12 is only the final
+coverage audit, not the first time fixtures appear.
+
+```text
+crates/llm-proxy-provider/tests/fixtures/openai_chat/
+crates/llm-proxy-provider/tests/fixtures/anthropic/
+crates/llm-proxy-provider/tests/fixtures/responses/
+crates/llm-proxy-provider/tests/fixtures/gemini/
+```
+
+Each provider protocol must include at least:
+
+- core text request to provider request
+- provider text response to core response
+- tool request/response mapping where supported
+- stop reason and stop sequence mapping
+- usage mapping
+- streaming text events
+- streaming tool events where supported
+- malformed provider response or stream event
 
 ### Gate
 
@@ -1433,7 +1544,7 @@ crates/llm-proxy-server/src/state.rs
 apps/llm-proxy/src/main.rs
 ```
 
-### Target state
+### Final target state
 
 ```rust
 #[derive(Clone, Debug)]
@@ -1451,16 +1562,53 @@ pub struct AppState {
 }
 ```
 
-During migration, if old `/v1/messages` still needs the old `Config`, use a
-temporary compatibility state:
+### Phase 7 transition state
+
+During Phase 7 only, keep a single legacy bridge so all routes compile until
+Phase 8/9 move to the core pipeline. Two standalone fields are not enough:
+current `/v1/messages`, `/health`, `/version`, and router middleware read old
+config, model router, fallback handler, and client state.
 
 ```rust
-pub old_config: Option<Arc<Config>>,
-pub old_client: Option<Arc<OpenCodeClient>>,
+#[derive(Clone, Debug)]
+pub struct LegacyState {
+    pub config: Arc<Config>,
+    pub client: Arc<OpenCodeClient>,
+    pub model_router: Arc<ModelRouter>,
+    pub fallback_handler: Arc<FallbackHandler>,
+}
+
+#[derive(Clone, Debug)]
+pub struct AppState {
+    pub app_config: Arc<AppConfig>,
+    pub providers: Arc<ProviderRegistry>,
+    pub provider_adapters: Arc<ProviderAdapterRegistry>,
+    pub proxy_client: Arc<ProxyClient>,
+    pub legacy: Option<Arc<LegacyState>>,
+    pub build: Arc<BuildInfo>,
+    pub token_counter: Arc<Counter>,
+    pub metrics: Arc<Metrics>,
+    pub rate_limiter: Arc<RateLimiter>,
+    pub request_dedup: Arc<RequestDeduplicator>,
+    pub request_id_gen: Arc<RequestIdGenerator>,
+}
 ```
 
-Remove those fields in Phase 10. Do not leave compatibility fields in the final
-state.
+Add helper methods so route code does not scatter `legacy.as_ref()` checks:
+
+```rust
+impl AppState {
+    pub fn request_timeout(&self) -> Duration;
+    pub fn server_name(&self) -> &str;
+    pub fn legacy(&self) -> Option<&LegacyState>;
+}
+```
+
+Update `routes/mod.rs`, `/health`, and `/version` in this phase to use those
+helpers. `/health` may return an empty `circuit_breakers` map when legacy state
+is gone. Remove `LegacyState` after Phase 8 and Phase 9 are complete and CLI
+JSON compatibility is no longer needed. Do not leave compatibility fields in
+the final state.
 
 ### Main binary construction
 
@@ -1471,7 +1619,7 @@ In `cmd_serve`:
 3. Load old `Config` only during compatibility period if path ends with `.json`.
 4. Load providers from `providers/` next to the main config.
 5. Build `ProviderAdapterRegistry::builtin()`.
-6. Validate provider protocol names against adapter registry.
+6. Pass adapter registry protocol names into core provider config validation.
 7. Build `ProxyClient::new()`.
 8. Build `AppState`.
 
@@ -1505,6 +1653,19 @@ Rewrite:
 
 ```text
 crates/llm-proxy-server/src/routes/messages.rs
+```
+
+Update:
+
+```text
+crates/llm-proxy-server/src/routes/token_count.rs
+```
+
+Add or update shared pipeline modules:
+
+```text
+crates/llm-proxy-server/src/routes/core_pipeline.rs
+crates/llm-proxy-server/src/routes/error_response.rs
 ```
 
 Do not keep:
@@ -1558,6 +1719,73 @@ CoreRequest
   -> HTTP response
 ```
 
+Shared `handle_core_stream`:
+
+```text
+CoreRequest
+  -> resolve_model_route(state.app_config.models, core.model.requested)
+  -> state.providers.resolve_adapter_target(...)
+  -> ProviderProtocol::parse(...)
+  -> state.provider_adapters.get(...)
+  -> adapter.encode_request(...)
+  -> state.proxy_client.send_stream(...)
+  -> SseFramer.push_chunk(...)
+  -> adapter.decode_frame(...)
+  -> client adapter encode_event(...)
+  -> route-specific SSE/chunk response
+  -> adapter.finish()
+  -> client adapter terminal event if needed
+```
+
+Do not decode provider streams in `/v1/messages` directly. The route chooses the
+client protocol encoder only; provider stream parsing belongs to
+`SseFramer + ProviderStreamDecoder`.
+
+### Shared route errors
+
+Do not keep an Anthropic-only `ApiError` as the shared pipeline error. Use one
+internal error model and encode it per client route.
+
+```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClientProtocol {
+    Anthropic,
+    OpenAiChat,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum RouteError {
+    #[error("invalid request: {0}")]
+    InvalidRequest(String),
+    #[error("unknown model: {0}")]
+    UnknownModel(String),
+    #[error("upstream error: {status}")]
+    Upstream { status: StatusCode, body: String },
+    #[error("provider decode error: {0}")]
+    ProviderDecode(String),
+    #[error("internal error: {0}")]
+    Internal(String),
+}
+
+pub fn route_error_response(protocol: ClientProtocol, error: RouteError) -> Response<Body>;
+```
+
+`/v1/messages` passes `ClientProtocol::Anthropic`. `/v1/chat/completions`
+passes `ClientProtocol::OpenAiChat`. The shared pipeline may return
+`RouteError`, but only `error_response.rs` knows the client-specific JSON
+envelope.
+
+### Token count endpoint
+
+Update `/v1/messages/count_tokens` in this phase so it no longer depends on old
+core request helper types that Phase 11 will delete. It remains an Anthropic
+client endpoint, but it should parse `MessageRequest`, validate it, decode it
+through `client::anthropic::decode_request`, and estimate text tokens from
+`CoreRequest.system` and `CoreRequest.messages`.
+
+Do not resolve providers or call upstream for token counting. The endpoint is a
+local estimate only.
+
 ### Error behavior
 
 - Unknown model: `400 Bad Request`.
@@ -1591,6 +1819,8 @@ Add server tests with local/mock provider endpoint:
 - upstream 500 returns 502
 - invalid JSON returns 400
 - request ID header is present on success
+- token count endpoint still returns Anthropic-compatible count response
+- token count endpoint does not require legacy state
 
 ### Gate
 
@@ -1635,6 +1865,9 @@ ChatCompletionRequest
   -> client::openai_chat::encode_response
   -> ChatCompletionResponse
 ```
+
+Reuse `routes/core_pipeline.rs` and `routes/error_response.rs` from Phase 8.
+Do not add a second provider execution path in `routes/chat.rs`.
 
 Streaming:
 
@@ -1733,6 +1966,13 @@ or generate them directly from `llm-proxy init`.
 
 ### Backward compatibility
 
+Phase 10 is the config cutover point. Start this phase only after:
+
+- `/v1/messages` uses the core pipeline
+- `/v1/chat/completions` uses the core pipeline
+- `/v1/messages/count_tokens` no longer depends on legacy state
+- all Phase 8 and Phase 9 tests pass
+
 For one release window, allow JSON config only to print a migration error:
 
 ```text
@@ -1740,8 +1980,17 @@ JSON oc-go-cc config is no longer supported by serve.
 Run `llm-proxy init` to create TOML config, then copy model/API settings.
 ```
 
+`serve --config old.json` must exit non-zero before constructing `AppState`.
+It must not start the server with old JSON config. If `$OC_GO_CC_CONFIG` is
+present, print the same migration error unless an explicit TOML `--config` or
+`$LLM_PROXY_CONFIG` is provided.
+
 Do not silently translate old scenario JSON into new model routes. That would
 preserve the wrong mental model.
+
+After this phase, remove `LegacyState` from `AppState` unless a still-mounted
+route has a documented compile-time dependency on it. The expected result is no
+legacy state.
 
 ### Tests
 
@@ -1786,6 +2035,21 @@ crates/llm-proxy-protocol/src/transformer/stream.rs
 
 Prefer deleting `transformer/` entirely once adapters cover all tests.
 
+Remove protocol exports and dependencies tied to the old direct architecture:
+
+```text
+crates/llm-proxy-protocol/src/lib.rs
+crates/llm-proxy-protocol/Cargo.toml
+```
+
+Required cleanup:
+
+- remove `pub mod transformer`
+- remove `llm-proxy-core` from `llm-proxy-protocol` dependencies
+- keep protocol crate independent of core crate; normalized core types now live
+  inside `llm-proxy-protocol::core`
+- verify no protocol module imports `llm_proxy_core::*`
+
 Delete from provider:
 
 ```text
@@ -1820,6 +2084,7 @@ fallback_handler
 circuit_breakers in health response
 scenario logs
 fallback-chain logic
+LegacyState
 ```
 
 ### Tests to delete or rewrite
@@ -1841,9 +2106,11 @@ cargo clippy --all-targets --all-features --locked -- -D warnings
 cargo fmt --all -- --check
 ```
 
-## Phase 12 - Golden Fixtures
+## Phase 12 - Complete Golden Fixture Coverage
 
-Goal: stop relying on memory of protocol shapes.
+Goal: audit and complete fixture coverage. Basic client fixtures must already
+exist from Phase 2, and basic provider fixtures must already exist from Phase 5.
+This phase closes gaps; it must not be the first time fixtures are added.
 
 ### Fixture layout
 
@@ -1857,6 +2124,9 @@ crates/llm-proxy-provider/tests/fixtures/anthropic/
 crates/llm-proxy-provider/tests/fixtures/responses/
 crates/llm-proxy-provider/tests/fixtures/gemini/
 ```
+
+If these directories already exist from earlier phases, keep them and add only
+the missing cases.
 
 Each fixture case should have:
 
@@ -1930,16 +2200,26 @@ curl -sS http://127.0.0.1:3456/version
 curl -sS -X POST http://127.0.0.1:3456/v1/messages \
   -H 'content-type: application/json' \
   -d '{"model":"unknown","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}'
+curl -sS -X POST http://127.0.0.1:3456/v1/messages/count_tokens \
+  -H 'content-type: application/json' \
+  -d '{"model":"any","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}'
 curl -sS -X POST http://127.0.0.1:3456/v1/chat/completions \
   -H 'content-type: application/json' \
   -d '{"model":"unknown","messages":[{"role":"user","content":"hi"}]}'
+llm-proxy validate --config ./config.toml
+llm-proxy models --config ./config.toml
+llm-proxy serve --config ./old.json
 ```
 
 Expected:
 
 - health/ready/version return 200
 - unknown Anthropic model returns 400 Anthropic-shaped error
+- token count returns 200 and does not call upstream
 - unknown OpenAI Chat model returns 400 OpenAI-shaped error
+- validate succeeds for TOML config
+- models prints configured client model IDs
+- old JSON serve exits non-zero with migration error
 - no request performs scenario detection
 - no request invokes fallback
 - no model ID classifier decides protocol
@@ -1949,19 +2229,20 @@ Expected:
 ```text
 0. Verify current green baseline.
 1. Add CoreRequest/CoreResponse/CoreEvent.
-2. Add Anthropic and OpenAI Chat client adapters.
+2. Add Anthropic and OpenAI Chat client adapters plus client fixtures.
 3. Add TOML model/provider config beside old JSON config.
-4. Add protocol-neutral ProxyClient.
-5. Add provider protocol adapters.
+4. Add protocol-neutral ProxyClient and SSE framer.
+5. Add provider protocol adapters plus provider fixtures.
 6. Add provider registry resolution.
 7. Rewrite AppState.
 8. Rewrite /v1/messages through core.
 9. Mount real /v1/chat/completions through core.
 10. Replace CLI config commands.
 11. Delete old scenario/fallback/direct-transform code.
-12. Add golden fixtures.
+12. Complete golden fixture coverage.
 ```
 
-The architecture is complete only when Phase 11 is done. Before that, the
-workspace may contain compatibility code, but new route behavior must use the
-core pipeline as soon as Phase 8 starts.
+The runtime architecture is complete only when Phase 11 is done. The migration
+is not implementation-complete until Phase 12 verifies fixture coverage. Before
+Phase 11, the workspace may contain compatibility code, but new route behavior
+must use the core pipeline as soon as Phase 8 starts.
