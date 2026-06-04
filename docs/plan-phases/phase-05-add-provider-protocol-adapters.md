@@ -102,10 +102,25 @@ pub struct ProviderAdapterRegistry {
 
 impl ProviderAdapterRegistry {
     pub fn builtin() -> Self;
+    pub fn protocol_names(&self) -> Vec<&'static str>;
     pub fn has_protocol_name(&self, protocol: &str) -> bool;
     pub fn get(&self, protocol: ProviderProtocol) -> Option<&ProviderAdapter>;
 }
 ```
+
+Add parse/name tests for every TOML protocol string used in Phase 3 examples.
+
+### Scope guardrails
+
+Provider adapters must not import client adapters or implement direct
+client-protocol behavior. They only translate:
+
+```text
+CoreRequest -> provider request JSON/URL
+provider response JSON/SSE -> CoreResponse/CoreEvent
+```
+
+They must not inspect client protocol names, route errors, or server state.
 
 ### OpenAI Chat provider adapter
 
@@ -123,9 +138,9 @@ Important migration from old code:
 - Do not take `ModelConfig`.
 - Do not override temperature from config.
 - Do not override max tokens from config.
-- DeepSeek/Kimi provider quirks may be handled here because they are provider
-  compatibility rules, but they must be derived from `target.upstream_model` or
-  provider hints, not router scenarios.
+- DeepSeek/Kimi provider quirks require an explicit compatibility profile in
+  provider config or a separate adapter. Do not infer quirks from provider/model
+  string matching inside the generic OpenAI Chat adapter.
 
 ### Anthropic provider adapter
 
@@ -180,6 +195,17 @@ The adapter expands URL templates:
 
 The router must not know Gemini puts the model in the path.
 
+### Lossy translation
+
+Every unsupported feature must choose one of these outcomes:
+
+1. Reject with `ProviderError` if sending it would change behavior silently.
+2. Omit with an explicit warning in `provider_meta` when the omission is safe.
+3. Preserve opaque provider-specific data in `provider_meta`.
+
+Do not special-case Provider A inside Protocol B's adapter unless it is selected
+through an explicit compatibility profile or separate adapter.
+
 ### Tests
 
 Each provider adapter needs tests for:
@@ -192,11 +218,21 @@ Each provider adapter needs tests for:
 - core tool result to provider request
 - provider text response to core response
 - provider tool call response to core response
+- model alias response preserves `CoreResponse.model.requested =
+  target.requested_model`
+- provider adapters encode `target.upstream_model` for provider requests
+- `CoreRequest.stream` maps to `ProxyRequest.stream`
 - stop reason mapping
 - stop sequence mapping where supported
 - usage mapping
+- Thinking, RedactedThinking, Refusal, and reasoning fields
+- multimodal content supported/unsupported behavior
 - streaming text
 - streaming tool call
+- full stream `CoreEvent` sequence with `MessageStart`, `ContentStart`,
+  `UsageDelta`, and `MessageStop`
+- content indexes and partial tool-call buffering
+- unknown provider events
 - streaming terminal frame handling
 - malformed stream frame behavior
 - provider-specific unsupported field behavior
@@ -229,9 +265,25 @@ Each provider protocol must include at least:
 - streaming tool events where supported
 - malformed provider response or stream event
 
+Each non-stream fixture case should use:
+
+```text
+input.json
+core.json
+output.json
+```
+
+Each stream fixture case should use:
+
+```text
+input.sse
+core-events.json
+output.sse
+```
+
 ### Gate
 
 ```sh
-cargo test -p llm-proxy-provider adapter
+cargo test -p llm-proxy-provider
 cargo test --workspace
 ```

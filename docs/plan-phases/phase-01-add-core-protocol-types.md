@@ -21,8 +21,10 @@ crates/llm-proxy-protocol/src/lib.rs
 
 ### `core.rs` target shape
 
-Keep these types intentionally chat-focused. Do not add embeddings, images,
-audio, rerank, files, or batch endpoints in this phase.
+Keep these types intentionally chat-endpoint focused. Do not add embeddings,
+image generation, audio endpoints, rerank, files, or batch endpoint families in
+this phase. Chat content still must preserve image/document/audio/video blocks
+because those can appear inside chat requests and responses.
 
 ```rust
 use serde::{Deserialize, Serialize};
@@ -201,6 +203,26 @@ pub enum CoreErrorKind {
 }
 ```
 
+### Core invariants
+
+- `CoreRequest.system` is the canonical location for system/developer
+  instructions. Client adapters should normalize system-role messages into this
+  field where the client protocol allows it. `CoreRole::System` exists only for
+  protocols or future edge cases that cannot separate system content cleanly.
+- `CoreRequest.messages` should contain conversation turns after system content
+  has been separated.
+- `CoreRequest.model.requested` is always the client-facing model. Provider
+  resolution may set `ModelRef.upstream`, but adapters must not replace
+  `requested`.
+- `CoreToolChoice::Raw` is allowed only as a temporary preservation mechanism
+  for a client tool-choice shape that affects behavior but has no canonical
+  variant yet. It must not contain unrelated wire nesting, and adapter tests
+  must either round-trip it intentionally or move it into metadata/provider
+  hints.
+- `RequestMetadata.raw`, `ProviderHints.raw`, and `provider_meta` are the only
+  places for opaque data. No adapter may special-case another protocol inside
+  these core types.
+
 ### Tests
 
 Add unit tests in `core.rs`:
@@ -212,10 +234,28 @@ Add unit tests in `core.rs`:
 - `core_content_tool_result_can_nest_text`
 - `core_response_can_preserve_stop_sequence`
 - `message_stop_event_can_preserve_stop_sequence`
+- `core_request_preserves_client_intent`
+- `core_request_preserves_metadata_and_provider_hints`
+- `core_request_system_field_is_canonical`
+- `core_request_round_trips_through_json`
+- `core_response_round_trips_through_json`
+- `core_event_round_trips_through_json`
+- `core_tool_choice_raw_round_trips_when_intentional`
+
+Add an integration smoke test in
+`crates/llm-proxy-protocol/tests/core_exports.rs` that imports:
+
+```rust
+use llm_proxy_protocol::core::{CoreEvent, CoreRequest, CoreResponse};
+```
+
+This prevents the Phase 1 gate from passing if `core.rs` or `pub mod core;` is
+missing.
 
 ### Gate
 
 ```sh
 cargo test -p llm-proxy-protocol core
+cargo test -p llm-proxy-protocol --test core_exports
 cargo test --workspace
 ```

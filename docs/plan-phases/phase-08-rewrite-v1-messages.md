@@ -117,6 +117,22 @@ Do not decode provider streams in `/v1/messages` directly. The route chooses the
 client protocol encoder only; provider stream parsing belongs to
 `SseFramer + ProviderStreamDecoder`.
 
+Stream finalization order:
+
+```text
+consume provider byte chunks
+  -> SseFramer emits frames
+  -> ProviderStreamDecoder emits CoreEvent values
+  -> client stream encoder emits route SSE events
+  -> provider decoder finish()
+  -> encode any remaining CoreEvent values
+  -> emit Anthropic terminal event if the client encoder requires one
+```
+
+`routes/messages.rs` must not import or call legacy transformers,
+`OpenCodeClient`, endpoint classification, scenario routing, fallback handlers,
+or provider-specific stream handlers.
+
 ### Shared route errors
 
 Do not keep an Anthropic-only `ApiError` as the shared pipeline error. Use one
@@ -162,11 +178,17 @@ through `client::anthropic::decode_request`, and estimate text tokens from
 Do not resolve providers or call upstream for token counting. The endpoint is a
 local estimate only.
 
+Token count tests must cover tool definitions, tool results, and non-text
+content. Either count text-bearing tool/schema fields or document that the local
+estimate intentionally ignores them.
+
 ### Error behavior
 
 - Unknown model: `400 Bad Request`.
 - Config/registry resolution error: `500 Internal Server Error` unless it is
   clearly a request model error.
+- Provider-local missing model, missing adapter, unknown protocol, or compiled
+  adapter missing: `500 Internal Server Error`.
 - Upstream `>= 400`: `502 Bad Gateway` with route-specific error envelope.
 - Provider adapter decode failure: `502 Bad Gateway`.
 - Client adapter decode failure: `400 Bad Request`.
@@ -192,11 +214,25 @@ Add server tests with local/mock provider endpoint:
 - configured Responses provider returns Anthropic response
 - configured Gemini provider returns Anthropic response
 - configured Anthropic provider returns Anthropic response through core, not raw pipe
+- `stream: true` OpenAI Chat provider returns Anthropic-shaped SSE text deltas
+- `stream: true` Responses provider returns Anthropic-shaped SSE text/tool deltas
+- `stream: true` Gemini provider returns Anthropic-shaped SSE text/tool deltas
+- `stream: true` Anthropic provider returns Anthropic-shaped SSE through core
+- stream terminal event is emitted after provider decoder `finish()`
+- malformed stream frame returns Anthropic-shaped error
+- upstream disconnect returns Anthropic-shaped error
 - upstream 500 returns 502
 - invalid JSON returns 400
 - request ID header is present on success
+- `/v1/messages` works with `legacy = None`, `app_config = Some`,
+  `providers = Some`
+- route preserves system, tools, tool choice, temperature, top-p, max tokens,
+  metadata, thinking/reasoning, cache hints, and stream intent through core
 - token count endpoint still returns Anthropic-compatible count response
 - token count endpoint does not require legacy state
+- source guard confirms `messages.rs` does not import legacy transformers,
+  endpoint classification, scenario/fallback code, or provider-specific stream
+  handlers
 
 ### Gate
 

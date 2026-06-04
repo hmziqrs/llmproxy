@@ -21,6 +21,7 @@ Update:
 ```text
 crates/llm-proxy-protocol/src/anthropic.rs
 crates/llm-proxy-protocol/src/lib.rs
+crates/llm-proxy-protocol/Cargo.toml
 ```
 
 ### Module exports
@@ -52,6 +53,26 @@ pub enum ProtocolError {
 
 This requires adding `thiserror = { workspace = true }` to
 `crates/llm-proxy-protocol/Cargo.toml`.
+
+### Scope guardrails
+
+Client protocol adapters must not import or call:
+
+- `llm-proxy-provider`
+- `llm-proxy-server`
+- core config or routing modules
+- endpoint classification helpers
+- scenario or fallback code
+- `transformer/*`
+
+They only translate:
+
+```text
+client wire JSON/SSE <-> CoreRequest/CoreResponse/CoreEvent
+```
+
+They do not select providers, infer protocol families from model names, mutate
+sampling settings, or inspect provider config.
 
 ### Wire DTO updates
 
@@ -95,14 +116,26 @@ module functions:
 ```text
 client::anthropic::decode_request(MessageRequest) -> Result<CoreRequest, ProtocolError>
 client::anthropic::encode_response(CoreResponse) -> Result<MessageResponse, ProtocolError>
-client::anthropic::encode_event(CoreEvent) -> Result<Vec<MessageEvent>, ProtocolError>
+client::anthropic::StreamEncoder::encode_event(CoreEvent) -> Result<Vec<MessageEvent>, ProtocolError>
+client::anthropic::StreamEncoder::finish() -> Result<Vec<MessageEvent>, ProtocolError>
 
 client::openai_chat::decode_request(ChatCompletionRequest) -> Result<CoreRequest, ProtocolError>
 client::openai_chat::encode_response(CoreResponse) -> Result<ChatCompletionResponse, ProtocolError>
-client::openai_chat::encode_event(CoreEvent) -> Result<Vec<ChatCompletionChunk>, ProtocolError>
+client::openai_chat::StreamEncoder::encode_event(CoreEvent) -> Result<Vec<ChatCompletionChunk>, ProtocolError>
+client::openai_chat::StreamEncoder::finish() -> Result<Vec<ChatCompletionChunk>, ProtocolError>
 ```
 
-Only after these are stable should a trait be introduced.
+The stream encoders are stateful because OpenAI chunk envelopes and tool-call
+sequencing need stable IDs/indexes, and Anthropic content blocks need coherent
+start/delta/stop event ordering. Only after both stateful encoders are stable
+should a shared trait be introduced.
+
+Phase 2 client encoders produce typed route payloads and terminal protocol
+events/chunks. HTTP framing remains a route concern:
+
+- Anthropic encoder returns `MessageEvent` values with the correct event names.
+- OpenAI encoder returns `ChatCompletionChunk` values and exposes when the
+  route must emit final `data: [DONE]`.
 
 ### Anthropic decode rules
 
@@ -129,6 +162,7 @@ MessageRequest.max_tokens                  -> SamplingOptions.max_tokens
 MessageRequest.thinking                    -> SamplingOptions.thinking
 MessageRequest.stream.unwrap_or(false)     -> CoreRequest.stream
 MessageRequest.metadata.user_id            -> RequestMetadata.user_id
+unknown metadata fields                    -> RequestMetadata.raw
 ```
 
 Do not run scenario detection. Do not look up providers. Do not infer endpoint
@@ -155,6 +189,20 @@ Usage                                       -> anthropic::Usage
 
 If `CoreResponse.content` is empty, emit one empty text block.
 
+Core event mapping:
+
+```text
+MessageStart                    -> message_start
+ContentStart Text/Thinking/Tool -> content_block_start
+TextDelta                       -> content_block_delta text_delta
+ThinkingDelta                   -> content_block_delta thinking_delta
+ToolCallStart/Delta/Stop        -> content_block_start/delta/stop tool_use
+UsageDelta                      -> message_delta usage
+MessageStop                     -> message_delta stop fields + message_stop
+Error                           -> error event
+Ping                            -> ping event
+```
+
 ### OpenAI Chat decode rules
 
 Source: current `openai.rs` types.
@@ -176,6 +224,8 @@ temperature/top_p/max_tokens/stop           -> SamplingOptions
 reasoning_effort/thinking                   -> SamplingOptions
 stream.unwrap_or(false)                     -> CoreRequest.stream
 stream_options                             -> ProviderHints.raw["stream_options"]
+user                                        -> RequestMetadata.user_id
+unknown metadata/client fields              -> RequestMetadata.raw or ProviderHints.raw
 ```
 
 ### OpenAI Chat encode rules
@@ -191,6 +241,37 @@ StopReason::MaxTokens                       -> finish_reason="length"
 other normal stop                           -> finish_reason="stop"
 Usage                                       -> UsageInfo
 ```
+
+Core event mapping:
+
+```text
+MessageStart                    -> first chat.completion.chunk envelope state
+ContentStart                    -> initializes content/tool index state
+TextDelta                       -> choices[].delta.content
+ThinkingDelta                   -> choices[].delta.reasoning_content where supported
+ToolCallStart/Delta/Stop        -> choices[].delta.tool_calls
+UsageDelta                      -> stream_options include_usage usage chunk
+MessageStop                     -> finish_reason and terminal chunk
+Error                           -> route error stream chunk or route error response
+Ping                            -> no-op unless route chooses heartbeat
+```
+
+### Lossy and unsupported content
+
+Every core content variant must be handled explicitly. Do not silently drop
+content.
+
+- `Text`, `ToolUse`, `ToolResult`, and `Thinking`: encode/decode where the
+  client protocol supports them.
+- `Image`, `Document`, `Audio`, `Video`: preserve on decode when present in the
+  client protocol; on encode either emit the closest supported client block or
+  return `ProtocolError::Encode`.
+- `RedactedThinking`: preserve on Anthropic decode/encode where supported; for
+  OpenAI Chat, return `ProtocolError::Encode` or preserve through raw metadata
+  only if there is an intentional route behavior.
+- `Refusal`: map to OpenAI refusal fields where available; for Anthropic, emit
+  a text/refusal-compatible block only if the wire DTO supports it, otherwise
+  return `ProtocolError::Encode`.
 
 ### Tests
 
@@ -217,6 +298,11 @@ Minimum tests:
 - stop sequence mapping
 - streaming text event mapping
 - streaming tool event mapping
+- every `CoreEvent` variant maps or errors intentionally
+- unsupported content variants error or preserve raw data intentionally
+- metadata raw/provider hints raw are preserved
+- multiple messages decode to ordered core messages
+- malformed or unsupported client fields return `ProtocolError`
 
 ### Fixture requirement
 
@@ -242,6 +328,24 @@ Each client adapter must have fixture cases for:
 - usage encode
 - streaming text event encode
 - streaming tool event encode
+- streaming usage, terminal, ping, and error events
+- malformed/unsupported fields
+
+Each non-stream fixture case should use:
+
+```text
+input.json
+core.json
+output.json
+```
+
+Each stream fixture case should use:
+
+```text
+input.sse
+core-events.json
+output.sse
+```
 
 ### Gate
 

@@ -38,12 +38,15 @@ or generate them directly from `llm-proxy init`.
 - creates `providers/opencode-go.toml`
 - creates `providers/opencode-zen.toml`
 - does not write fallback/scenario JSON
+- does not write model/provider sampling, tool, reasoning, cache, or stream
+  overrides
 
 `validate`:
 
 - loads main TOML
 - loads provider files
 - validates provider adapter protocols against builtins
+- rejects legacy scenario/fallback JSON instead of translating it
 - prints model route table:
 
   ```text
@@ -79,19 +82,17 @@ present, print the same migration error unless an explicit TOML `--config` or
 Do not silently translate old scenario JSON into new model routes. That would
 preserve the wrong mental model.
 
-After this phase, remove `LegacyState` from `AppState` unless a still-mounted
-route has a documented compile-time dependency on it. The expected result is no
-legacy state.
-
-Also make the new runtime fields non-optional:
+After this phase, serving requires TOML config. Phase 11 owns final server-state
+cleanup, including removal of `LegacyState` and making the new runtime fields
+non-optional:
 
 ```rust
 pub app_config: Arc<AppConfig>,
 pub providers: Arc<ProviderRegistry>,
 ```
 
-Remove `app_config()` and `providers()` option helpers if they only existed to
-bridge Phase 7 JSON compatibility. After Phase 10, serving requires TOML config.
+Phase 10 owns CLI/config cutover behavior and should not leave any live
+JSON-serving path.
 
 ### Tests
 
@@ -102,6 +103,18 @@ If CLI tests are not present, add unit tests for pure helpers:
 - provider directory path is next to config file
 - generated TOML parses as `AppConfig`
 - generated provider TOML parses as `ProviderFile`
+- generated config plus provider files pass full provider-registry validation
+  against builtin protocols
+- every generated `[models]` route resolves to
+  `provider/upstream_model/adapter/protocol`
+- `serve --config old.json` exits before constructing `AppState`
+- `$OC_GO_CC_CONFIG` alone emits the migration error
+- explicit TOML `--config` or `$LLM_PROXY_CONFIG` wins over `$OC_GO_CC_CONFIG`
+- `models` lists only configured client models from `[models]`
+- `models` respects TOML aliases and does not use hardcoded OpenCode model lists
+- generated config contains no sampling/tool/reasoning/cache/stream overrides
+- `init` writes no fallback/scenario JSON
+- `validate` rejects legacy scenario config instead of translating it
 
 ### Gate
 

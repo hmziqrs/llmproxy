@@ -109,6 +109,14 @@ endpoint = "https://example.com/v1/responses"
 "gpt-5.5" = { adapter = "responses" }
 ```
 
+Main config route:
+
+```toml
+[models]
+"gpt-5.4" = { provider = "responses-provider" }
+"gpt-5.5" = { provider = "responses-provider" }
+```
+
 #### Gemini GenerateContent provider
 
 URL templates are provider-adapter behavior. The router does not know that the
@@ -126,6 +134,13 @@ endpoint = "https://example.com/v1/models/{model}:generateContent"
 
 [provider.models]
 "gemini-3.5-flash" = { adapter = "generate" }
+```
+
+Main config route:
+
+```toml
+[models]
+"gemini-3.5-flash" = { provider = "gemini-provider" }
 ```
 
 #### New provider wire protocol

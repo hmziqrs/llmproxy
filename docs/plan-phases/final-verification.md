@@ -7,7 +7,13 @@ cargo fmt --all -- --check
 cargo clippy --all-targets --all-features --locked -- -D warnings
 cargo test --workspace
 cargo build --workspace --locked --release
+! rg -n "transformer|detect_scenario|route_for_streaming|FallbackHandler|OpenCodeClient|EndpointType|classify_endpoint" crates apps
+! rg -n "handle_openai_streaming|handle_responses_streaming|handle_gemini_streaming|spawn_proxy_task" crates/llm-proxy-server/src/routes
 ```
+
+The negative `rg` checks enforce the architecture: no direct transformer path,
+scenario/fallback chain, model-ID protocol classifier, or provider-specific
+stream handler may remain in live code.
 
 Manual smoke after `llm-proxy serve --config ./config.toml`:
 
@@ -28,6 +34,31 @@ llm-proxy validate --config ./config.toml
 llm-proxy models --config ./config.toml
 ```
 
+Manual smoke with configured mock/local providers:
+
+```sh
+curl -sS -X POST http://127.0.0.1:3456/v1/messages \
+  -H 'content-type: application/json' \
+  -d '{"model":"configured-chat","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}'
+curl -sS -N -X POST http://127.0.0.1:3456/v1/messages \
+  -H 'content-type: application/json' \
+  -d '{"model":"configured-chat","max_tokens":16,"stream":true,"messages":[{"role":"user","content":"hi"}]}'
+curl -sS -X POST http://127.0.0.1:3456/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -d '{"model":"configured-chat","messages":[{"role":"user","content":"hi"}]}'
+curl -sS -N -X POST http://127.0.0.1:3456/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -d '{"model":"configured-chat","stream":true,"messages":[{"role":"user","content":"hi"}]}'
+```
+
+Streaming smoke assertions:
+
+- Anthropic stream emits `message_start`, content delta events, usage where
+  available, and terminal `message_stop`.
+- OpenAI stream emits `chat.completion.chunk`, usage where available, and final
+  `data: [DONE]`.
+- Stream error paths use the route-specific error envelope.
+
 Then stop the TOML server and run the old-JSON migration check as a separate
 invocation:
 
@@ -47,6 +78,10 @@ Expected:
 - no request performs scenario detection
 - no request invokes fallback
 - no model ID classifier decides protocol
+- successful configured Anthropic and OpenAI Chat non-stream requests traverse
+  `wire -> core -> wire`
+- successful configured Anthropic and OpenAI Chat stream requests traverse
+  provider decoder state and client stream encoders
 
 ## Implementation Order Summary
 

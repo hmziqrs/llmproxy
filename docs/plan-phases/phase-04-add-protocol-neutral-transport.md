@@ -44,6 +44,14 @@ Then update old `client.rs`, new `transport.rs`, and provider adapters to import
 `crate::ProviderError`. This prevents Phase 11 from accidentally deleting the
 shared provider error when `OpenCodeClient` is removed.
 
+`ProviderError` must include variants for:
+
+- JSON encode/decode errors
+- HTTP transport errors
+- API status errors with status/body
+- SSE/framing errors
+- invalid UTF-8 in streamed bytes
+
 ### Types
 
 ```rust
@@ -80,7 +88,7 @@ impl ProxyClient {
         req: ProxyRequest,
     ) -> Result<
         std::pin::Pin<
-            Box<dyn futures::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send + 'static>
+            Box<dyn futures::Stream<Item = Result<bytes::Bytes, ProviderError>> + Send + 'static>
         >,
         ProviderError,
     >;
@@ -95,8 +103,27 @@ Transport rules:
 - `AuthStyle::XApiKey` sets `x-api-key: <key>`.
 - `AuthStyle::Both` sets both headers.
 - HTTP status `>= 400` returns `ProviderError::Api { status, body }`.
+- Streaming HTTP status `>= 400` also returns `ProviderError::Api` before any
+  byte stream is exposed.
+- Stream item errors are wrapped as `ProviderError`; adapters and routes should
+  not see raw `reqwest::Error`.
 - The transport does not know protocol names.
 - The transport does not serialize typed request structs. It sends bytes.
+- Non-stream requests must not set `Accept: text/event-stream`.
+- `ProxyRequest.body` is sent byte-for-byte.
+
+### Neutrality guardrails
+
+`transport.rs` must not import or mention:
+
+- `EndpointType`
+- `classify_endpoint`
+- `OpenCodeClient`
+- model IDs or provider names
+- `llm_proxy_protocol`
+
+The transport only sends prepared bytes to a prepared URL with prepared auth
+headers. Provider adapters own protocol-specific request/response behavior.
 
 ### SSE framing helper
 
@@ -146,10 +173,21 @@ Test:
 - x-api-key header set
 - both headers set
 - error status returns `ProviderError::Api`
+- streaming error status returns `ProviderError::Api`
 - stream request sets `Accept: text/event-stream`
+- non-stream request does not set `Accept: text/event-stream`
+- request body is sent byte-for-byte
 - SSE framer handles partial frames split across chunks
 - SSE framer handles multi-line data fields
+- SSE framer handles `\r\n`
+- SSE framer ignores comments
+- SSE framer preserves `event:` and `id:`
+- SSE framer emits a trailing frame from `finish()`
+- SSE framer respects blank-line frame boundaries
 - SSE framer preserves `[DONE]`
+- SSE framer rejects invalid UTF-8 with `ProviderError`
+- source guard checks confirm `transport.rs` has no endpoint classification,
+  provider model, or protocol imports
 
 ### Gate
 

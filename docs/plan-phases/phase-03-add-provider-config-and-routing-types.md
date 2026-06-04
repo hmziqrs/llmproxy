@@ -81,12 +81,14 @@ In `provider_config.rs`:
 
 ```rust
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AppConfig {
     pub server: ServerConfig,
     pub models: std::collections::HashMap<String, ModelRoute>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ServerConfig {
     pub bind: std::net::SocketAddr,
     #[serde(with = "humantime_serde")]
@@ -97,11 +99,13 @@ pub struct ServerConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProviderFile {
     pub provider: ProviderConfig,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProviderConfig {
     pub name: String,
     pub api_key: String,
@@ -119,22 +123,29 @@ pub enum AuthStyle {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProviderAdapterConfig {
     pub protocol: String,
     pub endpoint: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProviderModelConfig {
     pub adapter: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ModelRoute {
     pub provider: String,
     pub upstream_model: Option<String>,
 }
 ```
+
+`ProviderConfig` needs a custom `Debug` implementation or redacted API-key
+wrapper so resolved secrets do not appear in logs, snapshots, or test failure
+output.
 
 In `model_route.rs`:
 
@@ -183,13 +194,28 @@ pub use model_route::{ModelRouteError, ProviderTarget, resolve_model_route};
 
 ### Validation
 
-Core config validation must check only config shape and references it owns:
+Phase 3 validation checks config shape and same-phase references only:
 
-- every `[models]` provider exists
 - every provider-local model points to an existing adapter
 - every endpoint is non-empty
 - every `${ENV_VAR}` in `api_key` resolves to a non-empty value
 - no `ModelRoute` contains endpoint/protocol fields
+- provider names, route keys, adapter names, provider-local model keys,
+  protocol names, and endpoints are non-empty
+- literal `api_key` values are non-empty
+- empty environment-variable values fail validation
+
+Use `#[serde(deny_unknown_fields)]` so misplaced `endpoint` or `protocol`
+fields inside `[models]` or `[provider.models]` fail while parsing instead of
+being silently ignored.
+
+Cross-file validation that needs both the main config and provider files moves
+to Phase 6:
+
+- every `[models]` provider exists
+- every effective upstream model exists in the selected provider's
+  `[provider.models]`
+- every provider protocol name is implemented by the compiled adapter registry
 
 Do not make `llm-proxy-core` depend on `llm-proxy-provider`. Core may expose a
 validation function that accepts a caller-provided list of known protocol names,
@@ -214,16 +240,22 @@ Add tests for:
 - provider TOML parse
 - `${ENV_VAR}` interpolation
 - unknown env var fails validation
-- unknown provider in route fails validation
+- empty env var fails validation
+- literal empty API key fails validation
+- unknown TOML fields fail parse
+- `ModelRoute` with endpoint/protocol fields fails parse
 - provider-local unknown adapter fails validation
 - known protocol passes validation when supplied by caller
 - unknown protocol fails validation when not supplied by caller
+- unknown provider in route fails in Phase 6 cross-file registry validation
+- effective upstream model missing from selected provider fails in Phase 6
 - upstream model alias resolves correctly
 - unknown model returns `ModelRouteError::UnknownModel`
 
 ### Gate
 
 ```sh
-cargo test -p llm-proxy-core provider_config model_route
+cargo test -p llm-proxy-core provider_config
+cargo test -p llm-proxy-core model_route
 cargo test --workspace
 ```

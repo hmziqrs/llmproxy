@@ -26,6 +26,28 @@ crates/llm-proxy-core/src/lib.rs
 The registry loads provider TOML files and resolves a route target into a
 provider adapter target.
 
+Routing and registry resolution are separate:
+
+```text
+resolve_model_route(...) -> ProviderTarget
+ProviderRegistry::resolve_adapter_target(ProviderTarget) -> ProviderAdapterTargetConfig
+```
+
+The router/model-route code selects `provider + requested_model +
+upstream_model`. The provider registry only resolves that provider-local
+upstream model to adapter config.
+
+### Out of scope / guardrails
+
+The provider registry must not:
+
+- translate protocol fields
+- parse response or stream chunks
+- build final protocol-specific URL paths
+- inspect messages or content
+- mutate sampling, tools, metadata, reasoning, cache, or stream intent
+- infer protocol families from model names
+
 ```rust
 #[derive(Debug, Clone)]
 pub struct ProviderRegistry {
@@ -62,12 +84,24 @@ pub struct ProviderAdapterTargetConfig {
 `llm-proxy-provider` can convert `ProviderAdapterTargetConfig` into its own
 `ProviderAdapterTarget` by parsing `protocol`.
 
+`endpoint` is the raw endpoint or URL template from provider TOML. It is not a
+route-built final URL. Provider adapters own endpoint URL shape, including
+Gemini `{model}` expansion.
+
 ### Lookup rule
+
+Router lookup:
 
 ```text
 requested_model -> ModelRoute
-ModelRoute.upstream_model.unwrap_or(requested_model) -> upstream_model
-provider.models[upstream_model] -> adapter_name
+ModelRoute.upstream_model.unwrap_or(requested_model) -> ProviderTarget.upstream_model
+```
+
+Registry lookup:
+
+```text
+ProviderTarget.provider -> provider
+provider.models[ProviderTarget.upstream_model] -> adapter_name
 provider.adapters[adapter_name] -> protocol + endpoint
 ```
 
@@ -85,10 +119,16 @@ This lookup allows aliases:
 
 - provider registry loads multiple files
 - duplicate provider names fail
+- missing provider fails
 - requested model alias resolves through upstream model
+- `upstream_model` defaults to `requested_model`
+- resolved target preserves both requested and upstream model names
 - provider-local missing model fails
 - provider-local missing adapter fails
 - protocol validation fails for unknown protocol
+- model names do not imply protocols; a Claude-looking model can resolve to an
+  OpenAI adapter when TOML says so
+- one provider with multiple adapters resolves only by provider-local model table
 
 ### Gate
 
@@ -96,3 +136,8 @@ This lookup allows aliases:
 cargo test -p llm-proxy-core provider_registry model_route
 cargo test --workspace
 ```
+
+Server/provider composition must also validate provider TOML against the
+compiled `llm-proxy-provider` adapter registry by passing
+`ProviderAdapterRegistry::protocol_names()`. Do not pass an ad hoc string list;
+config cannot drift from actual protocol support.

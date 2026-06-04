@@ -12,6 +12,8 @@ Update:
 
 ```text
 crates/llm-proxy-server/src/state.rs
+crates/llm-proxy-server/src/routes/mod.rs
+crates/llm-proxy-server/src/routes/health.rs
 apps/llm-proxy/src/main.rs
 ```
 
@@ -79,16 +81,32 @@ impl AppState {
 
 Update `routes/mod.rs`, `/health`, and `/version` in this phase to use those
 helpers. `/health` may return an empty `circuit_breakers` map when legacy state
-is gone. Remove `LegacyState` after Phase 8 and Phase 9 are complete and CLI
-JSON compatibility is no longer needed. Do not leave compatibility fields in
-the final state.
+is gone.
+
+Add explicit constructors or invariants so mixed state is impossible:
+
+```rust
+impl AppState {
+    pub fn from_legacy(...legacy fields...) -> Self;
+    pub fn from_toml(...new runtime fields...) -> Self;
+}
+```
+
+Do not expose or construct `OpenCodeClient`, `ModelRouter`, or
+`FallbackHandler` in TOML new-runtime mode. They are allowed only inside
+`LegacyState`.
+
+Keep `LegacyState` for compatibility through Phase 10. Phase 11 owns final
+deletion of `LegacyState` and other legacy server fields.
 
 Valid Phase 7 construction modes:
 
 - JSON compatibility mode: `legacy = Some(...)`, `app_config = None`,
   `providers = None`. Only old routes should use this mode.
 - TOML new-runtime mode: `app_config = Some(...)`, `providers = Some(...)`.
-  This is the mode Phase 8 and later route tests must use.
+  In this mode `legacy = None`. This is the mode Phase 8 and later route tests
+  must use.
+- Any mixed combination is invalid and must be rejected by constructors/tests.
 
 Phase 8 is the point where live core-pipeline routes require TOML-backed
 `app_config` and `providers`. Phase 10 formalizes the CLI migration behavior and
@@ -119,6 +137,17 @@ crates/llm-proxy-server/tests/chat_echo.rs
 The test state should not need a live provider API key. It should use a tiny
 in-memory config/registry with a fake local endpoint where route tests need a
 provider call, or avoid provider calls for pure ops route tests.
+
+Add tests for:
+
+- TOML `AppState` construction
+- JSON legacy construction
+- mixed construction rejected or impossible
+- `.toml` provider protocol validation against builtin protocols
+- `.json` compatibility construction during Phase 7 only
+- unsupported config extensions fail
+- `routes/mod.rs` and `/health` use helpers instead of direct legacy field
+  access
 
 ### Gate
 
