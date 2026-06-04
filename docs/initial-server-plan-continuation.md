@@ -2,8 +2,9 @@
 
 > **Status:** Implementation plan for the next protocol/provider phase
 > **Date:** 2026-06-04
-> **Source of truth:** This document continues `docs/initial-server-plan.md` and
-> supersedes `docs/provider-agnostic-refactor.md` for implementation order.
+> **Source of truth:** This document continues
+> `docs/completed/initial-server-plan.md` and supersedes
+> `docs/provider-agnostic-refactor.md` for implementation order.
 
 ## Purpose
 
