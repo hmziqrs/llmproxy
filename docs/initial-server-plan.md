@@ -161,6 +161,9 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "tim
 
 # Web
 axum = { version = "0.7", features = ["macros", "json"] }
+# axum-serde 0.7.x tracks axum 0.7 (0.8+ tracks axum 0.8). The `sonic`
+# feature pulls sonic-rs and exposes the `Sonic<T>` extractor/responder.
+axum-serde = { version = "0.7", features = ["sonic"] }
 tower = "0.5"
 tower-http = { version = "0.5", features = ["trace", "timeout"] }
 
@@ -421,6 +424,7 @@ workspace = true
 llm-proxy-core = { workspace = true }
 
 axum = { workspace = true }
+axum-serde = { workspace = true }
 tokio = { workspace = true }
 tower = { workspace = true }
 tower-http = { workspace = true }
@@ -677,7 +681,8 @@ pub async fn version(State(state): State<AppState>) -> Json<VersionBody> {
 > Non-string user content is logged and coerced to its JSON form.
 
 ```rust
-use axum::{Json, extract::State};
+use axum::extract::State;
+use axum_serde::Sonic;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tracing::warn;
@@ -734,11 +739,13 @@ struct Usage {
 ///
 /// Accepts any well-formed JSON, rejects `stream: true` with 400,
 /// otherwise returns the last user message echoed back wrapped in
-/// the OpenAI chat completion shape.
+/// the OpenAI chat completion shape. Uses `Sonic` (sonic-rs, SIMD) on
+/// both the request and response — this is the one route where payload
+/// size justifies it; ops/error routes stay on serde_json's `Json`.
 pub async fn echo_chat(
     State(_state): State<AppState>,
-    Json(req): Json<ChatRequest>,
-) -> Result<Json<ChatResponse>, ApiError> {
+    Sonic(req): Sonic<ChatRequest>,
+) -> Result<Sonic<ChatResponse>, ApiError> {
     if req.stream {
         return Err(ApiError::BadRequest(
             "streaming not supported in this build".to_string(),
@@ -757,7 +764,7 @@ pub async fn echo_chat(
             other.to_string()
         }
     };
-    Ok(Json(ChatResponse {
+    Ok(Sonic(ChatResponse {
         id: format!("chatcmpl-{}", Uuid::new_v4()),
         object: "chat.completion",
         created: now_unix(),
@@ -1021,7 +1028,7 @@ library caller; main wraps it with `.context()` for the user.
 | Section | Use here |
 |---|---|
 | Router, `nest`, `with_state` | `routes::router()` |
-| Extractors: `State`, `Json` | `health`, `chat`, integration test |
+| Extractors: `State`, `Json`, `Sonic` (sonic-rs) | `health`, `chat`, integration test |
 | Custom error type + `IntoResponse` | `ApiError` |
 | Middleware: `TraceLayer`, `TimeoutLayer`, `DefaultBodyLimit`, order via `ServiceBuilder` | `routes::router()` |
 | Fallback | `not_found` |
@@ -1165,19 +1172,68 @@ the std code it replaces. Decisions for v1:
 | Graceful shutdown | **hand-rolled** (`tokio::signal` + `select!`) | This *is* the idiomatic axum-documented pattern. `tokio-graceful-shutdown` adds subsystem orchestration that v1 does not need. |
 | Unix timestamp for `created` | **hand-rolled** | A 5-line `SystemTime` calc. Pulling in `time`/`jiff`/`chrono` is not justified until a date dependency exists for another reason. |
 | Error response envelope | **hand-rolled** (custom shape) | Must mirror OpenAI, not a generic problem-details crate. See open question 8 — the current `{message, kind}` shape should converge on OpenAI's `{message, type, code}`. |
+| JSON on the hot path | **`sonic-rs` via `axum-serde` `Sonic<T>`** | SIMD parse *and* serialize, serde-compatible, near-drop-in: swap `Json`→`Sonic` on the chat route. `serde_json` is kept for the tiny ops/error bodies and the dynamic `content` `Value`. `simd-json` was rejected — it needs `&mut` buffers and a hand-rolled extractor and wins only on parse. |
 
-Deferred (adopt when the need lands, not in v1):
+### Ecosystem crate map (post-v1)
 
-- **`async-openai-types`** for the real `llm-proxy-protocol` schema —
-  do not hand-roll the full OpenAI request/response/streaming types
-  (content-part arrays, tool calls, logprobs) once past the echo stub.
-- **`figment`** for layered config (defaults → file → env overrides)
-  when per-field env overrides are wanted; replaces `Config::load`.
-- **`tower-http::request_id`** (`SetRequestId` + `PropagateRequestId`)
-  for request correlation once there is more than one route worth
-  tracing across.
-- **`axum-test`** (`TestServer`) if the `oneshot` boilerplate in the
-  integration tests becomes a drag.
+Forward-looking — none of these enter the v1 build. Mapped to the stub
+crates so each lands where it belongs, and to the cross-cutting concerns
+the README already names ("pool keys, log usage, fail over").
+
+**`llm-proxy-provider` — upstream clients**
+
+| Crate | Role |
+|---|---|
+| `reqwest` (`json`, `stream`, `rustls-tls`) | HTTP client to providers |
+| `reqwest-eventsource` / `eventsource-stream` | consume upstream SSE streams (OpenAI/Anthropic) |
+| `backon` (or `backoff`) | retry + exponential backoff for failover |
+| `async-trait` / `trait-variant` | `dyn Provider` dispatch (edition 2024 has async-fn-in-trait, but `dyn` still needs boxing) |
+
+**`llm-proxy-protocol` — schema & normalization**
+
+| Crate | Role |
+|---|---|
+| `async-openai-types` | OpenAI request/response/stream types — don't re-derive content-part arrays, tool calls, logprobs |
+| `serde_with` | provider quirks (string-or-array `content`, default-on-null, skip-empty) per `docs/research/quirks` |
+
+**`llm-proxy-storage` — persistence (`.gitignore`'s `*.db` ⇒ SQLite)**
+
+| Crate | Role |
+|---|---|
+| `sqlx` (`sqlite`, `runtime-tokio`, `rustls`) | async, compile-time-checked queries + migrations |
+
+**Cross-cutting (server / api)**
+
+| Crate | Role |
+|---|---|
+| `secrecy` | wrap API keys in `SecretString`; no leak via `Debug`/logs — essential once keys are pooled |
+| `subtle` | constant-time API-key comparison (timing-safe auth) |
+| `governor` + `tower_governor` | per-key rate limiting as a tower layer |
+| `moka` | concurrent response / model-metadata cache |
+| `tower-http` (`compression`, `request-id`, `cors`, `sensitive-headers`) | already a dep — enable features as needed; `sensitive-headers` redacts `Authorization` from traces |
+| `metrics` + `metrics-exporter-prometheus` | usage logging / `/metrics` endpoint |
+| `tiktoken-rs` (or a `bpe`-based tokenizer) | token counting so `usage` isn't hardcoded to 0 |
+| `arc-swap` / `dashmap` | hot-swap config + concurrent key-pool state |
+| `figment` | layered config (defaults → file → env); replaces `Config::load` |
+
+**Observability & testing**
+
+| Crate | Role |
+|---|---|
+| `tracing-opentelemetry` + `opentelemetry-otlp` | distributed tracing |
+| `wiremock` | mock upstream providers in tests (no live API calls in CI) |
+| `insta` | snapshot/golden tests — directly implements `protocol-normalization.md` §10 "Golden test rule" |
+| `rstest` | parameterized tests |
+| `axum-test` (`TestServer`) | nicer than `oneshot` boilerplate |
+
+**Binary / throughput**
+
+| Crate | Role |
+|---|---|
+| `mimalloc` or `tikv-jemallocator` | allocator swap for the alloc-heavy forward path |
+
+Reference Rust proxies validating this stack: Traceloop Hub (sqlx + OTel)
+and LLM Link.
 
 ## Open questions / next steps after this plan
 
@@ -1196,8 +1252,8 @@ Deferred (adopt when the need lands, not in v1):
 6. Re-enable `pedantic` per-crate once each crate stabilizes.
 7. Layered config via `figment` (defaults → file → env) when
    per-field env overrides are wanted.
-8. Error-envelope compatibility: axum's `Json` extractor rejects
-   malformed bodies with its own plain-text 400 *before* `ApiError`
-   runs, so bad JSON does not get the `{error: …}` shape. Add a
-   custom `Json` extractor (or `JsonRejection` handler) and converge
-   the envelope on OpenAI's `{message, type, param, code}`.
+8. Error-envelope compatibility: the body extractors (`Sonic` on the
+   chat route, `Json` elsewhere) reject malformed bodies with their own
+   400 *before* `ApiError` runs, so bad JSON does not get the
+   `{error: …}` shape. Add a wrapper extractor (or rejection handler)
+   and converge the envelope on OpenAI's `{message, type, param, code}`.
