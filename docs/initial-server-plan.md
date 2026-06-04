@@ -160,12 +160,12 @@ llm-proxy-server = { path = "crates/llm-proxy-server" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time"] }
 
 # Web
-axum = { version = "0.7", features = ["macros", "json"] }
-# axum-serde 0.7.x tracks axum 0.7 (0.8+ tracks axum 0.8). The `sonic`
-# feature pulls sonic-rs and exposes the `Sonic<T>` extractor/responder.
-axum-serde = { version = "0.7", features = ["sonic"] }
+axum = { version = "0.8", features = ["macros", "json"] }
+# axum-serde 0.9 tracks axum 0.8 and ships the `Sonic<T>` extractor/
+# responder behind the `sonic` feature (pulls sonic-rs).
+axum-serde = { version = "0.9", features = ["sonic"] }
 tower = "0.5"
-tower-http = { version = "0.5", features = ["trace", "timeout"] }
+tower-http = { version = "0.6", features = ["trace", "timeout"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -1187,6 +1187,8 @@ the README already names ("pool keys, log usage, fail over").
 | `reqwest` (`json`, `stream`, `rustls-tls`) | HTTP client to providers |
 | `reqwest-eventsource` / `eventsource-stream` | consume upstream SSE streams (OpenAI/Anthropic) |
 | `backon` (or `backoff`) | retry + exponential backoff for failover |
+| `reqwest-middleware` + `reqwest-retry` + `reqwest-tracing` | outbound HTTP middleware stack: retry policy and tracing spans on provider calls (cleaner than wrapping `backon` by hand) |
+| `failsafe` | circuit breaker — stop hammering a provider that is failing, trip to the next one |
 | `async-trait` / `trait-variant` | `dyn Provider` dispatch (edition 2024 has async-fn-in-trait, but `dyn` still needs boxing) |
 
 **`llm-proxy-protocol` — schema & normalization**
@@ -1195,12 +1197,16 @@ the README already names ("pool keys, log usage, fail over").
 |---|---|
 | `async-openai-types` | OpenAI request/response/stream types — don't re-derive content-part arrays, tool calls, logprobs |
 | `serde_with` | provider quirks (string-or-array `content`, default-on-null, skip-empty) per `docs/research/quirks` |
+| `base64` | encode/decode multimodal content (data-URL images, audio blobs) |
+| `garde` (or `validator`) | declarative request validation beyond what `serde` enforces |
 
 **`llm-proxy-storage` — persistence (`.gitignore`'s `*.db` ⇒ SQLite)**
 
 | Crate | Role |
 |---|---|
 | `sqlx` (`sqlite`, `runtime-tokio`, `rustls`) | async, compile-time-checked queries + migrations |
+| `time` or `jiff` | timestamps on usage/request rows (`sqlx` integrates with `time`) |
+| `rust_decimal` | precise token-cost / spend accounting — never float money |
 
 **Cross-cutting (server / api)**
 
@@ -1215,6 +1221,12 @@ the README already names ("pool keys, log usage, fail over").
 | `tiktoken-rs` (or a `bpe`-based tokenizer) | token counting so `usage` isn't hardcoded to 0 |
 | `arc-swap` / `dashmap` | hot-swap config + concurrent key-pool state |
 | `figment` | layered config (defaults → file → env); replaces `Config::load` |
+| `axum-extra` (`headers`) | `TypedHeader<Authorization<Bearer>>` for the deferred auth (open question 5) |
+| `tokio-util` (`CancellationToken`) | propagate graceful shutdown to background workers (e.g. usage-log flush) |
+| `notify` | watch the config file for hot-reload (pairs with the Ch. 7 type-state note) |
+| `dotenvy` | load `.env` in dev — `.gitignore` already expects it |
+| `blake3` / `xxhash-rust` | fast cache-key hashing for the response cache |
+| `rand` | generate proxy-issued API keys |
 
 **Observability & testing**
 
@@ -1224,13 +1236,37 @@ the README already names ("pool keys, log usage, fail over").
 | `wiremock` | mock upstream providers in tests (no live API calls in CI) |
 | `insta` | snapshot/golden tests — directly implements `protocol-normalization.md` §10 "Golden test rule" |
 | `rstest` | parameterized tests |
+| `proptest` | property tests for normalization invariants (complements the `insta` goldens) |
 | `axum-test` (`TestServer`) | nicer than `oneshot` boilerplate |
+
+**Streaming (SSE)**
+
+| Crate | Role |
+|---|---|
+| `axum::response::sse::Sse` (built-in) | server-side SSE responses — no extra crate needed |
+| `futures` / `tokio-stream` | stream combinators to adapt provider events → client events |
+| `async-stream` | `yield`-style ergonomic stream construction for the adapter |
+
+**Scaling / distributed state** (only once running more than one replica)
+
+| Crate | Role |
+|---|---|
+| `fred` (or `redis` + `deadpool`) | shared key pool, distributed rate limiting, and cross-replica cache — `governor`/`moka` are in-process only |
+
+**API surface & transport**
+
+| Crate | Role |
+|---|---|
+| `utoipa` + `utoipa-swagger-ui` | publish the OpenAI-compatible OpenAPI schema + docs UI |
+| `axum` (`multipart`) / `axum-extra` | multipart endpoints beyond chat (`/v1/audio/*`, `/v1/files`) |
+| `axum-server` (rustls) | in-process TLS termination if not behind a TLS-terminating reverse proxy |
 
 **Binary / throughput**
 
 | Crate | Role |
 |---|---|
 | `mimalloc` or `tikv-jemallocator` | allocator swap for the alloc-heavy forward path |
+| `color-eyre` | richer binary error reports (optional alternative to `anyhow`) |
 
 Reference Rust proxies validating this stack: Traceloop Hub (sqlx + OTel)
 and LLM Link.
