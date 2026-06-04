@@ -483,3 +483,339 @@ impl OpenCodeClient {
         Ok(Box::pin(resp.bytes_stream()))
     }
 }
+
+// ===========================================================================
+// Tests (ported from oc-go-cc/internal/client/opencode_test.go)
+// ===========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use llm_proxy_core::config::ModelConfig;
+
+    // Helper to build a ModelConfig with only provider set.
+    fn model_config(provider: &str) -> ModelConfig {
+        ModelConfig {
+            provider: provider.to_owned(),
+            ..Default::default()
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // is_anthropic_model
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn is_anthropic_model_minimax_m25() {
+        assert!(is_anthropic_model("minimax-m2.5"));
+    }
+
+    #[test]
+    fn is_anthropic_model_minimax_m27() {
+        assert!(is_anthropic_model("minimax-m2.7"));
+    }
+
+    #[test]
+    fn is_anthropic_model_qwen37_max() {
+        assert!(is_anthropic_model("qwen3.7-max"));
+    }
+
+    #[test]
+    fn is_anthropic_model_qwen_prefix_match() {
+        // Rust-specific: anything starting with "qwen" is anthropic.
+        assert!(is_anthropic_model("qwen3.5-plus"));
+        assert!(is_anthropic_model("qwen-coder"));
+        assert!(is_anthropic_model("qwen"));
+    }
+
+    #[test]
+    fn is_anthropic_model_deepseek_v4_pro_is_not() {
+        assert!(!is_anthropic_model("deepseek-v4-pro"));
+    }
+
+    #[test]
+    fn is_anthropic_model_deepseek_v4_flash_is_not() {
+        assert!(!is_anthropic_model("deepseek-v4-flash"));
+    }
+
+    #[test]
+    fn is_anthropic_model_kimi_k26_is_not() {
+        assert!(!is_anthropic_model("kimi-k2.6"));
+    }
+
+    #[test]
+    fn is_anthropic_model_glm51_is_not() {
+        assert!(!is_anthropic_model("glm-5.1"));
+    }
+
+    // -----------------------------------------------------------------------
+    // provider
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn provider_empty_defaults_to_opencode_go() {
+        let m = ModelConfig {
+            model_id: "test-model".to_owned(),
+            ..Default::default()
+        };
+        assert_eq!(provider(&m), PROVIDER_OPENCODE_GO);
+    }
+
+    #[test]
+    fn provider_explicit_opencode_go() {
+        let m = ModelConfig {
+            provider: PROVIDER_OPENCODE_GO.to_owned(),
+            model_id: "test-model".to_owned(),
+            ..Default::default()
+        };
+        assert_eq!(provider(&m), PROVIDER_OPENCODE_GO);
+    }
+
+    #[test]
+    fn provider_explicit_opencode_zen() {
+        let m = ModelConfig {
+            provider: PROVIDER_OPENCODE_ZEN.to_owned(),
+            model_id: "test-model".to_owned(),
+            ..Default::default()
+        };
+        assert_eq!(provider(&m), PROVIDER_OPENCODE_ZEN);
+    }
+
+    // -----------------------------------------------------------------------
+    // is_zen
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn is_zen_opencode_go_is_not_zen() {
+        let m = model_config(PROVIDER_OPENCODE_GO);
+        assert!(!is_zen(&m));
+    }
+
+    #[test]
+    fn is_zen_opencode_zen_is_zen() {
+        let m = model_config(PROVIDER_OPENCODE_ZEN);
+        assert!(is_zen(&m));
+    }
+
+    #[test]
+    fn is_zen_empty_provider_is_not_zen() {
+        let m = model_config("");
+        assert!(!is_zen(&m));
+    }
+
+    // -----------------------------------------------------------------------
+    // classify_endpoint
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn classify_endpoint_minimax_m25_anthropic() {
+        assert_eq!(classify_endpoint("minimax-m2.5"), EndpointType::Anthropic);
+    }
+
+    #[test]
+    fn classify_endpoint_minimax_m27_anthropic() {
+        assert_eq!(classify_endpoint("minimax-m2.7"), EndpointType::Anthropic);
+    }
+
+    #[test]
+    fn classify_endpoint_qwen37_max_anthropic() {
+        assert_eq!(classify_endpoint("qwen3.7-max"), EndpointType::Anthropic);
+    }
+
+    #[test]
+    fn classify_endpoint_gemini35_flash() {
+        assert_eq!(classify_endpoint("gemini-3.5-flash"), EndpointType::Gemini);
+    }
+
+    #[test]
+    fn classify_endpoint_gemini31_pro() {
+        assert_eq!(classify_endpoint("gemini-3.1-pro"), EndpointType::Gemini);
+    }
+
+    #[test]
+    fn classify_endpoint_gemini3_flash() {
+        assert_eq!(classify_endpoint("gemini-3-flash"), EndpointType::Gemini);
+    }
+
+    #[test]
+    fn classify_endpoint_gpt55_responses() {
+        assert_eq!(classify_endpoint("gpt-5.5"), EndpointType::Responses);
+    }
+
+    #[test]
+    fn classify_endpoint_gpt54_responses() {
+        assert_eq!(classify_endpoint("gpt-5.4"), EndpointType::Responses);
+    }
+
+    #[test]
+    fn classify_endpoint_gpt5_responses() {
+        assert_eq!(classify_endpoint("gpt-5"), EndpointType::Responses);
+    }
+
+    #[test]
+    fn classify_endpoint_kimi_k26_chat_completions() {
+        assert_eq!(
+            classify_endpoint("kimi-k2.6"),
+            EndpointType::ChatCompletions
+        );
+    }
+
+    #[test]
+    fn classify_endpoint_glm51_chat_completions() {
+        assert_eq!(classify_endpoint("glm-5.1"), EndpointType::ChatCompletions);
+    }
+
+    #[test]
+    fn classify_endpoint_deepseek_v4_flash_chat_completions() {
+        assert_eq!(
+            classify_endpoint("deepseek-v4-flash"),
+            EndpointType::ChatCompletions
+        );
+    }
+
+    #[test]
+    fn classify_endpoint_unknown_model_chat_completions() {
+        assert_eq!(
+            classify_endpoint("unknown-model"),
+            EndpointType::ChatCompletions
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // is_gemini_model
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn is_gemini_model_gemini35_flash() {
+        assert!(is_gemini_model("gemini-3.5-flash"));
+    }
+
+    #[test]
+    fn is_gemini_model_gemini31_pro() {
+        assert!(is_gemini_model("gemini-3.1-pro"));
+    }
+
+    #[test]
+    fn is_gemini_model_gemini3_flash() {
+        assert!(is_gemini_model("gemini-3-flash"));
+    }
+
+    #[test]
+    fn is_gemini_model_kimi_k26_is_not() {
+        assert!(!is_gemini_model("kimi-k2.6"));
+    }
+
+    #[test]
+    fn is_gemini_model_glm51_is_not() {
+        assert!(!is_gemini_model("glm-5.1"));
+    }
+
+    #[test]
+    fn is_gemini_model_gpt55_is_not() {
+        assert!(!is_gemini_model("gpt-5.5"));
+    }
+
+    // -----------------------------------------------------------------------
+    // is_responses_model
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn is_responses_model_gpt55() {
+        assert!(is_responses_model("gpt-5.5"));
+    }
+
+    #[test]
+    fn is_responses_model_gpt55_pro() {
+        assert!(is_responses_model("gpt-5.5-pro"));
+    }
+
+    #[test]
+    fn is_responses_model_gpt54() {
+        assert!(is_responses_model("gpt-5.4"));
+    }
+
+    #[test]
+    fn is_responses_model_gpt54_pro() {
+        assert!(is_responses_model("gpt-5.4-pro"));
+    }
+
+    #[test]
+    fn is_responses_model_gpt54_mini() {
+        assert!(is_responses_model("gpt-5.4-mini"));
+    }
+
+    #[test]
+    fn is_responses_model_gpt54_nano() {
+        assert!(is_responses_model("gpt-5.4-nano"));
+    }
+
+    #[test]
+    fn is_responses_model_gpt53_codex() {
+        assert!(is_responses_model("gpt-5.3-codex"));
+    }
+
+    #[test]
+    fn is_responses_model_gpt53_codex_spark() {
+        assert!(is_responses_model("gpt-5.3-codex-spark"));
+    }
+
+    #[test]
+    fn is_responses_model_gpt52() {
+        assert!(is_responses_model("gpt-5.2"));
+    }
+
+    #[test]
+    fn is_responses_model_gpt52_codex() {
+        assert!(is_responses_model("gpt-5.2-codex"));
+    }
+
+    #[test]
+    fn is_responses_model_gpt51() {
+        assert!(is_responses_model("gpt-5.1"));
+    }
+
+    #[test]
+    fn is_responses_model_gpt51_codex() {
+        assert!(is_responses_model("gpt-5.1-codex"));
+    }
+
+    #[test]
+    fn is_responses_model_gpt51_codex_max() {
+        assert!(is_responses_model("gpt-5.1-codex-max"));
+    }
+
+    #[test]
+    fn is_responses_model_gpt51_codex_mini() {
+        assert!(is_responses_model("gpt-5.1-codex-mini"));
+    }
+
+    #[test]
+    fn is_responses_model_gpt5() {
+        assert!(is_responses_model("gpt-5"));
+    }
+
+    #[test]
+    fn is_responses_model_gpt5_codex() {
+        assert!(is_responses_model("gpt-5-codex"));
+    }
+
+    #[test]
+    fn is_responses_model_gpt5_nano() {
+        assert!(is_responses_model("gpt-5-nano"));
+    }
+
+    #[test]
+    fn is_responses_model_kimi_k26_is_not() {
+        assert!(!is_responses_model("kimi-k2.6"));
+    }
+
+    #[test]
+    fn is_responses_model_glm51_is_not() {
+        assert!(!is_responses_model("glm-5.1"));
+    }
+
+    #[test]
+    fn is_responses_model_gemini35_flash_is_not() {
+        assert!(!is_responses_model("gemini-3.5-flash"));
+    }
+}

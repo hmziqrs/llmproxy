@@ -155,7 +155,7 @@ fn default_server_name() -> String {
 // ---------------------------------------------------------------------------
 
 /// Routing rules for a specific model / scenario.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelConfig {
     /// Provider identifier (e.g. `"opencode-go"`).

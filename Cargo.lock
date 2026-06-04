@@ -2071,7 +2071,9 @@ dependencies = [
 name = "llm-proxy-core"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "humantime-serde",
+ "libc",
  "regex",
  "serde",
  "serde_json",
