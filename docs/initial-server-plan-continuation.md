@@ -1137,6 +1137,7 @@ Goal: replace OpenCode-specific HTTP transport without changing live routes yet.
 Add:
 
 ```text
+crates/llm-proxy-provider/src/error.rs
 crates/llm-proxy-provider/src/transport.rs
 crates/llm-proxy-provider/src/sse.rs
 ```
@@ -1144,10 +1145,31 @@ crates/llm-proxy-provider/src/sse.rs
 Update:
 
 ```text
+crates/llm-proxy-provider/src/client.rs
 crates/llm-proxy-provider/src/lib.rs
 ```
 
 Do not delete `client.rs` in this phase.
+
+### Provider error
+
+Move `ProviderError` out of the old OpenCode client before new transport and
+adapters depend on it:
+
+```text
+crates/llm-proxy-provider/src/client.rs -> crates/llm-proxy-provider/src/error.rs
+```
+
+Re-export it from `lib.rs`:
+
+```rust
+pub mod error;
+pub use error::ProviderError;
+```
+
+Then update old `client.rs`, new `transport.rs`, and provider adapters to import
+`crate::ProviderError`. This prevents Phase 11 from accidentally deleting the
+shared provider error when `OpenCodeClient` is removed.
 
 ### Types
 
@@ -1644,8 +1666,8 @@ pub struct LegacyState {
 
 #[derive(Clone, Debug)]
 pub struct AppState {
-    pub app_config: Arc<AppConfig>,
-    pub providers: Arc<ProviderRegistry>,
+    pub app_config: Option<Arc<AppConfig>>,
+    pub providers: Option<Arc<ProviderRegistry>>,
     pub provider_adapters: Arc<ProviderAdapterRegistry>,
     pub proxy_client: Arc<ProxyClient>,
     pub legacy: Option<Arc<LegacyState>>,
@@ -1665,6 +1687,8 @@ impl AppState {
     pub fn request_timeout(&self) -> Duration;
     pub fn server_name(&self) -> &str;
     pub fn legacy(&self) -> Option<&LegacyState>;
+    pub fn app_config(&self) -> Option<&AppConfig>;
+    pub fn providers(&self) -> Option<&ProviderRegistry>;
 }
 ```
 
@@ -1674,18 +1698,30 @@ is gone. Remove `LegacyState` after Phase 8 and Phase 9 are complete and CLI
 JSON compatibility is no longer needed. Do not leave compatibility fields in
 the final state.
 
+Valid Phase 7 construction modes:
+
+- JSON compatibility mode: `legacy = Some(...)`, `app_config = None`,
+  `providers = None`. Only old routes should use this mode.
+- TOML new-runtime mode: `app_config = Some(...)`, `providers = Some(...)`.
+  This is the mode Phase 8 and later route tests must use.
+
+Phase 8 is the point where live core-pipeline routes require TOML-backed
+`app_config` and `providers`. Phase 10 formalizes the CLI migration behavior and
+removes the last JSON-serving path.
+
 ### Main binary construction
 
 In `cmd_serve`:
 
 1. Resolve config path.
-2. Load new `AppConfig` if path ends with `.toml`.
-3. Load old `Config` only during compatibility period if path ends with `.json`.
-4. Load providers from `providers/` next to the main config.
-5. Build `ProviderAdapterRegistry::builtin()`.
-6. Pass adapter registry protocol names into core provider config validation.
-7. Build `ProxyClient::new()`.
-8. Build `AppState`.
+2. Build `ProviderAdapterRegistry::builtin()`.
+3. Build `ProxyClient::new()`.
+4. If path ends with `.toml`, load `AppConfig`, load providers from `providers/`
+   next to the main config, pass adapter registry protocol names into core
+   provider config validation, and build `AppState` in TOML new-runtime mode.
+5. If path ends with `.json`, load old `Config` only during the Phase 7
+   compatibility period and build `AppState` in JSON compatibility mode.
+6. Any other extension fails config loading.
 
 ### Tests
 
@@ -1783,9 +1819,11 @@ Shared `handle_core_once`:
 
 ```text
 CoreRequest
-  -> resolve_model_route(state.app_config.models, core.model.requested)
+  -> state.app_config().ok_or_else(|| RouteError::Internal("TOML config required".to_owned()))
+  -> state.providers().ok_or_else(|| RouteError::Internal("provider registry required".to_owned()))
+  -> resolve_model_route(app_config.models, core.model.requested)
   -> map ModelRouteError::UnknownModel to RouteError::UnknownModel
-  -> state.providers.resolve_adapter_target(...)
+  -> providers.resolve_adapter_target(...)
   -> ProviderProtocol::parse(...)
   -> state.provider_adapters.get(...)
   -> adapter.encode_request(...)
@@ -1799,9 +1837,11 @@ Shared `handle_core_stream`:
 
 ```text
 CoreRequest
-  -> resolve_model_route(state.app_config.models, core.model.requested)
+  -> state.app_config().ok_or_else(|| RouteError::Internal("TOML config required".to_owned()))
+  -> state.providers().ok_or_else(|| RouteError::Internal("provider registry required".to_owned()))
+  -> resolve_model_route(app_config.models, core.model.requested)
   -> map ModelRouteError::UnknownModel to RouteError::UnknownModel
-  -> state.providers.resolve_adapter_target(...)
+  -> providers.resolve_adapter_target(...)
   -> ProviderProtocol::parse(...)
   -> state.provider_adapters.get(...)
   -> adapter.encode_request(...)
@@ -2016,7 +2056,8 @@ or generate them directly from `llm-proxy init`.
 
 - `--config` points to `config.toml`.
 - `$LLM_PROXY_CONFIG` is the preferred env var.
-- `$OC_GO_CC_CONFIG` may be accepted temporarily with a warning.
+- `$OC_GO_CC_CONFIG` may be detected temporarily only to print the migration
+  warning; do not use it as the preferred live config path.
 
 `init`:
 
@@ -2068,6 +2109,16 @@ preserve the wrong mental model.
 After this phase, remove `LegacyState` from `AppState` unless a still-mounted
 route has a documented compile-time dependency on it. The expected result is no
 legacy state.
+
+Also make the new runtime fields non-optional:
+
+```rust
+pub app_config: Arc<AppConfig>,
+pub providers: Arc<ProviderRegistry>,
+```
+
+Remove `app_config()` and `providers()` option helpers if they only existed to
+bridge Phase 7 JSON compatibility. After Phase 10, serving requires TOML config.
 
 ### Tests
 
@@ -2287,6 +2338,12 @@ curl -sS -X POST http://127.0.0.1:3456/v1/chat/completions \
   -d '{"model":"unknown","messages":[{"role":"user","content":"hi"}]}'
 llm-proxy validate --config ./config.toml
 llm-proxy models --config ./config.toml
+```
+
+Then stop the TOML server and run the old-JSON migration check as a separate
+invocation:
+
+```sh
 llm-proxy serve --config ./old.json
 ```
 
