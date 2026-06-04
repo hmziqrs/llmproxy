@@ -1,0 +1,298 @@
+//! Middleware components for the LLM proxy server.
+//!
+//! Provides request deduplication, rate limiting, request ID generation,
+//! and client IP extraction.
+
+use std::collections::HashMap;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
+
+use sha2::{Digest, Sha256};
+
+// ---------------------------------------------------------------------------
+// RequestDeduplicator
+// ---------------------------------------------------------------------------
+
+/// Deduplicates requests based on a SHA-256 hash of the request body.
+///
+/// Tracks in-flight request hashes with a 500 ms deduplication window.
+/// If a second request with the same body arrives while the first is still
+/// in-flight, the duplicate is rejected.
+#[derive(Debug)]
+pub struct RequestDeduplicator {
+    /// SHA-256 hex digest -> insertion time.
+    in_flight: Mutex<HashMap<String, Instant>>,
+    /// Deduplication window in milliseconds.
+    window_ms: u64,
+}
+
+impl RequestDeduplicator {
+    /// Create a new deduplicator with a 500 ms window.
+    pub fn new() -> Self {
+        Self {
+            in_flight: Mutex::new(HashMap::new()),
+            window_ms: 500,
+        }
+    }
+
+    /// Check whether this request body is a duplicate.
+    ///
+    /// Returns `true` if the request is a duplicate (should be rejected),
+    /// `false` if it is new (should be processed).
+    pub fn is_duplicate(&self, body: &[u8]) -> bool {
+        let hash = Self::hash_body(body);
+        let now = Instant::now();
+
+        let mut map = self.in_flight.lock().expect("dedup lock poisoned");
+
+        // Prune expired entries.
+        map.retain(|_, t| now.duration_since(*t).as_millis() < self.window_ms as u128);
+
+        if map.contains_key(&hash) {
+            return true;
+        }
+
+        map.insert(hash, now);
+        false
+    }
+
+    /// Compute the SHA-256 hex digest of the request body.
+    fn hash_body(body: &[u8]) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(body);
+        format!("{:x}", hasher.finalize())
+    }
+}
+
+impl Default for RequestDeduplicator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RateLimiter
+// ---------------------------------------------------------------------------
+
+/// Per-client token bucket for rate limiting.
+#[derive(Debug)]
+struct ClientTokenBucket {
+    /// Remaining tokens.
+    tokens: f64,
+    /// Maximum tokens.
+    max_tokens: f64,
+    /// Timestamp of last refill.
+    last_refill: Instant,
+}
+
+impl ClientTokenBucket {
+    fn new(max_tokens: f64) -> Self {
+        Self {
+            tokens: max_tokens,
+            max_tokens,
+            last_refill: Instant::now(),
+        }
+    }
+
+    /// Try to consume one token. Returns `true` if allowed.
+    fn try_consume(&mut self, refill_rate: f64) -> bool {
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.last_refill).as_secs_f64();
+        self.tokens = (self.tokens + elapsed * refill_rate).min(self.max_tokens);
+        self.last_refill = now;
+
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// Per-IP rate limiter using token buckets.
+///
+/// Each client IP gets its own bucket allowing `max_requests_per_minute`
+/// requests per minute.
+#[derive(Debug)]
+pub struct RateLimiter {
+    /// Per-IP token buckets.
+    buckets: Mutex<HashMap<String, ClientTokenBucket>>,
+    /// Maximum requests per minute per client.
+    max_requests_per_minute: f64,
+}
+
+impl RateLimiter {
+    /// Create a new rate limiter.
+    ///
+    /// `max_requests_per_minute` is the maximum number of requests allowed
+    /// per client IP per minute.
+    pub fn new(max_requests_per_minute: u32) -> Self {
+        Self {
+            buckets: Mutex::new(HashMap::new()),
+            max_requests_per_minute: max_requests_per_minute as f64,
+        }
+    }
+
+    /// Check whether a request from `client_ip` is allowed.
+    ///
+    /// Returns `true` if the request is allowed, `false` if rate-limited.
+    pub fn is_allowed(&self, client_ip: &str) -> bool {
+        let mut buckets = self.buckets.lock().expect("rate limiter lock poisoned");
+
+        // Refill rate: tokens per second.
+        let refill_rate = self.max_requests_per_minute / 60.0;
+
+        let bucket = buckets
+            .entry(client_ip.to_owned())
+            .or_insert_with(|| ClientTokenBucket::new(self.max_requests_per_minute));
+
+        bucket.try_consume(refill_rate)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RequestIdGenerator
+// ---------------------------------------------------------------------------
+
+/// Generates unique request IDs in the format `req-{unix}-{counter}`.
+#[derive(Debug)]
+pub struct RequestIdGenerator {
+    counter: AtomicU64,
+}
+
+impl RequestIdGenerator {
+    /// Create a new request ID generator.
+    pub fn new() -> Self {
+        Self {
+            counter: AtomicU64::new(0),
+        }
+    }
+
+    /// Generate the next request ID.
+    pub fn next_id(&self) -> String {
+        let unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let counter = self.counter.fetch_add(1, Ordering::Relaxed);
+        format!("req-{unix}-{counter}")
+    }
+}
+
+impl Default for RequestIdGenerator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Client IP extraction
+// ---------------------------------------------------------------------------
+
+/// Extract the client IP from request headers or connection info.
+///
+/// Checks `X-Forwarded-For` first (leftmost IP), then falls back to
+/// connection info.
+pub fn get_client_ip(
+    headers: &axum::http::HeaderMap,
+    connect_info: Option<&axum::extract::ConnectInfo<std::net::SocketAddr>>,
+) -> String {
+    // Check X-Forwarded-For first (leftmost IP).
+    if let Some(xff) = headers.get("x-forwarded-for") {
+        if let Ok(val) = xff.to_str() {
+            if let Some(ip) = val.split(',').next() {
+                let trimmed = ip.trim();
+                if !trimmed.is_empty() {
+                    return trimmed.to_owned();
+                }
+            }
+        }
+    }
+
+    // Check X-Real-Ip.
+    if let Some(xri) = headers.get("x-real-ip") {
+        if let Ok(val) = xri.to_str() {
+            let trimmed = val.trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_owned();
+            }
+        }
+    }
+
+    // Fall back to connection info.
+    if let Some(ci) = connect_info {
+        return ci.0.ip().to_string();
+    }
+
+    "unknown".to_owned()
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -- RequestDeduplicator ---------------------------------------------------
+
+    #[test]
+    fn dedup_new_request_is_not_duplicate() {
+        let dedup = RequestDeduplicator::new();
+        assert!(!dedup.is_duplicate(b"hello"));
+    }
+
+    #[test]
+    fn dedup_same_body_is_duplicate() {
+        let dedup = RequestDeduplicator::new();
+        assert!(!dedup.is_duplicate(b"hello"));
+        assert!(dedup.is_duplicate(b"hello"));
+    }
+
+    #[test]
+    fn dedup_different_body_is_not_duplicate() {
+        let dedup = RequestDeduplicator::new();
+        assert!(!dedup.is_duplicate(b"hello"));
+        assert!(!dedup.is_duplicate(b"world"));
+    }
+
+    #[test]
+    fn request_id_format() {
+        let generator = RequestIdGenerator::new();
+        let id = generator.next_id();
+        assert!(id.starts_with("req-"));
+        assert!(id.contains('-'));
+    }
+
+    #[test]
+    fn request_id_monotonically_increasing() {
+        let generator = RequestIdGenerator::new();
+        let id1 = generator.next_id();
+        let id2 = generator.next_id();
+        // The counter portion should be different.
+        assert_ne!(id1, id2);
+    }
+
+    // -- RateLimiter -----------------------------------------------------------
+
+    #[test]
+    fn rate_limiter_allows_under_limit() {
+        let limiter = RateLimiter::new(100);
+        for _ in 0..10 {
+            assert!(limiter.is_allowed("127.0.0.1"));
+        }
+    }
+
+    #[test]
+    fn rate_limiter_different_ips_independent() {
+        let limiter = RateLimiter::new(5);
+        for _ in 0..5 {
+            assert!(limiter.is_allowed("10.0.0.1"));
+        }
+        // Different IP should still be allowed.
+        assert!(limiter.is_allowed("10.0.0.2"));
+    }
+}

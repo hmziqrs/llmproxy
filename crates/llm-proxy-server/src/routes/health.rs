@@ -1,5 +1,6 @@
 use axum::{Json, extract::State, http::StatusCode};
 use serde::Serialize;
+use std::collections::HashMap;
 
 use crate::state::AppState;
 
@@ -7,11 +8,47 @@ use crate::state::AppState;
 #[derive(Serialize)]
 pub(crate) struct HealthBody {
     status: &'static str,
+    service: String,
+    metrics: HealthMetrics,
+    circuit_breakers: HashMap<String, String>,
+    model_counts: HashMap<String, i64>,
 }
 
-/// Liveness probe. Always 200 if the process is up.
-pub async fn health() -> (StatusCode, Json<HealthBody>) {
-    (StatusCode::OK, Json(HealthBody { status: "ok" }))
+/// Metrics snapshot included in the health response.
+#[derive(Serialize)]
+struct HealthMetrics {
+    requests_received: i64,
+    requests_streamed: i64,
+    requests_success: i64,
+    requests_failed: i64,
+    upstream_calls: i64,
+    rate_limited: i64,
+    deduplicated: i64,
+}
+
+/// Liveness probe with expanded metrics.
+pub async fn health(State(state): State<AppState>) -> (StatusCode, Json<HealthBody>) {
+    let snapshot = state.metrics.get_snapshot();
+    let circuit_breakers = state.fallback_handler.get_circuit_states();
+
+    (
+        StatusCode::OK,
+        Json(HealthBody {
+            status: "ok",
+            service: state.config.server_name.clone(),
+            metrics: HealthMetrics {
+                requests_received: snapshot.requests_received,
+                requests_streamed: snapshot.requests_streamed,
+                requests_success: snapshot.requests_success,
+                requests_failed: snapshot.requests_failed,
+                upstream_calls: snapshot.upstream_calls,
+                rate_limited: snapshot.rate_limited,
+                deduplicated: snapshot.deduplicated,
+            },
+            circuit_breakers,
+            model_counts: snapshot.model_counts,
+        }),
+    )
 }
 
 /// Readiness response body.

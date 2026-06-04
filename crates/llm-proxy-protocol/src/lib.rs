@@ -1,4 +1,9 @@
-//! llm-proxy-protocol: stub.
+//! llm-proxy-protocol: wire-format types for the LLM proxy.
 //!
-//! Intentionally empty in v1. See `docs/protocol-normalization.md`
-//! and `docs/protocol-mini.md` for what goes here.
+//! Contains request/response types for the OpenAI Chat Completions API,
+//! Responses API, and Gemini API.
+
+pub mod anthropic;
+pub mod openai;
+pub mod transformer;
+pub mod zen;

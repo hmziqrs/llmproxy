@@ -10,20 +10,24 @@ workspace = true
 
 [dependencies]
 llm-proxy-core = { workspace = true }
+llm-proxy-protocol = { path = "../llm-proxy-protocol" }
+llm-proxy-provider = { path = "../llm-proxy-provider" }
 
-axum = { workspace = true }
-axum-serde = { workspace = true }
+axum = { workspace = true, features = ["macros", "json"] }
+axum-serde = { workspace = true, features = ["sonic"] }
 tokio = { workspace = true }
+tokio-stream = "0.1"
 tower = { workspace = true }
-tower-http = { workspace = true }
+tower-http = { version = "0.6", features = ["trace", "timeout"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
+bytes = "1"
+reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"] }
+futures = "0.3"
+sha2 = "0.10"
 
 [dev-dependencies]
-# `ServiceExt::oneshot` in the integration test needs tower's `util`
-# feature. Scoped to dev so the library build stays lean; cargo's
-# feature unification enables it only when compiling tests.
 tower = { workspace = true, features = ["util"] }

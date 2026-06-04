@@ -9,11 +9,13 @@ use tower_http::{timeout::TimeoutLayer, trace::TraceLayer};
 
 use crate::state::AppState;
 
-mod chat;
 mod health;
+mod messages;
+mod token_count;
 
-use chat::echo_chat;
 use health::{health, ready, version};
+use messages::handle_messages;
+use token_count::count_tokens;
 
 const MAX_BODY_BYTES: usize = 32 * 1024 * 1024; // 32 MiB
 
@@ -42,7 +44,8 @@ pub fn router(state: AppState) -> Router {
         .route("/health", get(health))
         .route("/ready", get(ready))
         .route("/version", get(version))
-        .route("/v1/chat/completions", post(echo_chat))
+        .route("/v1/messages", post(handle_messages))
+        .route("/v1/messages/count_tokens", post(count_tokens))
         .fallback(not_found)
         .layer(middleware)
         .with_state(state)

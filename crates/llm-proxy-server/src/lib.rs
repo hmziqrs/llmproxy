@@ -7,6 +7,8 @@
 
 /// API-layer error type.
 pub mod error;
+/// Middleware components (dedup, rate limiter, request ID, IP extraction).
+pub mod middleware;
 /// Route handlers and router composition.
 pub mod routes;
 /// Graceful shutdown signal.
@@ -15,8 +17,9 @@ pub mod shutdown;
 pub mod state;
 
 pub use error::ApiError;
+pub use middleware::{RateLimiter, RequestDeduplicator, RequestIdGenerator};
 pub use shutdown::shutdown_signal;
-pub use state::{AppState, BuildInfo};
+pub use state::{AppState, BuildInfo, ModelRouter};
 
 use axum::Router;
 

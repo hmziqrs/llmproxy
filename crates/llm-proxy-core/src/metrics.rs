@@ -1,0 +1,416 @@
+//! Runtime metrics for the LLM proxy.
+//!
+//! All counters are lock-free ([`std::sync::atomic::AtomicI64`]). The only
+//! mutex-guarded state is the latency ring-buffer (last 1 000 samples) and
+//! the per-model request counter map.
+
+use std::collections::HashMap;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::time::Duration;
+
+/// Maximum number of latency samples retained in the ring-buffer.
+const LATENCY_CAP: usize = 1000;
+
+// ---------------------------------------------------------------------------
+// Metrics
+// ---------------------------------------------------------------------------
+
+/// Thread-safe metrics collector.
+///
+/// Internally uses [`AtomicI64`] counters for hot-path increments and
+/// [`Mutex`] only for the latency ring-buffer and model map.
+#[derive(Debug)]
+pub struct Metrics {
+    requests_received: AtomicI64,
+    requests_streamed: AtomicI64,
+    requests_success: AtomicI64,
+    requests_failed: AtomicI64,
+    upstream_calls: AtomicI64,
+    rate_limited: AtomicI64,
+    deduplicated: AtomicI64,
+    /// Ring-buffer holding the last [`LATENCY_CAP`] latency samples.
+    latencies: Mutex<Vec<Duration>>,
+    /// Per-model request counts.
+    model_counts: Mutex<HashMap<String, AtomicI64>>,
+}
+
+impl Metrics {
+    /// Create a new, zeroed [`Metrics`] instance.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            requests_received: AtomicI64::new(0),
+            requests_streamed: AtomicI64::new(0),
+            requests_success: AtomicI64::new(0),
+            requests_failed: AtomicI64::new(0),
+            upstream_calls: AtomicI64::new(0),
+            rate_limited: AtomicI64::new(0),
+            deduplicated: AtomicI64::new(0),
+            latencies: Mutex::new(Vec::with_capacity(LATENCY_CAP)),
+            model_counts: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Record an incoming request.
+    ///
+    /// If `streaming` is `true`, both `requests_received` and
+    /// `requests_streamed` are incremented.
+    pub fn record_request(&self, streaming: bool) {
+        self.requests_received.fetch_add(1, Ordering::Relaxed);
+        if streaming {
+            self.requests_streamed.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Record a successful upstream response.
+    ///
+    /// Increments `requests_success` and `upstream_calls`, stores the
+    /// `latency` sample, and bumps the per-`model` counter.
+    pub fn record_success(&self, model: &str, latency: Duration) {
+        self.requests_success.fetch_add(1, Ordering::Relaxed);
+        self.upstream_calls.fetch_add(1, Ordering::Relaxed);
+
+        // Store latency sample (ring-buffer).
+        if let Ok(mut buf) = self.latencies.lock() {
+            if buf.len() >= LATENCY_CAP {
+                buf.remove(0);
+            }
+            buf.push(latency);
+        }
+
+        // Bump per-model counter.
+        if let Ok(mut map) = self.model_counts.lock() {
+            if let Some(counter) = map.get(model) {
+                counter.fetch_add(1, Ordering::Relaxed);
+            } else {
+                let counter = AtomicI64::new(1);
+                map.insert(model.to_owned(), counter);
+            }
+        }
+    }
+
+    /// Record a failed request.
+    ///
+    /// Increments `requests_failed` and `upstream_calls`.
+    pub fn record_failure(&self) {
+        self.requests_failed.fetch_add(1, Ordering::Relaxed);
+        self.upstream_calls.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a rate-limited request.
+    pub fn record_rate_limited(&self) {
+        self.rate_limited.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a deduplicated (deduplicated) request.
+    pub fn record_deduplicated(&self) {
+        self.deduplicated.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Take a point-in-time snapshot of all counters.
+    pub fn get_snapshot(&self) -> Snapshot {
+        let requests_received = self.requests_received.load(Ordering::Relaxed);
+        let requests_streamed = self.requests_streamed.load(Ordering::Relaxed);
+        let requests_success = self.requests_success.load(Ordering::Relaxed);
+        let requests_failed = self.requests_failed.load(Ordering::Relaxed);
+        let upstream_calls = self.upstream_calls.load(Ordering::Relaxed);
+        let rate_limited = self.rate_limited.load(Ordering::Relaxed);
+        let deduplicated = self.deduplicated.load(Ordering::Relaxed);
+
+        let latencies = self
+            .latencies
+            .lock()
+            .map(|buf| buf.clone())
+            .unwrap_or_default();
+
+        let model_counts = self
+            .model_counts
+            .lock()
+            .map(|map| {
+                map.iter()
+                    .map(|(k, v)| (k.clone(), v.load(Ordering::Relaxed)))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        Snapshot {
+            requests_received,
+            requests_streamed,
+            requests_success,
+            requests_failed,
+            upstream_calls,
+            rate_limited,
+            deduplicated,
+            latencies,
+            model_counts,
+        }
+    }
+}
+
+impl Default for Metrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Snapshot
+// ---------------------------------------------------------------------------
+
+/// A point-in-time copy of all metric counters.
+#[derive(Debug, Clone)]
+pub struct Snapshot {
+    /// Total requests received (streaming + non-streaming).
+    pub requests_received: i64,
+    /// Subset of received requests that used streaming.
+    pub requests_streamed: i64,
+    /// Requests that completed successfully.
+    pub requests_success: i64,
+    /// Requests that failed.
+    pub requests_failed: i64,
+    /// Total calls made to upstream providers.
+    pub upstream_calls: i64,
+    /// Requests rejected by the rate limiter.
+    pub rate_limited: i64,
+    /// Requests that were deduplicated before reaching upstream.
+    pub deduplicated: i64,
+    /// Collected latency samples (up to 1 000 entries).
+    pub latencies: Vec<Duration>,
+    /// Per-model request counts.
+    pub model_counts: HashMap<String, i64>,
+}
+
+impl Snapshot {
+    /// Compute the p95 latency from the collected samples.
+    ///
+    /// Returns [`Duration::ZERO`] when no samples have been recorded.
+    pub fn calculate_p95(&self) -> Duration {
+        percentile(&self.latencies, 95.0)
+    }
+
+    /// Compute the p99 latency from the collected samples.
+    ///
+    /// Returns [`Duration::ZERO`] when no samples have been recorded.
+    pub fn calculate_p99(&self) -> Duration {
+        percentile(&self.latencies, 99.0)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Return the latency at the given percentile (0..=100).
+///
+/// Uses the "exclusive" interpolation method common in monitoring systems:
+/// `rank = pct/100 * (n + 1)`, then clamped to `[0, n-1]`.
+///
+/// Returns [`Duration::ZERO`] for an empty slice.
+fn percentile(samples: &[Duration], pct: f64) -> Duration {
+    if samples.is_empty() {
+        return Duration::ZERO;
+    }
+
+    let mut sorted: Vec<Duration> = samples.to_vec();
+    sorted.sort();
+
+    let n = sorted.len();
+    // Nearest-rank (exclusive) method: rank = pct/100 * (n + 1), 1-based.
+    let rank = (pct / 100.0) * (n as f64 + 1.0);
+    // Convert to 0-based index, clamped to valid range.
+    let idx = (rank.floor() as usize).saturating_sub(1).min(n - 1);
+    sorted[idx]
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_metrics_all_zero() {
+        let m = Metrics::new();
+        let snap = m.get_snapshot();
+        assert_eq!(snap.requests_received, 0);
+        assert_eq!(snap.requests_streamed, 0);
+        assert_eq!(snap.requests_success, 0);
+        assert_eq!(snap.requests_failed, 0);
+        assert_eq!(snap.upstream_calls, 0);
+        assert_eq!(snap.rate_limited, 0);
+        assert_eq!(snap.deduplicated, 0);
+        assert!(snap.latencies.is_empty());
+        assert!(snap.model_counts.is_empty());
+    }
+
+    #[test]
+    fn record_request_non_streaming() {
+        let m = Metrics::new();
+        m.record_request(false);
+        let snap = m.get_snapshot();
+        assert_eq!(snap.requests_received, 1);
+        assert_eq!(snap.requests_streamed, 0);
+    }
+
+    #[test]
+    fn record_request_streaming() {
+        let m = Metrics::new();
+        m.record_request(true);
+        let snap = m.get_snapshot();
+        assert_eq!(snap.requests_received, 1);
+        assert_eq!(snap.requests_streamed, 1);
+    }
+
+    #[test]
+    fn record_success_tracks_latency_and_model() {
+        let m = Metrics::new();
+        m.record_success("gpt-4o", Duration::from_millis(120));
+        m.record_success("gpt-4o", Duration::from_millis(80));
+        m.record_success("claude-3", Duration::from_millis(200));
+
+        let snap = m.get_snapshot();
+        assert_eq!(snap.requests_success, 3);
+        assert_eq!(snap.upstream_calls, 3);
+        assert_eq!(snap.latencies.len(), 3);
+        assert_eq!(snap.model_counts.get("gpt-4o"), Some(&2));
+        assert_eq!(snap.model_counts.get("claude-3"), Some(&1));
+    }
+
+    #[test]
+    fn record_failure_increments_counters() {
+        let m = Metrics::new();
+        m.record_failure();
+        m.record_failure();
+        let snap = m.get_snapshot();
+        assert_eq!(snap.requests_failed, 2);
+        assert_eq!(snap.upstream_calls, 2);
+    }
+
+    #[test]
+    fn record_rate_limited_and_deduplicated() {
+        let m = Metrics::new();
+        m.record_rate_limited();
+        m.record_rate_limited();
+        m.record_rate_limited();
+        m.record_deduplicated();
+
+        let snap = m.get_snapshot();
+        assert_eq!(snap.rate_limited, 3);
+        assert_eq!(snap.deduplicated, 1);
+    }
+
+    #[test]
+    fn latency_ring_buffer_capped_at_1000() {
+        let m = Metrics::new();
+        for i in 0..1050 {
+            m.record_success("model", Duration::from_millis(i));
+        }
+
+        let snap = m.get_snapshot();
+        assert_eq!(snap.latencies.len(), LATENCY_CAP);
+        // The oldest 50 samples should have been evicted; the buffer should
+        // start at sample index 50.
+        assert_eq!(snap.latencies[0], Duration::from_millis(50));
+        assert_eq!(snap.latencies[LATENCY_CAP - 1], Duration::from_millis(1049));
+    }
+
+    #[test]
+    fn p95_p99_empty() {
+        let snap = Snapshot {
+            requests_received: 0,
+            requests_streamed: 0,
+            requests_success: 0,
+            requests_failed: 0,
+            upstream_calls: 0,
+            rate_limited: 0,
+            deduplicated: 0,
+            latencies: vec![],
+            model_counts: HashMap::new(),
+        };
+        assert_eq!(snap.calculate_p95(), Duration::ZERO);
+        assert_eq!(snap.calculate_p99(), Duration::ZERO);
+    }
+
+    #[test]
+    fn p95_p99_on_known_samples() {
+        // 100 samples from 0ms..99ms.
+        let latencies: Vec<Duration> = (0..100).map(Duration::from_millis).collect();
+
+        let snap = Snapshot {
+            requests_received: 0,
+            requests_streamed: 0,
+            requests_success: 0,
+            requests_failed: 0,
+            upstream_calls: 0,
+            rate_limited: 0,
+            deduplicated: 0,
+            latencies,
+            model_counts: HashMap::new(),
+        };
+
+        // p95: rank = 0.95 * (100+1) = 95.95 -> floor 95 -> idx 94 -> 94ms
+        assert_eq!(snap.calculate_p95(), Duration::from_millis(94));
+        // p99: rank = 0.99 * (100+1) = 99.99 -> floor 99 -> idx 98 -> 98ms
+        assert_eq!(snap.calculate_p99(), Duration::from_millis(98));
+    }
+
+    #[test]
+    fn snapshot_is_clone_and_debug() {
+        let m = Metrics::new();
+        m.record_success("test", Duration::from_millis(10));
+        let snap = m.get_snapshot();
+
+        let cloned = snap.clone();
+        assert_eq!(cloned.requests_success, 1);
+
+        let _debug_str = format!("{snap:?}");
+    }
+
+    #[test]
+    fn concurrent_access_does_not_panic() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let m = Arc::new(Metrics::new());
+        let mut handles = vec![];
+
+        for _ in 0..4 {
+            let m = Arc::clone(&m);
+            handles.push(thread::spawn(move || {
+                for i in 0..500 {
+                    m.record_request(i % 2 == 0);
+                    if i % 3 == 0 {
+                        m.record_success("model-a", Duration::from_micros(i));
+                    } else {
+                        m.record_failure();
+                    }
+                    if i % 10 == 0 {
+                        m.record_rate_limited();
+                    }
+                    if i % 7 == 0 {
+                        m.record_deduplicated();
+                    }
+                }
+            }));
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let snap = m.get_snapshot();
+        // 4 threads x 500 iterations = 2000 requests received.
+        assert_eq!(snap.requests_received, 2000);
+        assert_eq!(snap.requests_success + snap.requests_failed, 2000);
+    }
+
+    #[test]
+    fn default_trait() {
+        let m = Metrics::default();
+        let snap = m.get_snapshot();
+        assert_eq!(snap.requests_received, 0);
+    }
+}

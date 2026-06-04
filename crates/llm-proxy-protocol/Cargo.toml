@@ -10,3 +10,5 @@ workspace = true
 
 [dependencies]
 llm-proxy-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

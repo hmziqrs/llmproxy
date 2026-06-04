@@ -13,34 +13,93 @@ pub enum ApiError {
     /// Bad client input.
     #[error("bad request: {0}")]
     BadRequest(String),
+    /// Rate limited.
+    #[error("rate limit exceeded: {0}")]
+    RateLimited(String),
+    /// Upstream provider error.
+    #[error("upstream error: {0}")]
+    Upstream(String),
+    /// Duplicate request.
+    #[error("duplicate request: {0}")]
+    Duplicate(String),
     /// Anything else.
     #[error("internal error: {0}")]
     Internal(String),
 }
 
 #[derive(Serialize)]
-struct ErrorBody<'a> {
-    error: ErrorBodyInner<'a>,
+struct AnthropicErrorBody {
+    r#type: &'static str,
+    error: AnthropicErrorDetail,
 }
 
 #[derive(Serialize)]
-struct ErrorBodyInner<'a> {
+struct AnthropicErrorDetail {
+    r#type: String,
     message: String,
-    kind: &'a str,
+}
+
+impl ApiError {
+    /// Convert to an Anthropic-format error JSON and HTTP status code.
+    fn to_anthropic_response(&self) -> (StatusCode, Json<AnthropicErrorBody>) {
+        match self {
+            Self::BadRequest(msg) => (
+                StatusCode::BAD_REQUEST,
+                Json(AnthropicErrorBody {
+                    r#type: "error",
+                    error: AnthropicErrorDetail {
+                        r#type: "invalid_request_error".to_owned(),
+                        message: msg.clone(),
+                    },
+                }),
+            ),
+            Self::RateLimited(msg) => (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(AnthropicErrorBody {
+                    r#type: "error",
+                    error: AnthropicErrorDetail {
+                        r#type: "rate_limit_error".to_owned(),
+                        message: msg.clone(),
+                    },
+                }),
+            ),
+            Self::Upstream(msg) => (
+                StatusCode::BAD_GATEWAY,
+                Json(AnthropicErrorBody {
+                    r#type: "error",
+                    error: AnthropicErrorDetail {
+                        r#type: "api_error".to_owned(),
+                        message: msg.clone(),
+                    },
+                }),
+            ),
+            Self::Duplicate(msg) => (
+                StatusCode::CONFLICT,
+                Json(AnthropicErrorBody {
+                    r#type: "error",
+                    error: AnthropicErrorDetail {
+                        r#type: "invalid_request_error".to_owned(),
+                        message: msg.clone(),
+                    },
+                }),
+            ),
+            Self::Internal(msg) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(AnthropicErrorBody {
+                    r#type: "error",
+                    error: AnthropicErrorDetail {
+                        r#type: "api_error".to_owned(),
+                        message: msg.clone(),
+                    },
+                }),
+            ),
+        }
+    }
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let (status, kind) = match &self {
-            Self::BadRequest(_) => (StatusCode::BAD_REQUEST, "bad_request"),
-            Self::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal"),
-        };
-        let body = ErrorBody {
-            error: ErrorBodyInner {
-                message: self.to_string(),
-                kind,
-            },
-        };
-        (status, Json(body)).into_response()
+        let (status, body) = self.to_anthropic_response();
+        (status, body).into_response()
     }
 }
