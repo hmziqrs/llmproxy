@@ -1,9 +1,12 @@
-# Initial Server Plan Continuation
+# Protocol Normalization Implementation Plan
 
-> **Status:** Implementation plan for the next protocol/provider phase
-> **Date:** 2026-06-04
-> **Source of truth:** This document continues
-> `docs/completed/initial-server-plan.md` for implementation order.
+> **Status:** Active implementation plan for the next protocol/provider phase
+> **Date:** 2026-06-05
+> **Active path:** `docs/plan.md`
+> **Standards:** `docs/protocol-mini.md`,
+> `docs/protocol-normalization.md`
+> **History:** Continues `docs/completed/initial-server-plan.md` and
+> supersedes the old `docs/initial-server-plan-continuation.md` path.
 
 ## Purpose
 
@@ -34,6 +37,12 @@ client wire protocol -> CoreRequest/CoreResponse/CoreEvent -> provider wire prot
 
 Provider configurability lands inside that architecture, not beside it.
 
+This plan uses the local names `CoreRequest`, `CoreResponse`, and `CoreEvent`
+for the v1 chat-family core. Those are the same architectural layer called
+`CoreChat` and `CoreChatStream` in `docs/protocol-mini.md`; they are not a
+generic core for embeddings, images, audio, rerank, files, or batch endpoints.
+Future endpoint families must get their own core contracts.
+
 ## Hard Rules
 
 These rules prevent the plan from drifting into another direct pairwise
@@ -42,16 +51,17 @@ transform design.
 1. No direct protocol pairs:
 
    ```text
-   Anthropic -> OpenAI
-   Anthropic -> Responses
-   Anthropic -> Gemini
-   OpenAI -> Anthropic
+   OpenAI Chat -> Anthropic Messages
+   Anthropic Messages -> OpenAI Chat
+   OpenAI Responses -> Anthropic Messages
+   Gemini GenerateContent -> OpenAI Chat
+   Gemini GenerateContent -> Anthropic Messages
    ```
 
    Every conversion must be:
 
    ```text
-   wire -> core -> wire
+   client wire -> chat-family core -> provider wire
    ```
 
 2. The router only selects:
@@ -89,6 +99,16 @@ transform design.
    provider protocol adapter. A new wire protocol requires code and fixtures.
 
 7. Each phase must leave the workspace compiling and tests passing.
+
+8. The generic paths in `docs/protocol-normalization.md` map to this repo's
+   crate layout:
+
+   ```text
+   protocol/<client>.rs -> crates/llm-proxy-protocol/src/client/<client>.rs
+   provider/<protocol>.rs -> crates/llm-proxy-provider/src/adapter/<protocol>.rs
+   ```
+
+   Only truly new provider wire formats need additional wire DTO modules.
 
 ## Target Crate Boundaries
 
@@ -141,8 +161,8 @@ Replace later:
 The replacement is not one huge file. It is adapters:
 
 ```text
-Anthropic Messages <-> CoreChat
-OpenAI Chat        <-> CoreChat
+Anthropic Messages <-> CoreRequest/CoreResponse/CoreEvent
+OpenAI Chat        <-> CoreRequest/CoreResponse/CoreEvent
 ```
 
 Provider-side protocol adapters live in `llm-proxy-provider`, but may reuse wire
