@@ -208,6 +208,7 @@ pub enum CoreRole {
 /// self-documenting.
 #[non_exhaustive]
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum CoreContent {
     /// Plain text.
     Text {
@@ -771,6 +772,7 @@ pub enum UsageProvenance {
 /// never receive deltas for those kinds.
 #[non_exhaustive]
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum CoreEvent {
     /// The response has started.
     MessageStart {
@@ -2447,5 +2449,49 @@ mod tests {
         // The outer Object type is shown but Bool/Number values inside are
         // not printed verbatim -- redact_value hides inner details.
         assert!(debug.contains("Object"), "should show Object type for source");
+    }
+
+    #[test]
+    fn core_content_rejects_unknown_fields_in_variant() {
+        // Text variant with an extra field should be rejected, not silently dropped.
+        let json = r#"{"Text": {"text": "hi", "secret_extra": "leaked"}}"#;
+        assert!(
+            serde_json::from_str::<CoreContent>(json).is_err(),
+            "CoreContent::Text should reject unknown field"
+        );
+        // ToolUse variant with an extra field.
+        let json2 = r#"{"ToolUse": {"id": "1", "name": "fn", "input": {}, "extra": true}}"#;
+        assert!(
+            serde_json::from_str::<CoreContent>(json2).is_err(),
+            "CoreContent::ToolUse should reject unknown field"
+        );
+        // ToolResult variant with an extra field.
+        let json3 = r#"{"ToolResult": {"tool_use_id": "1", "content": [], "is_error": false, "extra": 1}}"#;
+        assert!(
+            serde_json::from_str::<CoreContent>(json3).is_err(),
+            "CoreContent::ToolResult should reject unknown field"
+        );
+    }
+
+    #[test]
+    fn core_event_rejects_unknown_fields_in_variant() {
+        // TextDelta with an extra field.
+        let json = r#"{"TextDelta": {"index": 0, "text": "hi", "extra": true}}"#;
+        assert!(
+            serde_json::from_str::<CoreEvent>(json).is_err(),
+            "CoreEvent::TextDelta should reject unknown field"
+        );
+        // MessageStart with an extra field.
+        let json2 = r#"{"MessageStart": {"id": null, "model": {"requested": "m"}, "extra": 1}}"#;
+        assert!(
+            serde_json::from_str::<CoreEvent>(json2).is_err(),
+            "CoreEvent::MessageStart should reject unknown field"
+        );
+        // MessageStop with an extra field.
+        let json3 = r#"{"MessageStop": {"stop_reason": "EndTurn", "stop_sequence": null, "extra": true}}"#;
+        assert!(
+            serde_json::from_str::<CoreEvent>(json3).is_err(),
+            "CoreEvent::MessageStop should reject unknown field"
+        );
     }
 }
