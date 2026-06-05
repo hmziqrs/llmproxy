@@ -527,8 +527,8 @@ pub fn load_provider_config(
         match resolved {
             None => {
                 // Env var is not set -- interpolation will leave ${VAR} as-is.
-                // The unresolved-env-var check in validate_provider_config will
-                // catch this. No action needed here.
+                // The unresolved-env-var check below (after interpolation) will
+                // catch this for all fields, not just api_key.
             }
             Some(value) if value.is_empty() => {
                 return Err(CoreError::ConfigValidation {
@@ -546,8 +546,19 @@ pub fn load_provider_config(
         }
     }
 
-    // Now perform full interpolation on the raw content and parse once.
+    // Now perform full interpolation on the raw content and check for any
+    // unresolved env vars that remain. This catches ${MISSING_VAR} patterns
+    // in *any* field (endpoint, protocol, name), not just api_key.
+    // validate_provider_config only checks api_key for unresolved patterns,
+    // so a whole-file check is needed here to match load_app_config behavior.
     let interpolated = interpolate_env_vars(&raw);
+    if let Some(var) = find_unresolved_env_var(&interpolated) {
+        return Err(CoreError::ConfigValidation {
+            message: format!(
+                "provider config contains unresolvable environment variable \"{var}\""
+            ),
+        });
+    }
     let file: ProviderFile = toml::from_str(&interpolated).map_err(CoreError::ConfigParse)?;
     validate_provider_config(&file.provider, known_protocols).map_err(|e| CoreError::ConfigValidation {
         message: e.to_string(),
@@ -2302,6 +2313,108 @@ adapter = "${{_LLM_PROXY_ADAPTER_NAME_VAR}}"
         assert!(
             err.contains("model key is empty"),
             "expected empty model key error, got: {err}"
+        );
+    }
+
+    // -- Unresolved env var in endpoint field fails (not just api_key) -----------
+
+    #[test]
+    fn unresolved_env_var_in_endpoint_fails() {
+        let _env = clean_env();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("provider.toml");
+        std::fs::write(
+            &path,
+            r#"
+[provider]
+name = "test"
+api_key = "static-key"
+auth_style = "bearer"
+
+[provider.adapters.chat]
+protocol = "openai_chat_completions"
+endpoint = "${_LLM_PROXY_NEVER_SET_ENDPOINT_VAR}/v1/chat/completions"
+"#,
+        )
+        .expect("write");
+
+        let result = load_provider_config(&path, None);
+        assert!(
+            result.is_err(),
+            "expected error for unresolved env var in endpoint, got: {result:?}"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("unresolvable environment variable"),
+            "expected unresolvable env var error, got: {err}"
+        );
+        assert!(
+            err.contains("_LLM_PROXY_NEVER_SET_ENDPOINT_VAR"),
+            "error should mention the unresolved var name, got: {err}"
+        );
+    }
+
+    // -- Unresolved env var in provider name fails --------------------------------
+
+    #[test]
+    fn unresolved_env_var_in_provider_name_fails() {
+        let _env = clean_env();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("provider.toml");
+        std::fs::write(
+            &path,
+            r#"
+[provider]
+name = "${_LLM_PROXY_NEVER_SET_NAME_VAR}"
+api_key = "static-key"
+auth_style = "bearer"
+"#,
+        )
+        .expect("write");
+
+        let result = load_provider_config(&path, None);
+        assert!(
+            result.is_err(),
+            "expected error for unresolved env var in provider name, got: {result:?}"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("unresolvable environment variable"),
+            "expected unresolvable env var error, got: {err}"
+        );
+    }
+
+    // -- Unresolved env var in protocol field fails -------------------------------
+
+    #[test]
+    fn unresolved_env_var_in_protocol_fails() {
+        let _env = clean_env();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("provider.toml");
+        std::fs::write(
+            &path,
+            r#"
+[provider]
+name = "test"
+api_key = "static-key"
+auth_style = "bearer"
+
+[provider.adapters.chat]
+protocol = "${_LLM_PROXY_NEVER_SET_PROTOCOL_VAR}"
+endpoint = "https://example.com/v1/chat/completions"
+"#,
+        )
+        .expect("write");
+
+        let result = load_provider_config(&path, None);
+        assert!(
+            result.is_err(),
+            "expected error for unresolved env var in protocol, got: {result:?}"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("unresolvable environment variable"),
+            "expected unresolvable env var error, got: {err}"
         );
     }
 }
