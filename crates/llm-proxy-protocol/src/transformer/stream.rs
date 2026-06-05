@@ -143,7 +143,7 @@ impl StreamProxy {
             finished: false,
             content_index: 0,
             started_tool_calls: HashMap::new(),
-            msg_id: format!("msg_{}", generate_id()),
+            msg_id: generate_id(),
             model_id: model_id.to_owned(),
         }
     }
