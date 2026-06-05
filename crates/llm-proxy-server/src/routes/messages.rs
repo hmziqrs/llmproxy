@@ -531,10 +531,13 @@ const MAX_UPSTREAM_ERROR_LEN: usize = 512;
 /// before calling this function.
 fn sanitize_upstream_error(msg: String) -> String {
     // Strip common API key prefixes that may appear in upstream error bodies.
+    // Order matters: longer (more specific) patterns must be replaced first,
+    // otherwise the shorter "sk-" pattern would partially consume "sk_live_"
+    // and "sk_test_", preventing those replacements from matching.
     let sanitized = msg
-        .replace("sk-", "***")
         .replace("sk_live_", "***")
         .replace("sk_test_", "***")
+        .replace("sk-", "***")
         .replace("key-", "***");
 
     // Truncate to prevent leaking large upstream responses.
