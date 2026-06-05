@@ -12,7 +12,7 @@ use crate::provider_config::ModelRoute;
 // ---------------------------------------------------------------------------
 
 /// Resolved routing target: which provider and which upstream model to use.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ProviderTarget {
     /// Provider name (identifies a provider config file).
     pub provider: String,
@@ -28,7 +28,11 @@ pub struct ProviderTarget {
 // ---------------------------------------------------------------------------
 
 /// Errors produced during model route resolution.
+///
+/// This enum is `#[non_exhaustive]` to allow adding new error variants in
+/// future phases without breaking downstream `match` expressions.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum ModelRouteError {
     /// The requested model name is not present in the routing table.
     #[error("unknown model: {0}")]

@@ -9,7 +9,6 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -75,16 +74,10 @@ fn expand_home(path: &str) -> PathBuf {
 
 /// Replace `${ENV_VAR}` patterns in `input` with the value of the
 /// corresponding environment variable.  Unset variables are left as-is.
+///
+/// Delegates to the shared [`crate::env_interpolate::interpolate_env_vars`].
 fn interpolate_env_vars(input: &str) -> String {
-    // Compile the regex once rather than on every call.
-    use std::sync::OnceLock;
-    static RE: OnceLock<Regex> = OnceLock::new();
-    let re = RE.get_or_init(|| Regex::new(r"\$\{([A-Za-z0-9_]+)\}").expect("env var regex is valid"));
-    re.replace_all(input, |caps: &regex::Captures<'_>| {
-        let var_name = &caps[1];
-        std::env::var(var_name).unwrap_or_else(|_| caps[0].to_owned())
-    })
-    .into_owned()
+    crate::env_interpolate::interpolate_env_vars(input)
 }
 
 // ---------------------------------------------------------------------------
@@ -480,72 +473,22 @@ fn validate(cfg: &Config, _path: &Path) -> Result<(), crate::error::CoreError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{EnvVarGuard, TestEnvLock};
     use std::io::Write as IoWrite;
-    use std::sync::Mutex;
-
-    /// Serialize all tests that touch environment variables so they
-    /// don't leak state into each other.  Tests that only call
-    /// `Config::default()` are safe to run in parallel.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-    /// RAII guard that saves an environment variable on creation and
-    /// restores it (or removes it) on drop.
-    struct EnvVarGuard {
-        key: String,
-        original: Option<String>,
-    }
-
-    impl EnvVarGuard {
-        fn set(key: &str, value: &str) -> Self {
-            let original = std::env::var(key).ok();
-            unsafe {
-                std::env::set_var(key, value);
-            }
-            Self {
-                key: key.to_owned(),
-                original,
-            }
-        }
-
-        fn remove(key: &str) -> Self {
-            let original = std::env::var(key).ok();
-            unsafe {
-                std::env::remove_var(key);
-            }
-            Self {
-                key: key.to_owned(),
-                original,
-            }
-        }
-    }
-
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            match &self.original {
-                Some(val) => unsafe {
-                    std::env::set_var(&self.key, val);
-                },
-                None => unsafe {
-                    std::env::remove_var(&self.key);
-                },
-            }
-        }
-    }
 
     /// Holds the mutex lock and env-var guards together so that
     /// the lock is held for the entire lifetime of the env cleanup.
     struct EnvScope {
-        _lock: std::sync::MutexGuard<'static, ()>,
+        _lock: TestEnvLock,
         _guards: Vec<EnvVarGuard>,
     }
 
     /// Save all `OC_GO_CC_*` env overrides so the test runs in a
-    /// clean environment.  The returned `EnvScope` holds a mutex lock
-    /// that serialises all env-touching tests.
+    /// clean environment.  The returned `EnvScope` holds the shared
+    /// crate-level mutex that serialises all env-touching tests across
+    /// both this module and `provider_config::tests`.
     fn save_oc_env() -> EnvScope {
-        // Recover from a poisoned mutex caused by a previous test panic,
-        // so that one failure does not cascade to every other env-touching test.
-        let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let lock = TestEnvLock::acquire();
         let guards = vec![
             EnvVarGuard::remove("OC_GO_CC_API_KEY"),
             EnvVarGuard::remove("OC_GO_CC_HOST"),

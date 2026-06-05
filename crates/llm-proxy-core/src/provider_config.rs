@@ -8,29 +8,12 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::Path;
-use std::sync::OnceLock;
 use std::time::Duration;
 
-use regex::Regex;
 use serde::{Deserialize, Serialize};
 
+use crate::env_interpolate::{find_unresolved_env_var, find_env_var_refs, interpolate_env_vars};
 use crate::error::CoreError;
-
-// ---------------------------------------------------------------------------
-// Env-var interpolation
-// ---------------------------------------------------------------------------
-
-/// Replace `${ENV_VAR}` patterns in `input` with the value of the
-/// corresponding environment variable.  Unset variables are left as-is.
-fn interpolate_env_vars(input: &str) -> String {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    let re = RE.get_or_init(|| Regex::new(r"\$\{([A-Za-z0-9_]+)\}").expect("env var regex is valid"));
-    re.replace_all(input, |caps: &regex::Captures<'_>| {
-        let var_name = &caps[1];
-        std::env::var(var_name).unwrap_or_else(|_| caps[0].to_owned())
-    })
-    .into_owned()
-}
 
 // ---------------------------------------------------------------------------
 // Main config: AppConfig
@@ -91,8 +74,9 @@ pub struct ProviderFile {
 
 /// Provider configuration loaded from a dedicated TOML file.
 ///
-/// The `api_key` field is redacted in [`Debug`] output to prevent credential
-/// leakage in logs, snapshots, and test failure output.
+/// The `api_key` field is redacted in [`Debug`] output and excluded from
+/// [`Serialize`] output to prevent credential leakage in logs, error messages,
+/// and API responses.
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderConfig {
@@ -100,6 +84,10 @@ pub struct ProviderConfig {
     pub name: String,
     /// API key for authenticating with the upstream provider.
     /// Supports `${ENV_VAR}` interpolation.
+    ///
+    /// Redacted in Debug output. Not serialized (use explicit methods if you
+    /// need to write a config file).
+    #[serde(default, skip_serializing)]
     pub api_key: String,
     /// Authentication header style.
     pub auth_style: AuthStyle,
@@ -187,7 +175,12 @@ pub struct ModelRoute {
 // ---------------------------------------------------------------------------
 
 /// Errors produced during config validation.
+///
+/// This enum is `#[non_exhaustive]` to allow adding new validation variants in
+/// future phases (e.g. Phase 6 cross-file validation) without breaking changes
+/// for downstream `match` expressions.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum ConfigValidationError {
     /// A provider-local model references an adapter that does not exist.
     #[error("provider \"{provider}\": model \"{model}\" references unknown adapter \"{adapter}\"")]
@@ -198,6 +191,14 @@ pub enum ConfigValidationError {
         model: String,
         /// Adapter name that was not found.
         adapter: String,
+    },
+    /// A provider-local model has an empty adapter reference.
+    #[error("provider \"{provider}\": model \"{model}\" has an empty adapter reference")]
+    EmptyAdapterInModel {
+        /// Provider name.
+        provider: String,
+        /// Model key within the provider.
+        model: String,
     },
     /// An endpoint URL is empty.
     #[error("provider \"{provider}\": adapter \"{adapter}\" has an empty endpoint")]
@@ -277,13 +278,6 @@ pub enum ConfigValidationError {
 // Validation helpers
 // ---------------------------------------------------------------------------
 
-/// Check whether `api_key` contains any unresolved `${VAR}` patterns.
-fn find_unresolved_env_var(api_key: &str) -> Option<String> {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    let re = RE.get_or_init(|| Regex::new(r"\$\{([A-Za-z0-9_]+)\}").expect("env var regex is valid"));
-    re.captures(api_key).map(|caps| caps[1].to_owned())
-}
-
 /// Validate a single [`ProviderConfig`].
 ///
 /// Checks:
@@ -301,21 +295,23 @@ pub fn validate_provider_config(
     provider: &ProviderConfig,
     known_protocols: Option<&[&str]>,
 ) -> Result<(), ConfigValidationError> {
+    let name = &provider.name;
+
     // Provider name must be non-empty.
-    if provider.name.is_empty() {
+    if name.is_empty() {
         return Err(ConfigValidationError::EmptyProviderName);
     }
 
     // api_key checks.
     if let Some(var) = find_unresolved_env_var(&provider.api_key) {
         return Err(ConfigValidationError::UnresolvedEnvVar {
-            provider: provider.name.clone(),
+            provider: name.clone(),
             var,
         });
     }
     if provider.api_key.is_empty() {
         return Err(ConfigValidationError::EmptyApiKey {
-            provider: provider.name.clone(),
+            provider: name.clone(),
         });
     }
 
@@ -323,25 +319,25 @@ pub fn validate_provider_config(
     for (adapter_name, adapter_cfg) in &provider.adapters {
         if adapter_name.is_empty() {
             return Err(ConfigValidationError::EmptyAdapterName {
-                provider: provider.name.clone(),
+                provider: name.clone(),
             });
         }
         if adapter_cfg.protocol.is_empty() {
             return Err(ConfigValidationError::EmptyProtocol {
-                provider: provider.name.clone(),
+                provider: name.clone(),
                 adapter: adapter_name.clone(),
             });
         }
         if adapter_cfg.endpoint.is_empty() {
             return Err(ConfigValidationError::EmptyEndpoint {
-                provider: provider.name.clone(),
+                provider: name.clone(),
                 adapter: adapter_name.clone(),
             });
         }
         if let Some(known) = known_protocols {
             if !known.contains(&adapter_cfg.protocol.as_str()) {
                 return Err(ConfigValidationError::UnknownProtocol {
-                    provider: provider.name.clone(),
+                    provider: name.clone(),
                     adapter: adapter_name.clone(),
                     protocol: adapter_cfg.protocol.clone(),
                 });
@@ -353,19 +349,18 @@ pub fn validate_provider_config(
     for (model_key, model_cfg) in &provider.models {
         if model_key.is_empty() {
             return Err(ConfigValidationError::EmptyProviderModelKey {
-                provider: provider.name.clone(),
+                provider: name.clone(),
             });
         }
         if model_cfg.adapter.is_empty() {
-            return Err(ConfigValidationError::UnknownAdapter {
-                provider: provider.name.clone(),
+            return Err(ConfigValidationError::EmptyAdapterInModel {
+                provider: name.clone(),
                 model: model_key.clone(),
-                adapter: String::new(),
             });
         }
         if !provider.adapters.contains_key(&model_cfg.adapter) {
             return Err(ConfigValidationError::UnknownAdapter {
-                provider: provider.name.clone(),
+                provider: name.clone(),
                 model: model_key.clone(),
                 adapter: model_cfg.adapter.clone(),
             });
@@ -400,6 +395,19 @@ pub fn validate_model_routes(models: &HashMap<String, ModelRoute>) -> Result<(),
 ///
 /// The raw file content is first processed for `${ENV_VAR}` interpolation,
 /// then parsed as TOML, then validated.
+///
+/// # Blocking I/O
+///
+/// This function performs synchronous filesystem I/O and is intended for use
+/// at startup. If hot-reload is implemented in future, an async variant will
+/// be needed.
+///
+/// # Trust boundary
+///
+/// The `path` parameter accepts arbitrary filesystem paths without
+/// canonicalisation or path-traversal checks. This is standard for
+/// env-var/CLI-driven config loading -- the process owner controls the path.
+/// The config file content is treated as trusted input.
 pub fn load_app_config(path: impl AsRef<Path>) -> Result<AppConfig, CoreError> {
     let path = path.as_ref();
     let raw = std::fs::read_to_string(path).map_err(|source| CoreError::ConfigLoad {
@@ -420,6 +428,19 @@ pub fn load_app_config(path: impl AsRef<Path>) -> Result<AppConfig, CoreError> {
 /// then parsed as TOML, then validated.
 ///
 /// `known_protocols` is forwarded to [`validate_provider_config`].
+///
+/// # Blocking I/O
+///
+/// This function performs synchronous filesystem I/O and is intended for use
+/// at startup. If hot-reload is implemented in future, an async variant will
+/// be needed.
+///
+/// # Trust boundary
+///
+/// The `path` parameter accepts arbitrary filesystem paths without
+/// canonicalisation or path-traversal checks. This is standard for
+/// env-var/CLI-driven config loading -- the process owner controls the path.
+/// The config file content is treated as trusted input.
 pub fn load_provider_config(
     path: impl AsRef<Path>,
     known_protocols: Option<&[&str]>,
@@ -429,6 +450,36 @@ pub fn load_provider_config(
         path: path.to_path_buf(),
         source,
     })?;
+
+    // Before interpolation, check if any env vars referenced in api_key
+    // resolve to empty strings. This must happen before interpolation replaces
+    // the ${VAR} pattern, otherwise we lose the diagnostic info about which
+    // env var was empty.
+    let raw_provider: ProviderFile = toml::from_str(&raw).map_err(CoreError::ConfigParse)?;
+    let api_key_raw = &raw_provider.provider.api_key;
+
+    // Check for env var references that resolve to empty.
+    for (var_name, resolved) in find_env_var_refs(api_key_raw) {
+        match resolved {
+            None => {
+                // Env var is not set -- interpolation will leave ${VAR} as-is.
+                // The unresolved-env-var check in validate_provider_config will
+                // catch this. No action needed here.
+            }
+            Some(value) if value.is_empty() => {
+                return Err(CoreError::ConfigValidation {
+                    message: ConfigValidationError::EmptyEnvVar {
+                        provider: raw_provider.provider.name.clone(),
+                        var: var_name,
+                    }
+                    .to_string(),
+                });
+            }
+            Some(_) => {}
+        }
+    }
+
+    // Now perform full interpolation on the raw content.
     let interpolated = interpolate_env_vars(&raw);
     let file: ProviderFile = toml::from_str(&interpolated).map_err(CoreError::ConfigParse)?;
     validate_provider_config(&file.provider, known_protocols).map_err(|e| CoreError::ConfigValidation {
@@ -444,64 +495,23 @@ pub fn load_provider_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{EnvVarGuard, TestEnvLock};
     use std::io::Write as IoWrite;
-    use std::sync::Mutex;
 
-    /// Serialize all tests that touch environment variables.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-    /// RAII guard that saves and restores an environment variable.
-    struct EnvVarGuard {
-        key: String,
-        original: Option<String>,
-    }
-
-    impl EnvVarGuard {
-        fn set(key: &str, value: &str) -> Self {
-            let original = std::env::var(key).ok();
-            unsafe {
-                std::env::set_var(key, value);
-            }
-            Self {
-                key: key.to_owned(),
-                original,
-            }
-        }
-
-        fn remove(key: &str) -> Self {
-            let original = std::env::var(key).ok();
-            unsafe {
-                std::env::remove_var(key);
-            }
-            Self {
-                key: key.to_owned(),
-                original,
-            }
-        }
-    }
-
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            match &self.original {
-                Some(val) => unsafe {
-                    std::env::set_var(&self.key, val);
-                },
-                None => unsafe {
-                    std::env::remove_var(&self.key);
-                },
-            }
-        }
-    }
-
+    /// Holds the mutex lock and env-var guards together so that
+    /// the lock is held for the entire lifetime of the env cleanup.
     struct EnvScope {
-        _lock: std::sync::MutexGuard<'static, ()>,
+        _lock: TestEnvLock,
         _guards: Vec<EnvVarGuard>,
     }
 
+    /// Clean all env vars used by tests in this module.
+    ///
+    /// Uses the shared crate-level [`TEST_ENV_LOCK`](crate::test_support::TEST_ENV_LOCK)
+    /// so that tests in `config::tests` and `provider_config::tests` are
+    /// properly serialised with each other.
     fn clean_env() -> EnvScope {
-        // Recover from a poisoned mutex caused by a previous test panic,
-        // so that one failure does not cascade to every other env-touching test.
-        let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let lock = TestEnvLock::acquire();
         let guards = vec![
             EnvVarGuard::remove("LLM_PROXY_TEST_KEY"),
             EnvVarGuard::remove("LLM_PROXY_TEST_PROVIDER_KEY"),
@@ -678,7 +688,7 @@ endpoint = "https://example.com/v1/chat/completions"
     #[test]
     fn empty_env_var_fails_validation() {
         let _env = clean_env();
-        // Set the env var but to an empty string — that should still fail.
+        // Set the env var but to an empty string -- that should still fail.
         let _g = EnvVarGuard::set("LLM_PROXY_EMPTY_KEY", "");
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("provider.toml");
@@ -705,8 +715,12 @@ endpoint = "https://example.com/v1/chat/completions"
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
-            err.contains("api_key is empty"),
-            "expected empty api_key error, got: {err}"
+            err.contains("resolved to an empty value"),
+            "expected empty env var error, got: {err}"
+        );
+        assert!(
+            err.contains("LLM_PROXY_EMPTY_KEY"),
+            "error should mention the env var name, got: {err}"
         );
     }
 
@@ -911,6 +925,29 @@ protocol = "openai_chat_completions"
             debug_output.contains("[REDACTED]"),
             "Debug output should show [REDACTED] for api_key"
         );
+    }
+
+    // -- ProviderConfig api_key is not serialized ------------------------------
+
+    #[test]
+    fn provider_config_api_key_not_serialized() {
+        let cfg = ProviderConfig {
+            name: "test".to_owned(),
+            api_key: "secret-key-do-not-leak".to_owned(),
+            auth_style: AuthStyle::Bearer,
+            adapters: HashMap::new(),
+            models: HashMap::new(),
+        };
+        let toml_str = toml::to_string(&cfg).expect("serialize");
+        assert!(
+            !toml_str.contains("secret-key-do-not-leak"),
+            "api_key must not appear in serialized output"
+        );
+        // Verify roundtrip: deserialized version has empty api_key
+        let file = ProviderFile { provider: cfg };
+        let toml_str = toml::to_string_pretty(&file).expect("serialize");
+        let back: ProviderFile = toml::from_str(&toml_str).expect("deserialize");
+        assert_eq!(back.provider.api_key, "", "api_key should be empty after roundtrip (skip_serializing)");
     }
 
     // -- deny_unknown_fields on all structs ------------------------------------
@@ -1170,5 +1207,351 @@ server_name = "llm-proxy"
         assert_eq!(back.server.request_timeout, original.server.request_timeout);
         assert_eq!(back.models.len(), 2);
         assert_eq!(back.models["claude-4"].upstream_model.as_deref(), Some("claude-sonnet-4-20250514"));
+    }
+
+    // -- Direct tests for validate_model_routes --------------------------------
+
+    #[test]
+    fn validate_model_routes_empty_route_key_fails() {
+        let mut models = HashMap::new();
+        models.insert(
+            String::new(),
+            ModelRoute {
+                provider: "opencode-go".to_owned(),
+                upstream_model: None,
+            },
+        );
+        let result = validate_model_routes(&models);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("route key is empty"),
+            "expected empty route key error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_model_routes_empty_provider_fails() {
+        let mut models = HashMap::new();
+        models.insert(
+            "my-model".to_owned(),
+            ModelRoute {
+                provider: String::new(),
+                upstream_model: None,
+            },
+        );
+        let result = validate_model_routes(&models);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("empty provider") && err.contains("my-model"),
+            "expected empty route provider error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_model_routes_valid_passes() {
+        let mut models = HashMap::new();
+        models.insert(
+            "kimi-k2.6".to_owned(),
+            ModelRoute {
+                provider: "opencode-go".to_owned(),
+                upstream_model: None,
+            },
+        );
+        models.insert(
+            "claude-4".to_owned(),
+            ModelRoute {
+                provider: "opencode-zen".to_owned(),
+                upstream_model: Some("claude-sonnet-4".to_owned()),
+            },
+        );
+        let result = validate_model_routes(&models);
+        assert!(result.is_ok(), "expected validation to pass, got: {result:?}");
+    }
+
+    // -- Direct test for EmptyProviderModelKey ---------------------------------
+
+    #[test]
+    fn empty_provider_model_key_fails_validation() {
+        let cfg = ProviderConfig {
+            name: "test".to_owned(),
+            api_key: "key".to_owned(),
+            auth_style: AuthStyle::Bearer,
+            adapters: {
+                let mut m = HashMap::new();
+                m.insert(
+                    "chat".to_owned(),
+                    ProviderAdapterConfig {
+                        protocol: "openai_chat_completions".to_owned(),
+                        endpoint: "https://example.com".to_owned(),
+                    },
+                );
+                m
+            },
+            models: {
+                let mut m = HashMap::new();
+                m.insert(
+                    String::new(),
+                    ProviderModelConfig {
+                        adapter: "chat".to_owned(),
+                    },
+                );
+                m
+            },
+        };
+        let result = validate_provider_config(&cfg, None);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("model key is empty"),
+            "expected empty model key error, got: {err}"
+        );
+    }
+
+    // -- Direct test for empty adapter in model config -------------------------
+
+    #[test]
+    fn empty_adapter_in_model_fails_validation() {
+        let cfg = ProviderConfig {
+            name: "test".to_owned(),
+            api_key: "key".to_owned(),
+            auth_style: AuthStyle::Bearer,
+            adapters: {
+                let mut m = HashMap::new();
+                m.insert(
+                    "chat".to_owned(),
+                    ProviderAdapterConfig {
+                        protocol: "openai_chat_completions".to_owned(),
+                        endpoint: "https://example.com".to_owned(),
+                    },
+                );
+                m
+            },
+            models: {
+                let mut m = HashMap::new();
+                m.insert(
+                    "my-model".to_owned(),
+                    ProviderModelConfig {
+                        adapter: String::new(),
+                    },
+                );
+                m
+            },
+        };
+        let result = validate_provider_config(&cfg, None);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("empty adapter reference"),
+            "expected empty adapter in model error, got: {err}"
+        );
+    }
+
+    // -- Load nonexistent file fails -------------------------------------------
+
+    #[test]
+    fn load_app_config_nonexistent_file_fails() {
+        let result = load_app_config("/tmp/__llm_proxy_no_such_file_app__.toml");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("failed to read config"),
+            "expected config load error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn load_provider_config_nonexistent_file_fails() {
+        let result = load_provider_config("/tmp/__llm_proxy_no_such_file_provider__.toml", None);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("failed to read config"),
+            "expected config load error, got: {err}"
+        );
+    }
+
+    // -- Malformed TOML fails --------------------------------------------------
+
+    #[test]
+    fn load_app_config_malformed_toml_fails() {
+        let _env = clean_env();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("bad.toml");
+        std::fs::write(&path, "this is not valid toml {{{}}").expect("write");
+
+        let result = load_app_config(&path);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("failed to parse config"),
+            "expected parse error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn load_provider_config_malformed_toml_fails() {
+        let _env = clean_env();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("bad.toml");
+        std::fs::write(&path, "this is not valid toml {{{}}").expect("write");
+
+        let result = load_provider_config(&path, None);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("failed to parse config"),
+            "expected parse error, got: {err}"
+        );
+    }
+
+    // -- Missing required fields in TOML --------------------------------------
+
+    #[test]
+    fn load_app_config_missing_server_fails() {
+        let _env = clean_env();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[models]\n").expect("write");
+
+        let result = load_app_config(&path);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("failed to parse config"),
+            "expected parse error for missing server, got: {err}"
+        );
+    }
+
+    #[test]
+    fn load_app_config_missing_bind_fails() {
+        let _env = clean_env();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[server]
+request_timeout = "300s"
+log_level = "info"
+hot_reload = false
+server_name = "llm-proxy"
+
+[models]
+"#,
+        )
+        .expect("write");
+
+        let result = load_app_config(&path);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("failed to parse config"),
+            "expected parse error for missing bind, got: {err}"
+        );
+    }
+
+    #[test]
+    fn load_provider_config_missing_name_fails() {
+        let _env = clean_env();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("provider.toml");
+        std::fs::write(
+            &path,
+            r#"
+[provider]
+api_key = "key"
+auth_style = "bearer"
+"#,
+        )
+        .expect("write");
+
+        let result = load_provider_config(&path, None);
+        assert!(result.is_err());
+    }
+
+    // -- Wrong field types in TOML --------------------------------------------
+
+    #[test]
+    fn load_app_config_wrong_bind_type_fails() {
+        let _env = clean_env();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[server]
+bind = 3456
+request_timeout = "300s"
+log_level = "info"
+hot_reload = false
+server_name = "llm-proxy"
+
+[models]
+"#,
+        )
+        .expect("write");
+
+        let result = load_app_config(&path);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn load_app_config_wrong_hot_reload_type_fails() {
+        let _env = clean_env();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[server]
+bind = "127.0.0.1:3456"
+request_timeout = "300s"
+log_level = "info"
+hot_reload = "not_a_bool"
+server_name = "llm-proxy"
+
+[models]
+"#,
+        )
+        .expect("write");
+
+        let result = load_app_config(&path);
+        assert!(result.is_err());
+    }
+
+    // -- Cross-field env var interpolation (endpoint field) --------------------
+
+    #[test]
+    fn env_var_interpolation_in_endpoint() {
+        let _env = clean_env();
+        let _g = EnvVarGuard::set("_LLM_PROXY_TEST_ENDPOINT", "https://custom.api.example.com");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("provider.toml");
+        let mut f = std::fs::File::create(&path).expect("create");
+        write!(
+            f,
+            r#"
+[provider]
+name = "test"
+api_key = "static-key"
+auth_style = "bearer"
+
+[provider.adapters.chat]
+protocol = "openai_chat_completions"
+endpoint = "${{_LLM_PROXY_TEST_ENDPOINT}}/v1/chat/completions"
+
+[provider.models]
+"test-model" = {{ adapter = "chat" }}
+"#
+        )
+        .expect("write");
+
+        let cfg = load_provider_config(&path, None).expect("load");
+        assert_eq!(
+            cfg.adapters["chat"].endpoint,
+            "https://custom.api.example.com/v1/chat/completions"
+        );
     }
 }
