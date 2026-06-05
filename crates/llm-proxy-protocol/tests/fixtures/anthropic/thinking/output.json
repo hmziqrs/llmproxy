@@ -1,13 +1,10 @@
 {
+  "id": "msg_test",
+  "type": "message",
+  "role": "assistant",
+  "content": [{ "type": "thinking", "thinking": "I thought about it.", "signature": "sig_test" }],
   "model": "claude-sonnet-4-20250514",
-  "max_tokens": 1024,
-  "messages": [
-    { "role": "user", "content": "hi" },
-    {
-      "role": "assistant",
-      "content": [
-        { "type": "thinking", "thinking": "hmm...", "signature": "sig_abc" }
-      ]
-    }
-  ]
+  "stop_reason": "end_turn",
+  "stop_sequence": null,
+  "usage": { "input_tokens": 10, "output_tokens": 20 }
 }

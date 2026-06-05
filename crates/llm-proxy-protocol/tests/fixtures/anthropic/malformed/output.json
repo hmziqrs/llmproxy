@@ -1,0 +1,5 @@
+{
+  "error": true,
+  "type": "InvalidRequest",
+  "message": "model is required"
+}

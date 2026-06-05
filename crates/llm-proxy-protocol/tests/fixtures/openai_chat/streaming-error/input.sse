@@ -1,0 +1,2 @@
+event: error
+data: {"kind":"RateLimit","message":"too many requests"}

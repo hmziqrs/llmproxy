@@ -1,0 +1,4 @@
+[
+  { "MessageStart": { "id": "msg_1", "model": { "requested": "claude-sonnet-4-20250514", "upstream": null } } },
+  { "Error": { "error": { "kind": "RateLimit", "message": "too many requests" } } }
+]

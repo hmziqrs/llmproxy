@@ -1,0 +1,6 @@
+data: {"id":"chatcmpl-test","object":"chat.completion.chunk","created":1000000,"model":"gpt-4o","choices":[{"index":0,"delta":{"role":"assistant","content":"","tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"get_weather","arguments":""}}]},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-test","object":"chat.completion.chunk","created":1000000,"model":"gpt-4o","choices":[{"index":0,"delta":{"role":"","content":"","tool_calls":[{"index":0,"id":null,"type":null,"function":{"name":null,"arguments":"{\"city\":"}}]},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-test","object":"chat.completion.chunk","created":1000000,"model":"gpt-4o","choices":[{"index":0,"delta":{"role":"","content":"","tool_calls":[{"index":0,"id":null,"type":null,"function":{"name":null,"arguments":"\"SF\"}"}}]},"finish_reason":null}]}
+

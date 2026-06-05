@@ -1,0 +1,11 @@
+{
+  "model": "claude-sonnet-4-20250514",
+  "max_tokens": 1024,
+  "messages": [
+    { "role": "user", "content": "What is the weather?" }
+  ],
+  "tools": [
+    { "name": "get_weather", "description": "Get weather", "input_schema": { "type": "object", "properties": { "city": { "type": "string" } } } }
+  ],
+  "tool_choice": { "type": "auto" }
+}

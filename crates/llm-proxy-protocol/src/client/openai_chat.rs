@@ -99,7 +99,7 @@ pub fn decode_request(req: ChatCompletionRequest) -> Result<CoreRequest, Protoco
                         });
                     }
                 }
-                for tc in &msg.tool_calls {
+                for tc in msg.tool_calls {
                     let args: serde_json::Value = tc
                         .function
                         .as_ref()
@@ -107,11 +107,10 @@ pub fn decode_request(req: ChatCompletionRequest) -> Result<CoreRequest, Protoco
                         .and_then(|a| serde_json::from_str(a).ok())
                         .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
                     content.push(CoreContent::ToolUse {
-                        id: tc.id.clone().unwrap_or_default(),
+                        id: tc.id.unwrap_or_default(),
                         name: tc
                             .function
-                            .as_ref()
-                            .and_then(|f| f.name.clone())
+                            .and_then(|f| f.name)
                             .unwrap_or_default(),
                         input: args,
                     });
@@ -380,15 +379,33 @@ fn encode_finish_reason(reason: StopReason) -> String {
     match reason {
         StopReason::ToolUse => "tool_calls".to_owned(),
         StopReason::MaxTokens => "length".to_owned(),
+        StopReason::Refusal => "content_filter".to_owned(),
+        StopReason::Error => {
+            tracing::warn!(
+                "StopReason::Error mapped to 'stop' in OpenAI finish_reason"
+            );
+            "stop".to_owned()
+        }
         _ => "stop".to_owned(),
     }
 }
 
 fn encode_usage(usage: &Usage) -> UsageInfo {
+    if let Some(rt) = usage.reasoning_tokens {
+        if rt != 0 {
+            tracing::warn!(
+                reasoning_tokens = rt,
+                "OpenAI UsageInfo does not map reasoning_tokens to completion_tokens_details; dropping"
+            );
+        }
+    }
     UsageInfo {
         prompt_tokens: usage.input_tokens,
         completion_tokens: usage.output_tokens,
-        total_tokens: usage.input_tokens + usage.output_tokens,
+        total_tokens: usage.input_tokens.saturating_add(usage.output_tokens),
+        // cache_creation_input_tokens (writing to cache) maps to prompt_cache_miss_tokens.
+        // These are semantically related because a cache miss results in a cache write.
+        // This mapping is intentional: the proxy treats cache creation as the cache-miss cost.
         prompt_cache_hit_tokens: usage.cache_read_input_tokens,
         prompt_cache_miss_tokens: usage.cache_creation_input_tokens,
     }
@@ -464,7 +481,7 @@ impl StreamEncoder {
                         name: None,
                         tool_call_id: None,
                         cache_control: None,
-                    refusal: None,
+                        refusal: None,
                     }),
                 }));
             }
@@ -499,7 +516,7 @@ impl StreamEncoder {
                         name: None,
                         tool_call_id: None,
                         cache_control: None,
-                    refusal: None,
+                        refusal: None,
                     }),
                 }));
             }
@@ -517,7 +534,7 @@ impl StreamEncoder {
                         name: None,
                         tool_call_id: None,
                         cache_control: None,
-                    refusal: None,
+                        refusal: None,
                     }),
                 }));
             }
@@ -543,7 +560,7 @@ impl StreamEncoder {
                         name: None,
                         tool_call_id: None,
                         cache_control: None,
-                    refusal: None,
+                        refusal: None,
                     }),
                 }));
             }
@@ -569,7 +586,7 @@ impl StreamEncoder {
                         name: None,
                         tool_call_id: None,
                         cache_control: None,
-                    refusal: None,
+                        refusal: None,
                     }),
                 }));
             }
@@ -597,7 +614,7 @@ impl StreamEncoder {
                         name: None,
                         tool_call_id: None,
                         cache_control: None,
-                    refusal: None,
+                        refusal: None,
                     }),
                 }));
 
@@ -624,14 +641,15 @@ impl StreamEncoder {
             }
 
             CoreEvent::Error { error } => {
-                // Return an error so the route handler can emit a proper error
-                // response rather than leaking error text into content delta.
-                // The error message was sanitized at CoreStreamError construction
-                // time by the provider adapter.
+                // Defense-in-depth note: the error message is embedded in the
+                // ProtocolError which may be logged or sent as a client response.
+                // Sanitization of secrets happens at CoreStreamError::new()
+                // construction time in the provider adapter. Only the error kind
+                // is used here to avoid leaking unsanitized messages through logs.
                 self.finished = true;
                 return Err(ProtocolError::Encode(format!(
-                    "stream error: {}",
-                    error.message()
+                    "stream error: {:?}",
+                    error.kind
                 )));
             }
 
@@ -750,7 +768,7 @@ mod tests {
                 name: None,
                 tool_call_id: None,
                 cache_control: None,
-                    refusal: None,
+                refusal: None,
             },
         );
         let core = decode_request(req).unwrap();
@@ -783,7 +801,7 @@ mod tests {
             name: None,
             tool_call_id: None,
             cache_control: None,
-                    refusal: None,
+            refusal: None,
         });
         let core = decode_request(req).unwrap();
         assert_eq!(core.messages[1].role, CoreRole::Assistant);
@@ -808,7 +826,7 @@ mod tests {
             name: None,
             tool_call_id: Some("call_1".into()),
             cache_control: None,
-                    refusal: None,
+            refusal: None,
         });
         let core = decode_request(req).unwrap();
         assert_eq!(core.messages[1].role, CoreRole::Tool);
@@ -832,7 +850,7 @@ mod tests {
             name: None,
             tool_call_id: None,
             cache_control: None,
-                    refusal: None,
+            refusal: None,
         });
         let core = decode_request(req).unwrap();
         match &core.messages[1].content[0] {
@@ -863,6 +881,30 @@ mod tests {
         req3.tool_choice = Some(serde_json::json!("required"));
         let core3 = decode_request(req3).unwrap();
         assert_eq!(core3.tool_choice, Some(CoreToolChoice::Any));
+    }
+
+    #[test]
+    fn tool_choice_none_decodes_to_core() {
+        let mut req = make_openai_request();
+        req.tool_choice = Some(serde_json::json!("none"));
+        let core = decode_request(req).unwrap();
+        assert_eq!(core.tool_choice, Some(CoreToolChoice::None));
+
+        let mut req2 = make_openai_request();
+        req2.tool_choice = Some(serde_json::json!({"type": "none"}));
+        let core2 = decode_request(req2).unwrap();
+        assert_eq!(core2.tool_choice, Some(CoreToolChoice::None));
+    }
+
+    #[test]
+    fn tool_choice_raw_preserved_for_unrecognized() {
+        let mut req = make_openai_request();
+        req.tool_choice = Some(serde_json::json!({"type": "future_mode"}));
+        let core = decode_request(req).unwrap();
+        match core.tool_choice {
+            Some(CoreToolChoice::Raw(_)) => {}
+            other => panic!("expected Raw, got {:?}", other),
+        }
     }
 
     #[test]
@@ -906,7 +948,7 @@ mod tests {
             name: None,
             tool_call_id: None,
             cache_control: None,
-                    refusal: None,
+            refusal: None,
         });
         req.messages.push(ChatMessage {
             role: "user".into(),
@@ -916,7 +958,7 @@ mod tests {
             name: None,
             tool_call_id: None,
             cache_control: None,
-                    refusal: None,
+            refusal: None,
         });
         let core = decode_request(req).unwrap();
         assert_eq!(core.messages.len(), 3);
@@ -949,7 +991,7 @@ mod tests {
             name: None,
             tool_call_id: None,
             cache_control: None,
-                    refusal: None,
+            refusal: None,
         });
         let err = decode_request(req).unwrap_err();
         assert!(matches!(err, ProtocolError::Decode(_)));
@@ -1039,6 +1081,8 @@ mod tests {
         assert_eq!(encode_finish_reason(StopReason::EndTurn), "stop");
         assert_eq!(encode_finish_reason(StopReason::StopSequence), "stop");
         assert_eq!(encode_finish_reason(StopReason::Unknown), "stop");
+        assert_eq!(encode_finish_reason(StopReason::Refusal), "content_filter");
+        assert_eq!(encode_finish_reason(StopReason::Error), "stop");
     }
 
     #[test]
@@ -1255,6 +1299,14 @@ mod tests {
         assert!(remaining.is_empty());
     }
 
+    #[test]
+    fn streaming_finish_without_prior_events_is_empty() {
+        let mut enc = StreamEncoder::new("chatcmpl-1".into(), "gpt-4o".into(), 1000, false);
+        // No events sent at all -- finish() returns empty for OpenAI.
+        let remaining = enc.finish().unwrap();
+        assert!(remaining.is_empty());
+    }
+
     // -- every CoreEvent variant handled ------------------------------------
 
     #[test]
@@ -1372,6 +1424,80 @@ mod tests {
         let msg = out.choices[0].message.as_ref().unwrap();
         // Refusal text goes into the native refusal field, not content.
         assert_eq!(msg.refusal.as_deref(), Some("I cannot help"));
+        assert!(msg.content.is_empty());
+    }
+
+    #[test]
+    fn encode_document_drops_with_warning() {
+        let resp = CoreResponse {
+            id: None,
+            model: ModelRef { requested: "m".into(), upstream: None },
+            content: vec![CoreContent::Document {
+                source: serde_json::json!({"url": "http://example.com/doc.pdf"}),
+            }],
+            stop_reason: StopReason::EndTurn,
+            stop_sequence: None,
+            usage: Usage::default(),
+            provider_meta: serde_json::Map::new(),
+        };
+        let out = encode_response(resp).unwrap();
+        let msg = out.choices[0].message.as_ref().unwrap();
+        assert!(msg.content.is_empty());
+    }
+
+    #[test]
+    fn encode_audio_drops_with_warning() {
+        let resp = CoreResponse {
+            id: None,
+            model: ModelRef { requested: "m".into(), upstream: None },
+            content: vec![CoreContent::Audio {
+                source: serde_json::json!({"data": "base64..."}),
+            }],
+            stop_reason: StopReason::EndTurn,
+            stop_sequence: None,
+            usage: Usage::default(),
+            provider_meta: serde_json::Map::new(),
+        };
+        let out = encode_response(resp).unwrap();
+        let msg = out.choices[0].message.as_ref().unwrap();
+        assert!(msg.content.is_empty());
+    }
+
+    #[test]
+    fn encode_video_drops_with_warning() {
+        let resp = CoreResponse {
+            id: None,
+            model: ModelRef { requested: "m".into(), upstream: None },
+            content: vec![CoreContent::Video {
+                source: serde_json::json!({"url": "http://example.com/vid.mp4"}),
+            }],
+            stop_reason: StopReason::EndTurn,
+            stop_sequence: None,
+            usage: Usage::default(),
+            provider_meta: serde_json::Map::new(),
+        };
+        let out = encode_response(resp).unwrap();
+        let msg = out.choices[0].message.as_ref().unwrap();
+        assert!(msg.content.is_empty());
+    }
+
+    #[test]
+    fn encode_tool_result_in_response_drops_with_warning() {
+        let resp = CoreResponse {
+            id: None,
+            model: ModelRef { requested: "m".into(), upstream: None },
+            content: vec![CoreContent::ToolResult {
+                tool_use_id: "call_1".into(),
+                content: vec![],
+                is_error: false,
+            }],
+            stop_reason: StopReason::EndTurn,
+            stop_sequence: None,
+            usage: Usage::default(),
+            provider_meta: serde_json::Map::new(),
+        };
+        let out = encode_response(resp).unwrap();
+        let msg = out.choices[0].message.as_ref().unwrap();
         assert!(msg.content.is_empty());
     }
 

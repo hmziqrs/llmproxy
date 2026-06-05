@@ -1,0 +1,11 @@
+event: message_start
+data: {"id":"msg_1","model":"gpt-4o"}
+
+event: text_delta
+data: {"index":0,"text":"Hi"}
+
+event: usage_delta
+data: {"input_tokens":10,"output_tokens":20}
+
+event: message_stop
+data: {"stop_reason":"EndTurn"}

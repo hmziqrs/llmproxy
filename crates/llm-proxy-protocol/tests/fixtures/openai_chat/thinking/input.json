@@ -1,0 +1,7 @@
+{
+  "model": "gpt-4o",
+  "messages": [
+    { "role": "user", "content": "Think about this" },
+    { "role": "assistant", "content": "The answer is 42", "reasoning_content": "Let me think about this..." }
+  ]
+}

@@ -1,57 +1,15 @@
 {
-  "model": {
-    "requested": "gpt-4o",
-    "upstream": null
-  },
+  "model": { "requested": "gpt-4o", "upstream": null },
   "system": [],
   "messages": [
-    {
-      "role": "User",
-      "content": [
-        {
-          "Text": {
-            "text": "hello",
-            "cache": null
-          }
-        }
-      ]
-    },
-    {
-      "role": "Tool",
-      "content": [
-        {
-          "ToolResult": {
-            "tool_use_id": "call_1",
-            "content": [
-              {
-                "Text": {
-                  "text": "72F and sunny",
-                  "cache": null
-                }
-              }
-            ],
-            "is_error": false
-          }
-        }
-      ]
-    }
+    { "role": "User", "content": [{ "Text": { "text": "What is the weather?", "cache": null } }] },
+    { "role": "Assistant", "content": [{ "ToolUse": { "id": "call_1", "name": "get_weather", "input": { "city": "SF" } } }] },
+    { "role": "Tool", "content": [{ "ToolResult": { "tool_use_id": "call_1", "content": [{ "Text": { "text": "72F and sunny", "cache": null } }], "is_error": false } }] }
   ],
   "tools": [],
   "tool_choice": null,
-  "sampling": {
-    "temperature": null,
-    "top_p": null,
-    "max_tokens": null,
-    "stop": null,
-    "reasoning_effort": null,
-    "thinking": null
-  },
+  "sampling": { "temperature": null, "top_p": null, "max_tokens": null, "stop": null, "reasoning_effort": null, "thinking": null },
   "stream": false,
-  "metadata": {
-    "user_id": null,
-    "raw": {}
-  },
-  "provider_hints": {
-    "raw": {}
-  }
+  "metadata": { "user_id": null, "raw": {} },
+  "provider_hints": { "raw": {} }
 }

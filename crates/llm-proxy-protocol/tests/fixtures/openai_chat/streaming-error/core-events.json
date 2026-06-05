@@ -1,0 +1,3 @@
+[
+  { "Error": { "error": { "kind": "RateLimit", "message": "too many requests" } } }
+]

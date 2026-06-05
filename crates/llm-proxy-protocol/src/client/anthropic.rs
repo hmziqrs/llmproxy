@@ -264,10 +264,9 @@ pub fn encode_response(resp: CoreResponse) -> Result<MessageResponse, ProtocolEr
     for block in resp.content {
         match encode_content_block(block) {
             Ok(encoded) => content.push(encoded),
-            Err(ProtocolError::Encode(msg)) => {
+            Err(ProtocolError::Encode(_msg)) => {
                 // Unsupported block type for this protocol -- skip it.
                 // The warning was already logged in encode_content_block.
-                tracing::warn!(reason = %msg, "omitting unsupported content block in Anthropic encode");
             }
             Err(other) => return Err(other),
         }
@@ -337,7 +336,7 @@ fn encode_content_block(content: CoreContent) -> Result<ContentBlock, ProtocolEr
                 signature: None,
                 source: Some(img_source),
                 cache_control: None,
-            data: None,
+                data: None,
             })
         }
         CoreContent::ToolUse { id, name, input } => Ok(ContentBlock {
@@ -386,7 +385,7 @@ fn encode_content_block(content: CoreContent) -> Result<ContentBlock, ProtocolEr
                 signature: None,
                 source: None,
                 cache_control: None,
-            data: None,
+                data: None,
             })
         }
         CoreContent::Thinking { text, signature } => Ok(ContentBlock {
@@ -463,14 +462,32 @@ fn encode_stop_reason(reason: StopReason) -> String {
         StopReason::EndTurn => "end_turn".to_owned(),
         StopReason::MaxTokens => "max_tokens".to_owned(),
         StopReason::ToolUse => "tool_use".to_owned(),
-        StopReason::StopSequence => "end_turn".to_owned(),
-        StopReason::Refusal => "end_turn".to_owned(),
-        StopReason::Error => "end_turn".to_owned(),
+        StopReason::StopSequence => "stop_sequence".to_owned(),
+        StopReason::Refusal => {
+            tracing::warn!(
+                "StopReason::Refusal has no native Anthropic stop_reason; mapping to end_turn"
+            );
+            "end_turn".to_owned()
+        }
+        StopReason::Error => {
+            tracing::warn!(
+                "StopReason::Error has no native Anthropic stop_reason; mapping to end_turn"
+            );
+            "end_turn".to_owned()
+        }
         StopReason::Unknown => "end_turn".to_owned(),
     }
 }
 
 fn encode_usage(usage: &Usage) -> anthropic::Usage {
+    if let Some(rt) = usage.reasoning_tokens {
+        if rt != 0 {
+            tracing::warn!(
+                reasoning_tokens = rt,
+                "Anthropic Usage does not support reasoning_tokens; dropping"
+            );
+        }
+    }
     anthropic::Usage {
         input_tokens: usage.input_tokens,
         output_tokens: usage.output_tokens,
@@ -576,7 +593,7 @@ impl StreamEncoder {
                         signature: None,
                         source: None,
                         cache_control: None,
-            data: None,
+                        data: None,
                     },
                     ContentKind::Thinking => ContentBlock {
                         r#type: "thinking".to_owned(),
@@ -592,7 +609,7 @@ impl StreamEncoder {
                         signature: None,
                         source: None,
                         cache_control: None,
-            data: None,
+                        data: None,
                     },
                     ContentKind::ToolUse => ContentBlock {
                         r#type: "tool_use".to_owned(),
@@ -608,7 +625,7 @@ impl StreamEncoder {
                         signature: None,
                         source: None,
                         cache_control: None,
-            data: None,
+                        data: None,
                     },
                     other => {
                         // ContentStart for unsupported kinds -- emit as text.
@@ -630,7 +647,7 @@ impl StreamEncoder {
                             signature: None,
                             source: None,
                             cache_control: None,
-            data: None,
+                            data: None,
                         }
                     }
                 };
@@ -702,7 +719,7 @@ impl StreamEncoder {
                         signature: None,
                         source: None,
                         cache_control: None,
-            data: None,
+                        data: None,
                     }),
                     delta: None,
                     usage: None,
@@ -791,6 +808,11 @@ impl StreamEncoder {
             }
 
             CoreEvent::Error { error } => {
+                // Defense-in-depth note: the error message flows directly into
+                // the client-facing SSE event. Sanitization of secrets happens
+                // at CoreStreamError::new() construction time in the provider
+                // adapter. If a provider adapter accidentally passes an
+                // unsanitized message, it will be visible to the client here.
                 events.push(MessageEvent {
                     r#type: "error".to_owned(),
                     message: None,
@@ -825,20 +847,29 @@ impl StreamEncoder {
     /// without a `MessageStop`).
     ///
     /// When the stream terminated abnormally (no explicit `MessageStop`), the
-    /// stop reason is set to `"max_tokens"` as a sentinel indicating the stream
-    /// was interrupted rather than completing with a natural `end_turn`. This
-    /// avoids fabricating a stop reason that does not reflect the actual state.
+    /// stop reason is set to `"end_turn"` with a `tracing::warn`, as this is the
+    /// least misleading stop reason for an interrupted stream. Always emits a
+    /// `message_delta` + `message_stop` pair so the Anthropic client receives a
+    /// proper terminal sequence.
     pub fn finish(&mut self) -> Result<Vec<MessageEvent>, ProtocolError> {
         if self.finished {
             return Ok(Vec::new());
         }
         self.finished = true;
 
-        let mut events = Vec::new();
+        tracing::warn!(
+            "StreamEncoder::finish() called without prior MessageStop; emitting synthetic terminal events"
+        );
 
-        // If we have pending usage, emit a terminal message_delta.
-        if let Some(usage) = self.pending_usage.take() {
-            events.push(MessageEvent {
+        let usage = self.pending_usage.take().unwrap_or(anthropic::Usage {
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_input_tokens: None,
+            cache_read_input_tokens: None,
+        });
+
+        let events = vec![
+            MessageEvent {
                 r#type: "message_delta".to_owned(),
                 message: None,
                 index: None,
@@ -848,14 +879,17 @@ impl StreamEncoder {
                     text: None,
                     thinking: None,
                     partial_json: None,
-                    // Use max_tokens as a sentinel for abnormal termination.
-                    stop_reason: Some("max_tokens".to_owned()),
+                    // Use end_turn as the least misleading stop reason for abnormal
+                    // termination. max_tokens has a specific semantic meaning that
+                    // would cause clients to incorrectly believe the model ran out
+                    // of tokens.
+                    stop_reason: Some("end_turn".to_owned()),
                     stop_sequence: None,
                 }),
                 usage: Some(usage),
                 error: None,
-            });
-            events.push(MessageEvent {
+            },
+            MessageEvent {
                 r#type: "message_stop".to_owned(),
                 message: None,
                 index: None,
@@ -863,8 +897,8 @@ impl StreamEncoder {
                 delta: None,
                 usage: None,
                 error: None,
-            });
-        }
+            },
+        ];
 
         Ok(events)
     }
@@ -1008,6 +1042,44 @@ mod tests {
                 assert_eq!(signature.as_deref(), Some("sig_abc"));
             }
             _ => panic!("expected Thinking"),
+        }
+    }
+
+    #[test]
+    fn tool_result_with_is_error_decodes_to_core() {
+        let mut req = make_anthropic_request();
+        req.messages.push(Message {
+            role: "user".into(),
+            content: serde_json::json!([
+                { "type": "tool_result", "tool_use_id": "tu_1", "is_error": true, "content": "something went wrong" }
+            ]),
+        });
+        let core = decode_request(req).unwrap();
+        match &core.messages[1].content[0] {
+            CoreContent::ToolResult { tool_use_id, is_error, .. } => {
+                assert_eq!(tool_use_id, "tu_1");
+                assert!(is_error);
+            }
+            _ => panic!("expected ToolResult"),
+        }
+    }
+
+    #[test]
+    fn image_block_decodes_to_core() {
+        let mut req = make_anthropic_request();
+        req.messages.push(Message {
+            role: "user".into(),
+            content: serde_json::json!([
+                { "type": "image", "source": { "type": "base64", "media_type": "image/png", "data": "iVBOR..." } }
+            ]),
+        });
+        let core = decode_request(req).unwrap();
+        match &core.messages[1].content[0] {
+            CoreContent::Image { source } => {
+                assert!(source.is_object());
+                assert_eq!(source["type"], "base64");
+            }
+            _ => panic!("expected Image"),
         }
     }
 
@@ -1196,7 +1268,9 @@ mod tests {
             (StopReason::EndTurn, "end_turn"),
             (StopReason::MaxTokens, "max_tokens"),
             (StopReason::ToolUse, "tool_use"),
-            (StopReason::StopSequence, "end_turn"),
+            (StopReason::StopSequence, "stop_sequence"),
+            (StopReason::Refusal, "end_turn"),
+            (StopReason::Error, "end_turn"),
             (StopReason::Unknown, "end_turn"),
         ];
         for (reason, expected) in cases {
@@ -1437,11 +1511,29 @@ mod tests {
         let remaining = enc.finish().unwrap();
         assert_eq!(remaining.len(), 2);
         assert_eq!(remaining[0].r#type, "message_delta");
-        // Abnormal termination uses max_tokens as a sentinel, not end_turn.
+        // Abnormal termination uses end_turn as the least misleading stop reason.
         assert_eq!(
             remaining[0].delta.as_ref().unwrap().stop_reason.as_deref(),
-            Some("max_tokens")
+            Some("end_turn")
         );
+        assert_eq!(remaining[1].r#type, "message_stop");
+    }
+
+    #[test]
+    fn streaming_finish_without_pending_usage_still_emits_terminal() {
+        let mut enc = StreamEncoder::new("msg_1".into(), "m".into());
+        // No UsageDelta sent -- finish() should still emit terminal events
+        // with synthetic zero usage.
+        let remaining = enc.finish().unwrap();
+        assert_eq!(remaining.len(), 2);
+        assert_eq!(remaining[0].r#type, "message_delta");
+        assert_eq!(
+            remaining[0].delta.as_ref().unwrap().stop_reason.as_deref(),
+            Some("end_turn")
+        );
+        assert!(remaining[0].usage.is_some());
+        assert_eq!(remaining[0].usage.as_ref().unwrap().input_tokens, 0);
+        assert_eq!(remaining[0].usage.as_ref().unwrap().output_tokens, 0);
         assert_eq!(remaining[1].r#type, "message_stop");
     }
 
@@ -1527,6 +1619,16 @@ mod tests {
     }
 
     // -- unsupported content variants ---------------------------------------
+
+    #[test]
+    fn encode_image_produces_image_block() {
+        let content = CoreContent::Image {
+            source: serde_json::json!({"type": "base64", "media_type": "image/png", "data": "iVBOR..."}),
+        };
+        let block = encode_content_block(content).unwrap();
+        assert_eq!(block.r#type, "image");
+        assert!(block.source.is_some());
+    }
 
     #[test]
     fn encode_refusal_returns_encode_error() {

@@ -1,13 +1,10 @@
 {
+  "id": "msg_test",
+  "type": "message",
+  "role": "assistant",
+  "content": [{ "type": "text", "text": "The weather is 72F and sunny." }],
   "model": "claude-sonnet-4-20250514",
-  "max_tokens": 1024,
-  "messages": [
-    { "role": "user", "content": "hi" },
-    {
-      "role": "user",
-      "content": [
-        { "type": "tool_result", "tool_use_id": "tu_1", "content": "72F and sunny" }
-      ]
-    }
-  ]
+  "stop_reason": "end_turn",
+  "stop_sequence": null,
+  "usage": { "input_tokens": 10, "output_tokens": 20 }
 }

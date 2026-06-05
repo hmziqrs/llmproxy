@@ -1,0 +1,15 @@
+{
+  "model": { "requested": "claude-sonnet-4-20250514", "upstream": null },
+  "system": [],
+  "messages": [
+    { "role": "User", "content": [{ "Text": { "text": "What is the weather?", "cache": null } }] }
+  ],
+  "tools": [
+    { "name": "get_weather", "description": "Get weather", "input_schema": { "type": "object", "properties": { "city": { "type": "string" } } } }
+  ],
+  "tool_choice": "Auto",
+  "sampling": { "temperature": null, "top_p": null, "max_tokens": 1024, "stop": null, "reasoning_effort": null, "thinking": null },
+  "stream": false,
+  "metadata": { "user_id": null, "raw": {} },
+  "provider_hints": { "raw": {} }
+}

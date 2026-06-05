@@ -1,0 +1,8 @@
+[
+  { "ContentStart": { "index": 1, "kind": "ToolUse" } },
+  { "ToolCallDelta": { "index": 1, "args_delta": "{\"city\":" } },
+  { "ToolCallDelta": { "index": 1, "args_delta": "\"SF\"}" } },
+  { "ToolCallStop": { "index": 1 } },
+  { "UsageDelta": { "usage": { "input_tokens": 0, "output_tokens": 50, "reasoning_tokens": null, "cache_creation_input_tokens": null, "cache_read_input_tokens": null, "provenance": "ProviderReported" } } },
+  { "MessageStop": { "stop_reason": "ToolUse", "stop_sequence": null } }
+]

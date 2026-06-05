@@ -1,0 +1,11 @@
+event: tool_call_start
+data: {"index":0,"id":"call_1","name":"get_weather"}
+
+event: tool_call_delta
+data: {"index":0,"args_delta":"{\"city\":"}
+
+event: tool_call_delta
+data: {"index":0,"args_delta":"\"SF\"}"}
+
+event: tool_call_stop
+data: {"index":0}
