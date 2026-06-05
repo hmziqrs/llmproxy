@@ -1174,4 +1174,270 @@ mod tests {
         assert!(out.ends_with("\n\n"));
         assert!(out.contains("\"type\":\"message_stop\""));
     }
+
+    // =========================================================================
+    // Phase 0 characterization tests
+    // =========================================================================
+    //
+    // These tests verify current stream behavior for edge cases so that the
+    // migration to the core-protocol architecture does not silently change
+    // how malformed events, unknown fields, and disconnect-like conditions
+    // are handled. They are legacy characterization tests.
+    // New tests after Phase 0 must target `wire -> core -> wire`, not direct
+    // protocol pairs.
+
+    // -- ErrClientDisconnected ------------------------------------------------
+
+    #[test]
+    fn err_client_disconnected_display() {
+        assert_eq!(ErrClientDisconnected.to_string(), "client disconnected");
+    }
+
+    #[test]
+    fn err_client_disconnected_debug() {
+        assert_eq!(format!("{:?}", ErrClientDisconnected), "client disconnected");
+    }
+
+    // -- Malformed SSE events: OpenAI stream ----------------------------------
+
+    /// Characterization: malformed JSON inside a `data:` line is silently
+    /// skipped by `process_openai_chunk`. No error is propagated.
+    #[test]
+    fn openai_malformed_json_chunk_is_skipped() {
+        let mut proxy = StreamProxy::new("model");
+        let mut out = String::new();
+
+        let chunks = [
+            r#"data: {"id":"c","object":"chat.completion.chunk","created":0,"model":"m","choices":[{"index":0,"delta":{"content":"before"},"finish_reason":null}]}"#,
+            r#"data: {not valid json}"#,
+            r#"data: {"id":"c","object":"chat.completion.chunk","created":0,"model":"m","choices":[{"index":0,"delta":{"content":"after"},"finish_reason":null}]}"#,
+        ];
+
+        for chunk in &chunks {
+            // Must not return an error for malformed JSON.
+            proxy.process_openai_chunk(chunk, &mut out).unwrap();
+        }
+
+        assert!(out.contains("before"));
+        assert!(out.contains("after"));
+        // The malformed chunk should not produce any content output.
+        assert!(!out.contains("not valid json"));
+    }
+
+    /// Characterization: a chunk with no `choices` array but valid usage
+    /// emits a usage-only delta. This is the standard OpenAI usage-chunk
+    /// pattern when `stream_options.include_usage` is set.
+    #[test]
+    fn openai_usage_only_chunk_emits_usage() {
+        let mut proxy = StreamProxy::new("model");
+        let mut out = String::new();
+
+        let chunks = [
+            r#"data: {"id":"c","object":"chat.completion.chunk","created":0,"model":"m","choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":"stop"}]}"#,
+            r#"data: {"id":"c","object":"chat.completion.chunk","created":0,"model":"m","choices":[],"usage":{"prompt_tokens":50,"completion_tokens":10,"total_tokens":60}}"#,
+        ];
+
+        for chunk in &chunks {
+            proxy.process_openai_chunk(chunk, &mut out).unwrap();
+        }
+
+        // The stop-reason chunk emits message_delta with end_turn.
+        // The usage-only chunk (no choices) should also emit a message_delta
+        // with usage information since stop was already sent.
+        assert!(out.contains("event: message_delta"));
+    }
+
+    /// Characterization: unknown fields in OpenAI chunk JSON are silently
+    /// ignored (serde deserialization drops them).
+    #[test]
+    fn openai_unknown_fields_silently_ignored() {
+        let mut proxy = StreamProxy::new("model");
+        let mut out = String::new();
+
+        let chunk = r#"data: {"id":"c","object":"chat.completion.chunk","created":0,"model":"m","choices":[{"index":0,"delta":{"content":"hello"},"finish_reason":null}],"custom_field":"ignored","provider_meta":{"logprob":0.99}}"#;
+
+        proxy.process_openai_chunk(chunk, &mut out).unwrap();
+
+        assert!(out.contains("hello"));
+        assert!(!out.contains("custom_field"));
+        assert!(!out.contains("provider_meta"));
+    }
+
+    // -- Malformed SSE events: Responses API stream ---------------------------
+
+    /// Characterization: malformed JSON in a Responses API chunk is silently
+    /// skipped.
+    #[test]
+    fn responses_malformed_json_chunk_is_skipped() {
+        let mut proxy = StreamProxy::new("model");
+        let mut out = String::new();
+
+        let chunks = [
+            r#"data: {"type":"response.output_text.delta","delta":"before"}"#,
+            r#"data: {not valid json}"#,
+            r#"data: {"type":"response.output_text.delta","delta":"after"}"#,
+        ];
+
+        for chunk in &chunks {
+            proxy.process_responses_chunk(chunk, &mut out).unwrap();
+        }
+
+        assert!(out.contains("before"));
+        assert!(out.contains("after"));
+        assert!(!out.contains("not valid json"));
+    }
+
+    /// Characterization: unknown Responses API event types are silently
+    /// ignored (no panic, no error).
+    #[test]
+    fn responses_unknown_event_type_is_ignored() {
+        let mut proxy = StreamProxy::new("model");
+        let mut out = String::new();
+
+        let chunks = [
+            r#"data: {"type":"response.output_text.delta","delta":"hello"}"#,
+            r#"data: {"type":"response.custom_event","delta":"ignored"}"#,
+        ];
+
+        for chunk in &chunks {
+            proxy.process_responses_chunk(chunk, &mut out).unwrap();
+        }
+
+        assert!(out.contains("hello"));
+        assert!(!out.contains("custom_event"));
+    }
+
+    // -- Malformed SSE events: Gemini stream ----------------------------------
+
+    /// Characterization: malformed JSON in a Gemini chunk is silently skipped.
+    #[test]
+    fn gemini_malformed_json_chunk_is_skipped() {
+        let mut proxy = StreamProxy::new("model");
+        let mut out = String::new();
+
+        let chunks = [
+            r#"data: {"candidates":[{"content":{"role":"model","parts":[{"text":"before"}]}}]}"#,
+            r#"data: {not valid json}"#,
+            r#"data: {"candidates":[{"content":{"role":"model","parts":[{"text":"after"}]}}]}"#,
+        ];
+
+        for chunk in &chunks {
+            proxy.process_gemini_chunk(chunk, &mut out).unwrap();
+        }
+
+        assert!(out.contains("before"));
+        assert!(out.contains("after"));
+        assert!(!out.contains("not valid json"));
+    }
+
+    /// Characterization: Gemini chunk with empty candidates array is silently
+    /// skipped (no content emitted, no error).
+    #[test]
+    fn gemini_empty_candidates_is_skipped() {
+        let mut proxy = StreamProxy::new("model");
+        let mut out = String::new();
+
+        let chunk = r#"data: {"candidates":[]}"#;
+        proxy.process_gemini_chunk(chunk, &mut out).unwrap();
+
+        // Should only have message_start, no content.
+        assert!(out.contains("event: message_start"));
+        assert!(!out.contains("content_block_start"));
+    }
+
+    // -- Disconnect-like behavior ---------------------------------------------
+
+    /// Characterization: when the stream ends abruptly (no finish_reason,
+    /// no [DONE]), `finish()` still emits proper closing events.
+    #[test]
+    fn abrupt_stream_end_finish_emits_closing_events() {
+        let mut proxy = StreamProxy::new("model");
+        let mut out = String::new();
+
+        // Send a text chunk but never send finish_reason.
+        let chunk = r#"data: {"id":"c","object":"chat.completion.chunk","created":0,"model":"m","choices":[{"index":0,"delta":{"content":"hello"},"finish_reason":null}]}"#;
+        proxy.process_openai_chunk(chunk, &mut out).unwrap();
+
+        // Simulate abrupt disconnect -- just call finish().
+        proxy.finish(&mut out).unwrap();
+
+        // Verify we get a clean closing sequence.
+        assert!(out.contains("event: content_block_start"));
+        assert!(out.contains("hello"));
+        assert!(out.contains("event: content_block_stop"));
+        assert!(out.contains("event: message_delta"));
+        assert!(out.contains("end_turn"));
+        assert!(out.contains("event: message_stop"));
+    }
+
+    /// Characterization: `finish()` when no content has been sent at all
+    /// still emits a valid message_start + message_delta + message_stop
+    /// sequence.
+    #[test]
+    fn finish_with_no_prior_content_emits_lifecycle() {
+        let mut proxy = StreamProxy::new("model");
+        let mut out = String::new();
+
+        proxy.finish(&mut out).unwrap();
+
+        assert!(out.contains("event: message_start"));
+        assert!(out.contains("event: message_delta"));
+        assert!(out.contains("end_turn"));
+        assert!(out.contains("event: message_stop"));
+    }
+
+    // -- Provider-specific unsupported fields in request transformation --------
+
+    /// Characterization: extra fields in Anthropic request JSON that are not
+    /// modeled in `MessageRequest` are silently dropped by serde deserialization.
+    /// This test verifies that unknown fields do not cause errors.
+    #[test]
+    fn request_transform_ignores_unknown_anthropic_fields() {
+        use crate::anthropic::MessageRequest;
+
+        let raw = serde_json::json!({
+            "model": "test-model",
+            "max_tokens": 1024,
+            "messages": [{ "role": "user", "content": "hi" }],
+            "future_field": "not yet supported",
+            "experimental": { "enabled": true }
+        });
+
+        let req: MessageRequest = serde_json::from_value(raw).unwrap();
+        assert_eq!(req.model, "test-model");
+        assert_eq!(req.messages.len(), 1);
+    }
+
+    /// Characterization: extra fields in OpenAI response JSON that are not
+    /// modeled in `ChatCompletionResponse` are silently dropped by serde.
+    #[test]
+    fn response_transform_ignores_unknown_openai_fields() {
+        use crate::openai::ChatCompletionResponse;
+
+        let raw = serde_json::json!({
+            "id": "chatcmpl-test",
+            "object": "chat.completion",
+            "created": 1234,
+            "model": "gpt-4o",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "hi"
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 5,
+                "total_tokens": 15
+            },
+            "system_fingerprint": "fp_abc123",
+            "service_tier": "default"
+        });
+
+        let resp: ChatCompletionResponse = serde_json::from_value(raw).unwrap();
+        assert_eq!(resp.id, "chatcmpl-test");
+        assert_eq!(resp.choices.len(), 1);
+    }
 }

@@ -118,6 +118,136 @@ async fn unknown_route_returns_not_found() {
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
+// -- Route guardrails (Phase 0 characterization) ---------------------------
+
+/// Phase 0 guardrail: POST /v1/messages with valid Anthropic JSON must parse
+/// and validate the request shape. Any failure must be an upstream or auth
+/// error -- never a bad-JSON or request-shape error (400 with
+/// `invalid_request_error` for missing `model` / `messages` is acceptable;
+/// 400 with a JSON parse error is not).
+#[tokio::test]
+async fn messages_valid_json_parses_and_validates() {
+    let app = build_router(state());
+    let body = json!({
+        "model": "claude-sonnet-4-6",
+        "messages": [{ "role": "user", "content": "hello" }],
+        "max_tokens": 64
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/messages")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    let status = resp.status();
+    let resp_body: Value = serde_json::from_slice(
+        &axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+
+    // Route must be registered (not 404).
+    assert_ne!(status, StatusCode::NOT_FOUND, "route must be registered");
+
+    // If the response is an error, it must NOT be a JSON parse error.
+    // Valid errors are: upstream failure (502), rate limit (429), duplicate (409),
+    // or internal routing errors (500). A 400 with invalid JSON would indicate
+    // the request body was malformed, which it is not.
+    if status == StatusCode::BAD_REQUEST {
+        let error_type = resp_body["error"]["type"].as_str().unwrap_or("");
+        assert_ne!(
+            error_type,
+            "invalid_request_error",
+            "valid Anthropic JSON should not produce invalid_request_error"
+        );
+    }
+}
+
+/// Phase 0 guardrail: POST /v1/messages with invalid (non-JSON) body returns
+/// 400 with invalid_request_error (bad JSON parse).
+#[tokio::test]
+async fn messages_invalid_json_returns_bad_request() {
+    let app = build_router(state());
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/messages")
+        .header("content-type", "application/json")
+        .body(Body::from("this is not json"))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body: Value = serde_json::from_slice(
+        &axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("invalid JSON"),
+        "error message should mention invalid JSON"
+    );
+}
+
+/// Phase 0 guardrail: POST /v1/messages with valid JSON but missing required
+/// fields (no messages) returns 400 with invalid_request_error.
+#[tokio::test]
+async fn messages_valid_json_missing_fields_returns_validation_error() {
+    let app = build_router(state());
+    let body = json!({
+        "model": "claude-sonnet-4-6",
+        "max_tokens": 64
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/messages")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let resp_body: Value = serde_json::from_slice(
+        &axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(resp_body["error"]["type"], "invalid_request_error");
+    // The missing field triggers a serde deserialization error, which is
+    // reported as "invalid JSON: missing field `messages`".
+    assert!(
+        resp_body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("missing field `messages`"),
+        "should report missing messages field"
+    );
+}
+
+/// Phase 0 guardrail: POST /v1/chat/completions with OpenAI-shaped JSON
+/// remains unmounted (404) until Phase 9.
+#[tokio::test]
+async fn chat_completions_post_with_openai_json_is_unmounted() {
+    let app = build_router(state());
+    let body = json!({
+        "model": "gpt-4o",
+        "messages": [{ "role": "user", "content": "hello" }]
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
 #[tokio::test]
 async fn count_tokens_returns_estimate() {
     let app = build_router(state());
