@@ -344,10 +344,36 @@ codified during the audit process:
    `CoreStreamError.message` shows only length.
 
 8. **`CoreStreamError` implements `Display` and `std::error::Error`** in
-   addition to the plan's `Debug` and `Clone`.
+   addition to the plan's `Debug` and `Clone`.  The `message` field is
+   `pub(crate)` and must be set via `CoreStreamError::new(kind, message)`.
+   The `Debug` impl redacts the message to its character count; `Display`
+   shows only the error kind (not the message); `Serialize` skips the
+   message field to prevent leaking unsanitized content to client responses.
 
 9. **`Usage` has `synthetic_zero()` and `provider_reported()` constructors**
-   to help enforce the usage provenance invariant.
+   to help enforce the usage provenance invariant.  `synthetic_zero()` sets
+   provenance to `SyntheticZero` (not `Unknown`).
+
+10. **`CoreStreamErrorKind` has `http_status()` and `Display`** methods.
+    `http_status()` returns the canonical HTTP status code (400/401/403/429/502/500)
+    so adapters produce consistent responses.  `Display` returns a
+    human-friendly snake_case name (e.g. `rate_limit`).
+
+11. **`OpaqueJsonRef` replaces `OpaqueJson` for Debug formatting**.  The
+    owned `OpaqueJson` wrapper was removed; all Debug impls use the
+    borrowing `OpaqueJsonRef` to avoid cloning potentially large
+    `serde_json::Value` instances during debug formatting.
+
+12. **`redact_value` hides `Bool` and `Number` values** in addition to
+    `String`, `Array`, and `Object`.  Previously `Bool(true)` and
+    `Number(42)` would print the actual value; now they show `Bool(_)`
+    and `Number(_)` for consistent redaction.
+
+13. **`Usage` derives `Eq`** in addition to `PartialEq`.  All fields are
+    `Eq`-compatible (no `serde_json::Value`), so this is sound.
+
+14. **`ModelRef` uses `#[serde(deny_unknown_fields)]`** consistent with
+    all other public structs in the module.
 
 ### Tracking for future phases
 
@@ -359,3 +385,21 @@ codified during the audit process:
   `ClientDisconnect` variant should be considered in a future phase.
 - Token count upper-bound validation (capping at a reasonable maximum) is
   deferred to a future phase.
+- `CoreStreamError` should consider an optional `source` field
+  (`Option<Box<dyn std::error::Error + Send + Sync>>`) to preserve error
+  causality when wrapping upstream provider errors.
+- A `CoreEvent -> SSE frame` encoding convention should be defined before
+  Phase 2 to prevent SSE framing inconsistency across adapters.
+- Consider adding `#[serde(rename_all = "snake_case")]` to `CoreRole`,
+  `CoreContent`, and `StopReason` in a future phase to align JSON
+  serialization with dominant wire conventions (Anthropic/OpenAI).
+- `SamplingOptions` should document the NaN/Infinity serialization pitfall
+  or add a validation layer in a future phase.
+- `messages.rs` route handler directly imports transformer types instead of
+  going through the core protocol layer.  Phase 2/3 should refactor this
+  to use `CoreRequest -> provider adapter -> CoreResponse/CoreEvent`.
+- The global `TimeoutLayer` in `routes/mod.rs` applies to streaming SSE
+  responses.  Streaming routes should be exempted or use a streaming-aware
+  timeout.
+- Anthropic streaming path does not set `X-Accel-Buffering: no`.  Consider
+  adding it for consistency with other streaming paths.

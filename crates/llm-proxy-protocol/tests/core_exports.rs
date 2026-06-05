@@ -6,8 +6,9 @@
 //! `pub mod core;` is missing.
 
 use llm_proxy_protocol::core::{
-    CacheControl, CacheControlType, CoreEvent, CoreRequest, CoreResponse, CoreRole, CoreMessage,
-    CoreContent, ModelRef, RequestMetadata, SamplingOptions, ProviderHints,
+    CacheControl, CacheControlType, ContentKind, CoreEvent, CoreRequest, CoreResponse, CoreRole,
+    CoreMessage, CoreContent, CoreStreamError, CoreStreamErrorKind, CoreTool, CoreToolChoice,
+    ModelRef, RequestMetadata, SamplingOptions, ProviderHints, StopReason, Usage, UsageProvenance,
 };
 
 /// Trivial compile-time check: the types exist and are constructible.
@@ -16,6 +17,14 @@ fn core_types_are_exported() {
     let _request: CoreRequest;
     let _response: CoreResponse;
     let _event: CoreEvent;
+    let _content_kind: ContentKind;
+    let _stream_error: CoreStreamError;
+    let _stream_error_kind: CoreStreamErrorKind;
+    let _tool: CoreTool;
+    let _tool_choice: CoreToolChoice;
+    let _stop_reason: StopReason;
+    let _usage: Usage;
+    let _provenance: UsageProvenance;
 }
 
 /// Stronger check: construct a minimal CoreRequest and verify serialization.

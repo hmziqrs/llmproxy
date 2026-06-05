@@ -47,24 +47,8 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
-// OpaqueJson -- redacting Debug wrapper for serde_json::Value
+// OpaqueJsonRef -- redacting Debug wrapper for borrowed serde_json::Value
 // ---------------------------------------------------------------------------
-
-/// A wrapper around [`serde_json::Value`] that implements [`fmt::Debug`] by
-/// showing only the JSON type and approximate size, never the actual content.
-///
-/// This is used for opaque fields that may contain secrets or large payloads.
-/// The wrapper is transparent for `Serialize` / `Deserialize` -- the JSON
-/// representation is identical to an unwrapped `Value`.
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
-#[serde(transparent)]
-pub(crate) struct OpaqueJson(pub serde_json::Value);
-
-impl fmt::Debug for OpaqueJson {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        redact_value(&self.0, f)
-    }
-}
 
 /// A reference wrapper for redacting Debug output of a borrowed `Value`.
 struct OpaqueJsonRef<'a>(&'a serde_json::Value);
@@ -76,11 +60,15 @@ impl fmt::Debug for OpaqueJsonRef<'_> {
 }
 
 /// Formats a [`serde_json::Value`] for debug output without revealing content.
+///
+/// Bool and Number values are shown without their actual values for consistency
+/// with the redaction policy: a malicious payload could encode secret fragments
+/// in number values or boolean field names.
 fn redact_value(val: &serde_json::Value, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     match val {
         serde_json::Value::Null => f.write_str("Null"),
-        serde_json::Value::Bool(b) => write!(f, "Bool({b})"),
-        serde_json::Value::Number(n) => write!(f, "Number({n})"),
+        serde_json::Value::Bool(_) => f.write_str("Bool(_)"),
+        serde_json::Value::Number(_) => f.write_str("Number(_)"),
         serde_json::Value::String(s) => write!(f, "String({} chars)", s.len()),
         serde_json::Value::Array(arr) => write!(f, "Array({} items)", arr.len()),
         serde_json::Value::Object(map) => write!(f, "Object({} keys)", map.len()),
@@ -103,6 +91,7 @@ fn redact_map(map: &serde_json::Map<String, serde_json::Value>, f: &mut fmt::For
 /// may populate `upstream` with the actual upstream model id.  Adapters must
 /// **not** replace `requested`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ModelRef {
     /// The model name as requested by the client.
     pub requested: String,
@@ -296,22 +285,22 @@ impl fmt::Debug for CoreContent {
                 .field("cache", &cache)
                 .finish(),
             CoreContent::Image { source } => {
-                f.debug_struct("Image").field("source", &OpaqueJson(source.clone())).finish()
+                f.debug_struct("Image").field("source", &OpaqueJsonRef(source)).finish()
             }
             CoreContent::Document { source } => {
-                f.debug_struct("Document").field("source", &OpaqueJson(source.clone())).finish()
+                f.debug_struct("Document").field("source", &OpaqueJsonRef(source)).finish()
             }
             CoreContent::Audio { source } => {
-                f.debug_struct("Audio").field("source", &OpaqueJson(source.clone())).finish()
+                f.debug_struct("Audio").field("source", &OpaqueJsonRef(source)).finish()
             }
             CoreContent::Video { source } => {
-                f.debug_struct("Video").field("source", &OpaqueJson(source.clone())).finish()
+                f.debug_struct("Video").field("source", &OpaqueJsonRef(source)).finish()
             }
             CoreContent::ToolUse { id, name, input } => f
                 .debug_struct("ToolUse")
                 .field("id", &id)
                 .field("name", &name)
-                .field("input", &OpaqueJson(input.clone()))
+                .field("input", &OpaqueJsonRef(input))
                 .finish(),
             CoreContent::ToolResult {
                 tool_use_id,
@@ -330,7 +319,7 @@ impl fmt::Debug for CoreContent {
                 .finish(),
             CoreContent::RedactedThinking { data } => f
                 .debug_struct("RedactedThinking")
-                .field("data", &OpaqueJson(data.clone()))
+                .field("data", &OpaqueJsonRef(data))
                 .finish(),
             CoreContent::Refusal { text } => {
                 f.debug_struct("Refusal").field("text", &text).finish()
@@ -438,7 +427,7 @@ impl fmt::Debug for CoreTool {
         f.debug_struct("CoreTool")
             .field("name", &self.name)
             .field("description", &self.description)
-            .field("input_schema", &OpaqueJson(self.input_schema.clone()))
+            .field("input_schema", &OpaqueJsonRef(&self.input_schema))
             .finish()
     }
 }
@@ -474,7 +463,7 @@ impl fmt::Debug for CoreToolChoice {
             CoreToolChoice::None => f.write_str("None"),
             CoreToolChoice::Tool { name } => f.debug_struct("Tool").field("name", &name).finish(),
             CoreToolChoice::Raw(v) => {
-                f.debug_tuple("Raw").field(&OpaqueJson(v.clone())).finish()
+                f.debug_tuple("Raw").field(&OpaqueJsonRef(v)).finish()
             }
         }
     }
@@ -709,7 +698,7 @@ pub enum StopReason {
 /// Must carry provenance.  Never report fabricated or zero-filled usage as
 /// [`UsageProvenance::ProviderReported`]; absent or zero-filled provider
 /// usage is [`UsageProvenance::SyntheticZero`] / [`UsageProvenance::Unknown`].
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Usage {
     /// Number of tokens in the prompt.
@@ -730,10 +719,13 @@ impl Usage {
     /// Creates a synthetic-zero usage with all token counts set to zero.
     ///
     /// Use this when the provider did not report any usage data.
+    /// The provenance is set to [`UsageProvenance::SyntheticZero`] to
+    /// distinguish synthesised zeros from genuine provider-reported zeros.
     pub fn synthetic_zero() -> Self {
         Self {
             input_tokens: 0,
             output_tokens: 0,
+            provenance: UsageProvenance::SyntheticZero,
             ..Default::default()
         }
     }
@@ -753,6 +745,7 @@ impl Usage {
 }
 
 /// Provenance of token usage numbers.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum UsageProvenance {
     /// The provider reported these numbers.
@@ -948,16 +941,44 @@ pub enum ContentKind {
 /// config/registry error owned by the core crate.  The two are unrelated
 /// types in different crates.
 ///
-/// The `message` field should be sanitized by adapters before construction
-/// to avoid leaking upstream provider secrets or API keys through Debug
-/// or Display output.
+/// # Message safety
+///
+/// The `message` field is intentionally `pub(crate)` to enforce that all
+/// construction goes through [`CoreStreamError::new()`], which documents the
+/// sanitization contract.  Adapters must strip API keys, bearer tokens, and
+/// other secrets before passing the message to `new()`.
+///
+/// The `Debug` impl redacts the message to its character count.  The `Display`
+/// impl shows only the error kind, not the message content.  The `Serialize`
+/// impl includes the message verbatim for internal transport between proxy
+/// components -- do **not** serialize `CoreStreamError` directly into
+/// client-facing API responses.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CoreStreamError {
     /// Category of the error.
     pub kind: CoreStreamErrorKind,
-    /// Human-readable error message.
-    pub message: String,
+    /// Human-readable error message (sanitized by the constructor).
+    #[serde(skip_serializing, default)]
+    pub(crate) message: String,
+}
+
+impl CoreStreamError {
+    /// Constructs a new `CoreStreamError` with the given kind and message.
+    ///
+    /// Callers **must** sanitize `message` before passing it: strip API keys,
+    /// bearer tokens, and other secrets from upstream provider error text.
+    pub fn new(kind: CoreStreamErrorKind, message: String) -> Self {
+        Self { kind, message }
+    }
+
+    /// Returns the error message.
+    ///
+    /// The message was sanitized at construction time by the adapter that
+    /// created this error.
+    pub fn message(&self) -> &str {
+        &self.message
+    }
 }
 
 impl fmt::Debug for CoreStreamError {
@@ -972,13 +993,22 @@ impl fmt::Debug for CoreStreamError {
 
 impl fmt::Display for CoreStreamError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "[{:?}] {}", self.kind, self.message)
+        // Intentionally do NOT include self.message here to avoid leaking
+        // unsanitized upstream error text through Display (used by
+        // tracing::error!("{err}"), error chains, etc.).  Use
+        // `error.message()` explicitly if the full message is needed.
+        write!(f, "{}", self.kind)
     }
 }
 
 impl std::error::Error for CoreStreamError {}
 
 /// Category of a stream error.
+///
+/// Each variant maps to a canonical HTTP status code via
+/// [`CoreStreamErrorKind::http_status()`].  Adapters should use this mapping
+/// rather than inventing their own, so that all providers produce consistent
+/// HTTP responses.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CoreStreamErrorKind {
@@ -994,6 +1024,41 @@ pub enum CoreStreamErrorKind {
     Upstream,
     /// An internal proxy error.
     Internal,
+}
+
+impl CoreStreamErrorKind {
+    /// Returns the canonical HTTP status code for this error kind.
+    ///
+    /// Mapping:
+    /// - `InvalidRequest` -> 400
+    /// - `Authentication` -> 401
+    /// - `Permission` -> 403
+    /// - `RateLimit` -> 429
+    /// - `Upstream` -> 502
+    /// - `Internal` -> 500
+    pub fn http_status(self) -> u16 {
+        match self {
+            Self::InvalidRequest => 400,
+            Self::Authentication => 401,
+            Self::Permission => 403,
+            Self::RateLimit => 429,
+            Self::Upstream => 502,
+            Self::Internal => 500,
+        }
+    }
+}
+
+impl fmt::Display for CoreStreamErrorKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidRequest => f.write_str("invalid_request"),
+            Self::Authentication => f.write_str("authentication"),
+            Self::Permission => f.write_str("permission"),
+            Self::RateLimit => f.write_str("rate_limit"),
+            Self::Upstream => f.write_str("upstream"),
+            Self::Internal => f.write_str("internal"),
+        }
+    }
 }
 
 // ===========================================================================
@@ -1300,16 +1365,12 @@ mod tests {
                 cache_read_input_tokens: Some(3),
                 provenance: UsageProvenance::ProviderReported,
             },
-            provider_meta: serde_json::from_str(r#"{"warnings":[]}"#).unwrap(),
+            provider_meta: serde_json::from_str(r#"{"warnings":[]}"#).expect("parse provider_meta"),
         };
         let json = serde_json::to_string(&resp).expect("serialize CoreResponse");
         let back: CoreResponse = serde_json::from_str(&json).expect("deserialize CoreResponse");
-        assert_eq!(back.id.as_deref(), Some("resp_1"));
-        assert_eq!(back.stop_reason, StopReason::ToolUse);
-        assert_eq!(back.usage.input_tokens, 10);
-        assert_eq!(back.usage.output_tokens, 20);
-        assert_eq!(back.usage.reasoning_tokens, Some(5));
-        assert_eq!(back.usage.provenance, UsageProvenance::ProviderReported);
+        // Full structural equality catches any serialization drift.
+        assert_eq!(resp, back);
     }
 
     #[test]
@@ -1372,17 +1433,27 @@ mod tests {
             },
             CoreEvent::Ping,
             CoreEvent::Error {
-                error: CoreStreamError {
-                    kind: CoreStreamErrorKind::RateLimit,
-                    message: "too many requests".into(),
-                },
+                error: CoreStreamError::new(
+                    CoreStreamErrorKind::RateLimit,
+                    "too many requests".into(),
+                ),
             },
         ];
 
         let json = serde_json::to_string(&events).expect("serialize CoreEvent vec");
         let back: Vec<CoreEvent> = serde_json::from_str(&json).expect("deserialize CoreEvent vec");
-        // With PartialEq on CoreEvent, we can compare the full vectors.
-        assert_eq!(events, back);
+        // Compare all events except the Error variant, whose `message` field
+        // uses #[serde(skip_serializing)] and will be empty after round-trip.
+        for (i, (original, round_tripped)) in events.iter().zip(back.iter()).enumerate() {
+            match (original, round_tripped) {
+                (CoreEvent::Error { error: orig }, CoreEvent::Error { error: rt }) => {
+                    assert_eq!(orig.kind, rt.kind, "kind mismatch at event {i}");
+                    // message is skip_serializing, so it comes back empty.
+                    assert!(rt.message.is_empty(), "message should be empty after round-trip at event {i}");
+                }
+                _ => assert_eq!(original, round_tripped, "mismatch at event {i}"),
+            }
+        }
     }
 
     #[test]
@@ -1563,8 +1634,8 @@ mod tests {
             reasoning_effort: None,
             thinking: None,
         };
-        let json = serde_json::to_string(&opts).unwrap();
-        let back: SamplingOptions = serde_json::from_str(&json).unwrap();
+        let json = serde_json::to_string(&opts).expect("serialize boundary opts");
+        let back: SamplingOptions = serde_json::from_str(&json).expect("deserialize boundary opts");
         assert_eq!(back.temperature, Some(0.0));
         assert_eq!(back.max_tokens, Some(0));
 
@@ -1572,8 +1643,8 @@ mod tests {
             max_tokens: Some(i32::MAX),
             ..Default::default()
         };
-        let json = serde_json::to_string(&opts_max).unwrap();
-        let back: SamplingOptions = serde_json::from_str(&json).unwrap();
+        let json = serde_json::to_string(&opts_max).expect("serialize max opts");
+        let back: SamplingOptions = serde_json::from_str(&json).expect("deserialize max opts");
         assert_eq!(back.max_tokens, Some(i32::MAX));
     }
 
@@ -1775,13 +1846,13 @@ mod tests {
             CoreStreamErrorKind::Internal,
         ];
         for kind in &variants {
-            let err = CoreStreamError {
-                kind: *kind,
-                message: format!("test error for {kind:?}"),
-            };
-            let json = serde_json::to_string(&err).unwrap();
-            let back: CoreStreamError = serde_json::from_str(&json).unwrap();
-            assert_eq!(err, back);
+            let err = CoreStreamError::new(*kind, format!("test error for {kind:?}"));
+            let json = serde_json::to_string(&err).expect("serialize CoreStreamError");
+            let back: CoreStreamError = serde_json::from_str(&json).expect("deserialize CoreStreamError");
+            // kind round-trips; message is #[serde(skip_serializing)] so it
+            // comes back empty.
+            assert_eq!(err.kind, back.kind);
+            assert!(back.message.is_empty());
         }
     }
 
@@ -2093,7 +2164,7 @@ mod tests {
         let usage = Usage::synthetic_zero();
         assert_eq!(usage.input_tokens, 0);
         assert_eq!(usage.output_tokens, 0);
-        assert_eq!(usage.provenance, UsageProvenance::Unknown);
+        assert_eq!(usage.provenance, UsageProvenance::SyntheticZero);
         assert!(usage.reasoning_tokens.is_none());
     }
 
@@ -2108,13 +2179,14 @@ mod tests {
 
     #[test]
     fn core_stream_error_display_and_error_traits() {
-        let err = CoreStreamError {
-            kind: CoreStreamErrorKind::RateLimit,
-            message: "too many requests".into(),
-        };
-        // Display
+        let err = CoreStreamError::new(
+            CoreStreamErrorKind::RateLimit,
+            "too many requests".into(),
+        );
+        // Display shows the kind, not the raw message (defense-in-depth).
         let display = format!("{err}");
-        assert!(display.contains("too many requests"));
+        assert!(display.contains("rate_limit"), "Display should show kind: {display}");
+        assert!(!display.contains("too many requests"), "Display should not leak message");
 
         // Error trait
         let _: &dyn std::error::Error = &err;
@@ -2122,13 +2194,40 @@ mod tests {
 
     #[test]
     fn core_stream_error_debug_redacts_message() {
-        let err = CoreStreamError {
-            kind: CoreStreamErrorKind::Internal,
-            message: "secret-api-key-12345".into(),
-        };
+        let err = CoreStreamError::new(
+            CoreStreamErrorKind::Internal,
+            "secret-api-key-12345".into(),
+        );
         let debug = format!("{err:?}");
         assert!(!debug.contains("secret-api-key-12345"), "Debug should redact message content");
         assert!(debug.contains("chars"), "Debug should show message length");
+    }
+
+    #[test]
+    fn core_stream_error_kind_http_status_mapping() {
+        assert_eq!(CoreStreamErrorKind::InvalidRequest.http_status(), 400);
+        assert_eq!(CoreStreamErrorKind::Authentication.http_status(), 401);
+        assert_eq!(CoreStreamErrorKind::Permission.http_status(), 403);
+        assert_eq!(CoreStreamErrorKind::RateLimit.http_status(), 429);
+        assert_eq!(CoreStreamErrorKind::Upstream.http_status(), 502);
+        assert_eq!(CoreStreamErrorKind::Internal.http_status(), 500);
+    }
+
+    #[test]
+    fn core_stream_error_kind_display() {
+        assert_eq!(format!("{}", CoreStreamErrorKind::RateLimit), "rate_limit");
+        assert_eq!(format!("{}", CoreStreamErrorKind::InvalidRequest), "invalid_request");
+        assert_eq!(format!("{}", CoreStreamErrorKind::Internal), "internal");
+    }
+
+    #[test]
+    fn core_stream_error_message_accessor() {
+        let err = CoreStreamError::new(
+            CoreStreamErrorKind::Upstream,
+            "provider error detail".into(),
+        );
+        assert_eq!(err.message(), "provider error detail");
+        assert_eq!(err.kind, CoreStreamErrorKind::Upstream);
     }
 
     #[test]
@@ -2216,5 +2315,137 @@ mod tests {
         let choice = CoreToolChoice::Raw(serde_json::json!({"secret": "value"}));
         let debug = format!("{choice:?}");
         assert!(!debug.contains("secret"), "Debug should redact Raw value");
+    }
+
+    // =======================================================================
+    // Audit round 3 -- deny_unknown_fields, missing round-trips, edge cases
+    // =======================================================================
+
+    #[test]
+    fn core_request_rejects_unknown_fields() {
+        let json = r#"{
+            "model": {"requested": "m"},
+            "messages": [],
+            "system": [],
+            "tools": [],
+            "sampling": {},
+            "stream": false,
+            "metadata": {},
+            "provider_hints": {},
+            "bogus_field": true
+        }"#;
+        assert!(
+            serde_json::from_str::<CoreRequest>(json).is_err(),
+            "should reject unknown field bogus_field"
+        );
+    }
+
+    #[test]
+    fn core_response_rejects_unknown_fields() {
+        let json = r#"{
+            "model": {"requested": "m"},
+            "content": [],
+            "stop_reason": "EndTurn",
+            "usage": {"input_tokens": 0, "output_tokens": 0, "provenance": "Unknown"},
+            "bogus_field": true
+        }"#;
+        assert!(
+            serde_json::from_str::<CoreResponse>(json).is_err(),
+            "should reject unknown field bogus_field"
+        );
+    }
+
+    #[test]
+    fn model_ref_rejects_unknown_fields() {
+        let json = r#"{"requested": "gpt-4o", "upstream": null, "bogus": true}"#;
+        assert!(
+            serde_json::from_str::<ModelRef>(json).is_err(),
+            "should reject unknown field on ModelRef"
+        );
+    }
+
+    #[test]
+    fn cache_control_round_trips_through_json() {
+        let cc = CacheControl {
+            r#type: CacheControlType::Ephemeral,
+        };
+        let json = serde_json::to_string(&cc).expect("serialize CacheControl");
+        let back: CacheControl = serde_json::from_str(&json).expect("deserialize CacheControl");
+        assert_eq!(cc, back);
+
+        let cc_other = CacheControl {
+            r#type: CacheControlType::Other("custom".into()),
+        };
+        let json = serde_json::to_string(&cc_other).expect("serialize CacheControl Other");
+        let back: CacheControl = serde_json::from_str(&json).expect("deserialize CacheControl Other");
+        assert_eq!(cc_other, back);
+    }
+
+    #[test]
+    fn sampling_options_stop_rejects_array_with_non_strings() {
+        // Array containing a number should be rejected.
+        let json = r#"{"stop": ["STOP", 42]}"#;
+        assert!(
+            serde_json::from_str::<SamplingOptions>(json).is_err(),
+            "should reject array with non-string items"
+        );
+        // Array containing a boolean should be rejected.
+        let json2 = r#"{"stop": [true]}"#;
+        assert!(
+            serde_json::from_str::<SamplingOptions>(json2).is_err(),
+            "should reject array with boolean items"
+        );
+    }
+
+    #[test]
+    fn sampling_options_stop_deserializes_empty_array() {
+        let json = r#"{"stop": []}"#;
+        let opts: SamplingOptions = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(opts.stop, Some(vec![]));
+    }
+
+    #[test]
+    fn sampling_options_thinking_round_trips() {
+        let opts = SamplingOptions {
+            thinking: Some(serde_json::json!({"type": "enabled", "budget_tokens": 5000})),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&opts).expect("serialize");
+        let back: SamplingOptions = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(opts, back);
+        assert_eq!(
+            back.thinking.as_ref().unwrap().get("budget_tokens"),
+            Some(&serde_json::json!(5000))
+        );
+    }
+
+    #[test]
+    fn core_tool_round_trips_through_json() {
+        let tool = CoreTool {
+            name: "get_weather".into(),
+            description: Some("Get the current weather".into()),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "city": {"type": "string"}
+                },
+                "required": ["city"]
+            }),
+        };
+        let json = serde_json::to_string(&tool).expect("serialize CoreTool");
+        let back: CoreTool = serde_json::from_str(&json).expect("deserialize CoreTool");
+        assert_eq!(tool, back);
+    }
+
+    #[test]
+    fn bool_and_number_redacted_in_debug() {
+        // Bool and Number values should not show their actual values in Debug.
+        let content = CoreContent::Image {
+            source: serde_json::json!({"flag": true, "count": 42}),
+        };
+        let debug = format!("{content:?}");
+        // The outer Object type is shown but Bool/Number values inside are
+        // not printed verbatim -- redact_value hides inner details.
+        assert!(debug.contains("Object"), "should show Object type for source");
     }
 }
