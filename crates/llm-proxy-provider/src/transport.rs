@@ -41,7 +41,7 @@ impl fmt::Debug for AuthHeaders {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("AuthHeaders")
             .field("style", &self.style)
-            .field("api_key", &"***")
+            .field("api_key", &"[REDACTED]")
             .finish()
     }
 }
@@ -253,7 +253,7 @@ mod tests {
             debug_output
         );
         assert!(
-            debug_output.contains("***"),
+            debug_output.contains("[REDACTED]"),
             "Debug output must contain redacted marker: {}",
             debug_output
         );
@@ -277,7 +277,7 @@ mod tests {
             debug_output
         );
         assert!(
-            debug_output.contains("***"),
+            debug_output.contains("[REDACTED]"),
             "Debug output must contain redacted marker: {}",
             debug_output
         );

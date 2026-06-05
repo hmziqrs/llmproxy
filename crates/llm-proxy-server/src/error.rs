@@ -1,6 +1,6 @@
 use axum::{
     Json,
-    http::{StatusCode, header},
+    http::{HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
 };
 use serde::Serialize;
@@ -62,7 +62,7 @@ impl IntoResponse for ApiErrorWithRequestId {
         // changes in future refactoring.
         response.headers_mut().insert(
             header::CONTENT_TYPE,
-            "application/json".parse().unwrap_or_else(|_| "application/json".parse().unwrap()),
+            HeaderValue::from_static("application/json"),
         );
         response.headers_mut().insert(
             "x-request-id",
@@ -178,7 +178,7 @@ impl IntoResponse for ApiError {
         // Explicitly ensure Content-Type is set for resilience against future refactoring.
         response.headers_mut().insert(
             header::CONTENT_TYPE,
-            "application/json".parse().unwrap_or_else(|_| "application/json".parse().unwrap()),
+            HeaderValue::from_static("application/json"),
         );
         response
     }

@@ -117,7 +117,7 @@ impl fmt::Debug for ProviderAdapterTarget {
             .field("protocol", &self.protocol)
             .field("endpoint", &self.endpoint)
             .field("auth_style", &self.auth_style)
-            .field("api_key", &"***")
+            .field("api_key", &"[REDACTED]")
             .field("requested_model", &self.requested_model)
             .field("upstream_model", &self.upstream_model)
             .finish()
@@ -571,7 +571,7 @@ mod tests {
         let debug = format!("{:?}", target);
         assert!(!debug.contains("sk-test-super-secret-key-1234567890"),
             "Debug output must not contain the actual API key");
-        assert!(debug.contains("***"), "Debug output must show *** for api_key");
+        assert!(debug.contains("[REDACTED]"), "Debug output must show [REDACTED] for api_key");
     }
 
     // -- Finish reason mapping -----------------------------------------------

@@ -44,6 +44,7 @@ use crate::provider_config::{AuthStyle, ProviderConfig, load_provider_config};
 /// **not** a route-built final URL. Provider adapters own endpoint URL shape,
 /// including Gemini `{model}` expansion.
 #[derive(Clone)]
+#[non_exhaustive]
 pub struct ProviderAdapterTargetConfig {
     /// Provider name (identifies the provider config).
     pub provider_name: String,
@@ -94,6 +95,7 @@ impl std::fmt::Debug for ProviderAdapterTargetConfig {
 /// provider.adapters[adapter_name]  -> protocol + endpoint
 /// ```
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ProviderRegistry {
     providers: HashMap<String, ProviderConfig>,
 }
@@ -141,7 +143,10 @@ impl ProviderRegistry {
         for entry in sorted_entries {
             let file_path = entry.path();
 
-            // Skip non-regular files (directories, symlinks, pipes, etc.).
+            // Skip non-regular files (directories, pipes, sockets, etc.).
+            // Note: symlinks pointing to regular files are followed (is_file()
+            // returns true for them). The config directory trust boundary is
+            // documented in provider_config.rs.
             if let Ok(ft) = entry.file_type() {
                 if !ft.is_file() {
                     tracing::debug!(
@@ -162,11 +167,12 @@ impl ProviderRegistry {
 
             let provider = load_provider_config(&file_path, None)?;
 
-            if let Some(_existing) = providers.get(&provider.name) {
+            if providers.contains_key(&provider.name) {
                 return Err(CoreError::ProviderResolution {
                     message: format!(
-                        "duplicate provider name \"{}\": provider names must be unique across all config files",
-                        provider.name
+                        "duplicate provider name \"{}\" in {}: provider names must be unique across all config files",
+                        provider.name,
+                        file_path.display()
                     ),
                 });
             }
@@ -225,6 +231,10 @@ impl ProviderRegistry {
         &self,
         known_protocols: impl IntoIterator<Item = impl AsRef<str>>,
     ) -> Result<(), CoreError> {
+        // Note: This allocates a String per protocol name. The set is tiny
+        // (4 built-in protocols) and this runs once at startup, so the cost
+        // is negligible. A HashSet<String> is used because the input iterator
+        // owns its items and we cannot borrow from them.
         let known: HashSet<String> = known_protocols
             .into_iter()
             .map(|s| s.as_ref().to_owned())

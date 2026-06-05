@@ -55,36 +55,33 @@ pub struct ProviderRegistry {
 }
 
 impl ProviderRegistry {
+    /// Load all provider TOML files from a directory.
     pub fn load_from_dir(path: impl AsRef<std::path::Path>) -> Result<Self, CoreError>;
 
-    pub fn validate_protocols(
-        &self,
-        known_protocols: impl IntoIterator<Item = String>,
-    ) -> Result<(), CoreError>;
+    /// Build a registry from an existing iterator of provider configs.
+    /// Primarily for testing and programmatic construction.
+    pub fn from_providers(
+        providers: impl IntoIterator<Item = ProviderConfig>,
+    ) -> Result<Self, CoreError>;
 
-    pub fn resolve_adapter_target(
-        &self,
-        target: &ProviderTarget,
-    ) -> Result<ProviderAdapterTargetConfig, CoreError>;
-}
-
-#[derive(Debug, Clone)]
-pub struct ProviderRegistry {
-    providers: std::collections::HashMap<String, ProviderConfig>,
-}
-
-impl ProviderRegistry {
-    pub fn load_from_dir(path: impl AsRef<std::path::Path>) -> Result<Self, CoreError>;
-
+    /// Validate that all protocols referenced by providers are in the known set.
+    /// Accepts `impl IntoIterator<Item = impl AsRef<str>>` so both
+    /// `Vec<String>` and `Vec<&'static str>` can be passed.
     pub fn validate_protocols(
         &self,
         known_protocols: impl IntoIterator<Item = impl AsRef<str>>,
     ) -> Result<(), CoreError>;
 
+    /// Resolve a ProviderTarget to a concrete adapter configuration.
     pub fn resolve_adapter_target(
         &self,
         target: &ProviderTarget,
     ) -> Result<ProviderAdapterTargetConfig, CoreError>;
+
+    // Standard collection helpers (undocumented but reasonable additions):
+    pub fn len(&self) -> usize;
+    pub fn is_empty(&self) -> bool;
+    pub fn get(&self, name: &str) -> Option<&ProviderConfig>;
 }
 
 /// Manual `Debug` impl redacts `api_key` to `[REDACTED]` so that

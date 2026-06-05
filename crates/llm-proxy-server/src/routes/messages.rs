@@ -330,7 +330,6 @@ async fn handle_anthropic_streaming(
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "text/event-stream")
         .header(header::CACHE_CONTROL, "no-cache")
-        .header(header::CONNECTION, "keep-alive")
         .header("X-Accel-Buffering", "no")
         .header("x-request-id", request_id)
         .body(body)
@@ -526,14 +525,12 @@ fn parse_sse_events(output: &str) -> Vec<Event> {
                 if line.starts_with(':') {
                     continue;
                 }
-                if let Some(rest) = line.strip_prefix("event") {
-                    if let Some(val) = strip_field_value(rest) {
-                        etype = val.to_owned();
-                    }
-                } else if let Some(rest) = line.strip_prefix("data") {
-                    if let Some(val) = strip_field_value(rest) {
-                        data_parts.push(val.to_owned());
-                    }
+                if let Some(rest) = line.strip_prefix("event:") {
+                    let val = rest.strip_prefix(' ').unwrap_or(rest);
+                    etype = val.to_owned();
+                } else if let Some(rest) = line.strip_prefix("data:") {
+                    let val = rest.strip_prefix(' ').unwrap_or(rest);
+                    data_parts.push(val.to_owned());
                 }
                 // `id:` and `retry:` fields are acknowledged but not needed
                 // for our proxy pass-through.
@@ -549,16 +546,6 @@ fn parse_sse_events(output: &str) -> Vec<Event> {
         .collect()
 }
 
-/// Strip the `: ` or `:` separator after an SSE field name, returning the value.
-///
-/// SSE spec: `field: value` or `field:value` (space after colon is optional).
-/// Returns `None` if the input does not start with `:`.
-fn strip_field_value(rest: &str) -> Option<&str> {
-    let after_colon = rest.strip_prefix(':')?;
-    // Strip optional single space after the colon.
-    Some(after_colon.strip_prefix(' ').unwrap_or(after_colon))
-}
-
 fn build_sse_response(events: BoxStream<'static, Event>) -> Result<Response<Body>, String> {
     let sse = Sse::new(events.map(Ok::<_, std::convert::Infallible>))
         .keep_alive(KeepAlive::new().interval(HEARTBEAT_INTERVAL));
@@ -571,9 +558,6 @@ fn build_sse_response(events: BoxStream<'static, Event>) -> Result<Response<Body
     );
     // Sse::into_response() already sets Content-Type and Cache-Control.
     // Only add the extra headers not covered by the Sse wrapper.
-    parts
-        .headers
-        .insert(header::CONNECTION, "keep-alive".parse().expect("static header value is always valid"));
     parts
         .headers
         .insert("X-Accel-Buffering", "no".parse().expect("static header value is always valid"));
@@ -738,17 +722,9 @@ mod tests {
     }
 
     #[test]
-    fn strip_field_value_with_space() {
-        assert_eq!(strip_field_value(": value"), Some("value"));
-    }
-
-    #[test]
-    fn strip_field_value_without_space() {
-        assert_eq!(strip_field_value(":value"), Some("value"));
-    }
-
-    #[test]
-    fn strip_field_value_no_colon() {
-        assert_eq!(strip_field_value("value"), None);
+    fn parse_sse_field_without_colon_ignored() {
+        // Lines that don't match "field:" pattern are ignored.
+        let events = parse_sse_events("eventtype data\n\n");
+        assert!(events.is_empty(), "lines without colon separator should not produce events");
     }
 }
