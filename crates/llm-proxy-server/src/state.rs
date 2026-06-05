@@ -34,31 +34,29 @@ pub struct BuildInfo {
 }
 
 /// Model router that selects models based on scenario detection.
+///
+/// `pub(crate)` visibility: not re-exported from `lib.rs` and will be deleted
+/// in Phase 11 when the JSON legacy path is removed.
 #[derive(Debug, Clone)]
-pub struct ModelRouter {
+pub(crate) struct ModelRouter {
     /// Reference to the config for model lookup.
     config: Arc<Config>,
 }
 
 impl ModelRouter {
     /// Create a new model router.
-    pub fn new(config: Arc<Config>) -> Self {
+    pub(crate) fn new(config: Arc<Config>) -> Self {
         Self { config }
     }
 
     /// Resolve the model config for a given scenario name.
-    pub fn resolve(&self, scenario: &str) -> Option<llm_proxy_core::ModelConfig> {
+    pub(crate) fn resolve(&self, scenario: &str) -> Option<llm_proxy_core::ModelConfig> {
         self.config.models.get(scenario).cloned()
     }
 
     /// Get the fallback chain for a scenario.
-    pub fn fallback_chain(&self, scenario: &str) -> Option<&Vec<llm_proxy_core::ModelConfig>> {
+    pub(crate) fn fallback_chain(&self, scenario: &str) -> Option<&Vec<llm_proxy_core::ModelConfig>> {
         self.config.fallbacks.get(scenario)
-    }
-
-    /// Get a reference to the config.
-    pub fn config(&self) -> &Config {
-        &self.config
     }
 }
 
@@ -78,8 +76,16 @@ impl ModelRouter {
 /// Fields are `pub(crate)` to prevent external crates from depending on legacy
 /// internals. Route handlers within the server crate access them through
 /// [`AppState::legacy()`].
-#[derive(Debug, Clone)]
-pub struct LegacyState {
+///
+/// `pub(crate)` visibility prevents external crates from depending on a type
+/// that will be deleted in Phase 11.
+///
+/// Manual `Debug` impl ensures the redaction chain is self-documenting:
+/// delegates to `Config`'s manual Debug (which redacts `api_key`) rather than
+/// relying on a derived `Debug` that would break silently if `Config` ever
+/// gained a derived `Debug`.
+#[derive(Clone)]
+pub(crate) struct LegacyState {
     /// Legacy JSON config.
     pub(crate) config: Arc<Config>,
     /// Legacy OpenCode HTTP client.
@@ -88,6 +94,18 @@ pub struct LegacyState {
     pub(crate) model_router: Arc<ModelRouter>,
     /// Legacy fallback handler with circuit breaker protection.
     pub(crate) fallback_handler: Arc<FallbackHandler>,
+}
+
+impl std::fmt::Debug for LegacyState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LegacyState")
+            // SECURITY: Config has a manual Debug that redacts api_key.
+            .field("config", &self.config)
+            .field("client", &self.client)
+            .field("model_router", &self.model_router)
+            .field("fallback_handler", &self.fallback_handler)
+            .finish()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -185,6 +203,19 @@ impl std::fmt::Debug for AppState {
     }
 }
 
+/// Internal enum for dispatching on the active configuration mode.
+///
+/// Used by [`AppState::active_config_mode`] to centralize the
+/// `app_config` vs `legacy` dispatch logic.
+enum ActiveMode<'a> {
+    /// TOML new-runtime mode.
+    Toml(&'a Arc<AppConfig>),
+    /// JSON legacy compatibility mode.
+    Legacy(&'a Arc<LegacyState>),
+    /// Neither mode is configured (invalid, defense-in-depth only).
+    None,
+}
+
 impl AppState {
     /// Construct `AppState` in JSON legacy compatibility mode.
     ///
@@ -201,7 +232,7 @@ impl AppState {
         proxy_client: ProxyClient,
     ) -> Self {
         let cfg = Arc::new(config);
-        Self {
+        let state = Self {
             app_config: None,
             providers: None,
             provider_adapters: Arc::new(provider_adapters),
@@ -219,7 +250,10 @@ impl AppState {
             rate_limiter: Arc::new(RateLimiter::new(DEFAULT_RATE_LIMIT_RPM)),
             request_dedup: Arc::new(RequestDeduplicator::new()),
             request_id_gen: Arc::new(RequestIdGenerator::new()),
-        }
+        };
+        #[cfg(debug_assertions)]
+        state.validate_invariants("from_legacy");
+        state
     }
 
     /// Construct `AppState` in TOML new-runtime mode.
@@ -234,7 +268,7 @@ impl AppState {
         proxy_client: ProxyClient,
         build: BuildInfo,
     ) -> Self {
-        Self {
+        let state = Self {
             app_config: Some(Arc::new(app_config)),
             providers: Some(Arc::new(providers)),
             provider_adapters: Arc::new(provider_adapters),
@@ -246,7 +280,10 @@ impl AppState {
             rate_limiter: Arc::new(RateLimiter::new(DEFAULT_RATE_LIMIT_RPM)),
             request_dedup: Arc::new(RequestDeduplicator::new()),
             request_id_gen: Arc::new(RequestIdGenerator::new()),
-        }
+        };
+        #[cfg(debug_assertions)]
+        state.validate_invariants("from_toml");
+        state
     }
 
     /// Request timeout duration.
@@ -254,14 +291,17 @@ impl AppState {
     /// Uses the new `app_config` timeout when available, otherwise falls back
     /// to the legacy config timeout.
     pub fn request_timeout(&self) -> Duration {
-        if let Some(ac) = &self.app_config {
-            ac.server.request_timeout
-        } else if let Some(ls) = &self.legacy {
-            ls.config.request_timeout
-        } else {
-            warn!("AppState has neither app_config nor legacy; returning default 60s timeout. \
-                   This indicates an invalid construction and should be investigated.");
-            Duration::from_secs(60)
+        match self.active_config_mode() {
+            ActiveMode::Toml(ac) => ac.server.request_timeout,
+            ActiveMode::Legacy(ls) => ls.config.request_timeout,
+            ActiveMode::None => {
+                warn!("AppState has neither app_config nor legacy; returning default 60s timeout. \
+                       This indicates an invalid construction and should be investigated.");
+                // TODO: Remove this fallback when AppState transitions to the final
+                // target state (non-optional app_config). This branch is only reachable
+                // via direct struct construction in defense-in-depth test code.
+                Duration::from_secs(60)
+            }
         }
     }
 
@@ -270,21 +310,24 @@ impl AppState {
     /// Uses the new `app_config` server name when available, otherwise falls
     /// back to the legacy config server name.
     pub fn server_name(&self) -> &str {
-        if let Some(ac) = &self.app_config {
-            &ac.server.server_name
-        } else if let Some(ls) = &self.legacy {
-            &ls.config.server_name
-        } else {
-            warn!("AppState has neither app_config nor legacy; returning default server name. \
-                   This indicates an invalid construction and should be investigated.");
-            "llm-proxy"
+        match self.active_config_mode() {
+            ActiveMode::Toml(ac) => &ac.server.server_name,
+            ActiveMode::Legacy(ls) => &ls.config.server_name,
+            ActiveMode::None => {
+                warn!("AppState has neither app_config nor legacy; returning default server name. \
+                       This indicates an invalid construction and should be investigated.");
+                "llm-proxy"
+            }
         }
     }
 
     /// Access the legacy state bridge.
     ///
     /// Returns `None` in TOML new-runtime mode.
-    pub fn legacy(&self) -> Option<&LegacyState> {
+    ///
+    /// `pub(crate)` because `LegacyState` is `pub(crate)` and will be removed
+    /// in Phase 11.
+    pub(crate) fn legacy(&self) -> Option<&LegacyState> {
         self.legacy.as_deref()
     }
 
@@ -308,15 +351,68 @@ impl AppState {
     /// uses the pre-validated `config.bind` field. Returns `default_bind()`
     /// if neither mode is configured.
     pub fn bind_address(&self) -> SocketAddr {
-        if let Some(ac) = &self.app_config {
-            ac.server.bind
-        } else if let Some(ls) = &self.legacy {
-            ls.config.bind
-        } else {
-            warn!("AppState has neither app_config nor legacy; returning default bind address. \
-                   This indicates an invalid construction and should be investigated.");
-            default_bind()
+        match self.active_config_mode() {
+            ActiveMode::Toml(ac) => ac.server.bind,
+            ActiveMode::Legacy(ls) => ls.config.bind,
+            ActiveMode::None => {
+                warn!("AppState has neither app_config nor legacy; returning default bind address. \
+                       This indicates an invalid construction and should be investigated.");
+                default_bind()
+            }
         }
+    }
+
+    /// Access build metadata (version, target, git SHA).
+    ///
+    /// Returns a reference to the [`BuildInfo`] instance. Available in both
+    /// TOML and legacy modes.
+    pub fn build_info(&self) -> &BuildInfo {
+        &self.build
+    }
+
+    // -- Internal helpers -------------------------------------------------------
+
+    /// Which configuration mode is active.
+    ///
+    /// Centralizes the `app_config` vs `legacy` dispatch so that the three
+    /// helper methods (`request_timeout`, `server_name`, `bind_address`) do
+    /// not each duplicate the same match logic.
+    fn active_config_mode(&self) -> ActiveMode<'_> {
+        if let Some(ac) = &self.app_config {
+            ActiveMode::Toml(ac)
+        } else if let Some(ls) = &self.legacy {
+            ActiveMode::Legacy(ls)
+        } else {
+            ActiveMode::None
+        }
+    }
+
+    /// Assert construction invariants that the type system cannot enforce.
+    ///
+    /// Called at the end of each constructor to catch regressions early in
+    /// debug builds. The checks are:
+    ///
+    /// - `from_legacy` must not set `app_config` or `providers`.
+    /// - `from_toml` must not set `legacy`.
+    /// - At least one of `app_config` or `legacy` must be set.
+    #[cfg(debug_assertions)]
+    fn validate_invariants(&self, source: &str) {
+        if self.app_config.is_some() || self.providers.is_some() {
+            debug_assert!(
+                self.legacy.is_none(),
+                "AppState invariant violation ({source}): app_config/providers are set but legacy is also Some"
+            );
+        }
+        if self.legacy.is_some() {
+            debug_assert!(
+                self.app_config.is_none() && self.providers.is_none(),
+                "AppState invariant violation ({source}): legacy is set but app_config/providers are also Some"
+            );
+        }
+        debug_assert!(
+            self.app_config.is_some() || self.legacy.is_some(),
+            "AppState invariant violation ({source}): neither app_config nor legacy is set"
+        );
     }
 
     /// Legacy convenience constructor matching the old `AppState::new` signature.
@@ -492,27 +588,6 @@ mod tests {
         assert!(chain.unwrap().is_empty());
     }
 
-    // -- config() tests ------------------------------------------------------
-
-    #[test]
-    fn config_returns_reference_to_underlying_config() {
-        let mut models = HashMap::new();
-        models.insert(
-            "default".to_owned(),
-            ModelConfig {
-                model_id: "kimi-k2.6".to_owned(),
-                ..Default::default()
-            },
-        );
-        let router = make_router(models, HashMap::new());
-
-        let cfg = router.config();
-        assert_eq!(cfg.models["default"].model_id, "kimi-k2.6");
-        // Also verify non-model fields are defaults.
-        assert_eq!(cfg.host, "127.0.0.1");
-        assert_eq!(cfg.port, 3456);
-    }
-
     // -- Port of Go TestResolveRequestedModel_UsesFallbacks ------------------
 
     #[test]
@@ -612,16 +687,6 @@ mod tests {
 
     // Verify that the config's respect_requested_model flag is accessible
     // through the ModelRouter's config reference.
-
-    #[test]
-    fn config_respect_requested_model_flag() {
-        let config = Config {
-            respect_requested_model: true,
-            ..Default::default()
-        };
-        let router = ModelRouter::new(Arc::new(config));
-        assert!(router.config().respect_requested_model);
-    }
 
     // =========================================================================
     // Phase 7 tests
@@ -859,7 +924,12 @@ mod tests {
         // provider_adapters and proxy_client are always present.
         // Use >= 4 rather than == 4 so adding new builtin adapters does not
         // break this test (the intent is to verify adapters are populated).
-        assert!(state.provider_adapters.protocol_names().len() >= 4);
+        let protocol_names = state.provider_adapters.protocol_names();
+        assert!(protocol_names.len() >= 4, "expected at least 4 builtin adapters, got {len}", len = protocol_names.len());
+        // Verify specific known protocol names are present for stronger coverage.
+        let names: Vec<&str> = protocol_names;
+        assert!(names.contains(&"openai_chat_completions"), "missing openai_chat_completions adapter");
+        assert!(names.contains(&"anthropic_messages"), "missing anthropic_messages adapter");
     }
 
     // -- Default timeout when neither mode configured ------------------------

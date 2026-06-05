@@ -752,7 +752,8 @@ fn cmd_autostart_enable(config_path: Option<PathBuf>, port: Option<u16>) -> Resu
             })
             .unwrap_or_else(|| PathBuf::from("com.llm-proxy.plist"));
 
-        let plist_dir = plist_path.parent().unwrap();
+        let plist_dir = plist_path.parent()
+            .with_context(|| format!("invalid plist path: {}", plist_path.display()))?;
         std::fs::create_dir_all(plist_dir)
             .with_context(|| format!("creating {}", plist_dir.display()))?;
 
@@ -930,15 +931,17 @@ Hidden=false
 /// Load TOML config files and build [`AppState`] in TOML new-runtime mode.
 ///
 /// Loads the main `AppConfig` from `path`, then scans a `providers/` directory
-/// next to `path` for provider TOML files. Each file is validated against the
-/// known protocols in `adapter_registry`.
+/// next to `path` for provider TOML files. Uses [`ProviderRegistry::load_from_dir`]
+/// which handles non-regular-file filtering, deterministic sorted ordering, and
+/// duplicate-name detection. Protocol validation is performed separately against
+/// the builtin adapter set after loading.
 fn load_toml_state(
     path: &std::path::Path,
     adapter_registry: &ProviderAdapterRegistry,
     proxy_client: &ProxyClient,
     port_override: Option<u16>,
 ) -> Result<AppState> {
-    use llm_proxy_core::{AppConfig, ProviderRegistry, load_app_config, load_provider_config};
+    use llm_proxy_core::{AppConfig, ProviderRegistry, load_app_config};
 
     let mut app_config: AppConfig =
         load_app_config(path).with_context(|| format!("loading TOML config from {}", path.display()))?;
@@ -953,28 +956,21 @@ fn load_toml_state(
     }
 
     // Load provider files from providers/ directory next to the main config.
+    // ProviderRegistry::load_from_dir handles:
+    // - Non-regular-file filtering (skips directories, pipes, sockets)
+    // - Deterministic sorted ordering by filename
+    // - Duplicate provider name detection with file path reporting
     let providers_dir = path.parent().unwrap_or(std::path::Path::new(".")).join("providers");
-    let known_protocols: Vec<&str> = adapter_registry.protocol_names();
-
-    let mut provider_configs = Vec::new();
-    if providers_dir.exists() {
-        let entries = std::fs::read_dir(&providers_dir)
-            .with_context(|| format!("reading providers directory {}", providers_dir.display()))?;
-        for entry in entries {
-            let entry = entry.with_context(|| "reading provider directory entry")?;
-            let p = entry.path();
-            if p.extension().and_then(|e| e.to_str()) == Some("toml") {
-                let provider = load_provider_config(&p, Some(&known_protocols))
-                    .with_context(|| format!("loading provider config from {}", p.display()))?;
-                provider_configs.push(provider);
-            }
-        }
-    }
-
-    let registry = ProviderRegistry::from_providers(provider_configs)
-        .with_context(|| "building provider registry")?;
+    let registry = if providers_dir.exists() {
+        ProviderRegistry::load_from_dir(&providers_dir)
+            .with_context(|| format!("loading providers from {}", providers_dir.display()))?
+    } else {
+        ProviderRegistry::from_providers(vec![])
+            .with_context(|| "building empty provider registry")?
+    };
 
     // Validate all provider protocols against the builtin adapter set.
+    let known_protocols: Vec<&str> = adapter_registry.protocol_names();
     registry
         .validate_protocols(&known_protocols)
         .with_context(|| "validating provider protocols")?;

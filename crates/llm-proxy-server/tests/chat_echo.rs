@@ -522,3 +522,66 @@ async fn toml_ready_returns_ready() {
     .unwrap();
     assert_eq!(body["status"], "ready");
 }
+
+/// TOML mode: POST /v1/messages returns internal error (no legacy state available).
+/// The /v1/messages route currently requires legacy state for model resolution.
+/// When running in TOML mode, the route should return a clear error rather than
+/// panicking or returning an unexpected status.
+#[tokio::test]
+async fn toml_messages_returns_error_without_legacy_state() {
+    let app = build_router(toml_state());
+    let body = json!({
+        "model": "claude-sonnet-4-6",
+        "messages": [{ "role": "user", "content": "hello" }],
+        "max_tokens": 64
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/messages")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    // The route requires legacy state; without it, returns 500 Internal Server Error.
+    assert_eq!(
+        resp.status(),
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "TOML mode /v1/messages should return 500 when no legacy state is available"
+    );
+    let resp_body: Value = serde_json::from_slice(
+        &axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(resp_body["type"], "error");
+    assert_eq!(resp_body["error"]["type"], "api_error");
+}
+
+/// TOML mode: POST /v1/messages/count_tokens works without legacy state.
+/// The token count endpoint does not depend on legacy state; it only uses
+/// the token counter from AppState.
+#[tokio::test]
+async fn toml_count_tokens_returns_estimate() {
+    let app = build_router(toml_state());
+    let body = json!({
+        "model": "claude-sonnet-4-6",
+        "messages": [{ "role": "user", "content": "hello world" }],
+        "max_tokens": 1024
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/messages/count_tokens")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let resp_body: Value = serde_json::from_slice(
+        &axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(resp_body["input_tokens"].as_u64().unwrap() > 0);
+}

@@ -558,7 +558,14 @@ fn parse_sse_events(output: &str) -> Vec<Event> {
             if !data_parts.is_empty() {
                 // Per SSE spec, multiple `data:` lines are joined by newlines.
                 let data = data_parts.join("\n");
-                Some(Event::default().event(&etype).data(&data))
+                // Only set the event type when non-empty. Browsers will NOT
+                // dispatch a `message` event for an empty event type; they
+                // need no `event:` field at all to dispatch the default.
+                let mut ev = Event::default().data(&data);
+                if !etype.is_empty() {
+                    ev = ev.event(&etype);
+                }
+                Some(ev)
             } else {
                 None
             }

@@ -83,10 +83,11 @@ pub(crate) struct VersionBody {
 /// operators can distinguish deployments; the rest is compile-time
 /// build info.
 pub async fn version(State(state): State<AppState>) -> Json<VersionBody> {
+    let build = state.build_info();
     Json(VersionBody {
         name: state.server_name().to_owned(),
-        version: state.build.version,
-        target: state.build.target,
-        git_sha: state.build.git_sha,
+        version: build.version,
+        target: build.target,
+        git_sha: build.git_sha,
     })
 }
