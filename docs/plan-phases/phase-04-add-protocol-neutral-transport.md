@@ -111,6 +111,7 @@ Transport rules:
 - The transport does not serialize typed request structs. It sends bytes.
 - Non-stream requests must not set `Accept: text/event-stream`.
 - `ProxyRequest.body` is sent byte-for-byte.
+- `AuthHeaders` and `ProxyRequest` must NOT derive a `Debug` that prints `api_key`. Provide a manual `Debug` impl that redacts the key (render it as `"***"`), so `tracing::debug!(?req)` or snapshot output never leaks the secret.
 
 ### Neutrality guardrails
 
@@ -162,6 +163,14 @@ Framing rules:
 - treat `data: [DONE]` as a normal terminal frame for adapters to interpret
 - return a provider error for invalid UTF-8
 
+### Cancellation and disconnect
+
+When the client disconnects mid-stream, dropping the stream returned by `send_stream` must abort the in-flight upstream request and close its response body. Otherwise the proxy leaks sockets and keeps paying for abandoned upstream calls (`docs/research/quirks/05-routing-lifecycle.md`).
+
+- The stream future owns the `reqwest` response; dropping it drops the connection.
+- `send_stream`'s returned stream is cancel-safe: dropping it cancels upstream. Do not spawn a detached task that outlives the consumer.
+- Client disconnect is a terminal lifecycle event, distinct from an upstream error.
+
 ### Tests
 
 Use a local axum test server or `wiremock` if added. If avoiding a new
@@ -188,6 +197,8 @@ Test:
 - SSE framer rejects invalid UTF-8 with `ProviderError`
 - source guard checks confirm `transport.rs` has no endpoint classification,
   provider model, or protocol imports
+- `auth_headers_debug_redacts_api_key` and `proxy_request_debug_redacts_api_key`
+- dropping the returned stream aborts the upstream request (no detached task keeps it alive)
 
 ### Gate
 

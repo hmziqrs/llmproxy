@@ -73,6 +73,13 @@ transform design.
    It must not choose protocol families, build URLs, mutate sampling options, or
    inspect message content.
 
+   v1 routing scope: the new architecture intentionally drops scenario routing,
+   fallback chains, and circuit breakers. `resolve_model_route` returns exactly
+   one `ProviderTarget` per requested model; there is no fallback list and
+   `/health` reports an empty `circuit_breakers` map. This is a deliberate
+   simplification relative to the legacy direct architecture, which Phase 11
+   deletes.
+
 3. Provider adapters own provider wire details:
 
    - endpoint URL shape
@@ -151,6 +158,14 @@ Add:
 - `client/mod.rs`
 - `client/anthropic.rs`
 - `client/openai_chat.rs`
+
+Client (inbound) protocol scope for v1 is intentionally Anthropic Messages +
+OpenAI Chat Completions only. OpenAI Responses and Gemini GenerateContent ship
+as provider (outbound) adapters in v1, not as inbound client protocols.
+`docs/protocol-mini.md` §3 lists all four as recommended, but inbound
+Responses/Gemini are deferred; adding either later requires only a new
+`client/<name>.rs` plus fixtures, with no provider or core change (per
+`docs/protocol-normalization.md` §8).
 
 Replace later:
 

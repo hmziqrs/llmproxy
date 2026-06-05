@@ -154,8 +154,18 @@ pub enum StopReason {
 pub struct Usage {
     pub input_tokens: i32,
     pub output_tokens: i32,
+    pub reasoning_tokens: Option<i32>,
     pub cache_creation_input_tokens: Option<i32>,
     pub cache_read_input_tokens: Option<i32>,
+    pub provenance: UsageProvenance,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum UsageProvenance {
+    ProviderReported,
+    SyntheticZero,
+    #[default]
+    Unknown,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -169,7 +179,7 @@ pub enum CoreEvent {
     ToolCallStop { index: usize },
     UsageDelta { usage: Usage },
     MessageStop { stop_reason: StopReason, stop_sequence: Option<String> },
-    Error { error: CoreError },
+    Error { error: CoreStreamError },
     Ping,
 }
 
@@ -185,15 +195,23 @@ pub enum ContentKind {
     Video,
     Refusal,
 }
+```
 
+v1 streaming carries only `Text`, `Thinking`, and `ToolUse` incrementally
+(text/thinking/tool-call deltas). `Image`, `Document`, `Audio`, and `Video`
+have no per-delta stream event; if a provider streams them, the adapter buffers
+the block and emits it through the non-stream `CoreResponse` content path, or
+rejects it. Stream encoders therefore never receive deltas for those kinds.
+
+```rust
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CoreError {
-    pub kind: CoreErrorKind,
+pub struct CoreStreamError {
+    pub kind: CoreStreamErrorKind,
     pub message: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum CoreErrorKind {
+pub enum CoreStreamErrorKind {
     InvalidRequest,
     Authentication,
     Permission,
@@ -222,6 +240,18 @@ pub enum CoreErrorKind {
 - `RequestMetadata.raw`, `ProviderHints.raw`, and `provider_meta` are the only
   places for opaque data. No adapter may special-case another protocol inside
   these core types.
+- The stream error type is named `CoreStreamError` (with `CoreStreamErrorKind`),
+  not `CoreError`, to avoid colliding with `llm_proxy_core::CoreError`, which is
+  the config/registry error owned by the core crate. The two are unrelated types
+  in different crates.
+- Usage must carry provenance. Never report fabricated or zero-filled usage as
+  `ProviderReported`; absent or zero-filled provider usage is
+  `SyntheticZero`/`Unknown`. `reasoning_tokens` holds OpenAI/Responses-style
+  reasoning token counts when the provider reports them.
+- Lossy field drops must be observable, never silent. A dropped request field
+  (during provider `encode_request`) must emit a `tracing::warn!`; a dropped
+  response field records a warning in `CoreResponse.provider_meta` (e.g. under a
+  `warnings` key) in addition to `tracing::warn!`. Silent drops are disallowed.
 
 ### Tests
 
@@ -241,6 +271,8 @@ Add unit tests in `core.rs`:
 - `core_response_round_trips_through_json`
 - `core_event_round_trips_through_json`
 - `core_tool_choice_raw_round_trips_when_intentional`
+- `usage_default_provenance_is_unknown`
+- `usage_preserves_reasoning_tokens`
 
 Add an integration smoke test in
 `crates/llm-proxy-protocol/tests/core_exports.rs` that imports:

@@ -126,6 +126,10 @@ In `cmd_serve`:
    compatibility period and build `AppState` in JSON compatibility mode.
 6. Any other extension fails config loading.
 
+### Secret redaction
+
+`AppState` derives `Debug` and transitively holds `ProviderRegistry` → `ProviderConfig` (which carries `api_key`). The redacted `Debug` required for `ProviderConfig` (Phase 3) and for `AuthHeaders`/`ProxyRequest` (Phase 4) is therefore load-bearing here: `tracing::debug!(?state)` must never print an API key. If any of those types gains a plain derived `Debug`, this leaks.
+
 ### Tests
 
 Update integration test state construction in:
@@ -148,6 +152,7 @@ Add tests for:
 - unsupported config extensions fail
 - `routes/mod.rs` and `/health` use helpers instead of direct legacy field
   access
+- `app_state_debug_does_not_leak_api_key`
 
 ### Gate
 

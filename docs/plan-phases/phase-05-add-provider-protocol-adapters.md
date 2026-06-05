@@ -152,6 +152,8 @@ anthropic::MessageResponse -> CoreResponse
 anthropic::MessageEvent stream -> CoreEvent stream
 ```
 
+Anthropic requires tool names to match `^[a-zA-Z0-9_-]{1,128}$` and rejects non-object `input_schema.type`. When encoding `CoreTool`/`CoreContent::ToolUse` to Anthropic, the adapter must: sanitize tool names with collision-safe, REVERSIBLE rewrites (keep a reverse map only for names that were actually rewritten, so `tool_use.name` on the response path maps back correctly); sanitize `tool_use_id` to the provider regex; and coerce a non-object `input_schema.type` to `object` (inserting an empty `properties` map when needed). This sanitization lives in the Anthropic provider adapter only — it must not leak into core or client adapters.
+
 This replaces the current raw pipe behavior in `handle_anthropic_streaming`.
 Even if the provider speaks Anthropic, it still goes through core so all client
 protocols can use it.
@@ -195,6 +197,10 @@ The adapter expands URL templates:
 
 The router must not know Gemini puts the model in the path.
 
+### Provider hints passthrough
+
+Provider adapters MAY merge allowlisted entries from `CoreRequest.provider_hints.raw` into the outgoing provider request body (for example OpenAI `stream_options`, or OpenRouter-style `route`/`models`/`transforms`). Each adapter documents which hint keys it forwards. An adapter must never forward a client-protocol-specific hint into a mismatched provider, and must never let an unknown hint silently change behavior. Hints with no provider mapping are ignored (and may be `tracing::warn!`-logged).
+
 ### Lossy translation
 
 Every unsupported feature must choose one of these outcomes:
@@ -236,6 +242,9 @@ Each provider adapter needs tests for:
 - streaming terminal frame handling
 - malformed stream frame behavior
 - provider-specific unsupported field behavior
+- each provider stream decoder documents which `CoreEvent` variants it emits, and tests `Ping`, `ThinkingDelta`, and `Error`/`response.failed` handling (emit, or intentionally never), mirroring the Phase 2 client "every CoreEvent variant maps or errors intentionally" test
+- empty-chunk classification: usage-only, finish-reason-only, and heartbeat/ping chunks are NOT dropped just because they carry no text — they map to `UsageDelta`, `MessageStop`, and `Ping` respectively (empty is a protocol decision, not a generic truthy check)
+- OpenAI Chat adapter decode tolerates both `reasoning_content` and `reasoning` (including streamed `delta.reasoning`), mapping both to `CoreContent::Thinking` / `ThinkingDelta`, since OpenAI-compatible providers alias the field
 
 Use the existing transformer tests as a source of expected behavior, but assert
 against core values in the middle.
@@ -264,6 +273,7 @@ Each provider protocol must include at least:
 - streaming text events
 - streaming tool events where supported
 - malformed provider response or stream event
+- source guard: `adapter/*.rs` imports none of `llm_proxy_protocol::client`, `llm_proxy_server`, route errors, or server state (proves the `protocol-normalization.md` §9 invariant that adding a provider changes no client code; mirrors the Phase 4 transport source guard).
 
 Each non-stream fixture case should use:
 

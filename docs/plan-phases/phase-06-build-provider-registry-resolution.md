@@ -115,6 +115,10 @@ This lookup allows aliases:
 "claude-sonnet-4-20250514" = { adapter = "anthropic" }
 ```
 
+### Error type
+
+`CoreError` here is `llm_proxy_core::CoreError` — the core crate's config/registry error — NOT the protocol crate's stream error (`llm_proxy_protocol::core::CoreStreamError`). Registry resolution failures (duplicate provider name, missing provider, missing provider-local model, missing adapter, unknown protocol) are represented as `CoreError`: either reuse `CoreError::ConfigValidation { message }` with an actionable message, or add dedicated variants (e.g. `ProviderResolution`). Pick one and keep it consistent; the existing `CoreError` only has config-loading/parse/validation variants today, so new resolution errors must map onto `ConfigValidation` or new variants rather than a generic string.
+
 ### Tests
 
 - provider registry loads multiple files
@@ -129,6 +133,7 @@ This lookup allows aliases:
 - model names do not imply protocols; a Claude-looking model can resolve to an
   OpenAI adapter when TOML says so
 - one provider with multiple adapters resolves only by provider-local model table
+- resolution errors carry actionable messages (which provider/model/adapter/protocol failed)
 
 ### Gate
 

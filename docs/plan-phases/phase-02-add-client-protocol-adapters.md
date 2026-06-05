@@ -125,6 +125,8 @@ client::openai_chat::StreamEncoder::encode_event(CoreEvent) -> Result<Vec<ChatCo
 client::openai_chat::StreamEncoder::finish() -> Result<Vec<ChatCompletionChunk>, ProtocolError>
 ```
 
+The OpenAI `StreamEncoder` is constructed with the per-response context it needs to emit valid chunks: a stable completion `id`, the `model`, a `created` timestamp, and the client's `stream_options.include_usage` flag (decoded into `ProviderHints.raw["stream_options"]`). Sketch: `client::openai_chat::StreamEncoder::new(id: String, model: String, created: i64, include_usage: bool)`. Every `chat.completion.chunk` reuses that `id`/`model`/`created`; the encoder emits the usage chunk only when `include_usage` is set. `encode_event`/`finish` remain as listed. The route builds these args from the first `CoreEvent::MessageStart` and the decoded request.
+
 The stream encoders are stateful because OpenAI chunk envelopes and tool-call
 sequencing need stable IDs/indexes, and Anthropic content blocks need coherent
 start/delta/stop event ordering. Only after both stateful encoders are stable
@@ -203,6 +205,8 @@ Error                           -> error event
 Ping                            -> ping event
 ```
 
+The Anthropic `StreamEncoder` must coalesce the final `UsageDelta` and `MessageStop` into a SINGLE `message_delta` event that carries both `usage` and `delta.stop_reason`/`stop_sequence`, followed by one `message_stop` — matching native Anthropic, which never emits two `message_delta` events at end of turn. The encoder buffers the latest usage and flushes it with the terminal event rather than emitting a separate usage `message_delta`.
+
 ### OpenAI Chat decode rules
 
 Source: current `openai.rs` types.
@@ -264,8 +268,11 @@ content.
 - `Text`, `ToolUse`, `ToolResult`, and `Thinking`: encode/decode where the
   client protocol supports them.
 - `Image`, `Document`, `Audio`, `Video`: preserve on decode when present in the
-  client protocol; on encode either emit the closest supported client block or
-  return `ProtocolError::Encode`.
+  client protocol. On encode, follow `protocol-normalization.md` §7 explicitly:
+  preserve the block when the client wire format natively supports the modality;
+  otherwise return `ProtocolError::Encode` when silently sending would change
+  behavior, or drop the block with a recorded `tracing::warn!` when the omission
+  is safe. Never silently transform content into a different "closest" block.
 - `RedactedThinking`: preserve on Anthropic decode/encode where supported; for
   OpenAI Chat, return `ProtocolError::Encode` or preserve through raw metadata
   only if there is an intentional route behavior.
@@ -303,6 +310,7 @@ Minimum tests:
 - metadata raw/provider hints raw are preserved
 - multiple messages decode to ordered core messages
 - malformed or unsupported client fields return `ProtocolError`
+- source guard: `client/*.rs` imports none of `llm_proxy_provider`, `llm_proxy_server`, core config/routing, endpoint classification, scenario/fallback code, or `transformer::*` (proves the `protocol-normalization.md` §8 invariant that adding a client protocol changes no provider code; mirrors the Phase 4 transport source guard).
 
 ### Fixture requirement
 

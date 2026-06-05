@@ -66,7 +66,7 @@ is_anthropic_model
 is_gemini_model
 is_responses_model
 is_zen
-provider
+provider() helper fn
 ```
 
 Delete old config structs:
@@ -150,7 +150,7 @@ Rewrite tests that assert useful behavior through the new architecture:
 cargo test --workspace
 cargo clippy --all-targets --all-features --locked -- -D warnings
 cargo fmt --all -- --check
-! rg -n "transformer|detect_scenario|route_for_streaming|FallbackHandler|OpenCodeClient|EndpointType|classify_endpoint" crates apps
+! rg -n "transformer|detect_scenario|route_for_streaming|FallbackHandler|OpenCodeClient|EndpointType|classify_endpoint|is_anthropic_model|is_gemini_model|is_responses_model|is_zen" crates apps
 ! rg -n "handle_openai_streaming|handle_responses_streaming|handle_gemini_streaming|spawn_proxy_task" crates/llm-proxy-server/src/routes
 ```
 

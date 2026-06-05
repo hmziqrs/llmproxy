@@ -193,6 +193,8 @@ estimate intentionally ignores them.
 - Provider adapter decode failure: `502 Bad Gateway`.
 - Client adapter decode failure: `400 Bad Request`.
 
+Stream errors depend on visibility. Before the first byte of the SSE body is sent, an upstream or decode error becomes a normal HTTP error via `route_error_response` (e.g. `502`). After visible output has started, the HTTP status is already committed, so the error MUST be emitted as an in-band stream event (an Anthropic `error` event) followed by graceful termination — it cannot become an HTTP status. Track `first_byte_sent`. On client disconnect, drop the provider stream so the upstream request is aborted (see Phase 4 "Cancellation and disconnect").
+
 For `/v1/messages`, errors remain Anthropic-shaped.
 
 ### Metrics behavior
@@ -233,6 +235,9 @@ Add server tests with local/mock provider endpoint:
 - source guard confirms `messages.rs` does not import legacy transformers,
   endpoint classification, scenario/fallback code, or provider-specific stream
   handlers
+- `stream_error_before_first_byte_returns_http_502`
+- `stream_error_after_first_byte_emits_anthropic_error_event_then_terminates`
+- `client_disconnect_aborts_upstream_request`
 
 ### Gate
 
