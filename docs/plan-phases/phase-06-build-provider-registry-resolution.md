@@ -69,6 +69,27 @@ impl ProviderRegistry {
 }
 
 #[derive(Debug, Clone)]
+pub struct ProviderRegistry {
+    providers: std::collections::HashMap<String, ProviderConfig>,
+}
+
+impl ProviderRegistry {
+    pub fn load_from_dir(path: impl AsRef<std::path::Path>) -> Result<Self, CoreError>;
+
+    pub fn validate_protocols(
+        &self,
+        known_protocols: impl IntoIterator<Item = impl AsRef<str>>,
+    ) -> Result<(), CoreError>;
+
+    pub fn resolve_adapter_target(
+        &self,
+        target: &ProviderTarget,
+    ) -> Result<ProviderAdapterTargetConfig, CoreError>;
+}
+
+/// Manual `Debug` impl redacts `api_key` to `[REDACTED]` so that
+/// `format!("{:?}", target)` never leaks credentials in logs or errors.
+#[derive(Clone)]
 pub struct ProviderAdapterTargetConfig {
     pub provider_name: String,
     pub adapter_name: String,
@@ -79,6 +100,8 @@ pub struct ProviderAdapterTargetConfig {
     pub requested_model: String,
     pub upstream_model: String,
 }
+
+impl std::fmt::Debug for ProviderAdapterTargetConfig { /* redacts api_key */ }
 ```
 
 `llm-proxy-provider` can convert `ProviderAdapterTargetConfig` into its own
@@ -138,7 +161,8 @@ This lookup allows aliases:
 ### Gate
 
 ```sh
-cargo test -p llm-proxy-core provider_registry model_route
+cargo test -p llm-proxy-core -- provider_registry
+cargo test -p llm-proxy-core -- model_route
 cargo test --workspace
 ```
 

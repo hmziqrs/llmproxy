@@ -328,7 +328,7 @@ pub fn validate_provider_config(
             var,
         });
     }
-    if provider.api_key.is_empty() {
+    if provider.api_key.trim().is_empty() {
         return Err(ConfigValidationError::EmptyApiKey {
             provider: name.clone(),
         });
@@ -2045,14 +2045,13 @@ server_name = "${_LLM_PROXY_APP_EMPTY_VAR}"
         );
     }
 
-    // -- Whitespace-only api_key passes validation ---------------------------------
+    // -- Whitespace-only api_key fails validation ---------------------------------
     //
-    // Unlike names/identifiers, api_key validation uses .is_empty() (not
-    // .trim().is_empty()) because an api_key of all-spaces could theoretically
-    // be intentional (though unlikely). The plan only requires non-empty.
+    // api_key validation uses .trim().is_empty() consistent with all other field
+    // checks, so whitespace-only api_keys are rejected.
 
     #[test]
-    fn whitespace_only_api_key_passes_validation() {
+    fn whitespace_only_api_key_fails_validation() {
         let cfg = ProviderConfig {
             name: "test".to_owned(),
             api_key: "   ".to_owned(),
@@ -2062,8 +2061,13 @@ server_name = "${_LLM_PROXY_APP_EMPTY_VAR}"
         };
         let result = validate_provider_config(&cfg, None);
         assert!(
-            result.is_ok(),
-            "whitespace-only api_key should pass current validation (is_empty check), got: {result:?}"
+            result.is_err(),
+            "whitespace-only api_key should fail validation, got: {result:?}"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("api_key is empty"),
+            "expected empty api_key error, got: {err}"
         );
     }
 
@@ -2415,6 +2419,38 @@ endpoint = "https://example.com/v1/chat/completions"
         assert!(
             err.contains("unresolvable environment variable"),
             "expected unresolvable env var error, got: {err}"
+        );
+    }
+
+    // -- Unknown AuthStyle variant produces clear error ---------------------------
+
+    #[test]
+    fn unknown_auth_style_variant_produces_clear_error() {
+        let _env = clean_env();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("provider.toml");
+        std::fs::write(
+            &path,
+            r#"
+[provider]
+name = "test"
+api_key = "key"
+auth_style = "digest"
+
+[provider.adapters.chat]
+protocol = "openai_chat_completions"
+endpoint = "https://example.com/v1/chat/completions"
+"#,
+        )
+        .expect("write");
+
+        let result = load_provider_config(&path, None);
+        assert!(result.is_err(), "expected error for unknown auth_style variant");
+        let err = result.unwrap_err().to_string();
+        // Serde enum deserialization reports unknown variants clearly.
+        assert!(
+            err.contains("digest") || err.contains("unknown variant"),
+            "error should mention the unknown variant, got: {err}"
         );
     }
 }

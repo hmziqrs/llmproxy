@@ -200,4 +200,17 @@ mod tests {
             "expected UnknownModel with empty string"
         );
     }
+
+    // -- Whitespace-only model name returns UnknownModel -----------------------
+
+    #[test]
+    fn resolve_model_route_whitespace_only_returns_unknown_model() {
+        let routes = make_routes();
+        let result = resolve_model_route(&routes, "   ");
+        assert!(result.is_err());
+        assert!(
+            matches!(result.unwrap_err(), ModelRouteError::UnknownModel(ref m) if m == "   "),
+            "expected UnknownModel with whitespace-only string"
+        );
+    }
 }

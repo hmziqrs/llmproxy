@@ -461,7 +461,11 @@ where
                                 }
                             }
                         }
-                        Some(Err(_)) | None => break,
+                        Some(Err(e)) => {
+                            warn!("upstream stream error: {e}");
+                            break;
+                        }
+                        None => break,
                     }
                 }
             }
@@ -560,7 +564,11 @@ fn build_sse_response(events: BoxStream<'static, Event>) -> Result<Response<Body
         .keep_alive(KeepAlive::new().interval(HEARTBEAT_INTERVAL));
     let response = sse.into_response();
     let (mut parts, body) = response.into_parts();
-    parts.status = StatusCode::OK;
+    debug_assert!(
+        parts.status == StatusCode::OK,
+        "Sse::into_response() should produce 200 OK, got {}",
+        parts.status
+    );
     // Sse::into_response() already sets Content-Type and Cache-Control.
     // Only add the extra headers not covered by the Sse wrapper.
     parts

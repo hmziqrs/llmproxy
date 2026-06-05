@@ -22,8 +22,7 @@
 //! - mutate sampling, tools, metadata, reasoning, cache, or stream intent
 //! - infer protocol families from model names
 
-use std::collections::HashMap;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use crate::error::CoreError;
@@ -44,7 +43,7 @@ use crate::provider_config::{AuthStyle, ProviderConfig, load_provider_config};
 /// `endpoint` is the raw endpoint or URL template from provider TOML. It is
 /// **not** a route-built final URL. Provider adapters own endpoint URL shape,
 /// including Gemini `{model}` expansion.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct ProviderAdapterTargetConfig {
     /// Provider name (identifies the provider config).
     pub provider_name: String,
@@ -62,6 +61,21 @@ pub struct ProviderAdapterTargetConfig {
     pub requested_model: String,
     /// The model name to send to the upstream provider.
     pub upstream_model: String,
+}
+
+impl std::fmt::Debug for ProviderAdapterTargetConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProviderAdapterTargetConfig")
+            .field("provider_name", &self.provider_name)
+            .field("adapter_name", &self.adapter_name)
+            .field("protocol", &self.protocol)
+            .field("endpoint", &self.endpoint)
+            .field("auth_style", &self.auth_style)
+            .field("api_key", &"[REDACTED]")
+            .field("requested_model", &self.requested_model)
+            .field("upstream_model", &self.upstream_model)
+            .finish()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -94,8 +108,8 @@ impl ProviderRegistry {
     /// - any TOML file cannot be parsed or fails validation,
     /// - two files declare the same provider name (duplicate).
     ///
-    /// `known_protocols` is forwarded to [`load_provider_config`] for
-    /// protocol-name validation. Pass `None` to skip protocol checking.
+    /// Protocol validation is performed separately via [`validate_protocols`]
+    /// after loading, typically by passing `ProviderAdapterRegistry::protocol_names()`.
     ///
     /// # Errors
     ///
@@ -105,7 +119,6 @@ impl ProviderRegistry {
     /// in individual files.
     pub fn load_from_dir(
         path: impl AsRef<Path>,
-        known_protocols: Option<&[&str]>,
     ) -> Result<Self, CoreError> {
         let path = path.as_ref();
         let entries = std::fs::read_dir(path).map_err(|source| CoreError::ConfigLoad {
@@ -115,24 +128,45 @@ impl ProviderRegistry {
 
         let mut providers: HashMap<String, ProviderConfig> = HashMap::new();
 
-        for entry in entries {
-            let entry = entry.map_err(|source| CoreError::ConfigLoad {
+        // Collect and sort entries by filename for deterministic ordering across
+        // platforms (filesystem order is not guaranteed).
+        let mut sorted_entries: Vec<_> = entries
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|source| CoreError::ConfigLoad {
                 path: path.to_path_buf(),
                 source,
             })?;
+        sorted_entries.sort_by_key(|e| e.file_name());
+
+        for entry in sorted_entries {
             let file_path = entry.path();
 
+            // Skip non-regular files (directories, symlinks, pipes, etc.).
+            if let Ok(ft) = entry.file_type() {
+                if !ft.is_file() {
+                    tracing::debug!(
+                        path = %file_path.display(),
+                        "skipping non-regular file in provider directory"
+                    );
+                    continue;
+                }
+            }
+
             if file_path.extension().and_then(|e| e.to_str()) != Some("toml") {
+                tracing::debug!(
+                    path = %file_path.display(),
+                    "skipping non-toml file in provider directory"
+                );
                 continue;
             }
 
-            let provider = load_provider_config(&file_path, known_protocols)?;
+            let provider = load_provider_config(&file_path, None)?;
 
-            if let Some(existing) = providers.get(&provider.name) {
+            if let Some(_existing) = providers.get(&provider.name) {
                 return Err(CoreError::ProviderResolution {
                     message: format!(
-                        "duplicate provider name \"{}\": defined in multiple files (conflicting names are not allowed)",
-                        existing.name
+                        "duplicate provider name \"{}\": provider names must be unique across all config files",
+                        provider.name
                     ),
                 });
             }
@@ -178,6 +212,10 @@ impl ProviderRegistry {
     /// adapter registry (e.g. `ProviderAdapterRegistry::protocol_names()`),
     /// not an ad hoc string list.
     ///
+    /// Accepts any iterable of items that implement `AsRef<str>`, so both
+    /// `Vec<String>` and `Vec<&'static str>` (from `protocol_names()`) can be
+    /// passed directly without manual conversion.
+    ///
     /// # Errors
     ///
     /// Returns [`CoreError::ProviderResolution`] for the first unknown protocol
@@ -185,9 +223,12 @@ impl ProviderRegistry {
     /// protocol.
     pub fn validate_protocols(
         &self,
-        known_protocols: impl IntoIterator<Item = String>,
+        known_protocols: impl IntoIterator<Item = impl AsRef<str>>,
     ) -> Result<(), CoreError> {
-        let known: HashSet<String> = known_protocols.into_iter().collect();
+        let known: HashSet<String> = known_protocols
+            .into_iter()
+            .map(|s| s.as_ref().to_owned())
+            .collect();
 
         for provider in self.providers.values() {
             for (adapter_name, adapter_cfg) in &provider.adapters {
@@ -250,23 +291,29 @@ impl ProviderRegistry {
 
         // 3. Look up the adapter to get protocol and endpoint.
         let adapter_cfg = provider.adapters.get(&model_cfg.adapter).ok_or_else(|| {
+            let model_key = &target.upstream_model;
+            let available = if provider.adapters.is_empty() {
+                "(none)".to_owned()
+            } else {
+                let keys: Vec<&str> = provider.adapters.keys().map(|s| s.as_str()).collect();
+                if keys.len() <= 5 {
+                    keys.join(", ")
+                } else {
+                    format!(
+                        "{} (+{} more)",
+                        keys[..5].join(", "),
+                        keys.len() - 5
+                    )
+                }
+            };
             CoreError::ProviderResolution {
                 message: format!(
                     "provider \"{}\": model \"{}\" references adapter \"{}\" which does not exist \
                      in [provider.adapters]. Available adapters: {}",
                     provider.name,
-                    target.upstream_model,
+                    model_key,
                     model_cfg.adapter,
-                    if provider.adapters.is_empty() {
-                        "(none)".to_owned()
-                    } else {
-                        provider
-                            .adapters
-                            .keys()
-                            .cloned()
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    }
+                    available
                 ),
             }
         })?;
@@ -284,16 +331,19 @@ impl ProviderRegistry {
     }
 
     /// Returns the number of registered providers.
+    #[must_use]
     pub fn len(&self) -> usize {
         self.providers.len()
     }
 
     /// Returns `true` if no providers are registered.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.providers.is_empty()
     }
 
     /// Returns a reference to the provider config for the given name, if present.
+    #[must_use]
     pub fn get(&self, name: &str) -> Option<&ProviderConfig> {
         self.providers.get(name)
     }
@@ -422,7 +472,7 @@ endpoint = "https://b.example.com/v1/messages"
         )
         .expect("write");
 
-        let registry = ProviderRegistry::load_from_dir(dir.path(), None).expect("load_from_dir");
+        let registry = ProviderRegistry::load_from_dir(dir.path()).expect("load_from_dir");
         assert_eq!(registry.len(), 2);
         assert!(registry.get("provider-a").is_some());
         assert!(registry.get("provider-b").is_some());
@@ -460,7 +510,7 @@ endpoint = "https://example.com/v1/chat/completions"
             .expect("write");
         }
 
-        let result = ProviderRegistry::load_from_dir(dir.path(), None);
+        let result = ProviderRegistry::load_from_dir(dir.path());
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
@@ -913,7 +963,7 @@ endpoint = "https://example.com/v1/chat/completions"
     #[test]
     fn load_from_dir_nonexistent_directory_fails() {
         let _env = clean_env();
-        let result = ProviderRegistry::load_from_dir("/tmp/__llm_proxy_no_such_dir__", None);
+        let result = ProviderRegistry::load_from_dir("/tmp/__llm_proxy_no_such_dir__");
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
@@ -928,7 +978,7 @@ endpoint = "https://example.com/v1/chat/completions"
     fn load_from_dir_empty_directory_produces_empty_registry() {
         let _env = clean_env();
         let dir = tempfile::tempdir().expect("tempdir");
-        let registry = ProviderRegistry::load_from_dir(dir.path(), None).expect("load");
+        let registry = ProviderRegistry::load_from_dir(dir.path()).expect("load");
         assert!(registry.is_empty());
         assert_eq!(registry.len(), 0);
     }
@@ -965,7 +1015,7 @@ endpoint = "https://example.com/v1/chat/completions"
         )
         .expect("write");
 
-        let registry = ProviderRegistry::load_from_dir(dir.path(), None).expect("load");
+        let registry = ProviderRegistry::load_from_dir(dir.path()).expect("load");
         assert_eq!(registry.len(), 1);
         assert!(registry.get("test").is_some());
     }
@@ -994,10 +1044,11 @@ endpoint = "https://example.com/v1/chat/completions"
         )])
         .expect("registry");
 
-        let known = vec![
-            "openai_chat_completions".to_owned(),
-            "anthropic_messages".to_owned(),
-            "gemini_generate_content".to_owned(),
+        // Use &str slices to verify AsRef<str> acceptance (matches protocol_names() return type).
+        let known: Vec<&str> = vec![
+            "openai_chat_completions",
+            "anthropic_messages",
+            "gemini_generate_content",
         ];
         let result = registry.validate_protocols(known);
         assert!(result.is_ok(), "expected validation to pass, got: {result:?}");
@@ -1016,7 +1067,7 @@ endpoint = "https://example.com/v1/chat/completions"
         )])
         .expect("registry");
 
-        let known = vec!["openai_chat_completions".to_owned()];
+        let known: Vec<&str> = vec!["openai_chat_completions"];
         let result = registry.validate_protocols(known);
         assert!(result.is_ok(), "expected validation to pass, got: {result:?}");
     }
@@ -1034,7 +1085,7 @@ endpoint = "https://example.com/v1/chat/completions"
         )])
         .expect("registry");
 
-        let result = registry.validate_protocols(Vec::<String>::new());
+        let result = registry.validate_protocols(Vec::<&str>::new());
         assert!(
             result.is_ok(),
             "empty known set with no adapters should pass, got: {result:?}"
@@ -1061,12 +1112,46 @@ endpoint = "https://example.com/v1/chat/completions"
         )])
         .expect("registry");
 
-        let result = registry.validate_protocols(Vec::<String>::new());
+        let result = registry.validate_protocols(Vec::<&str>::new());
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
             err.contains("unknown protocol"),
             "expected unknown protocol error, got: {err}"
+        );
+    }
+
+    // -- validate_protocols partial mismatch fails (one valid, one unknown) ---
+
+    #[test]
+    fn validate_protocols_partial_mismatch_fails() {
+        let _env = clean_env();
+
+        let registry = ProviderRegistry::from_providers(vec![make_provider(
+            "test",
+            {
+                let mut m = HashMap::new();
+                m.insert(
+                    "chat".to_owned(),
+                    make_adapter("openai_chat_completions", "https://example.com"),
+                );
+                m.insert(
+                    "weird".to_owned(),
+                    make_adapter("totally_fake_protocol", "https://example.com"),
+                );
+                m
+            },
+            HashMap::new(),
+        )])
+        .expect("registry");
+
+        let known: Vec<&str> = vec!["openai_chat_completions"];
+        let result = registry.validate_protocols(known);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("totally_fake_protocol") && err.contains("unknown protocol"),
+            "expected unknown protocol error for the mismatched adapter, got: {err}"
         );
     }
 
@@ -1102,6 +1187,31 @@ endpoint = "https://example.com/v1/chat/completions"
         assert_eq!(resolved.api_key, "sk-secret-key");
     }
 
+    // -- ProviderAdapterTargetConfig Debug redacts api_key ---------------------
+
+    #[test]
+    fn provider_adapter_target_config_debug_redacts_api_key() {
+        let config = ProviderAdapterTargetConfig {
+            provider_name: "test".to_owned(),
+            adapter_name: "chat".to_owned(),
+            protocol: "openai_chat_completions".to_owned(),
+            endpoint: "https://example.com".to_owned(),
+            auth_style: AuthStyle::Bearer,
+            api_key: "sk-super-secret-key-do-not-leak".to_owned(),
+            requested_model: "gpt-4o".to_owned(),
+            upstream_model: "gpt-4o".to_owned(),
+        };
+        let debug = format!("{:?}", config);
+        assert!(
+            !debug.contains("sk-super-secret-key-do-not-leak"),
+            "Debug output must not contain the actual api_key, got: {debug}"
+        );
+        assert!(
+            debug.contains("[REDACTED]"),
+            "Debug output must show [REDACTED] for api_key, got: {debug}"
+        );
+    }
+
     // -- from_providers with empty list produces empty registry ----------------
 
     #[test]
@@ -1125,5 +1235,237 @@ endpoint = "https://example.com/v1/chat/completions"
             err.contains("duplicate provider name") && err.contains("dup"),
             "expected duplicate error, got: {err}"
         );
+    }
+
+    // -- resolve_adapter_target with empty provider name yields unknown provider error --
+
+    #[test]
+    fn resolve_adapter_target_empty_provider_name_yields_unknown_provider_error() {
+        let _env = clean_env();
+
+        let registry = ProviderRegistry::from_providers(vec![make_provider(
+            "real-provider",
+            {
+                let mut m = HashMap::new();
+                m.insert(
+                    "chat".to_owned(),
+                    make_adapter("openai_chat_completions", "https://example.com"),
+                );
+                m
+            },
+            {
+                let mut m = HashMap::new();
+                m.insert("model-a".to_owned(), make_model("chat"));
+                m
+            },
+        )])
+        .expect("registry");
+
+        let target = make_target("", "model-a", "model-a");
+        let result = registry.resolve_adapter_target(&target);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("unknown provider") && err.contains("no provider config"),
+            "expected unknown provider error for empty string, got: {err}"
+        );
+    }
+
+    // -- resolve_adapter_target with empty upstream_model yields missing model error --
+
+    #[test]
+    fn resolve_adapter_target_empty_upstream_model_yields_missing_model_error() {
+        let _env = clean_env();
+
+        let registry = ProviderRegistry::from_providers(vec![make_provider(
+            "test",
+            {
+                let mut m = HashMap::new();
+                m.insert(
+                    "chat".to_owned(),
+                    make_adapter("openai_chat_completions", "https://example.com"),
+                );
+                m
+            },
+            {
+                let mut m = HashMap::new();
+                m.insert("real-model".to_owned(), make_model("chat"));
+                m
+            },
+        )])
+        .expect("registry");
+
+        let target = make_target("test", "whatever", "");
+        let result = registry.resolve_adapter_target(&target);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("no model mapping"),
+            "expected missing model error for empty upstream_model, got: {err}"
+        );
+    }
+
+    // -- load_from_dir with malformed TOML file fails --------------------------
+
+    #[test]
+    fn load_from_dir_malformed_toml_file_fails() {
+        let _env = clean_env();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bad_path = dir.path().join("bad.toml");
+        std::fs::write(&bad_path, "this is not valid toml {{{}}").expect("write");
+
+        let result = ProviderRegistry::load_from_dir(dir.path());
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("failed to parse config"),
+            "expected parse error for malformed TOML, got: {err}"
+        );
+    }
+
+    // -- load_from_dir with empty TOML file fails ------------------------------
+
+    #[test]
+    fn load_from_dir_empty_toml_file_fails() {
+        let _env = clean_env();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let empty_path = dir.path().join("empty.toml");
+        std::fs::write(&empty_path, "").expect("write");
+
+        let result = ProviderRegistry::load_from_dir(dir.path());
+        assert!(result.is_err(), "empty TOML file should fail validation");
+    }
+
+    // -- load_from_dir with invalid config (empty provider name) fails ---------
+
+    #[test]
+    fn load_from_dir_invalid_config_fails_validation() {
+        let _env = clean_env();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("invalid.toml");
+        std::fs::write(
+            &path,
+            r#"
+[provider]
+name = ""
+api_key = "key"
+auth_style = "bearer"
+
+[provider.adapters]
+
+[provider.models]
+"#,
+        )
+        .expect("write");
+
+        let result = ProviderRegistry::load_from_dir(dir.path());
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("provider name is empty"),
+            "expected empty provider name error, got: {err}"
+        );
+    }
+
+    // -- resolve_adapter_target with provider that has no models fails ---------
+
+    #[test]
+    fn resolve_adapter_target_provider_with_no_models_fails() {
+        let _env = clean_env();
+
+        let registry = ProviderRegistry::from_providers(vec![make_provider(
+            "empty-models",
+            {
+                let mut m = HashMap::new();
+                m.insert(
+                    "chat".to_owned(),
+                    make_adapter("openai_chat_completions", "https://example.com"),
+                );
+                m
+            },
+            HashMap::new(), // no models
+        )])
+        .expect("registry");
+
+        let target = make_target("empty-models", "any-model", "any-model");
+        let result = registry.resolve_adapter_target(&target);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("no model mapping") && err.contains("any-model"),
+            "expected no model mapping error, got: {err}"
+        );
+    }
+
+    // -- load_from_dir sorts entries deterministically -------------------------
+
+    #[test]
+    fn load_from_dir_deterministic_ordering() {
+        let _env = clean_env();
+        let _g = EnvVarGuard::set("LLM_PROXY_TEST_PROVIDER_KEY", "sk-key");
+
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        // Write two providers in reverse alphabetical filename order.
+        // The registry should still load both successfully (sorted order is stable).
+        let path_b = dir.path().join("z-provider.toml");
+        let mut f = std::fs::File::create(&path_b).expect("create");
+        write!(
+            f,
+            r#"
+[provider]
+name = "provider-z"
+api_key = "${{LLM_PROXY_TEST_PROVIDER_KEY}}"
+auth_style = "bearer"
+
+[provider.adapters.chat]
+protocol = "openai_chat_completions"
+endpoint = "https://z.example.com/v1/chat/completions"
+
+[provider.models]
+"model-z" = {{ adapter = "chat" }}
+"#
+        )
+        .expect("write");
+
+        let path_a = dir.path().join("a-provider.toml");
+        let mut f = std::fs::File::create(&path_a).expect("create");
+        write!(
+            f,
+            r#"
+[provider]
+name = "provider-a"
+api_key = "${{LLM_PROXY_TEST_PROVIDER_KEY}}"
+auth_style = "bearer"
+
+[provider.adapters.chat]
+protocol = "openai_chat_completions"
+endpoint = "https://a.example.com/v1/chat/completions"
+
+[provider.models]
+"model-a" = {{ adapter = "chat" }}
+"#
+        )
+        .expect("write");
+
+        let registry = ProviderRegistry::load_from_dir(dir.path()).expect("load_from_dir");
+        assert_eq!(registry.len(), 2);
+        assert!(registry.get("provider-a").is_some());
+        assert!(registry.get("provider-z").is_some());
+    }
+
+    // -- load_from_dir skips directories with .toml extension ------------------
+
+    #[test]
+    fn load_from_dir_skips_toml_named_directories() {
+        let _env = clean_env();
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        // Create a directory with .toml extension -- should be skipped.
+        let toml_dir = dir.path().join("subdir.toml");
+        std::fs::create_dir(&toml_dir).expect("create dir");
+
+        let registry = ProviderRegistry::load_from_dir(dir.path()).expect("load");
+        assert!(registry.is_empty(), "directory named .toml should be skipped");
     }
 }

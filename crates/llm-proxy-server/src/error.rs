@@ -1,6 +1,6 @@
 use axum::{
     Json,
-    http::StatusCode,
+    http::{StatusCode, header},
     response::{IntoResponse, Response},
 };
 use serde::Serialize;
@@ -58,6 +58,12 @@ impl IntoResponse for ApiErrorWithRequestId {
     fn into_response(self) -> Response {
         let (status, body) = self.error.to_anthropic_response();
         let mut response = (status, body).into_response();
+        // Explicitly ensure Content-Type is set, even if the inner representation
+        // changes in future refactoring.
+        response.headers_mut().insert(
+            header::CONTENT_TYPE,
+            "application/json".parse().unwrap_or_else(|_| "application/json".parse().unwrap()),
+        );
         response.headers_mut().insert(
             "x-request-id",
             self.request_id.parse().unwrap_or_else(|_| "unknown".parse().unwrap()),
@@ -168,7 +174,13 @@ impl ApiError {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let (status, body) = self.to_anthropic_response();
-        (status, body).into_response()
+        let mut response = (status, body).into_response();
+        // Explicitly ensure Content-Type is set for resilience against future refactoring.
+        response.headers_mut().insert(
+            header::CONTENT_TYPE,
+            "application/json".parse().unwrap_or_else(|_| "application/json".parse().unwrap()),
+        );
+        response
     }
 }
 

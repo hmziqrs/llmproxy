@@ -52,24 +52,30 @@ pub enum ProviderProtocol {
 
 impl ProviderProtocol {
     /// Returns the canonical string name for this protocol.
+    ///
+    /// Names use snake_case to match the provider TOML convention
+    /// (e.g. `openai_chat_completions`, `anthropic_messages`).
     #[must_use]
     pub fn name(self) -> &'static str {
         match self {
-            Self::OpenAiChatCompletions => "openai-chat",
-            Self::AnthropicMessages => "anthropic",
-            Self::OpenAiResponses => "openai-responses",
-            Self::GeminiGenerateContent => "gemini",
+            Self::OpenAiChatCompletions => "openai_chat_completions",
+            Self::AnthropicMessages => "anthropic_messages",
+            Self::OpenAiResponses => "openai_responses",
+            Self::GeminiGenerateContent => "gemini_generate_content",
         }
     }
 
     /// Parse a protocol name string (case-insensitive).
+    ///
+    /// Accepts both the canonical snake_case names and the legacy kebab-case
+    /// names for backward compatibility.
     #[must_use]
     pub fn parse(name: &str) -> Option<Self> {
         match name.to_ascii_lowercase().as_str() {
-            "openai-chat" => Some(Self::OpenAiChatCompletions),
-            "anthropic" => Some(Self::AnthropicMessages),
-            "openai-responses" => Some(Self::OpenAiResponses),
-            "gemini" => Some(Self::GeminiGenerateContent),
+            "openai_chat_completions" | "openai-chat" => Some(Self::OpenAiChatCompletions),
+            "anthropic_messages" | "anthropic" => Some(Self::AnthropicMessages),
+            "openai_responses" | "openai-responses" => Some(Self::OpenAiResponses),
+            "gemini_generate_content" | "gemini" => Some(Self::GeminiGenerateContent),
             _ => None,
         }
     }
@@ -421,15 +427,36 @@ mod tests {
     #[test]
     fn protocol_parse_case_insensitive() {
         assert_eq!(
-            ProviderProtocol::parse("OpenAI-Chat"),
+            ProviderProtocol::parse("OpenAI_Chat_Completions"),
             Some(ProviderProtocol::OpenAiChatCompletions)
         );
         assert_eq!(
-            ProviderProtocol::parse("ANTHROPIC"),
+            ProviderProtocol::parse("ANTHROPIC_MESSAGES"),
             Some(ProviderProtocol::AnthropicMessages)
         );
         assert_eq!(
-            ProviderProtocol::parse("Gemini"),
+            ProviderProtocol::parse("Gemini_Generate_Content"),
+            Some(ProviderProtocol::GeminiGenerateContent)
+        );
+    }
+
+    #[test]
+    fn protocol_parse_legacy_kebab_case() {
+        // Legacy kebab-case names are still accepted for backward compatibility.
+        assert_eq!(
+            ProviderProtocol::parse("openai-chat"),
+            Some(ProviderProtocol::OpenAiChatCompletions)
+        );
+        assert_eq!(
+            ProviderProtocol::parse("anthropic"),
+            Some(ProviderProtocol::AnthropicMessages)
+        );
+        assert_eq!(
+            ProviderProtocol::parse("openai-responses"),
+            Some(ProviderProtocol::OpenAiResponses)
+        );
+        assert_eq!(
+            ProviderProtocol::parse("gemini"),
             Some(ProviderProtocol::GeminiGenerateContent)
         );
     }
@@ -457,20 +484,23 @@ mod tests {
         let reg = ProviderAdapterRegistry::builtin();
         let names = reg.protocol_names();
         assert_eq!(names.len(), 4);
-        assert!(names.contains(&"openai-chat"));
-        assert!(names.contains(&"anthropic"));
-        assert!(names.contains(&"openai-responses"));
-        assert!(names.contains(&"gemini"));
+        assert!(names.contains(&"openai_chat_completions"));
+        assert!(names.contains(&"anthropic_messages"));
+        assert!(names.contains(&"openai_responses"));
+        assert!(names.contains(&"gemini_generate_content"));
     }
 
     #[test]
     fn registry_has_protocol_name() {
         let reg = ProviderAdapterRegistry::builtin();
+        assert!(reg.has_protocol_name("openai_chat_completions"));
+        assert!(reg.has_protocol_name("anthropic_messages"));
+        assert!(reg.has_protocol_name("openai_responses"));
+        assert!(reg.has_protocol_name("gemini_generate_content"));
+        assert!(!reg.has_protocol_name("unknown"));
+        // Legacy kebab-case names are also accepted.
         assert!(reg.has_protocol_name("openai-chat"));
         assert!(reg.has_protocol_name("anthropic"));
-        assert!(reg.has_protocol_name("openai-responses"));
-        assert!(reg.has_protocol_name("gemini"));
-        assert!(!reg.has_protocol_name("unknown"));
     }
 
     // -- Adapter protocol method ---------------------------------------------
