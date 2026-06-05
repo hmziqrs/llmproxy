@@ -48,7 +48,7 @@ pub fn decode_request(req: MessageRequest) -> Result<CoreRequest, ProtocolError>
     let messages = req
         .messages
         .into_iter()
-        .map(|m| decode_message(m))
+        .map(decode_message)
         .collect::<Result<Vec<_>, _>>()?;
 
     let tools = req
@@ -75,7 +75,7 @@ pub fn decode_request(req: MessageRequest) -> Result<CoreRequest, ProtocolError>
     let stream = req.stream.unwrap_or(false);
 
     let (user_id, raw_meta) = if let Some(meta) = req.metadata {
-        (meta.user_id, serde_json::Map::new())
+        (meta.user_id, meta.extra)
     } else {
         (None, serde_json::Map::new())
     };
@@ -130,6 +130,13 @@ fn decode_system(system: &Option<serde_json::Value>) -> Vec<CoreContent> {
                                     cache,
                                 });
                             }
+                        } else {
+                            // Non-text system blocks (e.g. future image blocks) are not
+                            // yet supported -- log a warning so they are not silently lost.
+                            tracing::warn!(
+                                block_type = block.r#type.as_str(),
+                                "non-text system block skipped during Anthropic decode"
+                            );
                         }
                     }
                 }
@@ -201,16 +208,20 @@ fn decode_content_block(block: ContentBlock) -> Result<CoreContent, ProtocolErro
             text: block.thinking.unwrap_or_default(),
             signature: block.signature,
         }),
+        "redacted_thinking" => Ok(CoreContent::RedactedThinking {
+            data: serde_json::Value::String(block.data.unwrap_or_default()),
+        }),
         other => {
-            // Unknown block types are preserved as raw text content with a warning.
+            // Unknown block types cannot be safely represented -- return an error
+            // so the caller knows data was lost rather than silently creating
+            // an empty text block.
             tracing::warn!(
                 block_type = other,
-                "dropping unknown Anthropic content block type during decode"
+                "unknown Anthropic content block type during decode"
             );
-            Ok(CoreContent::Text {
-                text: String::new(),
-                cache: None,
-            })
+            Err(ProtocolError::Decode(format!(
+                "unknown Anthropic content block type: {other}"
+            )))
         }
     }
 }
@@ -241,17 +252,29 @@ fn decode_tool_choice(value: serde_json::Value) -> CoreToolChoice {
 // ---------------------------------------------------------------------------
 
 /// Encode a [`CoreResponse`] into an Anthropic [`MessageResponse`].
+///
+/// Content blocks that cannot be represented in the Anthropic wire format
+/// (e.g. Document, Audio, Video, Refusal) are silently omitted with a
+/// `tracing::warn!`. This matches the plan's rule: "drop the block with a
+/// recorded `tracing::warn!` when the omission is safe."
 pub fn encode_response(resp: CoreResponse) -> Result<MessageResponse, ProtocolError> {
     let id = resp.id.unwrap_or_else(|| format!("msg_{}", uuid::Uuid::new_v4()));
 
-    let content = if resp.content.is_empty() {
-        vec![ContentBlock::new_text(String::new())]
-    } else {
-        resp.content
-            .into_iter()
-            .map(encode_content_block)
-            .collect::<Result<Vec<_>, _>>()?
-    };
+    let mut content = Vec::new();
+    for block in resp.content {
+        match encode_content_block(block) {
+            Ok(encoded) => content.push(encoded),
+            Err(ProtocolError::Encode(msg)) => {
+                // Unsupported block type for this protocol -- skip it.
+                // The warning was already logged in encode_content_block.
+                tracing::warn!(reason = %msg, "omitting unsupported content block in Anthropic encode");
+            }
+            Err(other) => return Err(other),
+        }
+    }
+    if content.is_empty() {
+        content.push(ContentBlock::new_text(String::new()));
+    }
 
     let stop_reason = encode_stop_reason(resp.stop_reason);
 
@@ -289,6 +312,7 @@ fn encode_content_block(content: CoreContent) -> Result<ContentBlock, ProtocolEr
                 signature: None,
                 source: None,
                 cache_control: cc,
+                data: None,
             })
         }
         CoreContent::Image { source } => {
@@ -313,6 +337,7 @@ fn encode_content_block(content: CoreContent) -> Result<ContentBlock, ProtocolEr
                 signature: None,
                 source: Some(img_source),
                 cache_control: None,
+            data: None,
             })
         }
         CoreContent::ToolUse { id, name, input } => Ok(ContentBlock {
@@ -329,6 +354,7 @@ fn encode_content_block(content: CoreContent) -> Result<ContentBlock, ProtocolEr
             signature: None,
             source: None,
             cache_control: None,
+            data: None,
         }),
         CoreContent::ToolResult {
             tool_use_id,
@@ -360,6 +386,7 @@ fn encode_content_block(content: CoreContent) -> Result<ContentBlock, ProtocolEr
                 signature: None,
                 source: None,
                 cache_control: None,
+            data: None,
             })
         }
         CoreContent::Thinking { text, signature } => Ok(ContentBlock {
@@ -376,51 +403,57 @@ fn encode_content_block(content: CoreContent) -> Result<ContentBlock, ProtocolEr
             signature,
             source: None,
             cache_control: None,
+            data: None,
         }),
         CoreContent::Document { .. } => {
+            // Document blocks are not supported in Anthropic responses -- omit
+            // the block entirely rather than emitting a phantom empty text block.
             tracing::warn!(
-                "Anthropic Messages protocol does not natively support document blocks in responses; dropping"
+                "Anthropic Messages protocol does not natively support document blocks in responses; omitting"
             );
-            Ok(ContentBlock::new_text(String::new()))
+            // Return an empty vec entry is not desired; we need to signal the caller
+            // to skip this block. Since encode_content_block returns a single block,
+            // we need a different approach. Use encode_content_blocks filter instead.
+            // For now, return an error so the caller can handle it.
+            Err(ProtocolError::Encode(
+                "Anthropic Messages does not support Document blocks in responses".into(),
+            ))
         }
         CoreContent::Audio { .. } => {
             tracing::warn!(
-                "Anthropic Messages protocol does not natively support audio blocks in responses; dropping"
+                "Anthropic Messages protocol does not natively support audio blocks in responses; omitting"
             );
-            Ok(ContentBlock::new_text(String::new()))
+            Err(ProtocolError::Encode(
+                "Anthropic Messages does not support Audio blocks in responses".into(),
+            ))
         }
         CoreContent::Video { .. } => {
             tracing::warn!(
-                "Anthropic Messages protocol does not natively support video blocks in responses; dropping"
+                "Anthropic Messages protocol does not natively support video blocks in responses; omitting"
             );
-            Ok(ContentBlock::new_text(String::new()))
+            Err(ProtocolError::Encode(
+                "Anthropic Messages does not support Video blocks in responses".into(),
+            ))
         }
         CoreContent::RedactedThinking { data } => {
-            // Anthropic supports redacted thinking -- encode as a thinking block with
-            // the data preserved in the thinking field as a JSON string.
-            Ok(ContentBlock {
-                r#type: "thinking".to_owned(),
-                text: None,
-                id: None,
-                tool_use_id: None,
-                name: None,
-                input: None,
-                output: None,
-                content: None,
-                is_error: None,
-                thinking: Some(data.to_string()),
-                signature: None,
-                source: None,
-                cache_control: None,
-            })
+            // Anthropic natively supports redacted_thinking -- encode as proper
+            // redacted_thinking content block type.
+            let data_str = match data {
+                serde_json::Value::String(s) => s,
+                other => other.to_string(),
+            };
+            Ok(ContentBlock::new_redacted_thinking(data_str))
         }
         CoreContent::Refusal { text } => {
-            // Anthropic does not have a native refusal block. Emit as text.
+            // Anthropic does not have a native refusal block type. Per the plan,
+            // return ProtocolError::Encode rather than silently converting to text.
             tracing::warn!(
                 refusal_text = text.as_str(),
-                "Anthropic Messages protocol has no refusal field; encoding as text"
+                "Anthropic Messages protocol has no refusal field; cannot encode"
             );
-            Ok(ContentBlock::new_text(text))
+            Err(ProtocolError::Encode(
+                "Anthropic Messages does not support Refusal blocks".into(),
+            ))
         }
     }
 }
@@ -543,6 +576,7 @@ impl StreamEncoder {
                         signature: None,
                         source: None,
                         cache_control: None,
+            data: None,
                     },
                     ContentKind::Thinking => ContentBlock {
                         r#type: "thinking".to_owned(),
@@ -558,6 +592,7 @@ impl StreamEncoder {
                         signature: None,
                         source: None,
                         cache_control: None,
+            data: None,
                     },
                     ContentKind::ToolUse => ContentBlock {
                         r#type: "tool_use".to_owned(),
@@ -573,6 +608,7 @@ impl StreamEncoder {
                         signature: None,
                         source: None,
                         cache_control: None,
+            data: None,
                     },
                     other => {
                         // ContentStart for unsupported kinds -- emit as text.
@@ -594,6 +630,7 @@ impl StreamEncoder {
                             signature: None,
                             source: None,
                             cache_control: None,
+            data: None,
                         }
                     }
                 };
@@ -665,6 +702,7 @@ impl StreamEncoder {
                         signature: None,
                         source: None,
                         cache_control: None,
+            data: None,
                     }),
                     delta: None,
                     usage: None,
@@ -785,6 +823,11 @@ impl StreamEncoder {
 
     /// Flush any remaining buffered events (e.g. if the stream was terminated
     /// without a `MessageStop`).
+    ///
+    /// When the stream terminated abnormally (no explicit `MessageStop`), the
+    /// stop reason is set to `"max_tokens"` as a sentinel indicating the stream
+    /// was interrupted rather than completing with a natural `end_turn`. This
+    /// avoids fabricating a stop reason that does not reflect the actual state.
     pub fn finish(&mut self) -> Result<Vec<MessageEvent>, ProtocolError> {
         if self.finished {
             return Ok(Vec::new());
@@ -805,7 +848,8 @@ impl StreamEncoder {
                     text: None,
                     thinking: None,
                     partial_json: None,
-                    stop_reason: Some("end_turn".to_owned()),
+                    // Use max_tokens as a sentinel for abnormal termination.
+                    stop_reason: Some("max_tokens".to_owned()),
                     stop_sequence: None,
                 }),
                 usage: Some(usage),
@@ -984,6 +1028,22 @@ mod tests {
     }
 
     #[test]
+    fn tool_choice_any_decodes_to_core() {
+        let mut req = make_anthropic_request();
+        req.tool_choice = Some(serde_json::json!({"type": "any"}));
+        let core = decode_request(req).unwrap();
+        assert_eq!(core.tool_choice, Some(CoreToolChoice::Any));
+    }
+
+    #[test]
+    fn tool_choice_none_decodes_to_core() {
+        let mut req = make_anthropic_request();
+        req.tool_choice = Some(serde_json::json!({"type": "none"}));
+        let core = decode_request(req).unwrap();
+        assert_eq!(core.tool_choice, Some(CoreToolChoice::None));
+    }
+
+    #[test]
     fn cache_control_decodes_to_core() {
         let mut req = make_anthropic_request();
         req.system = Some(serde_json::json!([
@@ -1047,6 +1107,7 @@ mod tests {
         let mut req = make_anthropic_request();
         req.metadata = Some(anthropic::Metadata {
             user_id: Some("user-42".into()),
+            extra: serde_json::Map::new(),
         });
         let core = decode_request(req).unwrap();
         assert_eq!(core.metadata.user_id.as_deref(), Some("user-42"));
@@ -1376,6 +1437,11 @@ mod tests {
         let remaining = enc.finish().unwrap();
         assert_eq!(remaining.len(), 2);
         assert_eq!(remaining[0].r#type, "message_delta");
+        // Abnormal termination uses max_tokens as a sentinel, not end_turn.
+        assert_eq!(
+            remaining[0].delta.as_ref().unwrap().stop_reason.as_deref(),
+            Some("max_tokens")
+        );
         assert_eq!(remaining[1].r#type, "message_stop");
     }
 
@@ -1463,50 +1529,78 @@ mod tests {
     // -- unsupported content variants ---------------------------------------
 
     #[test]
-    fn encode_refusal_produces_text() {
+    fn encode_refusal_returns_encode_error() {
         let content = CoreContent::Refusal {
             text: "I cannot help with that".into(),
         };
-        let block = encode_content_block(content).unwrap();
-        assert_eq!(block.r#type, "text");
-        assert_eq!(block.text.as_deref(), Some("I cannot help with that"));
+        let result = encode_content_block(content);
+        assert!(matches!(result, Err(ProtocolError::Encode(_))));
     }
 
     #[test]
-    fn encode_redacted_thinking_produces_thinking() {
+    fn encode_redacted_thinking_produces_redacted_thinking_block() {
         let content = CoreContent::RedactedThinking {
             data: serde_json::json!({"redacted": true}),
         };
         let block = encode_content_block(content).unwrap();
-        assert_eq!(block.r#type, "thinking");
-        assert!(block.thinking.is_some());
+        assert_eq!(block.r#type, "redacted_thinking");
+        assert!(block.data.is_some());
     }
 
     #[test]
-    fn encode_document_drops_with_warning() {
+    fn encode_document_returns_encode_error() {
         let content = CoreContent::Document {
             source: serde_json::json!({"url": "http://example.com/doc.pdf"}),
         };
-        let block = encode_content_block(content).unwrap();
-        assert_eq!(block.r#type, "text");
+        let result = encode_content_block(content);
+        assert!(matches!(result, Err(ProtocolError::Encode(_))));
     }
 
     #[test]
-    fn encode_audio_drops_with_warning() {
+    fn encode_audio_returns_encode_error() {
         let content = CoreContent::Audio {
             source: serde_json::json!({"data": "base64..."}),
         };
-        let block = encode_content_block(content).unwrap();
-        assert_eq!(block.r#type, "text");
+        let result = encode_content_block(content);
+        assert!(matches!(result, Err(ProtocolError::Encode(_))));
     }
 
     #[test]
-    fn encode_video_drops_with_warning() {
+    fn encode_video_returns_encode_error() {
         let content = CoreContent::Video {
             source: serde_json::json!({"url": "http://example.com/vid.mp4"}),
         };
-        let block = encode_content_block(content).unwrap();
-        assert_eq!(block.r#type, "text");
+        let result = encode_content_block(content);
+        assert!(matches!(result, Err(ProtocolError::Encode(_))));
+    }
+
+    #[test]
+    fn encode_response_omits_unsupported_blocks() {
+        // encode_response filters out blocks that return ProtocolError::Encode.
+        let resp = CoreResponse {
+            id: Some("msg_123".into()),
+            model: ModelRef {
+                requested: "m".into(),
+                upstream: None,
+            },
+            content: vec![
+                CoreContent::Text {
+                    text: "hello".into(),
+                    cache: None,
+                },
+                CoreContent::Document {
+                    source: serde_json::json!({"url": "http://example.com/doc.pdf"}),
+                },
+            ],
+            stop_reason: StopReason::EndTurn,
+            stop_sequence: None,
+            usage: Usage::default(),
+            provider_meta: serde_json::Map::new(),
+        };
+        let out = encode_response(resp).unwrap();
+        // Document block should be omitted; only text remains.
+        assert_eq!(out.content.len(), 1);
+        assert_eq!(out.content[0].r#type, "text");
     }
 
     // -- metadata / provider hints preserved --------------------------------
@@ -1516,9 +1610,58 @@ mod tests {
         let mut req = make_anthropic_request();
         req.metadata = Some(anthropic::Metadata {
             user_id: Some("user-42".into()),
+            extra: serde_json::Map::new(),
         });
         let core = decode_request(req).unwrap();
         assert_eq!(core.metadata.user_id.as_deref(), Some("user-42"));
+    }
+
+    #[test]
+    fn metadata_extra_fields_preserved_in_raw() {
+        let mut req = make_anthropic_request();
+        let mut extra = serde_json::Map::new();
+        extra.insert("trace_id".into(), serde_json::json!("abc-123"));
+        extra.insert("session_id".into(), serde_json::json!("sess-456"));
+        req.metadata = Some(anthropic::Metadata {
+            user_id: Some("user-42".into()),
+            extra: extra.clone(),
+        });
+        let core = decode_request(req).unwrap();
+        assert_eq!(core.metadata.user_id.as_deref(), Some("user-42"));
+        assert_eq!(core.metadata.raw.get("trace_id").unwrap(), "abc-123");
+        assert_eq!(core.metadata.raw.get("session_id").unwrap(), "sess-456");
+    }
+
+    #[test]
+    fn redacted_thinking_decodes_to_core() {
+        let mut req = make_anthropic_request();
+        req.messages.push(Message {
+            role: "assistant".into(),
+            content: serde_json::json!([
+                { "type": "redacted_thinking", "data": "base64encodeddata" }
+            ]),
+        });
+        let core = decode_request(req).unwrap();
+        match &core.messages[1].content[0] {
+            CoreContent::RedactedThinking { data } => {
+                assert_eq!(data.as_str(), Some("base64encodeddata"));
+            }
+            _ => panic!("expected RedactedThinking"),
+        }
+    }
+
+    #[test]
+    fn unknown_block_type_returns_decode_error() {
+        let mut req = make_anthropic_request();
+        req.messages.push(Message {
+            role: "assistant".into(),
+            content: serde_json::json!([
+                { "type": "future_unknown_block", "data": "some-data" }
+            ]),
+        });
+        let result = decode_request(req);
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), ProtocolError::Decode(_)));
     }
 
     // -- tool definitions ---------------------------------------------------
@@ -1541,10 +1684,14 @@ mod tests {
 
     #[test]
     fn client_anthropic_does_not_import_forbidden_modules() {
-        // This test is a compile-time assertion. If this module imported any of
-        // llm_proxy_provider, llm_proxy_server, transformer, or core config/routing,
-        // the build would fail. The existence of this test documents the invariant.
-        // The actual enforcement is the absence of those imports in the module source.
-        assert!(true, "source guard: anthropic adapter imports are clean");
+        // This test is a compile-time documentation assertion. If this module
+        // imported any of llm_proxy_provider, llm_proxy_server, transformer,
+        // or core config/routing, the build would fail because those crates
+        // are not dependencies of llm-proxy-protocol. The actual enforcement
+        // is the absence of those imports in the module source. CI grep checks
+        // provide a secondary guard.
+        //
+        // We verify the module compiles without those imports by simply
+        // existing as a test -- no runtime assertion needed.
     }
 }

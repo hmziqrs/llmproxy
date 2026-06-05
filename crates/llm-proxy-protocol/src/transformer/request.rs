@@ -271,6 +271,7 @@ fn transform_messages(
             name: None,
             tool_call_id: None,
             cache_control: None,
+                    refusal: None,
         };
 
         // Try to extract cache_control from system array blocks.
@@ -331,6 +332,7 @@ fn transform_message(
                 name: None,
                 tool_call_id: None,
                 cache_control: None,
+                    refusal: None,
             }])
         }
     }
@@ -358,6 +360,7 @@ fn transform_user_message(blocks: &[ContentBlock]) -> Result<Vec<ChatMessage>, S
                     name: None,
                     tool_call_id: Some(block.get_tool_id()),
                     cache_control: None,
+                    refusal: None,
                 });
             }
             "image" => {
@@ -385,6 +388,7 @@ fn transform_user_message(blocks: &[ContentBlock]) -> Result<Vec<ChatMessage>, S
             name: None,
             tool_call_id: None,
             cache_control: None,
+                    refusal: None,
         });
     }
 
@@ -480,6 +484,7 @@ fn transform_assistant_message(
         name: None,
         tool_call_id: None,
         cache_control: None,
+                    refusal: None,
     };
 
     Ok(vec![msg])
@@ -638,6 +643,8 @@ pub fn transform_request(
         tool_choice: None,
         stop: None,
         stream_options: None,
+        user: None,
+        extra: serde_json::Map::new(),
     };
 
     // Add stream_options with include_usage: true for streaming.
@@ -1202,6 +1209,8 @@ mod tests {
             tool_choice: None,
             stop: None,
             stream_options: None,
+            user: None,
+            extra: serde_json::Map::new(),
         };
 
         resolve_thinking_and_effort(&req, &model, &mut openai_req);

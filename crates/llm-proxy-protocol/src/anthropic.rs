@@ -144,11 +144,18 @@ pub struct CacheControl {
 // ---------------------------------------------------------------------------
 
 /// Optional metadata attached to a [`MessageRequest`].
+///
+/// Unknown metadata fields beyond `user_id` are preserved in the `extra`
+/// flattened map so they can be forwarded to `RequestMetadata.raw` during
+/// decode rather than silently dropped.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Metadata {
     /// An external identifier for the end-user.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_id: Option<String>,
+    /// Catch-all for unrecognized metadata fields from clients.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 // ---------------------------------------------------------------------------
@@ -204,6 +211,7 @@ impl Message {
                 signature: None,
                 source: None,
                 cache_control: None,
+                data: None,
             }];
         }
         // Try array of content blocks.
@@ -228,13 +236,14 @@ impl Message {
 ///
 /// The `r#type` field determines which other fields are populated:
 ///
-/// | Type           | Populated fields                                  |
-/// |----------------|---------------------------------------------------|
-/// | `"text"`       | `text`                                            |
-/// | `"tool_use"`   | `id`, `name`, `input`                             |
-/// | `"tool_result"`| `tool_use_id`, `content`, `is_error`              |
-/// | `"thinking"`   | `thinking`, `signature`                           |
-/// | `"image"`      | `source`                                          |
+/// | Type                 | Populated fields                                  |
+/// |----------------------|---------------------------------------------------|
+/// | `"text"`             | `text`                                            |
+/// | `"tool_use"`         | `id`, `name`, `input`                             |
+/// | `"tool_result"`      | `tool_use_id`, `content`, `is_error`              |
+/// | `"thinking"`         | `thinking`, `signature`                           |
+/// | `"redacted_thinking"`| `data`                                            |
+/// | `"image"`            | `source`                                          |
 ///
 /// Note: `deny_unknown_fields` is intentionally omitted because this struct
 /// receives polymorphic content blocks from external JSON. Unknown block types
@@ -287,6 +296,9 @@ pub struct ContentBlock {
     /// Cache control directive (for `"text"` blocks, but potentially others).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_control: Option<CacheControl>,
+    /// Opaque data for `"redacted_thinking"` blocks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<String>,
 }
 
 impl ContentBlock {
@@ -307,6 +319,7 @@ impl ContentBlock {
             signature: None,
             source: None,
             cache_control: None,
+            data: None,
         }
     }
 
@@ -327,6 +340,7 @@ impl ContentBlock {
             signature: None,
             source: None,
             cache_control: None,
+            data: None,
         }
     }
 
@@ -347,6 +361,28 @@ impl ContentBlock {
             signature: None,
             source: None,
             cache_control: None,
+            data: None,
+        }
+    }
+
+    /// Create a redacted_thinking content block.
+    #[must_use]
+    pub fn new_redacted_thinking(data: String) -> Self {
+        ContentBlock {
+            r#type: "redacted_thinking".to_owned(),
+            text: None,
+            id: None,
+            tool_use_id: None,
+            name: None,
+            input: None,
+            output: None,
+            content: None,
+            is_error: None,
+            thinking: None,
+            signature: None,
+            source: None,
+            cache_control: None,
+            data: Some(data),
         }
     }
 
@@ -458,6 +494,12 @@ impl Serialize for ContentBlock {
                 }
                 map.end()
             }
+            "redacted_thinking" => {
+                let mut map = serializer.serialize_map(Some(2))?;
+                map.serialize_entry("type", &self.r#type)?;
+                map.serialize_entry("data", self.data.as_deref().unwrap_or(""))?;
+                map.end()
+            }
             "image" => {
                 let mut map = serializer.serialize_map(Some(2))?;
                 map.serialize_entry("type", &self.r#type)?;
@@ -501,6 +543,8 @@ impl Serialize for ContentBlock {
                     source: Option<ImageSource>,
                     #[serde(skip_serializing_if = "Option::is_none")]
                     cache_control: Option<CacheControl>,
+                    #[serde(skip_serializing_if = "Option::is_none")]
+                    data: Option<String>,
                 }
 
                 let all = AllFields {
@@ -517,6 +561,7 @@ impl Serialize for ContentBlock {
                     signature: self.signature.clone(),
                     source: self.source.clone(),
                     cache_control: self.cache_control.clone(),
+                    data: self.data.clone(),
                 };
                 all.serialize(serializer)
             }
@@ -918,6 +963,7 @@ mod tests {
             signature: None,
             source: None,
             cache_control: None,
+            data: None,
         };
         let json = serde_json::to_value(&block).unwrap();
         assert_eq!(json["type"], "text");
@@ -943,6 +989,7 @@ mod tests {
             cache_control: Some(CacheControl {
                 r#type: "ephemeral".into(),
             }),
+            data: None,
         };
         let json = serde_json::to_value(&block).unwrap();
         assert_eq!(json["type"], "text");
@@ -967,6 +1014,7 @@ mod tests {
             signature: None,
             source: None,
             cache_control: None,
+            data: None,
         };
         let json = serde_json::to_value(&block).unwrap();
         assert_eq!(json["type"], "tool_use");
@@ -992,6 +1040,7 @@ mod tests {
             signature: None,
             source: None,
             cache_control: None,
+            data: None,
         };
         let json = serde_json::to_value(&block).unwrap();
         assert_eq!(json["type"], "tool_result");
@@ -1016,6 +1065,7 @@ mod tests {
             signature: Some("sig_abc".into()),
             source: None,
             cache_control: None,
+            data: None,
         };
         let json = serde_json::to_value(&block).unwrap();
         assert_eq!(json["type"], "thinking");
@@ -1042,6 +1092,7 @@ mod tests {
             signature: None,
             source: None,
             cache_control: None,
+            data: None,
         };
         assert_eq!(block.text_content(), "result text");
     }
@@ -1066,6 +1117,7 @@ mod tests {
             signature: None,
             source: None,
             cache_control: None,
+            data: None,
         };
         assert_eq!(block.text_content(), "part onepart two");
     }
@@ -1086,6 +1138,7 @@ mod tests {
             signature: None,
             source: None,
             cache_control: None,
+            data: None,
         };
         assert_eq!(block.text_content(), "legacy output");
     }
@@ -1129,6 +1182,7 @@ mod tests {
             signature: None,
             source: None,
             cache_control: None,
+            data: None,
         }
     }
 
@@ -1152,6 +1206,7 @@ mod tests {
             signature: None,
             source: None,
             cache_control: None,
+            data: None,
         };
         assert_eq!(block.text_content(), "");
     }

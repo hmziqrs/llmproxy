@@ -46,7 +46,8 @@ fn new_tool_use_response_block(
         thinking: None,
         signature: None,
         source: None,
-            cache_control: None,
+        cache_control: None,
+        data: None,
     }
 }
 
@@ -65,7 +66,8 @@ fn new_thinking_response_block(thinking: String) -> ContentBlock {
         is_error: None,
         signature: None,
         source: None,
-            cache_control: None,
+        cache_control: None,
+        data: None,
     }
 }
 
@@ -84,7 +86,8 @@ fn new_text_response_block(text: String) -> ContentBlock {
         thinking: None,
         signature: None,
         source: None,
-            cache_control: None,
+        cache_control: None,
+        data: None,
     }
 }
 
@@ -451,6 +454,7 @@ mod tests {
             name: None,
             tool_call_id: None,
             cache_control: None,
+                    refusal: None,
         };
         let resp = make_openai_response(
             vec![Choice {
@@ -499,6 +503,7 @@ mod tests {
             name: None,
             tool_call_id: None,
             cache_control: None,
+                    refusal: None,
         };
         let resp = make_openai_response(
             vec![Choice {
@@ -538,6 +543,7 @@ mod tests {
             name: None,
             tool_call_id: None,
             cache_control: None,
+                    refusal: None,
         };
         let resp = make_openai_response(
             vec![Choice {
@@ -566,6 +572,7 @@ mod tests {
             name: None,
             tool_call_id: None,
             cache_control: None,
+                    refusal: None,
         };
         let resp = make_openai_response(
             vec![Choice {
@@ -840,6 +847,7 @@ mod tests {
             name: None,
             tool_call_id: None,
             cache_control: None,
+                    refusal: None,
         };
         let resp = make_openai_response(
             vec![Choice {

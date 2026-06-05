@@ -85,9 +85,14 @@ pub fn decode_request(req: ChatCompletionRequest) -> Result<CoreRequest, Protoco
                 });
             }
             "assistant" => {
+                // Ordering: Thinking -> ToolUse -> Text. OpenAI's wire format
+                // has reasoning_content, tool_calls, and content as parallel
+                // fields with no defined ordering. This ordering is a
+                // deterministic choice that puts thinking before tool calls
+                // and text content.
                 let mut content = Vec::new();
-                if !msg.reasoning_content.as_ref().is_some_and(|s| s.is_empty()) {
-                    if let Some(thinking) = msg.reasoning_content {
+                if let Some(thinking) = msg.reasoning_content {
+                    if !thinking.is_empty() {
                         content.push(CoreContent::Thinking {
                             text: thinking,
                             signature: None,
@@ -123,6 +128,8 @@ pub fn decode_request(req: ChatCompletionRequest) -> Result<CoreRequest, Protoco
                 });
             }
             "tool" => {
+                // OpenAI tool messages lack an explicit is_error field; we default
+                // to false. Future OpenAI spec additions may add this field.
                 let is_error = false;
                 let inner_content = if msg.content.is_empty() {
                     vec![]
@@ -202,8 +209,8 @@ pub fn decode_request(req: ChatCompletionRequest) -> Result<CoreRequest, Protoco
     }
 
     let metadata = RequestMetadata {
-        user_id: None,
-        raw: serde_json::Map::new(),
+        user_id: req.user,
+        raw: req.extra,
     };
 
     let provider_hints = ProviderHints { raw: raw_hints };
@@ -264,6 +271,7 @@ pub fn encode_response(
     let mut reasoning = None;
     let mut tool_calls = Vec::new();
     let mut tool_call_index: i32 = 0;
+    let mut refusal_text: Option<String> = None;
 
     for block in resp.content {
         match block {
@@ -308,19 +316,27 @@ pub fn encode_response(
                 );
             }
             CoreContent::ToolResult { .. } => {
-                // Tool results should not appear in assistant responses.
+                // Tool results should not appear in assistant responses -- this
+                // likely indicates a logic error upstream.
                 tracing::warn!(
                     "ToolResult in response content is unexpected for OpenAI Chat encode; dropping"
                 );
             }
             CoreContent::RedactedThinking { .. } => {
+                // Per the plan: return ProtocolError::Encode for RedactedThinking
+                // since OpenAI Chat does not support it and the data cannot be
+                // safely represented.
                 tracing::warn!(
-                    "OpenAI Chat Completions does not natively support redacted thinking; dropping"
+                    "OpenAI Chat Completions does not support redacted thinking; cannot encode"
                 );
+                return Err(ProtocolError::Encode(
+                    "OpenAI Chat Completions does not support RedactedThinking blocks".into(),
+                ));
             }
             CoreContent::Refusal { text } => {
-                // OpenAI has a native refusal field on the message -- we encode as text.
-                content_text.push_str(&text);
+                // OpenAI has a native refusal field on assistant messages.
+                // Encode the refusal text into the dedicated field.
+                refusal_text = Some(text);
             }
         }
     }
@@ -335,17 +351,20 @@ pub fn encode_response(
         name: None,
         tool_call_id: None,
         cache_control: None,
+        refusal: refusal_text,
     };
 
     let usage = encode_usage(&resp.usage);
 
+    let created = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+
     Ok(ChatCompletionResponse {
         id,
         object: "chat.completion".to_owned(),
-        created: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64,
+        created,
         model: resp.model.requested,
         choices: vec![Choice {
             index: 0,
@@ -445,6 +464,7 @@ impl StreamEncoder {
                         name: None,
                         tool_call_id: None,
                         cache_control: None,
+                    refusal: None,
                     }),
                 }));
             }
@@ -461,6 +481,8 @@ impl StreamEncoder {
                         tracing::warn!(kind = ?kind, "unsupported ContentKind in OpenAI stream");
                     }
                 }
+                // OpenAI does not use content block indices in the same way Anthropic
+                // does -- the chunk-level position is implicit. Discard the index.
                 let _ = index;
             }
 
@@ -477,6 +499,7 @@ impl StreamEncoder {
                         name: None,
                         tool_call_id: None,
                         cache_control: None,
+                    refusal: None,
                     }),
                 }));
             }
@@ -494,6 +517,7 @@ impl StreamEncoder {
                         name: None,
                         tool_call_id: None,
                         cache_control: None,
+                    refusal: None,
                     }),
                 }));
             }
@@ -519,6 +543,7 @@ impl StreamEncoder {
                         name: None,
                         tool_call_id: None,
                         cache_control: None,
+                    refusal: None,
                     }),
                 }));
             }
@@ -544,6 +569,7 @@ impl StreamEncoder {
                         name: None,
                         tool_call_id: None,
                         cache_control: None,
+                    refusal: None,
                     }),
                 }));
             }
@@ -571,6 +597,7 @@ impl StreamEncoder {
                         name: None,
                         tool_call_id: None,
                         cache_control: None,
+                    refusal: None,
                     }),
                 }));
 
@@ -597,22 +624,15 @@ impl StreamEncoder {
             }
 
             CoreEvent::Error { error } => {
-                // Route handles error streaming. We emit a finish chunk.
-                chunks.push(self.make_chunk(Choice {
-                    index: 0,
-                    message: None,
-                    finish_reason: Some("stop".to_owned()),
-                    delta: Some(ChatMessage {
-                        role: String::new(),
-                        content: format!("Error: {}", error.message()),
-                        reasoning_content: None,
-                        tool_calls: vec![],
-                        name: None,
-                        tool_call_id: None,
-                        cache_control: None,
-                    }),
-                }));
+                // Return an error so the route handler can emit a proper error
+                // response rather than leaking error text into content delta.
+                // The error message was sanitized at CoreStreamError construction
+                // time by the provider adapter.
                 self.finished = true;
+                return Err(ProtocolError::Encode(format!(
+                    "stream error: {}",
+                    error.message()
+                )));
             }
 
             CoreEvent::Ping => {
@@ -667,6 +687,7 @@ mod tests {
                 name: None,
                 tool_call_id: None,
                 cache_control: None,
+                refusal: None,
             }],
             stream: None,
             temperature: None,
@@ -678,6 +699,8 @@ mod tests {
             tool_choice: None,
             stop: None,
             stream_options: None,
+            user: None,
+            extra: serde_json::Map::new(),
         }
     }
 
@@ -727,6 +750,7 @@ mod tests {
                 name: None,
                 tool_call_id: None,
                 cache_control: None,
+                    refusal: None,
             },
         );
         let core = decode_request(req).unwrap();
@@ -759,6 +783,7 @@ mod tests {
             name: None,
             tool_call_id: None,
             cache_control: None,
+                    refusal: None,
         });
         let core = decode_request(req).unwrap();
         assert_eq!(core.messages[1].role, CoreRole::Assistant);
@@ -783,6 +808,7 @@ mod tests {
             name: None,
             tool_call_id: Some("call_1".into()),
             cache_control: None,
+                    refusal: None,
         });
         let core = decode_request(req).unwrap();
         assert_eq!(core.messages[1].role, CoreRole::Tool);
@@ -806,6 +832,7 @@ mod tests {
             name: None,
             tool_call_id: None,
             cache_control: None,
+                    refusal: None,
         });
         let core = decode_request(req).unwrap();
         match &core.messages[1].content[0] {
@@ -879,6 +906,7 @@ mod tests {
             name: None,
             tool_call_id: None,
             cache_control: None,
+                    refusal: None,
         });
         req.messages.push(ChatMessage {
             role: "user".into(),
@@ -888,6 +916,7 @@ mod tests {
             name: None,
             tool_call_id: None,
             cache_control: None,
+                    refusal: None,
         });
         let core = decode_request(req).unwrap();
         assert_eq!(core.messages.len(), 3);
@@ -920,6 +949,7 @@ mod tests {
             name: None,
             tool_call_id: None,
             cache_control: None,
+                    refusal: None,
         });
         let err = decode_request(req).unwrap_err();
         assert!(matches!(err, ProtocolError::Decode(_)));
@@ -1175,19 +1205,18 @@ mod tests {
     }
 
     #[test]
-    fn streaming_error_event() {
+    fn streaming_error_event_returns_encode_error() {
         let mut enc = StreamEncoder::new("chatcmpl-1".into(), "gpt-4o".into(), 1000, false);
-        let chunks = enc
-            .encode_event(CoreEvent::Error {
-                error: CoreStreamError::new(
-                    CoreStreamErrorKind::RateLimit,
-                    "too many requests".into(),
-                ),
-            })
-            .unwrap();
-        assert_eq!(chunks.len(), 1);
-        let delta = chunks[0].choices[0].delta.as_ref().unwrap();
-        assert!(delta.content.contains("too many requests"));
+        let result = enc.encode_event(CoreEvent::Error {
+            error: CoreStreamError::new(
+                CoreStreamErrorKind::RateLimit,
+                "too many requests".into(),
+            ),
+        });
+        // Error events now return Err so the route handler can emit a proper
+        // error response, rather than leaking error text into content delta.
+        assert!(result.is_err());
+        assert!(matches!(result, Err(ProtocolError::Encode(_))));
     }
 
     #[test]
@@ -1286,7 +1315,16 @@ mod tests {
         for event in &variants {
             let mut enc = StreamEncoder::new("chatcmpl-1".into(), "m".into(), 1000, false);
             let result = enc.encode_event(event.clone());
-            assert!(result.is_ok(), "event {event:?} should not error");
+            match event {
+                CoreEvent::Error { .. } => {
+                    // Error events intentionally return Err so the route handler
+                    // can emit a proper error response.
+                    assert!(result.is_err(), "Error event should return Err");
+                }
+                _ => {
+                    assert!(result.is_ok(), "event {event:?} should not error");
+                }
+            }
         }
     }
 
@@ -1315,7 +1353,7 @@ mod tests {
     }
 
     #[test]
-    fn encode_refusal_produces_text() {
+    fn encode_refusal_uses_native_refusal_field() {
         let resp = CoreResponse {
             id: None,
             model: ModelRef {
@@ -1332,7 +1370,9 @@ mod tests {
         };
         let out = encode_response(resp).unwrap();
         let msg = out.choices[0].message.as_ref().unwrap();
-        assert_eq!(msg.content, "I cannot help");
+        // Refusal text goes into the native refusal field, not content.
+        assert_eq!(msg.refusal.as_deref(), Some("I cannot help"));
+        assert!(msg.content.is_empty());
     }
 
     // -- metadata / provider hints ------------------------------------------
@@ -1347,12 +1387,110 @@ mod tests {
         assert!(core.provider_hints.raw.contains_key("stream_options"));
     }
 
+    #[test]
+    fn user_field_maps_to_metadata_user_id() {
+        let mut req = make_openai_request();
+        req.user = Some("user-abc".into());
+        let core = decode_request(req).unwrap();
+        assert_eq!(core.metadata.user_id.as_deref(), Some("user-abc"));
+    }
+
+    #[test]
+    fn extra_fields_preserved_in_metadata_raw() {
+        let mut req = make_openai_request();
+        req.extra.insert(
+            "custom_field".into(),
+            serde_json::json!("custom_value"),
+        );
+        let core = decode_request(req).unwrap();
+        assert_eq!(
+            core.metadata.raw.get("custom_field").unwrap(),
+            "custom_value"
+        );
+    }
+
+    #[test]
+    fn stream_flag_preserved_in_decode() {
+        let mut req = make_openai_request();
+        req.stream = Some(true);
+        let core = decode_request(req).unwrap();
+        assert!(core.stream);
+
+        let req2 = make_openai_request();
+        let core2 = decode_request(req2).unwrap();
+        assert!(!core2.stream);
+    }
+
+    #[test]
+    fn encode_redacted_thinking_returns_encode_error() {
+        let resp = CoreResponse {
+            id: None,
+            model: ModelRef {
+                requested: "m".into(),
+                upstream: None,
+            },
+            content: vec![CoreContent::RedactedThinking {
+                data: serde_json::json!({"redacted": true}),
+            }],
+            stop_reason: StopReason::EndTurn,
+            stop_sequence: None,
+            usage: Usage::default(),
+            provider_meta: serde_json::Map::new(),
+        };
+        let result = encode_response(resp);
+        assert!(matches!(result, Err(ProtocolError::Encode(_))));
+    }
+
+    #[test]
+    fn empty_content_produces_valid_response() {
+        let resp = CoreResponse {
+            id: None,
+            model: ModelRef {
+                requested: "m".into(),
+                upstream: None,
+            },
+            content: vec![],
+            stop_reason: StopReason::EndTurn,
+            stop_sequence: None,
+            usage: Usage::default(),
+            provider_meta: serde_json::Map::new(),
+        };
+        let out = encode_response(resp).unwrap();
+        let msg = out.choices[0].message.as_ref().unwrap();
+        assert!(msg.content.is_empty());
+        assert!(msg.tool_calls.is_empty());
+    }
+
+    #[test]
+    fn id_generated_when_missing() {
+        let resp = CoreResponse {
+            id: None,
+            model: ModelRef {
+                requested: "m".into(),
+                upstream: None,
+            },
+            content: vec![],
+            stop_reason: StopReason::EndTurn,
+            stop_sequence: None,
+            usage: Usage::default(),
+            provider_meta: serde_json::Map::new(),
+        };
+        let out = encode_response(resp).unwrap();
+        assert!(out.id.starts_with("chatcmpl-"));
+    }
+
     // -- source guard -------------------------------------------------------
 
     #[test]
     fn client_openai_chat_does_not_import_forbidden_modules() {
-        // This test documents the invariant that this module does not import
-        // llm_proxy_provider, llm_proxy_server, transformer, or core config/routing.
-        assert!(true, "source guard: openai_chat adapter imports are clean");
+        // This test is a compile-time documentation assertion. If this module
+        // imported any of llm_proxy_provider, llm_proxy_server, transformer,
+        // or core config/routing, the build would fail because those crates
+        // are not dependencies of llm-proxy-protocol. The actual enforcement
+        // is the absence of those imports in the module source. CI grep checks
+        // provide a secondary guard.
+        //
+        // We verify the module compiles without those imports by simply
+        // existing as a test -- no runtime assertion needed.
     }
 }

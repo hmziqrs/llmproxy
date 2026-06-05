@@ -134,6 +134,10 @@ pub struct ChatMessage {
     /// Anthropic-style cache hint preserved across protocol translation.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_control: Option<CacheControl>,
+    /// Model refusal text (OpenAI-specific: present on assistant messages when
+    /// the model refuses to answer).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refusal: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -142,10 +146,11 @@ pub struct ChatMessage {
 
 /// Request body for `POST /v1/chat/completions`.
 ///
-/// Note: `deny_unknown_fields` is intentionally omitted because this is an
-/// outbound-only type -- the proxy constructs it internally via
-/// `transform_request()` and sends it to upstream providers. It is never
-/// deserialized from external input, so strict field checking is unnecessary.
+/// This type serves a dual purpose: it is both deserialized from inbound client
+/// requests (via `openai_chat::decode_request`) and constructed internally for
+/// outbound provider calls (via `transform_request()`). Unknown fields from
+/// clients are captured via the `extra` flattened map rather than silently
+/// dropped.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatCompletionRequest {
     /// Model identifier (e.g. `"gpt-4o"`, `"glm-5.1"`).
@@ -182,6 +187,15 @@ pub struct ChatCompletionRequest {
     /// Extra streaming metadata flags.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stream_options: Option<StreamOptions>,
+    /// End-user identifier for abuse monitoring.
+    ///
+    /// Maps to `RequestMetadata.user_id` during decode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+    /// Catch-all for unrecognized client fields, preserved in
+    /// `RequestMetadata.raw` during decode so nothing is silently dropped.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 // ---------------------------------------------------------------------------
