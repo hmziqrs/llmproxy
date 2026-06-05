@@ -7,6 +7,8 @@
 //!   validation.
 //! - **Routing**: [`ProviderTarget`] and [`resolve_model_route`] for mapping
 //!   client-facing model names to upstream providers.
+//! - **Registry**: [`ProviderRegistry`] and [`ProviderAdapterTargetConfig`] for
+//!   resolving route targets to concrete adapter configurations.
 //! - **Scenario routing**: [`Scenario`], [`ScenarioConfig`], and related types
 //!   for request classification.
 //! - **Metrics**: the runtime [`Metrics`] collector with counters and latency
@@ -20,6 +22,7 @@
 //! ```text
 //! config            - Legacy JSON config (oc-go-cc compatible)
 //! provider_config   - New TOML provider/app config types
+//! provider_registry - Provider registry and adapter target resolution
 //! model_route       - Model routing resolution
 //! env_interpolate   - Shared ${ENV_VAR} interpolation
 //! router            - Scenario-based request routing
@@ -45,6 +48,8 @@ pub mod model_route;
 pub mod pid;
 /// TOML provider configuration types, parsing, and validation.
 pub mod provider_config;
+/// Provider registry: load provider TOML files and resolve route targets.
+pub mod provider_registry;
 /// Scenario-based request routing for model selection.
 pub mod router;
 /// Token counting utilities.
@@ -64,6 +69,7 @@ pub use provider_config::{
     ProviderConfig, ProviderFile, ProviderModelConfig, ServerConfig, load_app_config,
     load_provider_config, validate_model_routes, validate_provider_config,
 };
+pub use provider_registry::{ProviderAdapterTargetConfig, ProviderRegistry};
 pub use router::{
     CircuitBreaker, CircuitState, FallbackHandler, FallbackResult, Scenario, ScenarioConfig,
     ScenarioResult, detect_scenario, get_fallback_chain, is_retryable_error, route_for_streaming,

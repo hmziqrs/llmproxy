@@ -26,4 +26,14 @@ pub enum CoreError {
         /// Human-readable description of the validation failure.
         message: String,
     },
+    /// Provider registry resolution failed.
+    ///
+    /// Produced when the registry cannot resolve a [`ProviderTarget`](crate::ProviderTarget)
+    /// to a concrete adapter configuration because a provider, model, adapter, or
+    /// protocol is missing from the loaded registry.
+    #[error("provider resolution error: {message}")]
+    ProviderResolution {
+        /// Human-readable description of the resolution failure.
+        message: String,
+    },
 }
