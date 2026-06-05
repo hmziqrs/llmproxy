@@ -524,10 +524,9 @@ async fn toml_ready_returns_ready() {
     assert_eq!(body["status"], "ready");
 }
 
-/// TOML mode: POST /v1/messages returns internal error (no legacy state available).
-/// The /v1/messages route currently requires legacy state for model resolution.
-/// When running in TOML mode, the route should return a clear error rather than
-/// panicking or returning an unexpected status.
+/// TOML mode: POST /v1/messages works with `legacy = None`, `app_config = Some`,
+/// `providers = Some`. The route uses the core pipeline and returns a 400 error
+/// for unknown models (empty routing table) without panicking.
 #[tokio::test]
 async fn toml_messages_returns_error_without_legacy_state() {
     let app = build_router(toml_state());
@@ -543,11 +542,12 @@ async fn toml_messages_returns_error_without_legacy_state() {
         .body(Body::from(body.to_string()))
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
-    // The route requires legacy state; without it, returns 500 Internal Server Error.
+    // The core pipeline resolves the model route. With an empty routing table,
+    // the model is unknown, so it returns 400 Bad Request.
     assert_eq!(
         resp.status(),
-        StatusCode::INTERNAL_SERVER_ERROR,
-        "TOML mode /v1/messages should return 500 when no legacy state is available"
+        StatusCode::BAD_REQUEST,
+        "TOML mode /v1/messages should return 400 for unknown model"
     );
     let resp_body: Value = serde_json::from_slice(
         &axum::body::to_bytes(resp.into_body(), 64 * 1024)
@@ -556,7 +556,7 @@ async fn toml_messages_returns_error_without_legacy_state() {
     )
     .unwrap();
     assert_eq!(resp_body["type"], "error");
-    assert_eq!(resp_body["error"]["type"], "api_error");
+    assert_eq!(resp_body["error"]["type"], "invalid_request_error");
 }
 
 /// TOML mode: POST /v1/messages/count_tokens works without legacy state.

@@ -10,6 +10,8 @@ use tower_http::{timeout::TimeoutLayer, trace::TraceLayer};
 
 use crate::state::AppState;
 
+mod core_pipeline;
+mod error_response;
 mod health;
 mod messages;
 mod token_count;
