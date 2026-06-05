@@ -130,6 +130,9 @@ impl ProviderRegistry {
         })?;
 
         let mut providers: HashMap<String, ProviderConfig> = HashMap::new();
+        // Track which file each provider name was first loaded from, so that
+        // duplicate-name errors can report *both* file paths for quick diagnosis.
+        let mut source_paths: HashMap<String, std::path::PathBuf> = HashMap::new();
 
         // Collect and sort entries by filename for deterministic ordering across
         // platforms (filesystem order is not guaranteed).
@@ -171,15 +174,22 @@ impl ProviderRegistry {
             let provider = load_provider_config(&file_path, None)?;
 
             if providers.contains_key(&provider.name) {
+                let first_path = source_paths
+                    .get(&provider.name)
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "(unknown)".to_owned());
                 return Err(CoreError::ProviderResolution {
                     message: format!(
-                        "duplicate provider name \"{}\" in {}: provider names must be unique across all config files",
+                        "duplicate provider name \"{}\": already defined in {}, redefined in {}. \
+                         Provider names must be unique across all config files",
                         provider.name,
+                        first_path,
                         file_path.display()
                     ),
                 });
             }
 
+            source_paths.insert(provider.name.clone(), file_path.clone());
             providers.insert(provider.name.clone(), provider);
         }
 
@@ -534,6 +544,11 @@ endpoint = "https://example.com/v1/chat/completions"
         assert!(
             err.contains("same-name"),
             "error should name the duplicate provider, got: {err}"
+        );
+        // The error should report both files so the user can find the collision.
+        assert!(
+            err.contains("alpha.toml") && err.contains("beta.toml"),
+            "error should name both files, got: {err}"
         );
     }
 
