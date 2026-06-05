@@ -33,44 +33,225 @@ pub enum ProviderError {
         body: String,
     },
 
-    /// An SSE framing error occurred while parsing the upstream stream.
-    #[error("SSE framing error: {0}")]
-    Sse(String),
-
     /// Invalid UTF-8 encountered in streamed bytes.
     #[error("invalid UTF-8 in stream: {0}")]
     Utf8(#[from] std::str::Utf8Error),
 }
 
 /// Maximum length for upstream API error bodies stored in [`ProviderError::Api`].
+///
+/// After truncation the string is at most `MAX_API_ERROR_BODY_LEN` bytes long
+/// (the `...[truncated]` suffix is included within this budget).
 pub(crate) const MAX_API_ERROR_BODY_LEN: usize = 512;
+
+/// Length of the `...[truncated]` suffix appended when a body exceeds the limit.
+const TRUNCATED_SUFFIX: &str = "...[truncated]";
+const TRUNCATED_SUFFIX_LEN: usize = 15; // "...[truncated]".len()
+
+/// Redaction patterns compiled once via `lazy_static` / `OnceLock`.
+///
+/// Each pattern matches a known API-key prefix followed by enough alphanumeric
+/// characters to be a real key (20+). This avoids false positives on short
+/// substrings like `sk-` that appear in ordinary words (e.g. "desk-area").
+static REDACTION_PATTERNS: std::sync::OnceLock<Vec<regex::Regex>> = std::sync::OnceLock::new();
+
+fn redaction_patterns() -> &'static Vec<regex::Regex> {
+    REDACTION_PATTERNS.get_or_init(|| {
+        // Order matters: longer/more-specific patterns first.
+        [
+            // Anthropic keys: sk-ant-api03-XXXXX
+            r"sk-ant-api03-[A-Za-z0-9_-]{10,}",
+            // Anthropic keys: sk-ant-XXXXX
+            r"sk-ant-[A-Za-z0-9_-]{10,}",
+            // OpenAI keys: sk-live-XXXXX (hyphen form)
+            r"sk-live-[A-Za-z0-9_-]{10,}",
+            // OpenAI keys: sk-test-XXXXX (hyphen form)
+            r"sk-test-[A-Za-z0-9_-]{10,}",
+            // OpenAI keys: sk_live_XXXXX (underscore form)
+            r"sk_live_[A-Za-z0-9_-]{10,}",
+            // OpenAI keys: sk_test_XXXXX (underscore form)
+            r"sk_test_[A-Za-z0-9_-]{10,}",
+            // Generic sk- prefix with enough trailing chars to look like a key
+            r"sk-[A-Za-z0-9_-]{20,}",
+            // Google API keys: AIza followed by 30+ alphanumeric chars
+            r"AIza[A-Za-z0-9_-]{30,}",
+            // Generic key- prefix with enough trailing chars
+            r"key-[A-Za-z0-9_-]{20,}",
+        ]
+        .iter()
+        .map(|pat| regex::Regex::new(pat).expect("invalid redaction regex"))
+        .collect()
+    })
+}
 
 /// Sanitize an upstream API error body: strip common key patterns and
 /// truncate to [`MAX_API_ERROR_BODY_LEN`].
 ///
 /// Covers:
-/// - OpenAI keys: `sk-live-...`, `sk-test-...`, `sk-...`
+/// - OpenAI keys: `sk-live-...`, `sk-test-...`, `sk_live_...`, `sk_test_...`,
+///   generic `sk-...` (only when followed by 20+ alphanumeric chars).
 /// - Anthropic keys: `sk-ant-api03-...`, `sk-ant-...`
-/// - Google API keys: `AIza...`
-/// - Generic key prefixes: `key-...`
-pub fn sanitize_api_error_body(mut body: String) -> String {
-    // Redact in order of longest prefix first to avoid partial matches.
-    // Anthropic prefixes before generic `sk-` to avoid partial redaction.
-    body = body
-        .replace("sk_live_", "***")
-        .replace("sk_test_", "***")
-        .replace("sk-ant-api03-", "***")
-        .replace("sk-ant-", "***")
-        .replace("sk-", "***")
-        .replace("AIza", "***")
-        .replace("key-", "***");
+/// - Google API keys: `AIza...` (only when followed by 30+ chars)
+/// - Generic key prefixes: `key-...` (only when followed by 20+ chars)
+///
+/// Uses regex-based matching to avoid false-positive redaction of short
+/// substrings like `sk-` or `key-` that appear in ordinary words.
+pub(crate) fn sanitize_api_error_body(mut body: String) -> String {
+    // Redact API key patterns (regex-based, avoids false positives on short substrings).
+    for re in redaction_patterns() {
+        body = re.replace_all(&body, "***").into_owned();
+    }
+
+    // Truncate if the sanitized body exceeds the limit.
+    // Account for the suffix so the final string is at most MAX_API_ERROR_BODY_LEN bytes.
     if body.len() > MAX_API_ERROR_BODY_LEN {
-        let mut end = MAX_API_ERROR_BODY_LEN;
+        let max_content = MAX_API_ERROR_BODY_LEN - TRUNCATED_SUFFIX_LEN;
+        let mut end = max_content;
         while !body.is_char_boundary(end) && end > 0 {
             end -= 1;
         }
         body.truncate(end);
-        body.push_str("...[truncated]");
+        body.push_str(TRUNCATED_SUFFIX);
     }
     body
+}
+
+// ===========================================================================
+// Tests
+// ===========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -----------------------------------------------------------------------
+    // sanitize_api_error_body tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn sanitize_body_under_limit_is_unchanged() {
+        let body = "simple error message".to_owned();
+        assert_eq!(sanitize_api_error_body(body.clone()), body);
+    }
+
+    #[test]
+    fn sanitize_body_over_limit_is_truncated() {
+        let body = "x".repeat(600);
+        let result = sanitize_api_error_body(body);
+        assert!(result.ends_with("...[truncated]"));
+        assert!(result.len() <= MAX_API_ERROR_BODY_LEN);
+    }
+
+    #[test]
+    fn sanitize_body_truncation_exact_length() {
+        // Exactly at the limit should NOT be truncated.
+        let body = "a".repeat(MAX_API_ERROR_BODY_LEN);
+        let result = sanitize_api_error_body(body.clone());
+        assert_eq!(result, body);
+
+        // One over the limit should be truncated.
+        let body = "a".repeat(MAX_API_ERROR_BODY_LEN + 1);
+        let result = sanitize_api_error_body(body);
+        assert!(result.ends_with("...[truncated]"));
+        assert!(result.len() <= MAX_API_ERROR_BODY_LEN);
+    }
+
+    #[test]
+    fn sanitize_body_multibyte_char_at_boundary_does_not_panic() {
+        // Japanese characters are 3 bytes each in UTF-8.
+        // Build a body whose byte length straddles the truncation boundary.
+        let body = "あ".repeat(200); // 600 bytes, exceeds 512
+        let result = sanitize_api_error_body(body);
+        // Must not panic and must be valid UTF-8.
+        assert!(result.len() <= MAX_API_ERROR_BODY_LEN);
+        assert!(result.ends_with("...[truncated]"));
+    }
+
+    #[test]
+    fn sanitize_redacts_openai_sk_live_underscore() {
+        let body = r#"error: key=sk_live_abc123def456ghi789jkl012mno"#.to_owned();
+        let result = sanitize_api_error_body(body);
+        assert!(!result.contains("sk_live_"));
+        assert!(result.contains("***"));
+    }
+
+    #[test]
+    fn sanitize_redacts_openai_sk_test_underscore() {
+        let body = r#"error: key=sk_test_abc123def456ghi789jkl012mno"#.to_owned();
+        let result = sanitize_api_error_body(body);
+        assert!(!result.contains("sk_test_"));
+        assert!(result.contains("***"));
+    }
+
+    #[test]
+    fn sanitize_redacts_openai_sk_live_hyphen() {
+        let body = r#"error: key=sk-live-abc123def456ghi789jkl012mno"#.to_owned();
+        let result = sanitize_api_error_body(body);
+        assert!(!result.contains("sk-live-"));
+        assert!(result.contains("***"));
+    }
+
+    #[test]
+    fn sanitize_redacts_openai_sk_test_hyphen() {
+        let body = r#"error: key=sk-test-abc123def456ghi789jkl012mno"#.to_owned();
+        let result = sanitize_api_error_body(body);
+        assert!(!result.contains("sk-test-"));
+        assert!(result.contains("***"));
+    }
+
+    #[test]
+    fn sanitize_redacts_anthropic_sk_ant_api03() {
+        let body = r#"error: key=sk-ant-api03-abc123def456ghi789jkl012"#.to_owned();
+        let result = sanitize_api_error_body(body);
+        assert!(!result.contains("sk-ant-api03-"));
+        assert!(result.contains("***"));
+    }
+
+    #[test]
+    fn sanitize_redacts_anthropic_sk_ant() {
+        let body = r#"error: key=sk-ant-abc123def456ghi789jkl012mno345"#.to_owned();
+        let result = sanitize_api_error_body(body);
+        assert!(!result.contains("sk-ant-"));
+        assert!(result.contains("***"));
+    }
+
+    #[test]
+    fn sanitize_redacts_google_aiza() {
+        let body = r#"error: key=AIzaSyD-abc123def456ghi789jkl012mno345pqr"#.to_owned();
+        let result = sanitize_api_error_body(body);
+        assert!(!result.contains("AIzaSyD-abc"));
+        assert!(result.contains("***"));
+    }
+
+    #[test]
+    fn sanitize_redacts_generic_key_prefix() {
+        let body = r#"error: key=key-abc123def456ghi789jkl012mno345pqr"#.to_owned();
+        let result = sanitize_api_error_body(body);
+        assert!(!result.contains("key-abc123def456ghi789"));
+        assert!(result.contains("***"));
+    }
+
+    #[test]
+    fn sanitize_does_not_redact_short_sk_substring() {
+        // "desk-area" should NOT be redacted -- `sk-` only matches with 20+ trailing chars.
+        let body = "the desk-area is reserved".to_owned();
+        let result = sanitize_api_error_body(body.clone());
+        assert_eq!(result, body);
+    }
+
+    #[test]
+    fn sanitize_does_not_redact_short_key_substring() {
+        // "key-value store" should NOT be redacted.
+        let body = "key-value store".to_owned();
+        let result = sanitize_api_error_body(body.clone());
+        assert_eq!(result, body);
+    }
+
+    #[test]
+    fn sanitize_does_not_redact_short_aiza_substring() {
+        // "AIza" alone without 30+ trailing chars should not be redacted.
+        let body = "The area is at AIza Lane".to_owned();
+        let result = sanitize_api_error_body(body.clone());
+        assert_eq!(result, body);
+    }
 }

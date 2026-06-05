@@ -12,6 +12,7 @@
 
 use std::fmt;
 use std::pin::Pin;
+use std::time::Duration;
 
 use bytes::Bytes;
 use futures::Stream;
@@ -91,12 +92,23 @@ pub struct ProxyClient {
     http: reqwest::Client,
 }
 
+impl Default for ProxyClient {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ProxyClient {
     /// Creates a new transport client with sensible connection pool defaults.
+    ///
+    /// `reqwest::Client::build()` cannot fail with the configuration used here
+    /// (no custom TLS backend, no proxy env validation at build time), so the
+    /// `expect` is safe. If future configuration changes make this fallible,
+    /// switch to `try_new()` returning `Result<Self, ProviderError>`.
     pub fn new() -> Self {
         let http = reqwest::Client::builder()
             .pool_max_idle_per_host(20)
-            .pool_idle_timeout(std::time::Duration::from_secs(90))
+            .pool_idle_timeout(Duration::from_secs(90))
             .build()
             .expect("failed to build reqwest client");
 
@@ -149,16 +161,20 @@ impl ProxyClient {
 
         if resp.status().as_u16() >= 400 {
             let status = resp.status().as_u16();
-            let body_text = resp.text().await.unwrap_or_default();
+            let body_text = resp
+                .text()
+                .await
+                .unwrap_or_else(|e| format!("<failed to read error body: {}>", e));
             return Err(ProviderError::Api {
                 status,
                 body: sanitize_api_error_body(body_text),
             });
         }
 
-        // The stream future owns the reqwest response; dropping it drops the
-        // connection, which aborts the upstream request. Do not spawn a detached
-        // task that outlives the consumer.
+        // `bytes_stream()` consumes the Response and returns an owned stream;
+        // dropping the stream drops the underlying connection, aborting the
+        // upstream request. Do not spawn a detached task that outlives the
+        // consumer.
         let stream = resp.bytes_stream();
         let mapped = stream.map_err(ProviderError::from);
         Ok(Box::pin(mapped))
@@ -174,17 +190,11 @@ fn apply_auth(
     mut builder: reqwest::RequestBuilder,
     auth: &AuthHeaders,
 ) -> reqwest::RequestBuilder {
-    match auth.style {
-        AuthStyle::Bearer => {
-            builder = builder.header("Authorization", format!("Bearer {}", auth.api_key));
-        }
-        AuthStyle::XApiKey => {
-            builder = builder.header("x-api-key", &auth.api_key);
-        }
-        AuthStyle::Both => {
-            builder = builder.header("Authorization", format!("Bearer {}", auth.api_key));
-            builder = builder.header("x-api-key", &auth.api_key);
-        }
+    if auth.style != AuthStyle::XApiKey {
+        builder = builder.header("Authorization", format!("Bearer {}", auth.api_key));
+    }
+    if auth.style != AuthStyle::Bearer {
+        builder = builder.header("x-api-key", &auth.api_key);
     }
     builder
 }
@@ -193,7 +203,10 @@ fn apply_auth(
 async fn check_status(resp: reqwest::Response) -> Result<Vec<u8>, ProviderError> {
     if resp.status().as_u16() >= 400 {
         let status = resp.status().as_u16();
-        let body_text = resp.text().await.unwrap_or_default();
+        let body_text = resp
+            .text()
+            .await
+            .unwrap_or_else(|e| format!("<failed to read error body: {}>", e));
         return Err(ProviderError::Api {
             status,
             body: sanitize_api_error_body(body_text),
@@ -363,7 +376,7 @@ mod tests {
         });
 
         // Give the server a moment to start accepting connections.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
 
         base
     }
@@ -610,7 +623,7 @@ mod tests {
                         None
                     } else {
                         counter.fetch_add(1, Ordering::SeqCst);
-                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                        tokio::time::sleep(Duration::from_millis(10)).await;
                         let chunk = format!("data: chunk {}\n\n", i);
                         Some((Ok::<_, std::convert::Infallible>(bytes::Bytes::from(chunk)), i + 1))
                     }
@@ -648,7 +661,7 @@ mod tests {
         }
 
         // Wait a bit for the server to notice the disconnect.
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
 
         // The counter should be well below 100 since we dropped early.
         let count = counter.load(Ordering::SeqCst);
@@ -721,5 +734,55 @@ mod tests {
             !source.contains("llm_proxy_protocol"),
             "transport.rs must not import llm_proxy_protocol"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Edge case tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn empty_body_sent_successfully() {
+        let app = Router::new().route("/test", post(echo_handler));
+        let base = start_test_server(app).await;
+
+        let client = ProxyClient::new();
+        let req = ProxyRequest {
+            url: format!("{}/test", base),
+            auth: AuthHeaders {
+                style: AuthStyle::Bearer,
+                api_key: "key".to_owned(),
+            },
+            body: vec![],
+            stream: false,
+        };
+
+        let resp = client.send(req).await.unwrap();
+        let text = String::from_utf8(resp).unwrap();
+        assert!(
+            text.contains("body: "),
+            "Response must echo body field even when empty: {}",
+            text
+        );
+    }
+
+    #[tokio::test]
+    async fn unreachable_url_returns_http_error() {
+        let client = ProxyClient::new();
+        let req = ProxyRequest {
+            // Non-routable address guarantees a connection failure.
+            url: "http://192.0.2.1:1/test".to_owned(),
+            auth: AuthHeaders {
+                style: AuthStyle::Bearer,
+                api_key: "key".to_owned(),
+            },
+            body: vec![],
+            stream: false,
+        };
+
+        let err = client.send(req).await.unwrap_err();
+        match err {
+            ProviderError::Http(_) => {} // expected
+            other => panic!("expected ProviderError::Http for unreachable URL, got: {:?}", other),
+        }
     }
 }

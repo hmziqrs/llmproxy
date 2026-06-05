@@ -2105,6 +2105,7 @@ dependencies = [
  "futures",
  "llm-proxy-core",
  "llm-proxy-protocol",
+ "regex",
  "reqwest",
  "serde",
  "serde_json",

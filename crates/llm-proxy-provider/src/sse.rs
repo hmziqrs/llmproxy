@@ -70,7 +70,7 @@ impl SseFramer {
     pub fn finish(&mut self) -> Result<Vec<SseFrame>, ProviderError> {
         // If there is anything left in the buffer, treat it as a line.
         if !self.buffer.is_empty() {
-            let line = take_buffer(&mut self.buffer);
+            let line = std::mem::take(&mut self.buffer);
             self.process_line(&line);
         }
         let frame = self.take_current_frame();
@@ -85,19 +85,10 @@ impl SseFramer {
     fn drain_buffer(&mut self) -> Result<Vec<SseFrame>, ProviderError> {
         let mut frames = Vec::new();
 
-        loop {
-            // Find the next line boundary (\n or \r\n).
-            let Some(nl_pos) = self.buffer.find('\n') else {
-                // No complete line yet; keep buffering.
-                break;
-            };
-
-            let line = self.buffer[..nl_pos].to_owned();
-            // Trim trailing \r if present.
-            let line = line.trim_end_matches('\r').to_owned();
-
-            // Remove the consumed portion including the \n.
-            self.buffer = self.buffer[nl_pos + 1..].to_owned();
+        while let Some(nl_pos) = self.buffer.find('\n') {
+            // Extract the line (trim trailing \r) and remove from buffer.
+            let line = self.buffer[..nl_pos].trim_end_matches('\r').to_owned();
+            self.buffer.drain(..nl_pos + 1);
 
             if line.is_empty() {
                 // Blank line = frame boundary.
@@ -171,11 +162,6 @@ impl SseFramer {
             data,
         })
     }
-}
-
-/// Take the entire buffer, leaving it empty.
-fn take_buffer(buf: &mut String) -> String {
-    std::mem::take(buf)
 }
 
 // ===========================================================================
@@ -353,5 +339,122 @@ mod tests {
         assert!(frames[1].event.is_none());
         assert!(frames[1].id.is_none());
         assert_eq!(frames[1].data, "world");
+    }
+
+    // -----------------------------------------------------------------------
+    // Edge case tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn sse_framer_empty_input_returns_no_frames() {
+        let mut framer = SseFramer::new();
+
+        let frames = framer.push_chunk(b"").unwrap();
+        assert!(frames.is_empty(), "Empty chunk should produce no frames");
+
+        let frames = framer.finish().unwrap();
+        assert!(
+            frames.is_empty(),
+            "Finish on empty framer should produce no frames"
+        );
+    }
+
+    #[test]
+    fn sse_framer_only_comments_yields_no_frames() {
+        let mut framer = SseFramer::new();
+
+        let frames = framer
+            .push_chunk(b": comment one\n: comment two\n\n")
+            .unwrap();
+        assert!(
+            frames.is_empty(),
+            "Comments-only stream should produce no frames"
+        );
+
+        let frames = framer.finish().unwrap();
+        assert!(
+            frames.is_empty(),
+            "Finish after comments-only stream should produce no frames"
+        );
+    }
+
+    #[test]
+    fn sse_framer_only_blank_lines_yields_no_frames() {
+        let mut framer = SseFramer::new();
+
+        let frames = framer.push_chunk(b"\n\n\n\n").unwrap();
+        assert!(
+            frames.is_empty(),
+            "Blank lines without data fields should produce no frames"
+        );
+
+        let frames = framer.finish().unwrap();
+        assert!(
+            frames.is_empty(),
+            "Finish after blank lines should produce no frames"
+        );
+    }
+
+    #[test]
+    fn sse_framer_data_field_empty_value() {
+        let mut framer = SseFramer::new();
+
+        let frames = framer.push_chunk(b"data:\n\n").unwrap();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].data, "");
+    }
+
+    #[test]
+    fn sse_framer_finish_after_complete_stream_is_empty() {
+        let mut framer = SseFramer::new();
+
+        // Push a complete frame (terminated by blank line).
+        let frames = framer.push_chunk(b"data: hello\n\n").unwrap();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].data, "hello");
+
+        // Calling finish() again should return empty.
+        let frames = framer.finish().unwrap();
+        assert!(
+            frames.is_empty(),
+            "Finish after fully drained stream should produce no frames"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Source guard: sse.rs must not import forbidden types
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn sse_source_no_forbidden_imports() {
+        let source = include_str!("sse.rs");
+        let prod = source
+            .split_once("#[cfg(test)]")
+            .map(|(p, _)| p)
+            .unwrap_or(source);
+        assert!(
+            !prod.contains("llm_proxy_protocol"),
+            "sse.rs must not import llm_proxy_protocol"
+        );
+        assert!(
+            !prod.contains("EndpointType"),
+            "sse.rs must not mention EndpointType"
+        );
+        assert!(
+            !prod.contains("OpenCodeClient"),
+            "sse.rs must not mention OpenCodeClient"
+        );
+        assert!(
+            !prod.contains("classify_endpoint"),
+            "sse.rs must not mention classify_endpoint"
+        );
+        assert!(
+            !prod.contains("is_anthropic_model"),
+            "sse.rs must not mention provider model classification"
+        );
+        assert!(
+            !prod.contains("is_gemini_model"),
+            "sse.rs must not mention provider model classification"
+        );
     }
 }
