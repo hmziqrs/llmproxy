@@ -54,12 +54,12 @@ pub fn decode_request(req: ChatCompletionRequest) -> Result<CoreRequest, Protoco
     for msg in req.messages {
         match msg.role.as_str() {
             "system" => {
-                if !msg.content.is_empty() {
-                    let cache = msg
-                        .cache_control
-                        .map(|cc| CacheControl {
-                            r#type: CacheControlType::from(cc.r#type),
-                        });
+                let cache = msg
+                    .cache_control
+                    .map(|cc| CacheControl {
+                        r#type: CacheControlType::from(cc.r#type),
+                    });
+                if !msg.content.is_empty() || cache.is_some() {
                     system.push(CoreContent::Text {
                         text: msg.content,
                         cache,
@@ -67,13 +67,13 @@ pub fn decode_request(req: ChatCompletionRequest) -> Result<CoreRequest, Protoco
                 }
             }
             "user" => {
+                let cache = msg
+                    .cache_control
+                    .map(|cc| CacheControl {
+                        r#type: CacheControlType::from(cc.r#type),
+                    });
                 let mut content = Vec::new();
-                if !msg.content.is_empty() {
-                    let cache = msg
-                        .cache_control
-                        .map(|cc| CacheControl {
-                            r#type: CacheControlType::from(cc.r#type),
-                        });
+                if !msg.content.is_empty() || cache.is_some() {
                     content.push(CoreContent::Text {
                         text: msg.content,
                         cache,
@@ -1104,6 +1104,59 @@ mod tests {
         });
         let err = decode_request(req).unwrap_err();
         assert!(matches!(err, ProtocolError::Decode(_)));
+    }
+
+    #[test]
+    fn empty_user_content_with_cache_control_preserves_cache() {
+        // When a user message has empty content but carries cache_control,
+        // the cache_control must not be silently dropped.
+        let mut req = make_openai_request();
+        req.messages[0].content = String::new();
+        req.messages[0].cache_control = Some(OpenAICacheControl {
+            r#type: "ephemeral".into(),
+        });
+        let core = decode_request(req).unwrap();
+        assert_eq!(core.messages[0].content.len(), 1, "empty user message with cache_control should still produce a content block");
+        match &core.messages[0].content[0] {
+            CoreContent::Text { text, cache } => {
+                assert!(text.is_empty());
+                assert!(cache.is_some(), "cache_control must be preserved even with empty text");
+                assert_eq!(cache.as_ref().unwrap().r#type, CacheControlType::Ephemeral);
+            }
+            _ => panic!("expected Text"),
+        }
+    }
+
+    #[test]
+    fn empty_system_content_with_cache_control_preserves_cache() {
+        // When a system message has empty content but carries cache_control,
+        // the cache_control must not be silently dropped.
+        let mut req = make_openai_request();
+        req.messages.insert(
+            0,
+            ChatMessage {
+                role: "system".into(),
+                content: String::new(),
+                reasoning_content: None,
+                tool_calls: vec![],
+                name: None,
+                tool_call_id: None,
+                cache_control: Some(OpenAICacheControl {
+                    r#type: "ephemeral".into(),
+                }),
+                refusal: None,
+            },
+        );
+        let core = decode_request(req).unwrap();
+        assert_eq!(core.system.len(), 1, "empty system message with cache_control should produce a system block");
+        match &core.system[0] {
+            CoreContent::Text { text, cache } => {
+                assert!(text.is_empty());
+                assert!(cache.is_some(), "cache_control must be preserved even with empty text");
+                assert_eq!(cache.as_ref().unwrap().r#type, CacheControlType::Ephemeral);
+            }
+            _ => panic!("expected Text"),
+        }
     }
 
     #[test]

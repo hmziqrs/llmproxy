@@ -558,11 +558,16 @@ impl StreamEncoder {
                 let block = match kind {
                     ContentKind::Text => ContentBlock::new_text(String::new()),
                     ContentKind::Thinking => ContentBlock::new_thinking(String::new()),
-                    ContentKind::ToolUse => ContentBlock::new_tool_use(
-                        String::new(),
-                        String::new(),
-                        serde_json::Value::Object(serde_json::Map::new()),
-                    ),
+                    // ToolUse start is handled by ToolCallStart, which carries the
+                    // actual id/name.  Emitting content_block_start here would
+                    // produce a duplicate when ToolCallStart follows.
+                    ContentKind::ToolUse => {
+                        tracing::trace!(
+                            index,
+                            "ContentStart ToolUse skipped; ToolCallStart will emit content_block_start"
+                        );
+                        return Ok(events);
+                    }
                     other => {
                         // ContentStart for unsupported kinds (Image, Document,
                         // Audio, Video, ToolResult, Refusal) -- skip entirely
@@ -1341,6 +1346,42 @@ mod tests {
     }
 
     #[test]
+    fn streaming_content_start_tool_use_defers_to_tool_call_start() {
+        // ContentStart { kind: ToolUse } must NOT emit content_block_start
+        // because ToolCallStart carries the actual id/name and will emit it.
+        // Emitting both would produce a duplicate content_block_start.
+        let mut enc = StreamEncoder::new("msg_1".into(), "m".into());
+
+        // ContentStart for ToolUse should produce zero events.
+        let content_start_events = enc
+            .encode_event(CoreEvent::ContentStart {
+                index: 0,
+                kind: ContentKind::ToolUse,
+            })
+            .unwrap();
+        assert!(
+            content_start_events.is_empty(),
+            "ContentStart ToolUse should produce zero events, got {}",
+            content_start_events.len()
+        );
+
+        // ToolCallStart should produce exactly one content_block_start.
+        let tool_start_events = enc
+            .encode_event(CoreEvent::ToolCallStart {
+                index: 0,
+                id: "tu_1".into(),
+                name: "get_weather".into(),
+            })
+            .unwrap();
+        assert_eq!(tool_start_events.len(), 1);
+        assert_eq!(tool_start_events[0].r#type, "content_block_start");
+        assert_eq!(
+            tool_start_events[0].content_block.as_ref().unwrap().id.as_deref(),
+            Some("tu_1")
+        );
+    }
+
+    #[test]
     fn streaming_usage_coalesced_with_message_stop() {
         let mut enc = StreamEncoder::new("msg_1".into(), "m".into());
 
@@ -1478,8 +1519,9 @@ mod tests {
     #[test]
     fn every_core_event_variant_maps_or_errors_intentionally() {
         // Test all ContentKind variants for ContentStart. The stream encoder
-        // handles Text, Thinking, and ToolUse explicitly; other kinds are
-        // skipped with a warning (returning empty events, not an error).
+        // handles Text and Thinking explicitly (emitting content_block_start);
+        // ToolUse is deferred to ToolCallStart; other kinds are skipped with a
+        // warning (returning empty events, not an error).
         let content_kinds: Vec<ContentKind> = vec![
             ContentKind::Text,
             ContentKind::Thinking,
