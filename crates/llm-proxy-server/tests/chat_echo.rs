@@ -273,3 +273,81 @@ async fn count_tokens_returns_estimate() {
     // Heuristic counter should return a positive token count.
     assert!(body["input_tokens"].as_u64().unwrap() > 0);
 }
+
+// -- Phase 0: Additional characterization tests -----------------------------
+
+/// Phase 0: not_found returns a JSON error envelope matching the Anthropic
+/// error format, not plain text.
+#[tokio::test]
+async fn not_found_returns_json_error_envelope() {
+    let app = build_router(state());
+    let req = Request::builder()
+        .uri("/v1/nonexistent")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let body: Value = serde_json::from_slice(
+        &axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(body["type"], "error");
+    assert_eq!(body["error"]["type"], "not_found_error");
+}
+
+/// Phase 0: POST /v1/messages with wrong types in JSON fields (e.g. max_tokens
+/// as a string) returns 400 with invalid_request_error.
+#[tokio::test]
+async fn messages_wrong_field_type_returns_bad_request() {
+    let app = build_router(state());
+    let body = json!({
+        "model": "claude-sonnet-4-6",
+        "messages": [{ "role": "user", "content": "hello" }],
+        "max_tokens": "big"
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/messages")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let resp_body: Value = serde_json::from_slice(
+        &axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(resp_body["error"]["type"], "invalid_request_error");
+}
+
+/// Phase 0: POST /v1/messages with unknown fields returns 400 since
+/// MessageRequest now uses deny_unknown_fields.
+#[tokio::test]
+async fn messages_unknown_fields_returns_bad_request() {
+    let app = build_router(state());
+    let body = json!({
+        "model": "claude-sonnet-4-6",
+        "messages": [{ "role": "user", "content": "hello" }],
+        "max_tokens": 64,
+        "future_field": "not supported"
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/messages")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let resp_body: Value = serde_json::from_slice(
+        &axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(resp_body["error"]["type"], "invalid_request_error");
+}

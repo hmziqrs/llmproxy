@@ -600,7 +600,11 @@ fn cmd_validate(config_path: Option<PathBuf>) -> Result<()> {
     println!("  port:              {}", config.port);
     println!(
         "  api_key:           {}...",
-        &config.api_key[..config.api_key.len().min(8)]
+        if config.api_key.is_empty() {
+            "(empty)"
+        } else {
+            "***"
+        }
     );
     println!("  hot_reload:        {}", config.hot_reload);
     println!(

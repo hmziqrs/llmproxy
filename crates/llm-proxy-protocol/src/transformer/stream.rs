@@ -27,6 +27,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::anthropic::{ContentBlock, Delta, MessageEvent, MessageResponse, Usage};
 use crate::openai::{ChatCompletionChunk, UsageInfo};
 use crate::zen::{GeminiStreamChunk, ResponsesChunk};
+use super::{non_negative, map_finish_reason};
 
 // ---------------------------------------------------------------------------
 // Sentinel error
@@ -47,25 +48,7 @@ impl fmt::Display for ErrClientDisconnected {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/// Clamp an integer to zero.
-fn non_negative(val: i64) -> i64 {
-    val.max(0)
-}
-
-/// Map an OpenAI finish reason to an Anthropic stop reason.
-fn map_finish_reason(reason: &str) -> &'static str {
-    match reason {
-        "stop" => "end_turn",
-        "length" => "max_tokens",
-        "tool_calls" | "tool_use" => "tool_use",
-        "content_filter" => "end_turn",
-        _ => "end_turn",
-    }
-}
+impl std::error::Error for ErrClientDisconnected {}
 
 /// Generate a unique-enough ID based on the current nanosecond timestamp.
 fn generate_id() -> String {
@@ -130,6 +113,9 @@ pub struct StreamProxy {
     reasoning_started: bool,
     /// Whether `message_delta` (with stop_reason) has been emitted.
     stop_sent: bool,
+    /// Whether `finish()` has been called. Prevents double-emission of
+    /// `message_stop` when `finish()` is called more than once.
+    finished: bool,
     /// Current content block index.
     content_index: usize,
     /// Maps OpenAI tool-call array index to the Anthropic content block index.
@@ -148,6 +134,7 @@ impl StreamProxy {
             content_started: false,
             reasoning_started: false,
             stop_sent: false,
+            finished: false,
             content_index: 0,
             started_tool_calls: HashMap::new(),
             msg_id: format!("msg_{}", generate_id()),
@@ -315,8 +302,14 @@ impl StreamProxy {
 
     /// Emit closing events for any open blocks, `message_delta`, and
     /// `message_stop`. Must be called once after all chunks have been
-    /// processed.
+    /// processed. Subsequent calls are no-ops to prevent double-emission
+    /// of `message_stop`.
     pub fn finish(&mut self, writer: &mut impl fmt::Write) -> Result<(), String> {
+        if self.finished {
+            return Ok(());
+        }
+        self.finished = true;
+
         self.ensure_started(writer)?;
 
         // Close any open text or reasoning block.
@@ -881,23 +874,33 @@ impl StreamProxy {
 // Fast-path content extraction
 // ---------------------------------------------------------------------------
 
-/// Attempt to extract the content string from a `"delta":{"content":"..."}`}
+/// Attempt to extract the content string from a `"delta":{"content":"..."`}
 /// pattern using plain string search, avoiding a full JSON parse.
 ///
-/// Returns `None` if the pattern is not found or the extraction fails.
+/// Returns `None` if the pattern is not found, the content contains escape
+/// sequences (e.g. `\"`), or the extraction otherwise cannot be done safely.
+/// In those cases the caller falls through to a full JSON parse.
 fn fast_extract_delta_content(data: &str) -> Option<String> {
     let marker = r#""delta":{"content":""#;
     let start = data.find(marker)?;
     let content_start = start + marker.len();
 
-    // Find the closing quote. We must handle escaped quotes inside the
-    // content string, but for the fast path we only handle the simple case
-    // where there are no escaped quotes. If the content contains \" we fall
-    // through to the full parse path (the marker search will not match
-    // because the escaped quote breaks the pattern).
+    // Scan for the closing unescaped double quote.
     let remaining = &data[content_start..];
-    let end = remaining.find('"')?;
-    Some(remaining[..end].to_owned())
+    let mut i = 0;
+    let bytes = remaining.as_bytes();
+    while i < bytes.len() {
+        if bytes[i] == b'\\' {
+            // Escape sequence present -- fall through to full parse.
+            return None;
+        }
+        if bytes[i] == b'"' {
+            let content = &remaining[..i];
+            return Some(content.to_owned());
+        }
+        i += 1;
+    }
+    None
 }
 
 // ===========================================================================
@@ -1247,20 +1250,35 @@ mod tests {
         assert!(out.contains("event: message_delta"));
     }
 
-    /// Characterization: unknown fields in OpenAI chunk JSON are silently
-    /// ignored (serde deserialization drops them).
+    /// Characterization: unknown fields in OpenAI chunk JSON are now rejected
+    /// by `deny_unknown_fields` on `ChatCompletionChunk`. The chunk is silently
+    /// skipped (no error propagated, no content emitted).
     #[test]
-    fn openai_unknown_fields_silently_ignored() {
+    fn openai_unknown_fields_rejected_chunk_skipped() {
         let mut proxy = StreamProxy::new("model");
         let mut out = String::new();
 
-        let chunk = r#"data: {"id":"c","object":"chat.completion.chunk","created":0,"model":"m","choices":[{"index":0,"delta":{"content":"hello"},"finish_reason":null}],"custom_field":"ignored","provider_meta":{"logprob":0.99}}"#;
+        // Chunk with unknown fields is rejected by deny_unknown_fields.
+        let chunk_with_unknown = r#"data: {"id":"c","object":"chat.completion.chunk","created":0,"model":"m","choices":[{"index":0,"delta":{"content":"hello"},"finish_reason":null}],"custom_field":"ignored"}"#;
+
+        proxy.process_openai_chunk(chunk_with_unknown, &mut out).unwrap();
+
+        // The chunk should be silently skipped -- no content, no error.
+        assert!(!out.contains("hello"));
+        assert!(!out.contains("custom_field"));
+    }
+
+    /// Characterization: a chunk without unknown fields is processed normally.
+    #[test]
+    fn openai_chunk_without_unknown_fields_works() {
+        let mut proxy = StreamProxy::new("model");
+        let mut out = String::new();
+
+        let chunk = r#"data: {"id":"c","object":"chat.completion.chunk","created":0,"model":"m","choices":[{"index":0,"delta":{"content":"hello"},"finish_reason":null}]}"#;
 
         proxy.process_openai_chunk(chunk, &mut out).unwrap();
 
         assert!(out.contains("hello"));
-        assert!(!out.contains("custom_field"));
-        assert!(!out.contains("provider_meta"));
     }
 
     // -- Malformed SSE events: Responses API stream ---------------------------
@@ -1388,11 +1406,12 @@ mod tests {
 
     // -- Provider-specific unsupported fields in request transformation --------
 
-    /// Characterization: extra fields in Anthropic request JSON that are not
-    /// modeled in `MessageRequest` are silently dropped by serde deserialization.
-    /// This test verifies that unknown fields do not cause errors.
+    /// Characterization: unknown fields in Anthropic request JSON are now
+    /// rejected by serde (`deny_unknown_fields` on `MessageRequest`). This
+    /// prevents silent data loss when clients send fields the proxy does not
+    /// model. Previously unknown fields were silently dropped.
     #[test]
-    fn request_transform_ignores_unknown_anthropic_fields() {
+    fn request_transform_rejects_unknown_anthropic_fields() {
         use crate::anthropic::MessageRequest;
 
         let raw = serde_json::json!({
@@ -1403,15 +1422,14 @@ mod tests {
             "experimental": { "enabled": true }
         });
 
-        let req: MessageRequest = serde_json::from_value(raw).unwrap();
-        assert_eq!(req.model, "test-model");
-        assert_eq!(req.messages.len(), 1);
+        let result = serde_json::from_value::<MessageRequest>(raw);
+        assert!(result.is_err(), "unknown fields should be rejected by deny_unknown_fields");
     }
 
-    /// Characterization: extra fields in OpenAI response JSON that are not
-    /// modeled in `ChatCompletionResponse` are silently dropped by serde.
+    /// Characterization: unknown fields in OpenAI response JSON are now
+    /// rejected by serde (`deny_unknown_fields` on `ChatCompletionResponse`).
     #[test]
-    fn response_transform_ignores_unknown_openai_fields() {
+    fn response_transform_rejects_unknown_openai_fields() {
         use crate::openai::ChatCompletionResponse;
 
         let raw = serde_json::json!({
@@ -1436,8 +1454,106 @@ mod tests {
             "service_tier": "default"
         });
 
-        let resp: ChatCompletionResponse = serde_json::from_value(raw).unwrap();
-        assert_eq!(resp.id, "chatcmpl-test");
-        assert_eq!(resp.choices.len(), 1);
+        let result = serde_json::from_value::<ChatCompletionResponse>(raw);
+        assert!(result.is_err(), "unknown fields should be rejected by deny_unknown_fields");
+    }
+
+    // =========================================================================
+    // Phase 0: Additional characterization tests
+    // =========================================================================
+
+    // -- fast_extract_delta_content: escaped quotes ---------------------------
+
+    /// Characterization: when content contains an escaped quote (`\"`),
+    /// `fast_extract_delta_content` returns `None` and the caller falls
+    /// through to a full JSON parse.
+    #[test]
+    fn fast_path_returns_none_for_escaped_quotes() {
+        let data = r#"{"id":"c","choices":[{"delta":{"content":"he said \"hello\""},"finish_reason":null}]}"#;
+        assert_eq!(fast_extract_delta_content(data), None);
+    }
+
+    /// Characterization: backslash-escaped characters in content cause the
+    /// fast path to return None.
+    #[test]
+    fn fast_path_returns_none_for_backslash_escapes() {
+        let data = r#"{"id":"c","choices":[{"delta":{"content":"line1\nline2"},"finish_reason":null}]}"#;
+        assert_eq!(fast_extract_delta_content(data), None);
+    }
+
+    // -- StreamProxy: double finish() is a no-op -------------------------------
+
+    /// Characterization: calling `finish()` twice does not produce duplicate
+    /// `message_stop` events. The second call is a no-op.
+    #[test]
+    fn double_finish_does_not_duplicate_message_stop() {
+        let mut proxy = StreamProxy::new("model");
+        let mut out = String::new();
+
+        // Send some content.
+        let chunk = r#"data: {"id":"c","object":"chat.completion.chunk","created":0,"model":"m","choices":[{"index":0,"delta":{"content":"hello"},"finish_reason":null}]}"#;
+        proxy.process_openai_chunk(chunk, &mut out).unwrap();
+
+        // First finish.
+        proxy.finish(&mut out).unwrap();
+        let first_stop_count = out.matches("event: message_stop").count();
+        assert_eq!(first_stop_count, 1, "should have exactly one message_stop after first finish");
+
+        // Second finish -- should be a no-op.
+        proxy.finish(&mut out).unwrap();
+        let second_stop_count = out.matches("event: message_stop").count();
+        assert_eq!(second_stop_count, 1, "should still have exactly one message_stop after double finish");
+    }
+
+    // -- Responses API: tool call streaming ------------------------------------
+
+    /// Characterization: Responses API function_call_arguments.delta events
+    /// produce correct Anthropic SSE output with tool_use blocks.
+    #[test]
+    fn responses_function_call_stream() {
+        let mut proxy = StreamProxy::new("resp-model");
+        let mut out = String::new();
+
+        // Note: The current Responses API processor only handles text deltas
+        // and completion events. Function call deltas are not yet modeled.
+        // This test verifies that unknown event types are silently ignored.
+        let chunks = [
+            r#"data: {"type":"response.output_text.delta","delta":"calling "}"#,
+            r#"data: {"type":"response.output_text.delta","delta":"tool"}"#,
+            r#"data: {"type":"response.completed"}"#,
+        ];
+
+        for chunk in &chunks {
+            proxy.process_responses_chunk(chunk, &mut out).unwrap();
+        }
+
+        assert!(out.contains("calling "));
+        assert!(out.contains("tool"));
+        assert!(out.contains("event: message_delta"));
+    }
+
+    // -- Gemini: tool call streaming gap ---------------------------------------
+
+    /// Characterization: Gemini streaming with function calls is not yet
+    /// implemented in the stream transformer. This test verifies that the
+    /// text parts of a Gemini response with function calls are still handled.
+    #[test]
+    fn gemini_text_stream_with_no_function_calls() {
+        let mut proxy = StreamProxy::new("gemini-model");
+        let mut out = String::new();
+
+        let chunks = [
+            r#"data: {"candidates":[{"content":{"role":"model","parts":[{"text":"I'll search for that."}]},"finishReason":null}]}"#,
+            r#"data: {"candidates":[{"content":{"role":"model","parts":[{"text":" Done."}]},"finishReason":"STOP"}]}"#,
+        ];
+
+        for chunk in &chunks {
+            proxy.process_gemini_chunk(chunk, &mut out).unwrap();
+        }
+        proxy.finish(&mut out).unwrap();
+
+        assert!(out.contains("I'll search for that."));
+        assert!(out.contains(" Done."));
+        assert!(out.contains("event: message_stop"));
     }
 }

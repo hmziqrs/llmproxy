@@ -340,7 +340,12 @@ mod tests {
 ///
 /// Cheap to clone: all fields are `Arc`-wrapped so cloning only bumps
 /// reference counts. Required by axum's `State` extractor.
-#[derive(Clone, Debug)]
+///
+/// # Security note
+///
+/// Manual `Debug` impl is provided to ensure `api_key` in the nested
+/// [`Config`] is never leaked through debug formatting (e.g. in error logs).
+#[derive(Clone)]
 pub struct AppState {
     /// Server configuration.
     pub config: Arc<Config>,
@@ -362,6 +367,23 @@ pub struct AppState {
     pub request_dedup: Arc<RequestDeduplicator>,
     /// Request ID generator.
     pub request_id_gen: Arc<RequestIdGenerator>,
+}
+
+impl std::fmt::Debug for AppState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AppState")
+            .field("config", &self.config) // Config has its own redacting Debug
+            .field("build", &self.build)
+            .field("client", &self.client)
+            .field("model_router", &self.model_router)
+            .field("fallback_handler", &self.fallback_handler)
+            .field("token_counter", &self.token_counter)
+            .field("metrics", &self.metrics)
+            .field("rate_limiter", &self.rate_limiter)
+            .field("request_dedup", &self.request_dedup)
+            .field("request_id_gen", &self.request_id_gen)
+            .finish()
+    }
 }
 
 impl AppState {

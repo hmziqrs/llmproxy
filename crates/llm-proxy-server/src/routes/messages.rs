@@ -174,14 +174,14 @@ async fn handle_non_streaming(
                 .header(header::CONTENT_TYPE, "application/json")
                 .header("x-request-id", &request_id)
                 .body(Body::from(bytes))
-                .unwrap())
+                .expect("static header values are valid"))
         } else {
             metrics.record_failure();
             Err(ApiError::Internal("no response body".to_owned()))
         }
     } else {
         metrics.record_failure();
-        error!(request_id = %request_id, error = ?result.error, attempted = result.attempted, "all models failed");
+        error!(request_id = %request_id, error = %result.error.as_deref().unwrap_or("unknown"), attempted = result.attempted, "all models failed");
         Err(ApiError::Upstream(
             result
                 .error
@@ -306,7 +306,7 @@ async fn handle_anthropic_streaming(
         .header(header::CONNECTION, "keep-alive")
         .header("X-Accel-Buffering", "no")
         .body(body)
-        .unwrap())
+        .expect("static header values are valid"))
 }
 
 // -- OpenAI streaming via channel ----------------------------------------
@@ -324,7 +324,9 @@ async fn handle_openai_streaming(
     let model_id = model.model_id.clone();
 
     let events = spawn_proxy_task(stream, model_id, |proxy, line, out| {
-        let _ = proxy.process_openai_chunk(line, out);
+        if let Err(e) = proxy.process_openai_chunk(line, out) {
+            warn!("openai chunk transform error: {e}");
+        }
     });
 
     build_sse_response(events)
@@ -345,7 +347,9 @@ async fn handle_responses_streaming(
     let model_id = model.model_id.clone();
 
     let events = spawn_proxy_task(stream, model_id, |proxy, line, out| {
-        let _ = proxy.process_responses_chunk(line, out);
+        if let Err(e) = proxy.process_responses_chunk(line, out) {
+            warn!("responses chunk transform error: {e}");
+        }
     });
 
     build_sse_response(events)
@@ -366,7 +370,9 @@ async fn handle_gemini_streaming(
     let model_id = model.model_id.clone();
 
     let events = spawn_proxy_task(stream, model_id, |proxy, line, out| {
-        let _ = proxy.process_gemini_chunk(line, out);
+        if let Err(e) = proxy.process_gemini_chunk(line, out) {
+            warn!("gemini chunk transform error: {e}");
+        }
     });
 
     build_sse_response(events)
@@ -399,6 +405,7 @@ where
             out.clear();
 
             for line in text.split('\n') {
+                let line = line.trim_end_matches('\r');
                 process(&mut proxy, line, &mut out);
             }
 
@@ -412,7 +419,9 @@ where
 
         // Send any final events from the proxy.
         out.clear();
-        let _ = proxy.finish(&mut out);
+        if let Err(e) = proxy.finish(&mut out) {
+            warn!("stream proxy finish error: {e}");
+        }
         for event in parse_sse_events(&out) {
             if tx.send(event).await.is_err() {
                 return;
@@ -452,12 +461,8 @@ fn build_sse_response(events: BoxStream<'static, Event>) -> Result<Response<Body
     let response = sse.into_response();
     let (mut parts, body) = response.into_parts();
     parts.status = StatusCode::OK;
-    parts
-        .headers
-        .insert(header::CONTENT_TYPE, "text/event-stream".parse().unwrap());
-    parts
-        .headers
-        .insert(header::CACHE_CONTROL, "no-cache".parse().unwrap());
+    // Sse::into_response() already sets Content-Type and Cache-Control.
+    // Only add the extra headers not covered by the Sse wrapper.
     parts
         .headers
         .insert(header::CONNECTION, "keep-alive".parse().unwrap());

@@ -44,7 +44,7 @@ impl RequestDeduplicator {
         let hash = Self::hash_body(body);
         let now = Instant::now();
 
-        let mut map = self.in_flight.lock().expect("dedup lock poisoned");
+        let mut map = self.in_flight.lock().unwrap_or_else(|e| e.into_inner());
 
         // Prune expired entries.
         map.retain(|_, t| now.duration_since(*t).as_millis() < self.window_ms as u128);
@@ -139,7 +139,7 @@ impl RateLimiter {
     ///
     /// Returns `true` if the request is allowed, `false` if rate-limited.
     pub fn is_allowed(&self, client_ip: &str) -> bool {
-        let mut buckets = self.buckets.lock().expect("rate limiter lock poisoned");
+        let mut buckets = self.buckets.lock().unwrap_or_else(|e| e.into_inner());
 
         // Refill rate: tokens per second.
         let refill_rate = self.max_requests_per_minute / 60.0;

@@ -415,6 +415,9 @@ fn transform_assistant_message(
 
                 let arguments = match &block.input {
                     Some(v) if !v.is_null() => {
+                        // Legacy behavior: serialization failure silently falls back
+                        // to an empty JSON object. The core protocol migration should
+                        // propagate this error instead of silently substituting.
                         serde_json::to_string(v).unwrap_or_else(|_| "{}".to_owned())
                     }
                     _ => "{}".to_owned(),
@@ -598,6 +601,9 @@ pub fn transform_request(
     }
 
     // Apply model-specific overrides (config wins over request).
+    // Legacy behavior: config-driven temperature/max_tokens overrides silently
+    // discard client intent. The core protocol migration should preserve client
+    // intent separately from config overrides.
     if model.temperature > 0.0 {
         openai_req.temperature = Some(model.temperature);
     }
@@ -611,6 +617,11 @@ pub fn transform_request(
     // Transform tools if present.
     if !anthropic_req.tools.is_empty() {
         openai_req.tools = transform_tools(&anthropic_req.tools);
+    }
+
+    // Map tool_choice if present.
+    if let Some(ref tc) = anthropic_req.tool_choice {
+        openai_req.tool_choice = Some(tc.clone());
     }
 
     Ok(openai_req)
@@ -860,6 +871,7 @@ mod tests {
             top_p: None,
             metadata: None,
             thinking: None,
+            tool_choice: None,
         }
     }
 
@@ -1297,6 +1309,12 @@ mod tests {
         assert_eq!(val["error"]["type"], "api_error");
     }
 
+    #[test]
+    fn error_response_502() {
+        let val = transform_error_response(502, "bad gateway");
+        assert_eq!(val["error"]["type"], "api_error");
+    }
+
     // -- has_thinking_blocks --------------------------------------------------
 
     #[test]
@@ -1320,5 +1338,162 @@ mod tests {
     fn no_thinking_blocks() {
         let msgs = vec![assistant_msg("plain text")];
         assert!(!has_thinking_blocks(&msgs));
+    }
+
+    // =========================================================================
+    // Phase 0: Additional characterization tests
+    // =========================================================================
+
+    // -- transform_request: empty messages array ------------------------------
+
+    /// Characterization: an empty messages array is passed through without error.
+    /// The transformer produces an empty OpenAI messages array (just the system
+    /// message if present, or nothing).
+    #[test]
+    fn transform_empty_messages_produces_empty_openai_messages() {
+        let req = make_request(vec![]);
+        let model = make_model("glm-5.1");
+        let result = transform_request(&req, &model).unwrap();
+        // No system prompt, no messages.
+        assert!(result.messages.is_empty());
+    }
+
+    // -- transform_request: boundary values for max_tokens --------------------
+
+    /// Characterization: max_tokens=0 means "do not set" (the transformer
+    /// checks `if anthropic_req.max_tokens > 0`).
+    #[test]
+    fn transform_max_tokens_zero_not_set() {
+        let mut req = make_request(vec![user_msg("hi")]);
+        req.max_tokens = 0;
+        let model = make_model("glm-5.1");
+        let result = transform_request(&req, &model).unwrap();
+        assert_eq!(result.max_tokens, None);
+    }
+
+    /// Characterization: negative max_tokens is treated as "do not set".
+    #[test]
+    fn transform_max_tokens_negative_not_set() {
+        let mut req = make_request(vec![user_msg("hi")]);
+        req.max_tokens = -1;
+        let model = make_model("glm-5.1");
+        let result = transform_request(&req, &model).unwrap();
+        assert_eq!(result.max_tokens, None);
+    }
+
+    // -- budget_tokens_to_effort boundary values ------------------------------
+
+    #[test]
+    fn budget_tokens_boundary_0() {
+        assert_eq!(budget_tokens_to_effort(0), "low");
+    }
+
+    #[test]
+    fn budget_tokens_boundary_2048() {
+        assert_eq!(budget_tokens_to_effort(2048), "low");
+    }
+
+    #[test]
+    fn budget_tokens_boundary_2049() {
+        assert_eq!(budget_tokens_to_effort(2049), "medium");
+    }
+
+    #[test]
+    fn budget_tokens_boundary_8192() {
+        assert_eq!(budget_tokens_to_effort(8192), "medium");
+    }
+
+    #[test]
+    fn budget_tokens_boundary_8193() {
+        assert_eq!(budget_tokens_to_effort(8193), "high");
+    }
+
+    #[test]
+    fn budget_tokens_boundary_32768() {
+        assert_eq!(budget_tokens_to_effort(32768), "high");
+    }
+
+    #[test]
+    fn budget_tokens_boundary_32769() {
+        assert_eq!(budget_tokens_to_effort(32769), "max");
+    }
+
+    #[test]
+    fn budget_tokens_boundary_max() {
+        assert_eq!(budget_tokens_to_effort(i64::MAX), "max");
+    }
+
+    // -- transform_request: minimal request (no optional fields) ---------------
+
+    /// Characterization: a request with only required fields produces an
+    /// OpenAI request where all optional fields are unset.
+    #[test]
+    fn transform_minimal_request_no_optional_fields() {
+        let req = make_request(vec![user_msg("hi")]);
+        let model = make_model("glm-5.1");
+        let result = transform_request(&req, &model).unwrap();
+
+        assert_eq!(result.tools.len(), 0);
+        assert_eq!(result.temperature, None);
+        assert_eq!(result.top_p, None);
+        assert_eq!(result.reasoning_effort, None);
+        assert_eq!(result.thinking, None);
+        assert!(result.stream_options.is_none());
+    }
+
+    // -- transform_request: tool_choice is forwarded --------------------------
+
+    /// Characterization: tool_choice from the Anthropic request is mapped to
+    /// the OpenAI request's tool_choice field.
+    #[test]
+    fn transform_tool_choice_forwarded() {
+        let mut req = make_request(vec![user_msg("hi")]);
+        req.tools = vec![crate::anthropic::Tool {
+            name: "get_weather".to_owned(),
+            description: Some("Get the weather".to_owned()),
+            input_schema: serde_json::json!({"type": "object", "properties": {}}),
+        }];
+        req.tool_choice = Some(serde_json::json!({"type": "auto"}));
+        let model = make_model("glm-5.1");
+        let result = transform_request(&req, &model).unwrap();
+
+        assert_eq!(result.tool_choice, Some(serde_json::json!({"type": "auto"})));
+    }
+
+    /// Characterization: tool_choice=None means no tool_choice in the OpenAI request.
+    #[test]
+    fn transform_no_tool_choice_when_absent() {
+        let req = make_request(vec![user_msg("hi")]);
+        let model = make_model("glm-5.1");
+        let result = transform_request(&req, &model).unwrap();
+        assert_eq!(result.tool_choice, None);
+    }
+
+    // -- transform_to_responses: tool result handling --------------------------
+
+    /// Characterization: tool_result blocks in Anthropic messages become
+    /// `tool` role inputs in the Responses API request.
+    #[test]
+    fn responses_tool_result_transformed() {
+        let req = make_request(vec![
+            assistant_msg_with_blocks(serde_json::json!([
+                { "type": "tool_use", "id": "tu_1", "name": "get_weather", "input": {"city": "SF"} }
+            ])),
+            user_msg_with_tool_result("tu_1", "72F and sunny"),
+        ]);
+        let model = make_model("gpt-4o");
+        let result = transform_to_responses(&req, &model).unwrap();
+
+        // Should have at least one tool role input.
+        let tool_inputs: Vec<_> = result
+            .input
+            .iter()
+            .filter(|i| i.role == "tool")
+            .collect();
+        assert_eq!(tool_inputs.len(), 1);
+        assert_eq!(
+            tool_inputs[0].content,
+            Some(serde_json::Value::String("72F and sunny".to_owned()))
+        );
     }
 }

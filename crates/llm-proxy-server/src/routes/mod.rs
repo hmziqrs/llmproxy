@@ -2,6 +2,7 @@ use axum::{
     Router,
     extract::DefaultBodyLimit,
     http::StatusCode,
+    response::IntoResponse,
     routing::{get, post},
 };
 use tower::ServiceBuilder;
@@ -30,6 +31,12 @@ const MAX_BODY_BYTES: usize = 32 * 1024 * 1024; // 32 MiB
 /// layers are listed here in the same outer-to-inner order. `TraceLayer`
 /// must be outermost for it to observe requests later layers reject
 /// (timeouts, oversized bodies).
+///
+/// Note: `TimeoutLayer` applies to the entire response lifetime, including
+/// streaming. The configured `request_timeout` must be set high enough for
+/// long-running LLM streaming responses (the default is 60s, which may be
+/// too aggressive for streaming). Consider exempting streaming routes or
+/// using a per-route timeout approach in future phases.
 pub fn router(state: AppState) -> Router {
     let timeout = state.config.request_timeout;
     let middleware = ServiceBuilder::new()
@@ -51,6 +58,13 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
-async fn not_found() -> (StatusCode, &'static str) {
-    (StatusCode::NOT_FOUND, "not found")
+async fn not_found() -> impl IntoResponse {
+    let body = serde_json::json!({
+        "type": "error",
+        "error": {
+            "type": "not_found_error",
+            "message": "not found"
+        }
+    });
+    (StatusCode::NOT_FOUND, axum::Json(body))
 }

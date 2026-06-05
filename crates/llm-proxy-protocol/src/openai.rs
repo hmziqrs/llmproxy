@@ -138,6 +138,7 @@ pub struct ChatMessage {
 
 /// Request body for `POST /v1/chat/completions`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ChatCompletionRequest {
     /// Model identifier (e.g. `"gpt-4o"`, `"glm-5.1"`).
     pub model: String,
@@ -222,6 +223,7 @@ pub struct Choice {
 
 /// Response body for a non-streaming Chat Completions call.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ChatCompletionResponse {
     /// Unique completion identifier.
     pub id: String,
@@ -243,6 +245,7 @@ pub struct ChatCompletionResponse {
 
 /// A single Server-Sent Events chunk for a streaming completion.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ChatCompletionChunk {
     /// Unique completion identifier (stable across all chunks).
     pub id: String,

@@ -13,30 +13,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::anthropic::{ContentBlock, MessageResponse, Usage};
 use crate::openai::{ChatCompletionResponse, UsageInfo};
 use crate::zen::{GeminiResponse, ResponsesResponse};
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/// Clamp an integer to zero.
-///
-/// Used when subtracting cache-token counts from prompt totals: defends
-/// against upstream payloads where the reported parts don't consistently
-/// sum to the whole.
-fn non_negative(val: i64) -> i64 {
-    val.max(0)
-}
-
-/// Map an OpenAI finish reason to an Anthropic stop reason.
-fn map_finish_reason(reason: &str) -> &'static str {
-    match reason {
-        "stop" => "end_turn",
-        "length" => "max_tokens",
-        "tool_calls" | "tool_use" => "tool_use",
-        "content_filter" => "end_turn",
-        _ => "end_turn",
-    }
-}
+use super::{non_negative, map_finish_reason};
 
 /// Build an empty-text content block (fallback when no other blocks exist).
 fn empty_text_block() -> ContentBlock {
@@ -121,6 +98,9 @@ pub fn transform_response(
 
     // Tool calls -> tool_use blocks.
     for tc in &msg.tool_calls {
+        // Legacy behavior: malformed tool_call arguments silently fall back to
+        // an empty JSON object. The core protocol migration should propagate
+        // the parse error or log a warning instead.
         let input_json = tc
             .function
             .as_ref()
@@ -186,7 +166,7 @@ pub fn transform_response(
         content: blocks,
         model: model_id.to_owned(),
         stop_reason: Some(stop_reason),
-        stop_sequence: Some(String::new()),
+        stop_sequence: None,
         usage,
     })
 }
@@ -236,6 +216,8 @@ pub fn transform_responses_response(
                 }
             }
             "function_call" => {
+                // Legacy behavior: malformed function_call arguments silently
+                // fall back to an empty JSON object.
                 let input_json = output
                     .arguments
                     .as_deref()
@@ -491,7 +473,7 @@ mod tests {
         assert_eq!(result.role, "assistant");
         assert_eq!(result.model, "my-model");
         assert_eq!(result.stop_reason.as_deref(), Some("end_turn"));
-        assert_eq!(result.stop_sequence.as_deref(), Some(""));
+        assert_eq!(result.stop_sequence, None);
 
         // input_tokens = 100 - 10 - 20 = 70
         assert_eq!(result.usage.input_tokens, 70);

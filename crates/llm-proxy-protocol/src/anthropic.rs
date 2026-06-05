@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize, Serializer};
 
 /// A request to the Anthropic Messages API.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MessageRequest {
     /// The model identifier (e.g. "claude-sonnet-4-20250514").
     pub model: String,
@@ -41,6 +42,13 @@ pub struct MessageRequest {
     /// Extended thinking configuration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking: Option<serde_json::Value>,
+    /// Controls which (if any) tool the model must call.
+    ///
+    /// Accepts `{"type": "auto"}`, `{"type": "any"}`, or
+    /// `{"type": "tool", "name": "..."}` as defined by the Anthropic
+    /// Messages API.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<serde_json::Value>,
 }
 
 impl MessageRequest {
@@ -150,6 +158,7 @@ pub struct Metadata {
 /// The `content` field can be either a plain string or an array of
 /// [`ContentBlock`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Message {
     /// The role of the message author (`"user"` or `"assistant"`).
     pub role: String,
@@ -216,6 +225,12 @@ impl Message {
 /// | `"tool_result"`| `tool_use_id`, `content`, `is_error`              |
 /// | `"thinking"`   | `thinking`, `signature`                           |
 /// | `"image"`      | `source`                                          |
+///
+/// Note: `deny_unknown_fields` is intentionally omitted because this struct
+/// receives polymorphic content blocks from external JSON. Unknown block types
+/// must be tolerated so that future Anthropic API additions do not break
+/// deserialization. The `Serialize` impl handles unknown types via the
+/// catch-all arm.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ContentBlock {
     /// Block type discriminator.
@@ -257,6 +272,60 @@ pub struct ContentBlock {
 }
 
 impl ContentBlock {
+    /// Create a text content block with the given string.
+    pub fn new_text(text: String) -> Self {
+        ContentBlock {
+            r#type: "text".to_owned(),
+            text: Some(text),
+            id: None,
+            tool_use_id: None,
+            name: None,
+            input: None,
+            output: None,
+            content: None,
+            is_error: None,
+            thinking: None,
+            signature: None,
+            source: None,
+        }
+    }
+
+    /// Create a tool_use content block.
+    pub fn new_tool_use(id: String, name: String, input: serde_json::Value) -> Self {
+        ContentBlock {
+            r#type: "tool_use".to_owned(),
+            text: None,
+            id: Some(id),
+            tool_use_id: None,
+            name: Some(name),
+            input: Some(input),
+            output: None,
+            content: None,
+            is_error: None,
+            thinking: None,
+            signature: None,
+            source: None,
+        }
+    }
+
+    /// Create a thinking content block.
+    pub fn new_thinking(thinking: String) -> Self {
+        ContentBlock {
+            r#type: "thinking".to_owned(),
+            text: None,
+            id: None,
+            tool_use_id: None,
+            name: None,
+            input: None,
+            output: None,
+            content: None,
+            is_error: None,
+            thinking: Some(thinking),
+            signature: None,
+            source: None,
+        }
+    }
+
     /// Returns the appropriate tool ID for this block.
     ///
     /// For `"tool_result"` blocks returns `tool_use_id`; for all others
@@ -475,6 +544,7 @@ pub struct ToolResult {
 
 /// A response from the Anthropic Messages API.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MessageResponse {
     /// Unique message identifier.
     pub id: String,
@@ -627,6 +697,7 @@ mod tests {
             top_p: None,
             metadata: None,
             thinking: None,
+            tool_choice: None,
         };
         assert_eq!(req.system_text(), "");
     }
@@ -647,6 +718,7 @@ mod tests {
             top_p: None,
             metadata: None,
             thinking: None,
+            tool_choice: None,
         };
         assert_eq!(req.system_text(), "You are helpful");
     }
@@ -671,6 +743,7 @@ mod tests {
             top_p: None,
             metadata: None,
             thinking: None,
+            tool_choice: None,
         };
         assert_eq!(req.system_text(), "You are helpful. Be concise.");
     }
@@ -735,6 +808,7 @@ mod tests {
             top_p: None,
             metadata: None,
             thinking: None,
+            tool_choice: None,
         };
         assert!(req.validate().is_ok());
     }
@@ -755,6 +829,7 @@ mod tests {
             top_p: None,
             metadata: None,
             thinking: None,
+            tool_choice: None,
         };
         let err = req.validate().unwrap_err();
         assert_eq!(err, "model is required");
@@ -773,6 +848,7 @@ mod tests {
             top_p: None,
             metadata: None,
             thinking: None,
+            tool_choice: None,
         };
         let err = req.validate().unwrap_err();
         assert_eq!(err, "messages is required");

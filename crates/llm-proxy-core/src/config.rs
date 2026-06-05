@@ -84,12 +84,22 @@ fn interpolate_env_vars(input: &str) -> String {
 /// Fully compatible with the Go `oc-go-cc` JSON schema while also
 /// retaining the original Rust fields (`bind`, `request_timeout`,
 /// `server_name`) for backward compatibility.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// # Security note
+///
+/// The `api_key` field is redacted in `Debug` output and excluded from
+/// `Serialize` output to prevent accidental credential leakage in logs,
+/// error messages, or API responses. Config files are loaded from trusted
+/// input only.
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     // -- oc-go-cc fields ---------------------------------------------------
     /// API key used to authenticate with upstream providers.
-    #[serde(default)]
+    ///
+    /// Redacted in Debug output. Not serialized by `serde_json::to_string`
+    /// (use explicit methods if you need to write a config file).
+    #[serde(default, skip_serializing)]
     pub api_key: String,
     /// Host interface to bind the proxy to.
     #[serde(default)]
@@ -148,6 +158,27 @@ fn default_request_timeout() -> Duration {
 
 fn default_server_name() -> String {
     env!("CARGO_PKG_NAME").to_owned()
+}
+
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field("api_key", &"[REDACTED]")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("hot_reload", &self.hot_reload)
+            .field("enable_streaming_scenario_routing", &self.enable_streaming_scenario_routing)
+            .field("respect_requested_model", &self.respect_requested_model)
+            .field("models", &self.models)
+            .field("fallbacks", &self.fallbacks)
+            .field("opencode_go", &self.opencode_go)
+            .field("opencode_zen", &self.opencode_zen)
+            .field("logging", &self.logging)
+            .field("bind", &self.bind)
+            .field("request_timeout", &self.request_timeout)
+            .field("server_name", &self.server_name)
+            .finish()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -795,8 +826,32 @@ mod tests {
         );
 
         let json = serde_json::to_string_pretty(&cfg).expect("serialize");
+        // api_key is skip_serializing, so it must NOT appear in the output.
+        assert!(
+            !json.contains("roundtrip-key"),
+            "api_key must not appear in serialized output"
+        );
         let back: Config = serde_json::from_str(&json).expect("deserialize");
-        assert_eq!(back.api_key, "roundtrip-key");
+        // api_key is not serialized, so it will be empty on deserialization.
+        assert_eq!(back.api_key, "");
         assert_eq!(back.models["default"].model_id, "glm-5.1");
+    }
+
+    /// Verify that Debug output does not leak the api_key.
+    #[test]
+    fn config_debug_redacts_api_key() {
+        let cfg = Config {
+            api_key: "super-secret-key-12345".to_owned(),
+            ..Default::default()
+        };
+        let debug_output = format!("{:?}", cfg);
+        assert!(
+            !debug_output.contains("super-secret-key-12345"),
+            "Debug output must not contain the actual api_key"
+        );
+        assert!(
+            debug_output.contains("[REDACTED]"),
+            "Debug output should show [REDACTED] for api_key"
+        );
     }
 }
