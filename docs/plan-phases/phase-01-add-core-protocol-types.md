@@ -257,6 +257,11 @@ pub enum CoreStreamErrorKind {
 
 Add unit tests in `core.rs`:
 
+> **Note:** All types derive `PartialEq` (and `Eq` where possible) beyond
+> what the derive lists above show.  This is needed for `assert_eq!` in
+> round-trip tests and is a positive deviation from the original derive
+> lists.
+
 - `model_ref_provider_model_uses_requested_without_override`
 - `model_ref_provider_model_uses_upstream_override`
 - `sampling_options_default_has_no_overrides`
@@ -277,6 +282,13 @@ Add unit tests in `core.rs`:
 Add an integration smoke test in
 `crates/llm-proxy-protocol/tests/core_exports.rs` that imports:
 
+> **Note:** The actual integration test imports a broader set of types
+> (`CacheControl`, `CacheControlType`, `CoreEvent`, `CoreRequest`,
+> `CoreResponse`, `CoreRole`, `CoreMessage`, `CoreContent`, `ModelRef`,
+> `RequestMetadata`, `SamplingOptions`, `ProviderHints`) to verify more
+> exports are publicly accessible.  This is a superset of the plan's
+> minimum requirement.
+
 ```rust
 use llm_proxy_protocol::core::{CoreEvent, CoreRequest, CoreResponse};
 ```
@@ -291,3 +303,59 @@ cargo test -p llm-proxy-protocol core
 cargo test -p llm-proxy-protocol --test core_exports
 cargo test --workspace
 ```
+
+### Deviations from original plan
+
+The following intentional deviations were made during implementation and
+codified during the audit process:
+
+1. **`CacheControl.type` uses `CacheControlType` enum** instead of raw `String`.
+   The enum has `Ephemeral` and `Other(String)` variants with custom
+   `Serialize`/`Deserialize` impls.  The JSON wire format is identical, but
+   the type system now distinguishes known vs unknown cache control types.
+   Also provides `as_str()` for non-consuming access.
+
+2. **`SamplingOptions.stop` uses `Option<Vec<String>>`** with a custom
+   deserializer instead of `Option<serde_json::Value>`.  The deserializer
+   normalises the OpenAI wire format (bare string `"STOP"`, array `["STOP"]`,
+   or null) into `Vec<String>`.  This provides type safety while maintaining
+   wire compatibility.
+
+3. **`CoreResponse.provider_meta` uses `serde_json::Map<String, Value>`**
+   instead of `serde_json::Value`.  The Map type serializes as `{}` when empty
+   rather than `null`, distinguishing "no metadata" from "null metadata".
+
+4. **All types derive `PartialEq`** (and `Eq` where serde_json::Value is not
+   present).  This enables `assert_eq!` in round-trip tests.
+
+5. **All public enums use `#[non_exhaustive]`** so adding variants is not a
+   semver break.  Structs do not use `#[non_exhaustive]` because adapters
+   must be able to construct them with struct literals.
+
+6. **All structs use `#[serde(deny_unknown_fields)]`** to prevent silent
+   field drops during deserialization.
+
+7. **All opaque/sensitive fields use redacting `Debug` implementations**
+   instead of derived `Debug`.  `serde_json::Value` fields in
+   `CoreContent`, `CoreTool`, `CoreToolChoice::Raw`, `RequestMetadata`,
+   `ProviderHints`, `CoreResponse.provider_meta`, and
+   `SamplingOptions.thinking` show only type and size.  The `Thinking`
+   variant's `signature` field is redacted to `[REDACTED]`.
+   `CoreStreamError.message` shows only length.
+
+8. **`CoreStreamError` implements `Display` and `std::error::Error`** in
+   addition to the plan's `Debug` and `Clone`.
+
+9. **`Usage` has `synthetic_zero()` and `provider_reported()` constructors**
+   to help enforce the usage provenance invariant.
+
+### Tracking for future phases
+
+- Lossy-drop warning tests (`tracing::warn!` on dropped fields, `warnings`
+  key in `provider_meta`) belong to the adapter phase, not Phase 1, since
+  no adapter code exists yet.
+- Cancellation / client-disconnect semantics currently map to
+  `CoreStreamErrorKind::Internal`.  A dedicated `Cancelled` or
+  `ClientDisconnect` variant should be considered in a future phase.
+- Token count upper-bound validation (capping at a reasonable maximum) is
+  deferred to a future phase.

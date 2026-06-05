@@ -144,13 +144,24 @@ pub enum ProviderError {
 /// Maximum length for upstream API error bodies stored in [`ProviderError::Api`].
 const MAX_API_ERROR_BODY_LEN: usize = 512;
 
-/// Sanitize an upstream API error body: strip common key prefixes and
+/// Sanitize an upstream API error body: strip common key patterns and
 /// truncate to [`MAX_API_ERROR_BODY_LEN`].
+///
+/// Covers:
+/// - OpenAI keys: `sk-live-...`, `sk-test-...`, `sk-...`
+/// - Anthropic keys: `sk-ant-api03-...`, `sk-ant-...`
+/// - Google API keys: `AIza...`
+/// - Generic key prefixes: `key-...`
 fn sanitize_api_error_body(mut body: String) -> String {
+    // Redact in order of longest prefix first to avoid partial matches.
+    // Anthropic prefixes before generic `sk-` to avoid partial redaction.
     body = body
         .replace("sk_live_", "***")
         .replace("sk_test_", "***")
+        .replace("sk-ant-api03-", "***")
+        .replace("sk-ant-", "***")
         .replace("sk-", "***")
+        .replace("AIza", "***")
         .replace("key-", "***");
     if body.len() > MAX_API_ERROR_BODY_LEN {
         let mut end = MAX_API_ERROR_BODY_LEN;
@@ -368,26 +379,23 @@ impl OpenCodeClient {
     /// Sends raw bytes to the Anthropic endpoint.
     ///
     /// Sets **both** `x-api-key` and `Authorization: Bearer` headers,
-    /// matching the Go reference implementation.
+    /// matching the Go reference implementation.  Uses [`SecretString`] via
+    /// [`get_endpoint`][Self::get_endpoint] for consistent key handling.
     pub async fn send_anthropic_request(
         &self,
         body: &[u8],
         stream: bool,
         model: &ModelConfig,
     ) -> Result<Response, ProviderError> {
-        let base_url = if is_zen(model) {
-            &self.config.opencode_zen.anthropic_base_url
-        } else {
-            &self.config.opencode_go.anthropic_base_url
-        };
-        let api_key = &self.config.api_key;
+        let model_id = model.model_id.as_str();
+        let endpoint = self.get_endpoint(model_id, model);
 
         let mut builder = self
             .http_client
-            .post(base_url.as_str())
+            .post(&endpoint.base_url)
             .header("Content-Type", "application/json")
-            .header("Authorization", format!("Bearer {}", api_key))
-            .header("x-api-key", api_key.as_str());
+            .header("Authorization", format!("Bearer {}", endpoint.api_key.expose()))
+            .header("x-api-key", endpoint.api_key.expose());
 
         if stream {
             builder = builder.header("Accept", "text/event-stream");
