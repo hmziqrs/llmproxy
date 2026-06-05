@@ -589,14 +589,23 @@ impl StreamProxy {
                 }
 
                 // Phase 2: close any open text/reasoning block (at most once).
+                // Track whether a block was actually open so we know whether
+                // content_index points at a consumed slot or is still free.
+                let had_prior_block = self.content_started || self.reasoning_started;
                 if !new_tools.is_empty() {
                     self.close_current_block(writer)?;
                 }
 
                 // Phase 3: open new tool blocks and register them.
-                for nt in &new_tools {
-                    self.content_index += 1;
-                    let block_idx = self.content_index;
+                for (i, nt) in new_tools.iter().enumerate() {
+                    // First tool block reuses the current content_index if no
+                    // prior text/reasoning block occupied it; otherwise increment.
+                    let block_idx = if i == 0 && !had_prior_block {
+                        self.content_index
+                    } else {
+                        self.content_index += 1;
+                        self.content_index
+                    };
                     self.started_tool_calls.insert(nt.openai_index, block_idx);
 
                     let start_event = MessageEvent {
@@ -1150,6 +1159,72 @@ mod tests {
         assert!(out.contains("city"));
         assert!(out.contains("SF"));
         assert!(out.contains("event: message_delta"));
+    }
+
+    // -- StreamProxy: tool call without prior text (content_index bug) --------
+
+    /// Phase 0 bug fix: When the stream starts directly with a tool call (no
+    /// prior text content), the tool block must be at content_index 0, not 1.
+    /// This test verifies the fix for the off-by-one content_index bug where
+    /// `content_index` was unconditionally incremented before assigning the
+    /// first tool block index, leaving index 0 unused.
+    #[test]
+    fn openai_tool_call_without_prior_text_uses_index_zero() {
+        let mut proxy = StreamProxy::new("tool-model");
+        let mut out = String::new();
+
+        let chunks = [
+            // Tool call start: id + name (NO prior text content chunk)
+            r#"data: {"id":"c","object":"chat.completion.chunk","created":0,"model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"get_weather","arguments":""}}]},"finish_reason":null}]}"#,
+            // Tool call argument delta
+            r#"data: {"id":"c","object":"chat.completion.chunk","created":0,"model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"city\":\"SF\"}"}}]},"finish_reason":null}]}"#,
+            // Finish
+            r#"data: {"id":"c","object":"chat.completion.chunk","created":0,"model":"m","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
+        ];
+
+        for chunk in &chunks {
+            proxy.process_openai_chunk(chunk, &mut out).unwrap();
+        }
+
+        // The tool_use block must start at index 0, not index 1.
+        assert!(
+            out.contains("\"index\":0"),
+            "first tool block should be at index 0, got: {out}"
+        );
+        assert!(
+            !out.contains("\"index\":1"),
+            "no block should be at index 1 when there's only one tool block with no prior text"
+        );
+        assert!(out.contains("get_weather"));
+        assert!(out.contains("tool_use"));
+    }
+
+    /// Phase 0: Multiple tool calls without prior text should use sequential
+    /// indices starting from 0.
+    #[test]
+    fn openai_multiple_tool_calls_no_prior_text_sequential_indices() {
+        let mut proxy = StreamProxy::new("tool-model");
+        let mut out = String::new();
+
+        let chunks = [
+            // Two tool calls in a single chunk, no prior text
+            r#"data: {"id":"c","object":"chat.completion.chunk","created":0,"model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"tool_a","arguments":""}},{"index":1,"id":"call_2","type":"function","function":{"name":"tool_b","arguments":""}}]},"finish_reason":null}]}"#,
+            // Finish
+            r#"data: {"id":"c","object":"chat.completion.chunk","created":0,"model":"m","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
+        ];
+
+        for chunk in &chunks {
+            proxy.process_openai_chunk(chunk, &mut out).unwrap();
+        }
+
+        assert!(
+            out.contains("\"index\":0"),
+            "first tool block should be at index 0, got: {out}"
+        );
+        assert!(
+            out.contains("\"index\":1"),
+            "second tool block should be at index 1, got: {out}"
+        );
     }
 
     // -- SSE format -----------------------------------------------------------
