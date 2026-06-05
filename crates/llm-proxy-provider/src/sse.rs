@@ -38,8 +38,10 @@ pub struct SseFrame {
 /// trailing partial frame.
 #[derive(Debug, Default)]
 pub struct SseFramer {
-    /// Buffered partial line data (valid UTF-8).
-    buffer: String,
+    /// Buffered raw bytes. Stores partial UTF-8 sequences that arrived split
+    /// across TCP chunks so that multi-byte characters (CJK, emoji) are not
+    /// rejected by an intermediate `str::from_utf8` call.
+    buffer: Vec<u8>,
     /// Current frame being assembled.
     current_event: Option<String>,
     current_id: Option<String>,
@@ -54,12 +56,13 @@ impl SseFramer {
 
     /// Feed a raw byte chunk and return any completed frames.
     ///
-    /// The chunk may contain partial lines. Completed frames are emitted only
-    /// when a blank line boundary is encountered. Returns an error for invalid
-    /// UTF-8.
+    /// The chunk may contain partial lines or partial UTF-8 sequences.
+    /// Completed frames are emitted only when a blank line boundary is
+    /// encountered. Returns an error if the accumulated buffer (after appending
+    /// the chunk) contains invalid UTF-8 that cannot be explained by a partial
+    /// multi-byte sequence at the tail.
     pub fn push_chunk(&mut self, chunk: &[u8]) -> Result<Vec<SseFrame>, ProviderError> {
-        let text = str::from_utf8(chunk)?;
-        self.buffer.push_str(text);
+        self.buffer.extend_from_slice(chunk);
         self.drain_buffer()
     }
 
@@ -70,12 +73,14 @@ impl SseFramer {
     pub fn finish(&mut self) -> Result<Vec<SseFrame>, ProviderError> {
         // If there is anything left in the buffer, treat it as a line.
         if !self.buffer.is_empty() {
-            let line = std::mem::take(&mut self.buffer);
-            let line = line.trim_end_matches('\r');
-            self.process_line(line);
+            // Attempt UTF-8 decode of the remaining bytes.
+            let text = str::from_utf8(&self.buffer).map_err(ProviderError::from)?;
+            let line = text.trim_end_matches('\r').to_owned();
+            self.buffer.clear();
+            self.process_line(&line);
         }
         let frame = self.take_current_frame();
-        Ok(frame.map(|f| vec![f]).unwrap_or_default())
+        Ok(frame.into_iter().collect())
     }
 
     // -----------------------------------------------------------------------
@@ -83,13 +88,30 @@ impl SseFramer {
     // -----------------------------------------------------------------------
 
     /// Parse as many complete lines as possible from the buffer.
+    ///
+    /// Handles the case where a multi-byte UTF-8 character is split across
+    /// two TCP chunks: we only decode up to the last newline, keeping any
+    /// trailing bytes (which may be an incomplete UTF-8 sequence) in the
+    /// buffer for the next chunk.
     fn drain_buffer(&mut self) -> Result<Vec<SseFrame>, ProviderError> {
         let mut frames = Vec::new();
 
-        while let Some(nl_pos) = self.buffer.find('\n') {
-            // Extract the line (trim trailing \r) and remove from buffer.
-            let line = self.buffer[..nl_pos].trim_end_matches('\r').to_owned();
+        while let Some(nl_pos) = self.buffer.iter().position(|&b| b == b'\n') {
+            // Extract the line bytes (excluding the newline itself).
+            let line_bytes = self.buffer[..nl_pos].to_vec();
+            // Remove the line + newline from the buffer.
             self.buffer.drain(..nl_pos + 1);
+
+            // Trim trailing \r bytes.
+            let line_bytes = match line_bytes.iter().rposition(|&b| b != b'\r') {
+                Some(pos) => &line_bytes[..=pos],
+                None => &[][..], // Line was all \r characters.
+            };
+
+            // Decode the trimmed line as UTF-8. The line is guaranteed to be
+            // valid UTF-8 because it ends at a \n boundary which is a single
+            // byte; any partial multi-byte UTF-8 sequence would not contain \n.
+            let line = str::from_utf8(line_bytes).map_err(ProviderError::from)?;
 
             if line.is_empty() {
                 // Blank line = frame boundary.
@@ -97,7 +119,7 @@ impl SseFramer {
                     frames.push(frame);
                 }
             } else {
-                self.process_line(&line);
+                self.process_line(line);
             }
         }
 
@@ -274,11 +296,32 @@ mod tests {
     fn sse_framer_rejects_invalid_utf8() {
         let mut framer = SseFramer::new();
 
+        // Invalid UTF-8 bytes buffered (no newline, so drain_buffer finds nothing).
         let result = framer.push_chunk(&[0xFF, 0xFE]);
         assert!(
-            result.is_err(),
-            "Expected error for invalid UTF-8"
+            result.is_ok(),
+            "push_chunk should buffer raw bytes without error"
         );
+        // The error surfaces when finish() tries to decode the buffer as UTF-8.
+        let result = framer.finish();
+        assert!(
+            result.is_err(),
+            "Expected error for invalid UTF-8 on finish"
+        );
+        match result.unwrap_err() {
+            ProviderError::Utf8(_) => {}
+            other => panic!("Expected ProviderError::Utf8, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn sse_framer_rejects_invalid_utf8_at_newline() {
+        let mut framer = SseFramer::new();
+
+        // Invalid UTF-8 followed by a newline: drain_buffer will try to decode
+        // the line and fail.
+        let result = framer.push_chunk(&[0xFF, 0xFE, b'\n']);
+        assert!(result.is_err(), "Expected error for invalid UTF-8 at newline");
         match result.unwrap_err() {
             ProviderError::Utf8(_) => {}
             other => panic!("Expected ProviderError::Utf8, got: {:?}", other),
@@ -457,6 +500,63 @@ mod tests {
         assert_eq!(frames.len(), 1);
         // The trailing \r must be trimmed, not preserved in the data.
         assert_eq!(frames[0].data, "hello");
+    }
+
+    #[test]
+    fn sse_framer_multibyte_utf8_split_across_chunks() {
+        // The character 'あ' is 3 bytes in UTF-8: 0xE3 0x81 0x82.
+        let full_char = "あ";
+        let full_bytes = full_char.as_bytes();
+        assert_eq!(full_bytes.len(), 3);
+
+        let mut framer = SseFramer::new();
+
+        // First chunk: "data: " + first 2 bytes of あ.
+        let mut chunk1 = b"data: ".to_vec();
+        chunk1.extend_from_slice(&full_bytes[..2]);
+        let frames = framer.push_chunk(&chunk1).unwrap();
+        assert!(frames.is_empty(), "No complete frame yet");
+
+        // Second chunk: remaining 1 byte of あ + "\n\n".
+        let mut chunk2 = full_bytes[2..].to_vec();
+        chunk2.extend_from_slice(b"\n\n");
+        let frames = framer.push_chunk(&chunk2).unwrap();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].data, "あ", "Multi-byte char must be preserved across chunk split");
+    }
+
+    #[test]
+    fn sse_framer_data_newline_then_finish() {
+        // "data: hello\n" (newline-terminated line but no blank line after it)
+        // push_chunk drains the line but doesn't emit a frame; finish() should
+        // emit it.
+        let mut framer = SseFramer::new();
+        let frames = framer.push_chunk(b"data: hello\n").unwrap();
+        assert!(frames.is_empty(), "No blank line yet, no frame");
+
+        let frames = framer.finish().unwrap();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].data, "hello");
+    }
+
+    #[test]
+    fn sse_framer_reusable_after_finish() {
+        // Verify the framer is in a clean state after finish() so it can be
+        // reused for a second stream.
+        let mut framer = SseFramer::new();
+
+        // First round.
+        let frames = framer.push_chunk(b"data: first\n\n").unwrap();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].data, "first");
+
+        let frames = framer.finish().unwrap();
+        assert!(frames.is_empty(), "Nothing left after complete stream");
+
+        // Second round -- framer should be clean.
+        let frames = framer.push_chunk(b"data: second\n\n").unwrap();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].data, "second");
     }
 
     // -----------------------------------------------------------------------

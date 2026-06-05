@@ -9,7 +9,11 @@
 // ---------------------------------------------------------------------------
 
 /// Errors produced by provider transport and adapter operations.
+///
+/// This enum may grow new variants in future phases; match exhaustively at your
+/// own risk. Prefer `match` with a catch-all `_ =>` arm in downstream code.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum ProviderError {
     /// Failed to serialize or deserialize JSON.
     #[error("failed to marshal request: {0}")]
@@ -21,9 +25,9 @@ pub enum ProviderError {
 
     /// The upstream API returned an error status code.
     ///
-    /// The `body` field is truncated to [`MAX_API_ERROR_BODY_LEN`] bytes and
-    /// stripped of common API key patterns at construction time so that
-    /// `Display` output (used in `warn!()` / `error!()` logging) never
+    /// The `body` field is truncated to the internal maximum error body length
+    /// (512 bytes) and stripped of common API key patterns at construction time
+    /// so that `Display` output (used in `warn!()` / `error!()` logging) never
     /// contains full key material.
     #[error("API error {status}: {body}")]
     Api {
@@ -38,6 +42,9 @@ pub enum ProviderError {
     Utf8(#[from] std::str::Utf8Error),
 
     /// SSE framing error (malformed frame structure, unexpected stream termination).
+    ///
+    /// Constructed by [`SseFramer`](crate::sse::SseFramer) when it detects
+    /// malformed SSE structure such as unterminated frames after stream end.
     #[error("SSE framing error: {0}")]
     SseFraming(String),
 }
@@ -81,8 +88,12 @@ fn redaction_patterns() -> &'static Vec<regex::Regex> {
             r"AIza[A-Za-z0-9_-]{30,}",
             // Generic key- prefix with enough trailing chars
             r"key-[A-Za-z0-9_-]{20,}",
+            // Bearer token values echoed in error responses
+            r"Bearer [A-Za-z0-9_-]{20,}",
         ]
         .iter()
+        // SAFETY: all patterns are static string literals known at compile time,
+        // so regex::Regex::new cannot fail here.
         .map(|pat| regex::Regex::new(pat).expect("invalid redaction regex"))
         .collect()
     })
@@ -125,10 +136,10 @@ pub(crate) fn sanitize_api_error_body(mut body: String) -> String {
 // ---------------------------------------------------------------------------
 
 impl ProviderError {
-    /// Construct an [`ProviderError::Api`] with automatic body sanitization.
+    /// Construct a [`ProviderError::Api`] with automatic body sanitization.
     ///
     /// Encapsulates the sanitization call so callers never need to remember
-    /// to call [`sanitize_api_error_body`] manually.
+    /// to call the internal `sanitize_api_error_body` function manually.
     pub fn api(status: u16, body_text: String) -> Self {
         Self::Api {
             status,
@@ -274,5 +285,15 @@ mod tests {
         let body = "The area is at AIza Lane".to_owned();
         let result = sanitize_api_error_body(body.clone());
         assert_eq!(result, body);
+    }
+
+    #[test]
+    fn sanitize_redacts_bearer_token_in_error_body() {
+        // If an upstream API echoes the Authorization header value back in its
+        // error response, the Bearer prefix + token must be redacted.
+        let body = r#"error: invalid key Bearer sk-ant-api03-abc123def456ghi789jkl012"#.to_owned();
+        let result = sanitize_api_error_body(body);
+        assert!(!result.contains("sk-ant-api03-abc123def456ghi789"), "Bearer token must be redacted: {}", result);
+        assert!(result.contains("***"), "Must contain redaction marker: {}", result);
     }
 }

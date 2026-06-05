@@ -18,8 +18,6 @@ use llm_proxy_protocol::zen::{GeminiRequest, GeminiResponse, ResponsesRequest, R
 
 pub use crate::error::ProviderError;
 
-use crate::error::sanitize_api_error_body;
-
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
@@ -275,11 +273,11 @@ impl OpenCodeClient {
 
         if resp.status().as_u16() >= 400 {
             let status = resp.status().as_u16();
-            let body_bytes = resp.text().await.unwrap_or_default();
-            return Err(ProviderError::Api {
-                status,
-                body: sanitize_api_error_body(body_bytes),
-            });
+            let body_text = resp
+                .text()
+                .await
+                .unwrap_or_else(|e| format!("<failed to read error body: {}>", e));
+            return Err(ProviderError::api(status, body_text));
         }
 
         Ok(resp)
@@ -348,11 +346,11 @@ impl OpenCodeClient {
 
         if resp.status().as_u16() >= 400 {
             let status = resp.status().as_u16();
-            let body_bytes = resp.text().await.unwrap_or_default();
-            return Err(ProviderError::Api {
-                status,
-                body: sanitize_api_error_body(body_bytes),
-            });
+            let body_text = resp
+                .text()
+                .await
+                .unwrap_or_else(|e| format!("<failed to read error body: {}>", e));
+            return Err(ProviderError::api(status, body_text));
         }
 
         Ok(resp)
@@ -384,11 +382,11 @@ impl OpenCodeClient {
 
         if resp.status().as_u16() >= 400 {
             let status = resp.status().as_u16();
-            let body_bytes = resp.text().await.unwrap_or_default();
-            return Err(ProviderError::Api {
-                status,
-                body: sanitize_api_error_body(body_bytes),
-            });
+            let body_text = resp
+                .text()
+                .await
+                .unwrap_or_else(|e| format!("<failed to read error body: {}>", e));
+            return Err(ProviderError::api(status, body_text));
         }
 
         Ok(resp)
@@ -450,11 +448,11 @@ impl OpenCodeClient {
 
         if resp.status().as_u16() >= 400 {
             let status = resp.status().as_u16();
-            let body_bytes = resp.text().await.unwrap_or_default();
-            return Err(ProviderError::Api {
-                status,
-                body: sanitize_api_error_body(body_bytes),
-            });
+            let body_text = resp
+                .text()
+                .await
+                .unwrap_or_else(|e| format!("<failed to read error body: {}>", e));
+            return Err(ProviderError::api(status, body_text));
         }
 
         Ok(resp)

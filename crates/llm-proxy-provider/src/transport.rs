@@ -66,15 +66,18 @@ pub struct ProxyRequest {
     pub body: Vec<u8>,
     /// Whether this is a streaming request (informational for logging/metrics).
     ///
-    /// The caller must pick the correct method: [`ProxyClient::send`] for
-    /// non-streaming requests and [`ProxyClient::send_stream`] for streaming
-    /// requests. This field does **not** control transport behaviour; it exists
-    /// for structured logging and future metrics.
+    /// **This field is NOT read by [`ProxyClient`].** The caller must pick the
+    /// correct method: [`ProxyClient::send`] for non-streaming requests and
+    /// [`ProxyClient::send_stream`] for streaming requests. This field exists
+    /// solely for structured logging and future metrics.
     pub stream: bool,
 }
 
 impl fmt::Debug for ProxyRequest {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // NOTE: The URL field is not sanitized for query-string secrets.
+        // Callers must never include API keys in query parameters; use
+        // AuthHeaders instead.
         f.debug_struct("ProxyRequest")
             .field("url", &self.url)
             .field("auth", &self.auth)
@@ -93,6 +96,7 @@ impl fmt::Debug for ProxyRequest {
 /// Owns a connection-pooled [`reqwest::Client`] and sends [`ProxyRequest`]
 /// instances without any knowledge of protocol names or model IDs.
 #[derive(Debug, Clone)]
+#[must_use = "ProxyClient does nothing until send/send_stream is called"]
 pub struct ProxyClient {
     http: reqwest::Client,
 }
@@ -141,6 +145,13 @@ impl ProxyClient {
     }
 
     /// Sends a streaming request and returns a byte stream.
+    ///
+    /// # Cancel safety
+    ///
+    /// The returned stream owns the `reqwest::Response` via `bytes_stream()`.
+    /// Dropping the stream drops the underlying connection, aborting the
+    /// upstream request. No detached task is spawned that outlives the
+    /// consumer.
     ///
     /// - Always sets `Content-Type: application/json`.
     /// - Sets `Accept: text/event-stream`.
@@ -405,6 +416,11 @@ mod tests {
             "Response must contain Bearer header: {}",
             text
         );
+        assert!(
+            !text.contains("x-api-key"),
+            "Bearer auth style must NOT set x-api-key header: {}",
+            text
+        );
     }
 
     #[tokio::test]
@@ -428,6 +444,11 @@ mod tests {
         assert!(
             text.contains("x-api-key: test-key-456"),
             "Response must contain x-api-key header: {}",
+            text
+        );
+        assert!(
+            !text.contains("authorization"),
+            "XApiKey auth style must NOT set Authorization header: {}",
             text
         );
     }
@@ -459,6 +480,70 @@ mod tests {
             text.contains("x-api-key: test-key-789"),
             "Response must contain x-api-key header: {}",
             text
+        );
+    }
+
+    #[tokio::test]
+    async fn content_type_always_set_to_application_json() {
+        let app = Router::new().route("/test", post(echo_handler));
+        let base = start_test_server(app).await;
+
+        let client = ProxyClient::new();
+        let req = ProxyRequest {
+            url: format!("{}/test", base),
+            auth: AuthHeaders {
+                style: AuthStyle::Bearer,
+                api_key: "key".to_owned(),
+            },
+            body: br#"{"hello":"world"}"#.to_vec(),
+            stream: false,
+        };
+
+        let resp = client.send(req).await.unwrap();
+        let text = String::from_utf8(resp).unwrap();
+        assert!(
+            text.contains("content-type: application/json"),
+            "Content-Type must always be application/json: {}",
+            text
+        );
+    }
+
+    #[tokio::test]
+    async fn non_json_body_sent_byte_for_byte() {
+        // Verify that arbitrary non-JSON bytes pass through unchanged.
+        let app = Router::new().route("/test", post(echo_handler));
+        let base = start_test_server(app).await;
+
+        let client = ProxyClient::new();
+        let raw_body: Vec<u8> = vec![0x00, 0x01, 0x02, 0xFF, 0xFE];
+        let req = ProxyRequest {
+            url: format!("{}/test", base),
+            auth: AuthHeaders {
+                style: AuthStyle::Bearer,
+                api_key: "key".to_owned(),
+            },
+            body: raw_body.clone(),
+            stream: false,
+        };
+
+        let resp = client.send(req).await.unwrap();
+        let resp_bytes = resp;
+        // The echo handler uses String::from_utf8_lossy, so check that the
+        // lossy-converted body contains the expected bytes.
+        let text = String::from_utf8_lossy(&resp_bytes);
+        // The raw bytes 0x00, 0x01, 0x02 will appear literally; 0xFF, 0xFE
+        // become the replacement char. Verify the body was received.
+        assert!(
+            text.contains("body:"),
+            "Response must echo body field: {}",
+            text
+        );
+        // Verify the exact raw bytes were received by checking the first few.
+        let body_prefix = b"body: \x00\x01\x02";
+        assert!(
+            resp_bytes.windows(body_prefix.len()).any(|w| w == body_prefix),
+            "Response must contain exact raw bytes: {:?}",
+            resp_bytes
         );
     }
 
