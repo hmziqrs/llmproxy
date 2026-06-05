@@ -29,13 +29,19 @@ struct HealthMetrics {
 /// Liveness probe with expanded metrics.
 pub async fn health(State(state): State<AppState>) -> (StatusCode, Json<HealthBody>) {
     let snapshot = state.metrics.get_snapshot();
-    let circuit_breakers = state.fallback_handler.get_circuit_states();
+
+    // When legacy state is present, use the legacy fallback handler's circuit
+    // states. When running in TOML new-runtime mode, return an empty map.
+    let circuit_breakers = state
+        .legacy()
+        .map(|ls| ls.fallback_handler.get_circuit_states())
+        .unwrap_or_default();
 
     (
         StatusCode::OK,
         Json(HealthBody {
             status: "ok",
-            service: state.config.server_name.clone(),
+            service: state.server_name().to_owned(),
             metrics: HealthMetrics {
                 requests_received: snapshot.requests_received,
                 requests_streamed: snapshot.requests_streamed,
@@ -78,7 +84,7 @@ pub(crate) struct VersionBody {
 /// build info.
 pub async fn version(State(state): State<AppState>) -> Json<VersionBody> {
     Json(VersionBody {
-        name: state.config.server_name.clone(),
+        name: state.server_name().to_owned(),
         version: state.build.version,
         target: state.build.target,
         git_sha: state.build.git_sha,

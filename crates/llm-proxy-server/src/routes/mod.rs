@@ -43,7 +43,7 @@ const MAX_BODY_BYTES: usize = 32 * 1024 * 1024; // 32 MiB
 /// specifically (e.g. via per-route middleware or a streaming-aware timeout
 /// that only covers the request-body phase) is deferred to a future phase.
 pub fn router(state: AppState) -> Router {
-    let timeout = state.config.request_timeout;
+    let timeout = state.request_timeout();
 
     // Lightweight routes: tracing only, no timeout or body limit.
     let lightweight = Router::new()

@@ -78,7 +78,14 @@ pub async fn handle_messages(
     info!(request_id = %request_id, model = %req.model, streaming = is_streaming, "processing request");
 
     let scenario = detect_scenario_from_request(&req, &state, is_streaming);
-    let model = state
+
+    // Legacy mode: resolve model via the legacy model router.
+    let ls = state
+        .legacy()
+        .ok_or_else(|| ApiError::Internal("server not configured for legacy message handling".to_owned())
+            .with_request_id(request_id.clone()))?;
+
+    let model = ls
         .model_router
         .resolve(&scenario.to_string())
         .ok_or_else(|| {
@@ -90,7 +97,7 @@ pub async fn handle_messages(
 
     let fallback_chain = {
         let mut chain = vec![model.clone()];
-        if let Some(fb) = state.model_router.fallback_chain(&scenario.to_string()) {
+        if let Some(fb) = ls.model_router.fallback_chain(&scenario.to_string()) {
             chain.extend(fb.iter().cloned());
         }
         chain
@@ -129,7 +136,12 @@ fn detect_scenario_from_request(
         .collect();
 
     let token_count = state.token_counter.count_messages(&system_text, &messages) as i32;
-    let cfg = build_scenario_config(&state.config);
+
+    // Legacy mode: use the legacy config for scenario detection.
+    let cfg = state
+        .legacy()
+        .map(|ls| build_scenario_config(&ls.config))
+        .unwrap_or_else(|| ScenarioConfig::new(100_000));
 
     if streaming {
         route_for_streaming(&messages, token_count, Some(&cfg)).scenario
@@ -161,10 +173,14 @@ async fn handle_non_streaming(
     models: Vec<ModelConfig>,
     start: Instant,
 ) -> Result<Response<Body>, ApiErrorWithRequestId> {
-    let client = Arc::clone(&state.client);
+    let ls = state
+        .legacy()
+        .ok_or_else(|| ApiError::Internal("server not configured for legacy message handling".to_owned())
+            .with_request_id(request_id.clone()))?;
+    let client = Arc::clone(&ls.client);
     let metrics = Arc::clone(&state.metrics);
 
-    let (result, response_bytes) = state
+    let (result, response_bytes) = ls
         .fallback_handler
         .execute_with_fallback(&models, |model| {
             let req = req.clone();
@@ -288,17 +304,21 @@ async fn try_streaming_model(
     model: &ModelConfig,
     request_id: &str,
 ) -> Result<Response<Body>, String> {
+    let ls = state
+        .legacy()
+        .ok_or_else(|| "server not configured for legacy message handling".to_owned())?;
+    let client = &ls.client;
     match classify_endpoint(&model.model_id) {
         EndpointType::Anthropic => {
-            handle_anthropic_streaming(&state.client, req, model, request_id).await
+            handle_anthropic_streaming(client, req, model, request_id).await
         }
         EndpointType::ChatCompletions => {
-            handle_openai_streaming(&state.client, req, model).await
+            handle_openai_streaming(client, req, model).await
         }
         EndpointType::Responses => {
-            handle_responses_streaming(&state.client, req, model).await
+            handle_responses_streaming(client, req, model).await
         }
-        EndpointType::Gemini => handle_gemini_streaming(&state.client, req, model).await,
+        EndpointType::Gemini => handle_gemini_streaming(client, req, model).await,
     }
 }
 

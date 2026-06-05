@@ -19,7 +19,7 @@ pub mod state;
 pub use error::ApiError;
 pub use middleware::{RateLimiter, RequestDeduplicator, RequestIdGenerator};
 pub use shutdown::shutdown_signal;
-pub use state::{AppState, BuildInfo, ModelRouter};
+pub use state::{AppState, BuildInfo, LegacyState, ModelRouter};
 
 use axum::Router;
 

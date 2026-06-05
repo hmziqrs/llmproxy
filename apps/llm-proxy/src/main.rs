@@ -17,7 +17,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use llm_proxy_core::{Config, FallbackHandler};
-use llm_proxy_provider::OpenCodeClient;
+use llm_proxy_provider::{OpenCodeClient, ProviderAdapterRegistry, ProxyClient};
 use llm_proxy_server::{AppState, BuildInfo, build_router, shutdown_signal};
 use tokio::net::TcpListener;
 use tracing::info;
@@ -338,6 +338,15 @@ async fn main() -> Result<()> {
 // ---------------------------------------------------------------------------
 
 /// Run the `serve` command.
+///
+/// Supports two config loading modes:
+///
+/// - **TOML** (`.toml` extension): loads [`AppConfig`] and provider files from
+///   a `providers/` directory next to the main config file. Builds
+///   [`AppState`] in TOML new-runtime mode.
+/// - **JSON** (`.json` extension): legacy compatibility mode. Loads the old
+///   [`Config`] and builds [`AppState`] in JSON legacy mode.
+/// - Any other extension (or no extension) is rejected.
 async fn cmd_serve(
     config_path: Option<PathBuf>,
     port_override: Option<u16>,
@@ -351,31 +360,12 @@ async fn cmd_serve(
 
     init_tracing();
 
-    // Load config.
+    // Resolve config file path.
     let path = resolve_config(config_path);
-    let config = if path.exists() {
-        Config::load(&path).with_context(|| format!("loading config from {}", path.display()))?
-    } else {
-        info!("no config file found, using defaults");
-        let mut cfg = Config::default();
-        // Allow env var overrides even without config file.
-        if let Ok(key) = std::env::var("OC_GO_CC_API_KEY") {
-            cfg.api_key = key;
-        }
-        cfg
-    };
 
-    // Apply CLI port override.
-    let mut config = config;
-    if let Some(p) = port_override {
-        config.port = p;
-    }
-
-    // Sync legacy bind field.
-    let bind_addr: std::net::SocketAddr = format!("{}:{}", config.host, config.port)
-        .parse()
-        .with_context(|| format!("invalid bind address {}:{}", config.host, config.port))?;
-    config.bind = bind_addr;
+    // Build shared infrastructure present in both modes.
+    let adapter_registry = ProviderAdapterRegistry::builtin();
+    let proxy_client = ProxyClient::new();
 
     // Check if already running.
     if let Some(pid) = read_pid()? {
@@ -399,16 +389,24 @@ async fn cmd_serve(
         let _ = std::fs::remove_file(&pid_path);
     };
 
-    // Build state and router.
-    let config_arc = Arc::new(config);
-    let client = OpenCodeClient::new(Arc::clone(&config_arc));
-    let fallback_handler = FallbackHandler::new(3, std::time::Duration::from_secs(30));
-    let state = AppState::new(
-        Arc::try_unwrap(config_arc).unwrap_or_else(|arc| (*arc).clone()),
-        build_info(),
-        client,
-        fallback_handler,
-    );
+    // Dispatch on config file extension to determine construction mode.
+    let extension = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    let state = match extension {
+        "toml" => {
+            load_toml_state(&path, &adapter_registry, &proxy_client, port_override)?
+        }
+        "json" => {
+            load_json_state(&path, &adapter_registry, &proxy_client, port_override)?
+        }
+        _ => {
+            bail!(
+                "unsupported config file extension: {:?} (expected .toml or .json)",
+                path.extension().map(|e| e.to_string_lossy()).unwrap_or_else(|| std::borrow::Cow::Borrowed("(none)"))
+            );
+        }
+    };
+
+    let bind_addr = state.bind_address();
     let app = build_router(state);
 
     let listener = TcpListener::bind(bind_addr)
@@ -928,6 +926,110 @@ Hidden=false
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Load TOML config files and build [`AppState`] in TOML new-runtime mode.
+///
+/// Loads the main `AppConfig` from `path`, then scans a `providers/` directory
+/// next to `path` for provider TOML files. Each file is validated against the
+/// known protocols in `adapter_registry`.
+fn load_toml_state(
+    path: &std::path::Path,
+    adapter_registry: &ProviderAdapterRegistry,
+    proxy_client: &ProxyClient,
+    port_override: Option<u16>,
+) -> Result<AppState> {
+    use llm_proxy_core::{AppConfig, ProviderRegistry, load_app_config, load_provider_config};
+
+    let mut app_config: AppConfig =
+        load_app_config(path).with_context(|| format!("loading TOML config from {}", path.display()))?;
+
+    // Apply CLI port override by patching the bind address port.
+    if let Some(p) = port_override {
+        app_config.server.bind.set_port(p);
+    }
+
+    // Load provider files from providers/ directory next to the main config.
+    let providers_dir = path.parent().unwrap_or(std::path::Path::new(".")).join("providers");
+    let known_protocols: Vec<&str> = adapter_registry.protocol_names();
+
+    let mut provider_configs = Vec::new();
+    if providers_dir.exists() {
+        let entries = std::fs::read_dir(&providers_dir)
+            .with_context(|| format!("reading providers directory {}", providers_dir.display()))?;
+        for entry in entries {
+            let entry = entry.with_context(|| "reading provider directory entry")?;
+            let p = entry.path();
+            if p.extension().and_then(|e| e.to_str()) == Some("toml") {
+                let provider = load_provider_config(&p, Some(&known_protocols))
+                    .with_context(|| format!("loading provider config from {}", p.display()))?;
+                provider_configs.push(provider);
+            }
+        }
+    }
+
+    let registry = ProviderRegistry::from_providers(provider_configs)
+        .with_context(|| "building provider registry")?;
+
+    // Validate all provider protocols against the builtin adapter set.
+    registry
+        .validate_protocols(&known_protocols)
+        .with_context(|| "validating provider protocols")?;
+
+    info!(
+        config = %path.display(),
+        providers = registry.len(),
+        "loaded TOML config"
+    );
+
+    Ok(AppState::from_toml(
+        app_config,
+        registry,
+        adapter_registry.clone(),
+        proxy_client.clone(),
+        build_info(),
+    ))
+}
+
+/// Load legacy JSON config and build [`AppState`] in JSON compatibility mode.
+///
+/// This path is retained during the Phase 7 transition period. Phase 10 will
+/// remove it in favor of TOML-only loading.
+fn load_json_state(
+    path: &std::path::Path,
+    adapter_registry: &ProviderAdapterRegistry,
+    proxy_client: &ProxyClient,
+    port_override: Option<u16>,
+) -> Result<AppState> {
+    let config = Config::load(path)
+        .with_context(|| format!("loading JSON config from {}", path.display()))?;
+
+    // Apply CLI port override.
+    let mut config = config;
+    if let Some(p) = port_override {
+        config.port = p;
+    }
+
+    // Sync legacy bind field.
+    let bind_addr: std::net::SocketAddr = format!("{}:{}", config.host, config.port)
+        .parse()
+        .with_context(|| format!("invalid bind address {}:{}", config.host, config.port))?;
+    config.bind = bind_addr;
+
+    let config_arc = Arc::new(config);
+    let client = OpenCodeClient::new(Arc::clone(&config_arc));
+    let fallback_handler = FallbackHandler::new(3, std::time::Duration::from_secs(30));
+
+    info!(config = %path.display(), "loaded JSON config (legacy mode)");
+
+    Ok(AppState::from_legacy(
+        Arc::try_unwrap(config_arc).unwrap_or_else(|arc| (*arc).clone()),
+        build_info(),
+        client,
+        fallback_handler,
+        adapter_registry.clone(),
+        proxy_client.clone(),
+    ))
+}
 
 fn build_info() -> BuildInfo {
     BuildInfo {
