@@ -22,6 +22,7 @@ llm-proxy-server = { path = "crates/llm-proxy-server" }
 
 # Async / runtime
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time"] }
+tokio-util = { version = "0.7", features = ["rt"] }
 
 # Web
 axum = { version = "0.8", features = ["macros", "json"] }

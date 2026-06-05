@@ -128,41 +128,78 @@ pub enum ProviderError {
     Http(#[from] reqwest::Error),
     /// The upstream API returned an error status code.
     ///
-    /// # Security note
-    ///
-    /// The `body` field stores the full upstream response body verbatim.
-    /// When upstream returns a 401/403 with an error message containing
-    /// hints about the API key (e.g. "invalid api_key: sk-..."), the body
-    /// is propagated as-is into error strings and eventually logged via
-    /// `error!()` or returned to the client. The `reqwest::Error` Display
-    /// format may also include the full URL with sensitive query parameters.
-    ///
-    /// Future phases should sanitize or truncate the body before storing it
-    /// (e.g. max 512 bytes, stripping patterns that look like API keys).
+    /// The `body` field is truncated to [`MAX_API_ERROR_BODY_LEN`] bytes and
+    /// stripped of common API key patterns at construction time so that
+    /// `Display` output (used in `warn!()` / `error!()` logging) never
+    /// contains full key material.
     #[error("API error {status}: {body}")]
     Api {
         /// HTTP status code.
         status: u16,
-        /// Response body text.
+        /// Response body text (truncated and sanitized).
         body: String,
     },
+}
+
+/// Maximum length for upstream API error bodies stored in [`ProviderError::Api`].
+const MAX_API_ERROR_BODY_LEN: usize = 512;
+
+/// Sanitize an upstream API error body: strip common key prefixes and
+/// truncate to [`MAX_API_ERROR_BODY_LEN`].
+fn sanitize_api_error_body(mut body: String) -> String {
+    body = body
+        .replace("sk_live_", "***")
+        .replace("sk_test_", "***")
+        .replace("sk-", "***")
+        .replace("key-", "***");
+    if body.len() > MAX_API_ERROR_BODY_LEN {
+        let mut end = MAX_API_ERROR_BODY_LEN;
+        while !body.is_char_boundary(end) && end > 0 {
+            end -= 1;
+        }
+        body.truncate(end);
+        body.push_str("...[truncated]");
+    }
+    body
 }
 
 // ---------------------------------------------------------------------------
 // Endpoint config (internal)
 // ---------------------------------------------------------------------------
 
+/// A string wrapper that always redacts its contents in `Debug` output.
+///
+/// Used for API keys and other secrets so that adding `#[derive(Debug)]` to
+/// a parent struct never leaks the key in log output.
+#[derive(Clone)]
+struct SecretString(String);
+
+impl std::fmt::Debug for SecretString {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("[REDACTED]")
+    }
+}
+
+impl SecretString {
+    /// Expose the inner secret value.
+    fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<String> for SecretString {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
 /// Resolved endpoint configuration (base URL + API key).
 ///
-/// # Security note
-///
-/// This struct MUST NOT derive `Debug` or have a manual `Debug` impl that
-/// exposes `api_key` in plain text. The parent `OpenCodeClient` struct
-/// correctly redacts the key via `Config`'s `Debug` impl, but any future
-/// `Debug` addition here would immediately leak the key in log output.
+/// The `api_key` field uses [`SecretString`] so that even if this struct
+/// gains a `Debug` impl, the key is never printed in plaintext.
 struct EndpointConfig {
     base_url: String,
-    api_key: String,
+    api_key: SecretString,
 }
 
 // ---------------------------------------------------------------------------
@@ -212,19 +249,19 @@ impl OpenCodeClient {
             match classify_endpoint(model_id) {
                 EndpointType::Anthropic => EndpointConfig {
                     base_url: zen.anthropic_base_url.clone(),
-                    api_key: self.config.api_key.clone(),
+                    api_key: SecretString::from(self.config.api_key.clone()),
                 },
                 EndpointType::Responses => EndpointConfig {
                     base_url: zen.responses_base_url.clone(),
-                    api_key: self.config.api_key.clone(),
+                    api_key: SecretString::from(self.config.api_key.clone()),
                 },
                 EndpointType::Gemini => EndpointConfig {
                     base_url: format!("{}/{}", zen.gemini_base_url, model_id),
-                    api_key: self.config.api_key.clone(),
+                    api_key: SecretString::from(self.config.api_key.clone()),
                 },
                 EndpointType::ChatCompletions => EndpointConfig {
                     base_url: zen.base_url.clone(),
-                    api_key: self.config.api_key.clone(),
+                    api_key: SecretString::from(self.config.api_key.clone()),
                 },
             }
         } else {
@@ -232,12 +269,12 @@ impl OpenCodeClient {
             if is_anthropic_model(model_id) {
                 EndpointConfig {
                     base_url: self.config.opencode_go.anthropic_base_url.clone(),
-                    api_key: self.config.api_key.clone(),
+                    api_key: SecretString::from(self.config.api_key.clone()),
                 }
             } else {
                 EndpointConfig {
                     base_url: self.config.opencode_go.base_url.clone(),
-                    api_key: self.config.api_key.clone(),
+                    api_key: SecretString::from(self.config.api_key.clone()),
                 }
             }
         }
@@ -270,10 +307,10 @@ impl OpenCodeClient {
         // Non-Anthropic endpoint only sets Authorization: Bearer.
         if is_anthropic_model(model_id) {
             builder = builder
-                .header("x-api-key", &endpoint.api_key)
-                .header("Authorization", format!("Bearer {}", &endpoint.api_key));
+                .header("x-api-key", endpoint.api_key.expose())
+                .header("Authorization", format!("Bearer {}", endpoint.api_key.expose()));
         } else {
-            builder = builder.header("Authorization", format!("Bearer {}", &endpoint.api_key));
+            builder = builder.header("Authorization", format!("Bearer {}", endpoint.api_key.expose()));
         }
 
         if req.stream == Some(true) {
@@ -287,7 +324,7 @@ impl OpenCodeClient {
             let body_bytes = resp.text().await.unwrap_or_default();
             return Err(ProviderError::Api {
                 status,
-                body: body_bytes,
+                body: sanitize_api_error_body(body_bytes),
             });
         }
 
@@ -363,7 +400,7 @@ impl OpenCodeClient {
             let body_bytes = resp.text().await.unwrap_or_default();
             return Err(ProviderError::Api {
                 status,
-                body: body_bytes,
+                body: sanitize_api_error_body(body_bytes),
             });
         }
 
@@ -389,7 +426,7 @@ impl OpenCodeClient {
             .http_client
             .post(&endpoint.base_url)
             .header("Content-Type", "application/json")
-            .header("Authorization", format!("Bearer {}", &endpoint.api_key))
+            .header("Authorization", format!("Bearer {}", endpoint.api_key.expose()))
             .body(body)
             .send()
             .await?;
@@ -399,7 +436,7 @@ impl OpenCodeClient {
             let body_bytes = resp.text().await.unwrap_or_default();
             return Err(ProviderError::Api {
                 status,
-                body: body_bytes,
+                body: sanitize_api_error_body(body_bytes),
             });
         }
 
@@ -455,7 +492,7 @@ impl OpenCodeClient {
             .http_client
             .post(&endpoint.base_url)
             .header("Content-Type", "application/json")
-            .header("Authorization", format!("Bearer {}", &endpoint.api_key))
+            .header("Authorization", format!("Bearer {}", endpoint.api_key.expose()))
             .body(body)
             .send()
             .await?;
@@ -465,7 +502,7 @@ impl OpenCodeClient {
             let body_bytes = resp.text().await.unwrap_or_default();
             return Err(ProviderError::Api {
                 status,
-                body: body_bytes,
+                body: sanitize_api_error_body(body_bytes),
             });
         }
 

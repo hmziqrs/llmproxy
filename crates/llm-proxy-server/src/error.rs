@@ -27,6 +27,39 @@ pub enum ApiError {
     Internal(String),
 }
 
+/// Wraps an [`ApiError`] with a request ID for inclusion in error responses.
+#[derive(Debug)]
+pub struct ApiErrorWithRequestId {
+    /// The underlying error.
+    pub error: ApiError,
+    /// The request ID to include in the response header.
+    pub request_id: String,
+}
+
+impl std::fmt::Display for ApiErrorWithRequestId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(f)
+    }
+}
+
+impl std::error::Error for ApiErrorWithRequestId {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.error.source()
+    }
+}
+
+impl IntoResponse for ApiErrorWithRequestId {
+    fn into_response(self) -> Response {
+        let (status, body) = self.error.to_anthropic_response();
+        let mut response = (status, body).into_response();
+        response.headers_mut().insert(
+            "x-request-id",
+            self.request_id.parse().unwrap_or_else(|_| "unknown".parse().unwrap()),
+        );
+        response
+    }
+}
+
 #[derive(Serialize)]
 struct AnthropicErrorBody {
     r#type: &'static str,
@@ -95,15 +128,20 @@ impl ApiError {
             ),
         }
     }
+
+    /// Wrap this error with a request ID so the response includes an
+    /// `x-request-id` header.
+    pub fn with_request_id(self, request_id: String) -> ApiErrorWithRequestId {
+        ApiErrorWithRequestId {
+            error: self,
+            request_id,
+        }
+    }
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let (status, body) = self.to_anthropic_response();
-        // Note: Error responses do not include `x-request-id`. This is an
-        // observability gap -- the request ID is only added in the
-        // non-streaming success path. Consider adding it via response
-        // middleware or storing the request ID in response extensions.
         (status, body).into_response()
     }
 }

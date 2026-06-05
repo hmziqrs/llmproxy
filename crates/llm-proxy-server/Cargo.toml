@@ -17,6 +17,7 @@ axum = { workspace = true, features = ["macros", "json"] }
 axum-serde = { workspace = true, features = ["sonic"] }
 tokio = { workspace = true }
 tokio-stream = "0.1"
+tokio-util = { workspace = true }
 tower = { workspace = true }
 tower-http = { version = "0.6", features = ["trace", "timeout"] }
 serde = { workspace = true }

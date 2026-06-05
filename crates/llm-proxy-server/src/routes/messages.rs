@@ -28,7 +28,7 @@ use llm_proxy_protocol::{
 use llm_proxy_provider::{EndpointType, OpenCodeClient, ProviderError, classify_endpoint};
 use tracing::{error, info, warn};
 
-use crate::error::ApiError;
+use crate::error::{ApiError, ApiErrorWithRequestId};
 use crate::middleware::get_client_ip;
 use crate::state::AppState;
 
@@ -38,7 +38,7 @@ pub async fn handle_messages(
     State(state): State<AppState>,
     headers: HeaderMap,
     body: axum::body::Bytes,
-) -> Result<Response<Body>, ApiError> {
+) -> Result<Response<Body>, ApiErrorWithRequestId> {
     let start = Instant::now();
     let request_id = state.request_id_gen.next_id();
 
@@ -50,20 +50,22 @@ pub async fn handle_messages(
         // is logged server-side for rate-limit monitoring.
         return Err(ApiError::RateLimited(
             "rate limit exceeded".to_owned(),
-        ));
+        ).with_request_id(request_id));
     }
 
     if state.request_dedup.is_duplicate(&body) {
         state.metrics.record_deduplicated();
         return Err(ApiError::Duplicate(
             "duplicate request, please retry".to_owned(),
-        ));
+        ).with_request_id(request_id));
     }
 
     let req: MessageRequest = serde_json::from_slice(&body)
-        .map_err(|e| ApiError::BadRequest(format!("invalid JSON: {e}")))?;
+        .map_err(|e| ApiError::BadRequest(format!("invalid JSON: {e}"))
+            .with_request_id(request_id.clone()))?;
 
-    req.validate().map_err(ApiError::BadRequest)?;
+    req.validate()
+        .map_err(|e| ApiError::BadRequest(e).with_request_id(request_id.clone()))?;
 
     let is_streaming = req.stream.unwrap_or(false);
     // Note: Metrics are recorded after rate-limit and dedup checks, so
@@ -81,6 +83,7 @@ pub async fn handle_messages(
         .resolve(&scenario.to_string())
         .ok_or_else(|| {
             ApiError::Internal(format!("no model configured for scenario: {scenario}"))
+                .with_request_id(request_id.clone())
         })?;
 
     info!(request_id = %request_id, scenario = %scenario, model = %model.model_id, "routed to model");
@@ -157,7 +160,7 @@ async fn handle_non_streaming(
     req: MessageRequest,
     models: Vec<ModelConfig>,
     start: Instant,
-) -> Result<Response<Body>, ApiError> {
+) -> Result<Response<Body>, ApiErrorWithRequestId> {
     let client = Arc::clone(&state.client);
     let metrics = Arc::clone(&state.metrics);
 
@@ -185,7 +188,8 @@ async fn handle_non_streaming(
                 .expect("static header values are valid"))
         } else {
             metrics.record_failure();
-            Err(ApiError::Internal("no response body".to_owned()))
+            Err(ApiError::Internal("no response body".to_owned())
+                .with_request_id(request_id))
         }
     } else {
         metrics.record_failure();
@@ -194,7 +198,7 @@ async fn handle_non_streaming(
             result
                 .error
                 .unwrap_or_else(|| "all models failed".to_owned()),
-        )))
+        )).with_request_id(request_id))
     }
 }
 
@@ -254,10 +258,10 @@ async fn handle_streaming(
     req: MessageRequest,
     models: Vec<ModelConfig>,
     start: Instant,
-) -> Result<Response<Body>, ApiError> {
+) -> Result<Response<Body>, ApiErrorWithRequestId> {
     let mut last_error: Option<String> = None;
     for model in &models {
-        match try_streaming_model(state, &req, model).await {
+        match try_streaming_model(state, &req, model, &request_id).await {
             Ok(response) => {
                 state
                     .metrics
@@ -275,38 +279,43 @@ async fn handle_streaming(
     Err(ApiError::Upstream(sanitize_upstream_error(format!(
         "all streaming models failed: {}",
         last_error.unwrap_or_default()
-    ))))
+    ))).with_request_id(request_id))
 }
 
 async fn try_streaming_model(
     state: &AppState,
     req: &MessageRequest,
     model: &ModelConfig,
+    request_id: &str,
 ) -> Result<Response<Body>, String> {
     match classify_endpoint(&model.model_id) {
-        EndpointType::Anthropic => handle_anthropic_streaming(&state.client, req, model).await,
-        EndpointType::ChatCompletions => handle_openai_streaming(&state.client, req, model).await,
-        EndpointType::Responses => handle_responses_streaming(&state.client, req, model).await,
+        EndpointType::Anthropic => {
+            handle_anthropic_streaming(&state.client, req, model, request_id).await
+        }
+        EndpointType::ChatCompletions => {
+            handle_openai_streaming(&state.client, req, model).await
+        }
+        EndpointType::Responses => {
+            handle_responses_streaming(&state.client, req, model).await
+        }
         EndpointType::Gemini => handle_gemini_streaming(&state.client, req, model).await,
     }
 }
 
 // -- Anthropic streaming: raw pipe ----------------------------------------
 
+/// Anthropic streaming passthrough.
+///
 /// Note: The Anthropic passthrough path does not include keep-alive/heartbeat
 /// events. Non-Anthropic streaming paths use `build_sse_response` which
 /// includes a 3-second `KeepAlive` interval. Anthropic's own SSE stream
 /// includes heartbeat events natively, so this is intentionally omitted.
 /// If the upstream is slow, the client may time out.
-///
-/// Note: The Anthropic passthrough path does not include `x-request-id` in
-/// the response headers. The non-streaming path adds it. For ops consistency,
-/// streaming responses should also carry the request ID -- this is deferred
-/// to a future phase when response middleware is introduced.
 async fn handle_anthropic_streaming(
     client: &OpenCodeClient,
     req: &MessageRequest,
     model: &ModelConfig,
+    request_id: &str,
 ) -> Result<Response<Body>, String> {
     let b = serde_json::to_vec(req).map_err(|e| format!("ser: {e}"))?;
     let resp = client
@@ -323,6 +332,7 @@ async fn handle_anthropic_streaming(
         .header(header::CACHE_CONTROL, "no-cache")
         .header(header::CONNECTION, "keep-alive")
         .header("X-Accel-Buffering", "no")
+        .header("x-request-id", request_id)
         .body(body)
         .expect("static header values are valid"))
 }
@@ -402,21 +412,15 @@ async fn handle_gemini_streaming(
 /// processes them through a StreamProxy, and sends SSE Events through a
 /// channel. Returns the receiving end as a BoxStream.
 ///
-/// # Cancel-safety note
+/// # Cancel-safety
 ///
-/// The spawned task is detached (`tokio::spawn` without storing the `JoinHandle`).
-/// When the client disconnects, the `mpsc::Receiver` is dropped and the task
-/// detects this via `tx.send().is_err()`. However, the upstream HTTP response
-/// body (the `reqwest` stream) is held alive inside the spawned task until it
-/// naturally completes or errors. There is no mechanism to abort the upstream
-/// request when the client goes away.
+/// A [`tokio_util::sync::CancellationToken`] is used to abort the upstream
+/// stream reader when the client disconnects.  When the SSE receiver (the
+/// returned `BoxStream`) is dropped, a drop-guard triggers the cancellation
+/// token, which causes the spawned task to exit on the next iteration and
+/// release the upstream HTTP connection.
 ///
-/// Future phases should either:
-/// - Pass a `CancellationToken` into the spawned task and cancel it when the
-///   SSE stream is dropped (using `tokio::pin!` + abort-on-drop pattern).
-/// - Use `tokio::spawn`'s `JoinHandle` with `AbortHandle` to cancel the task.
-///
-/// Additionally, the `TimeoutLayer` in the router applies to the full response
+/// The `TimeoutLayer` in the router still applies to the full response
 /// lifetime including SSE streams. For streaming routes, consider exempting
 /// them from the global timeout or using per-route middleware.
 fn spawn_proxy_task<S, F>(stream: S, model_id: String, process: F) -> BoxStream<'static, Event>
@@ -425,30 +429,40 @@ where
     F: Fn(&mut StreamProxy, &str, &mut String) + Send + 'static,
 {
     let (tx, rx) = tokio::sync::mpsc::channel::<Event>(128);
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let cancel_clone = cancel.clone();
 
     tokio::spawn(async move {
         let mut proxy = StreamProxy::new(&model_id);
         let mut out = String::new();
         let mut stream = Box::pin(stream);
 
-        while let Some(chunk) = stream.next().await {
-            let bytes = match chunk {
-                Ok(b) => b,
-                Err(_) => break,
-            };
-
-            let text = String::from_utf8_lossy(&bytes);
-            out.clear();
-
-            for line in text.split('\n') {
-                let line = line.trim_end_matches('\r');
-                process(&mut proxy, line, &mut out);
-            }
-
-            for event in parse_sse_events(&out) {
-                if tx.send(event).await.is_err() {
-                    // Receiver dropped, client disconnected.
+        loop {
+            tokio::select! {
+                _ = cancel_clone.cancelled() => {
+                    // Client disconnected; abort upstream stream.
                     return;
+                }
+                chunk = stream.next() => {
+                    match chunk {
+                        Some(Ok(bytes)) => {
+                            let text = String::from_utf8_lossy(&bytes);
+                            out.clear();
+
+                            for line in text.split('\n') {
+                                let line = line.trim_end_matches('\r');
+                                process(&mut proxy, line, &mut out);
+                            }
+
+                            for event in parse_sse_events(&out) {
+                                if tx.send(event).await.is_err() {
+                                    // Receiver dropped, client disconnected.
+                                    return;
+                                }
+                            }
+                        }
+                        Some(Err(_)) | None => break,
+                    }
                 }
             }
         }
@@ -465,7 +479,16 @@ where
         }
     });
 
-    tokio_stream::wrappers::ReceiverStream::new(rx).boxed()
+    // Wrap the receiver stream so that dropping it cancels the spawned task.
+    let rx_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+    let cancel_guard = cancel;
+    rx_stream
+        .map(move |item| {
+            // Keep the cancellation token alive for the lifetime of the stream.
+            let _guard = &cancel_guard;
+            item
+        })
+        .boxed()
 }
 
 /// Parse SSE events from the transformer output.
