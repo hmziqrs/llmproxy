@@ -75,7 +75,11 @@ impl ProviderStreamDecoder for OpenAiChatStreamDecoder {
         let chunk: ChatCompletionChunk = match serde_json::from_str(data) {
             Ok(c) => c,
             Err(_) => {
-                tracing::warn!(data, "malformed OpenAI chunk, skipping");
+                let truncated = if data.len() > 200 { &data[..200] } else { data };
+                tracing::warn!(
+                    data = truncated,
+                    "malformed OpenAI chunk, skipping"
+                );
                 return Ok(vec![]);
             }
         };
@@ -110,13 +114,17 @@ impl ProviderStreamDecoder for OpenAiChatStreamDecoder {
         // Handle reasoning content (both `reasoning_content` and `reasoning`).
         // The serde alias on ChatMessage ensures both field names deserialize
         // into `reasoning_content`.
+        //
+        // Empty-string reasoning deltas are intentionally skipped: OpenAI sends
+        // them as keep-alives with no semantic meaning, and usage-only /
+        // finish-reason-only chunks are handled in separate code paths below.
         if let Some(reasoning) = choice
             .delta
             .as_ref()
             .and_then(|d| d.reasoning_content.as_ref())
         {
             if !reasoning.is_empty() {
-                self.close_text_if_open(&mut events);
+                self.close_text_if_open();
                 if !self.reasoning_started {
                     self.reasoning_started = true;
                     events.push(CoreEvent::ContentStart {
@@ -132,9 +140,14 @@ impl ProviderStreamDecoder for OpenAiChatStreamDecoder {
         }
 
         // Handle text content deltas.
+        //
+        // Empty-string content deltas are intentionally skipped: OpenAI sends
+        // them as keep-alives with no semantic meaning.  The finish_reason and
+        // usage are handled in separate code paths, so this truthy check does not
+        // drop meaningful events.
         if let Some(ref delta) = choice.delta {
             if !delta.content.is_empty() {
-                self.close_reasoning_if_open(&mut events);
+                self.close_reasoning_if_open();
                 if !self.content_started {
                     self.content_started = true;
                     events.push(CoreEvent::ContentStart {
@@ -152,7 +165,7 @@ impl ProviderStreamDecoder for OpenAiChatStreamDecoder {
         // Handle tool call deltas.
         if let Some(ref delta) = choice.delta {
             if !delta.tool_calls.is_empty() {
-                self.close_content_if_open(&mut events);
+                self.close_content_if_open();
 
                 for tc in &delta.tool_calls {
                     let oi = tc.index.unwrap_or(0) as usize;
@@ -205,7 +218,7 @@ impl ProviderStreamDecoder for OpenAiChatStreamDecoder {
         // Handle finish reason.
         if let Some(ref reason) = choice.finish_reason {
             if !reason.is_empty() && !self.stop_sent {
-                self.close_content_if_open(&mut events);
+                self.close_content_if_open();
                 self.close_tool_blocks(&mut events);
 
                 let stop_reason = map_openai_finish_reason(reason);
@@ -243,7 +256,7 @@ impl ProviderStreamDecoder for OpenAiChatStreamDecoder {
             });
         }
 
-        self.close_content_if_open(&mut events);
+        self.close_content_if_open();
         self.close_tool_blocks(&mut events);
 
         if !self.stop_sent {
@@ -264,22 +277,24 @@ impl ProviderStreamDecoder for OpenAiChatStreamDecoder {
 }
 
 impl OpenAiChatStreamDecoder {
-    fn close_text_if_open(&mut self, _events: &mut Vec<CoreEvent>) {
+    /// Close any open text content block.  Reserved for future ContentStop emission.
+    fn close_text_if_open(&mut self) {
         if self.content_started {
-            // No explicit ToolCallStop for text; content_stop is implied.
             self.content_started = false;
             self.content_index += 1;
         }
     }
 
-    fn close_reasoning_if_open(&mut self, _events: &mut Vec<CoreEvent>) {
+    /// Close any open reasoning content block.  Reserved for future ContentStop emission.
+    fn close_reasoning_if_open(&mut self) {
         if self.reasoning_started {
             self.reasoning_started = false;
             self.content_index += 1;
         }
     }
 
-    fn close_content_if_open(&mut self, _events: &mut Vec<CoreEvent>) {
+    /// Close any open text or reasoning content blocks.
+    fn close_content_if_open(&mut self) {
         if self.content_started {
             self.content_started = false;
             self.content_index += 1;

@@ -88,6 +88,9 @@ pub struct ResponsesResponse {
     pub output: Vec<ResponsesOutput>,
     /// Token usage statistics.
     pub usage: ResponsesUsage,
+    /// Response status (e.g. `"completed"`, `"failed"`, `"incomplete"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
 }
 
 /// A single output item in a Responses API response.
@@ -226,6 +229,35 @@ pub struct GeminiFunctionResponse {
     pub name: String,
     /// The response payload from the function.
     pub response: serde_json::Value,
+}
+
+impl GeminiPart {
+    /// Create a text part.
+    pub fn text(text: String) -> Self {
+        Self {
+            text: Some(text),
+            function_call: None,
+            function_response: None,
+        }
+    }
+
+    /// Create a function call part.
+    pub fn function_call(name: String, args: Option<serde_json::Value>) -> Self {
+        Self {
+            text: None,
+            function_call: Some(GeminiFunctionCall { name, args }),
+            function_response: None,
+        }
+    }
+
+    /// Create a function response part.
+    pub fn function_response(name: String, response: serde_json::Value) -> Self {
+        Self {
+            text: None,
+            function_call: None,
+            function_response: Some(GeminiFunctionResponse { name, response }),
+        }
+    }
 }
 
 /// Generation parameters for a Gemini request.

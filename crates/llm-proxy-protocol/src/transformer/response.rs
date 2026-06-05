@@ -634,6 +634,7 @@ mod tests {
                 input_tokens: 200,
                 output_tokens: 100,
             },
+            status: None,
         };
 
         let result = transform_responses_response(&resp, "my-model").unwrap();
@@ -676,6 +677,7 @@ mod tests {
                 input_tokens: 0,
                 output_tokens: 0,
             },
+            status: None,
         };
 
         let result = transform_responses_response(&resp, "model").unwrap();
@@ -817,6 +819,7 @@ mod tests {
                 input_tokens,
                 output_tokens,
             },
+            status: None,
         }
     }
 

@@ -64,6 +64,10 @@ pub struct GeminiStreamDecoder {
     content_started: bool,
     /// Maps Gemini candidate index to tool content block index.
     tool_blocks: Vec<usize>,
+    /// Whether each tool block has already received a ToolCallStop during decode_frame.
+    tool_blocks_closed: Vec<bool>,
+    /// Monotonically increasing counter for generating unique tool use IDs.
+    tool_id_counter: usize,
     stop_sent: bool,
 }
 
@@ -77,7 +81,11 @@ impl ProviderStreamDecoder for GeminiStreamDecoder {
         let chunk: GeminiStreamChunk = match serde_json::from_str(data) {
             Ok(c) => c,
             Err(_) => {
-                tracing::warn!(data, "malformed Gemini chunk, skipping");
+                let truncated = if data.len() > 200 { &data[..200] } else { data };
+                tracing::warn!(
+                    data = truncated,
+                    "malformed Gemini chunk, skipping"
+                );
                 return Ok(vec![]);
             }
         };
@@ -128,15 +136,21 @@ impl ProviderStreamDecoder for GeminiStreamDecoder {
 
                 let block_idx = self.content_index;
                 self.tool_blocks.push(block_idx);
+                self.tool_blocks_closed.push(false);
 
                 events.push(CoreEvent::ToolCallStart {
                     index: block_idx,
-                    id: format!("gemini_call_{}", block_idx),
+                    id: format!("gemini_call_{}", self.tool_id_counter),
                     name: function_call.name.clone(),
                 });
+                self.tool_id_counter += 1;
 
                 if let Some(ref args) = function_call.args {
-                    let args_str = serde_json::to_string(args).unwrap_or_default();
+                    let args_str =
+                        serde_json::to_string(args).unwrap_or_else(|e| {
+                            tracing::warn!(error = %e, "Gemini: failed to serialize function_call args");
+                            String::new()
+                        });
                     if !args_str.is_empty() && args_str != "null" {
                         events.push(CoreEvent::ToolCallDelta {
                             index: block_idx,
@@ -146,6 +160,10 @@ impl ProviderStreamDecoder for GeminiStreamDecoder {
                 }
 
                 events.push(CoreEvent::ToolCallStop { index: block_idx });
+                // Mark this tool block as closed so finish() does not emit a duplicate.
+                if let Some(last) = self.tool_blocks_closed.last_mut() {
+                    *last = true;
+                }
                 self.content_index += 1;
             }
         }
@@ -187,11 +205,11 @@ impl ProviderStreamDecoder for GeminiStreamDecoder {
 
         self.close_content_if_open(&mut events);
 
-        // Emit ToolCallStop for any unclosed tool blocks.
-        let mut tool_indices: Vec<_> = self.tool_blocks.to_vec();
-        tool_indices.sort();
-        for idx in tool_indices {
-            events.push(CoreEvent::ToolCallStop { index: idx });
+        // Emit ToolCallStop for any tool blocks that were not closed during decode_frame().
+        for (&idx, &closed) in self.tool_blocks.iter().zip(&self.tool_blocks_closed) {
+            if !closed {
+                events.push(CoreEvent::ToolCallStop { index: idx });
+            }
         }
 
         if !self.stop_sent {
@@ -254,20 +272,15 @@ impl GeminiAdapter {
                 match c {
                     CoreContent::Text { text, .. } => {
                         if !text.is_empty() {
-                            parts.push(
-                                serde_json::from_value(serde_json::json!({"text": text}))
-                                    .expect("json! macro always produces valid GeminiPart"),
-                            );
+                            parts.push(GeminiPart::text(text.clone()));
                         }
                     }
                     CoreContent::ToolUse { name, input, .. } => {
                         // Encode tool-use as a functionCall part.
-                        parts.push(
-                            serde_json::from_value(serde_json::json!({
-                                "function_call": {"name": name, "args": input}
-                            }))
-                            .expect("json! macro always produces valid GeminiPart"),
-                        );
+                        parts.push(GeminiPart::function_call(
+                            name.clone(),
+                            Some(input.clone()),
+                        ));
                     }
                     CoreContent::ToolResult {
                         tool_use_id,
@@ -311,15 +324,7 @@ impl GeminiAdapter {
                                     .trim_start_matches("gemini_call_")
                                     .to_owned()
                             });
-                        parts.push(
-                            serde_json::from_value(serde_json::json!({
-                                "function_response": {
-                                    "name": fn_name,
-                                    "response": response_val,
-                                }
-                            }))
-                            .expect("json! macro always produces valid GeminiPart"),
-                        );
+                        parts.push(GeminiPart::function_response(fn_name, response_val));
                     }
                     _ => {
                         tracing::warn!(
@@ -342,7 +347,22 @@ impl GeminiAdapter {
         // to start with a user turn followed by a model turn, so this dummy
         // acknowledgment satisfies that constraint.  It does not affect model
         // behavior.
+        //
+        // DESIGN DECISION: If both `core.system` and `CoreRole::System` messages
+        // are present, both are included.  The prepended system prompt comes first,
+        // followed by CoreRole::System messages mapped to "user" role.  This may
+        // create duplicate system content, but deduplication is deferred to a
+        // future phase since the caller typically provides one or the other.
         if !core.system.is_empty() {
+            // Warn about non-text system content blocks (consistent with other adapters).
+            for c in &core.system {
+                if !matches!(c, CoreContent::Text { .. }) {
+                    tracing::warn!(
+                        ?c,
+                        "Gemini: dropping non-Text system content block during encode"
+                    );
+                }
+            }
             let system_text: String = core
                 .system
                 .iter()
@@ -402,9 +422,23 @@ impl GeminiAdapter {
         // omission is safe but potentially impactful.
         if core.tool_choice.is_some() {
             tracing::warn!(
-                ?core.tool_choice,
+                tool_choice = ?core.tool_choice.as_ref().map(|_| "set"),
                 "Gemini: tool_choice specified but not yet forwarded to upstream; \
                  the model will use its default tool calling behavior"
+            );
+        }
+
+        // Warn about fields that Gemini cannot forward.
+        if core.sampling.reasoning_effort.is_some() {
+            tracing::warn!(
+                "Gemini: reasoning_effort specified but not forwarded; \
+                 Gemini does not support this parameter"
+            );
+        }
+        if core.metadata.user_id.is_some() {
+            tracing::warn!(
+                "Gemini: user_id specified but not forwarded; \
+                 Gemini does not support this parameter"
             );
         }
 
@@ -437,6 +471,7 @@ impl GeminiAdapter {
 
         let candidate = &resp.candidates[0];
         let mut content = Vec::new();
+        let mut tool_id_counter = 0usize;
 
         for part in &candidate.content.parts {
             if let Some(ref text) = part.text {
@@ -453,10 +488,11 @@ impl GeminiAdapter {
                     .clone()
                     .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
                 content.push(CoreContent::ToolUse {
-                    id: format!("gemini_call_{}", content.len()),
+                    id: format!("gemini_call_{}", tool_id_counter),
                     name: function_call.name.clone(),
                     input,
                 });
+                tool_id_counter += 1;
             }
         }
 
@@ -507,6 +543,8 @@ impl GeminiAdapter {
             content_index: 0,
             content_started: false,
             tool_blocks: Vec::new(),
+            tool_blocks_closed: Vec::new(),
+            tool_id_counter: 0,
             stop_sent: false,
         })
     }
@@ -1227,6 +1265,86 @@ mod tests {
             }
             _ => panic!("expected ToolUse"),
         }
+    }
+
+    // -- Additional tests: upstream model alias, stream flag, malformed, etc --
+
+    #[test]
+    fn encode_uses_upstream_model() {
+        let mut target = make_target();
+        target.upstream_model = "gemini-2.5-flash-preview-05-20".into();
+        let core = make_core_request(vec![CoreMessage {
+            role: CoreRole::User,
+            content: vec![CoreContent::Text { text: "hi".into(), cache: None }],
+        }]);
+        let adapter = GeminiAdapter;
+        let proxy_req = adapter.encode_request(&core, &target).unwrap();
+        // The URL should contain the upstream model name.
+        assert!(proxy_req.url.contains("gemini-2.5-flash-preview-05-20"));
+    }
+
+    #[test]
+    fn encode_stream_flag_forwarded() {
+        let mut core = make_core_request(vec![CoreMessage {
+            role: CoreRole::User,
+            content: vec![CoreContent::Text { text: "hi".into(), cache: None }],
+        }]);
+        core.stream = true;
+        let target = make_target();
+        let adapter = GeminiAdapter;
+        let proxy_req = adapter.encode_request(&core, &target).unwrap();
+        assert!(proxy_req.stream, "stream flag should be forwarded to ProxyRequest");
+    }
+
+    #[test]
+    fn encode_empty_messages() {
+        let core = make_core_request(vec![]);
+        let adapter = GeminiAdapter;
+        let target = make_target();
+        let proxy_req = adapter.encode_request(&core, &target).unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&proxy_req.body).unwrap();
+        // Should produce a valid request with empty contents array.
+        assert_eq!(body["contents"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn decode_malformed_json_returns_error() {
+        let target = make_target();
+        let adapter = GeminiAdapter;
+        let result = adapter.decode_response(b"not valid json {{{", &target);
+        assert!(result.is_err(), "malformed JSON should produce an error");
+    }
+
+    #[test]
+    fn decode_empty_bytes_returns_error() {
+        let target = make_target();
+        let adapter = GeminiAdapter;
+        let result = adapter.decode_response(b"", &target);
+        assert!(result.is_err(), "empty bytes should produce an error");
+    }
+
+    #[test]
+    fn stream_no_duplicate_tool_call_stop() {
+        let target = make_target();
+        let adapter = GeminiAdapter;
+        let mut decoder = adapter.new_stream_decoder(&target);
+
+        let frames = vec![
+            make_frame(r#"{"candidates":[{"content":{"role":"model","parts":[{"function_call":{"name":"search","args":{"q":"rust"}}}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":5,"totalTokenCount":15}}"#),
+        ];
+
+        let mut all_events = Vec::new();
+        for frame in &frames {
+            all_events.extend(decoder.decode_frame(frame).unwrap());
+        }
+        all_events.extend(decoder.finish().unwrap());
+
+        // Count ToolCallStop events -- should be exactly 1.
+        let tool_call_stop_count = all_events
+            .iter()
+            .filter(|e| matches!(e, CoreEvent::ToolCallStop { .. }))
+            .count();
+        assert_eq!(tool_call_stop_count, 1, "ToolCallStop should be emitted exactly once");
     }
 
     // -- Source guard ---------------------------------------------------------

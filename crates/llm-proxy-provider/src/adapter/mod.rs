@@ -1,14 +1,14 @@
-//! Provider protocol adapters: CoreRequest -> provider wire format and back.
+//! Provider protocol adapters: [`CoreRequest`] -> provider wire format and back.
 //!
 //! Each adapter handles exactly one provider protocol:
 //!
-//! - `OpenAiChatAdapter` -- OpenAI Chat Completions API
-//! - `AnthropicAdapter`  -- Anthropic Messages API
-//! - `ResponsesAdapter`  -- OpenAI Responses API
-//! - `GeminiAdapter`     -- Google Gemini GenerateContent API
+//! - [`OpenAiChatAdapter`] -- OpenAI Chat Completions API
+//! - [`AnthropicAdapter`]  -- Anthropic Messages API
+//! - [`ResponsesAdapter`]  -- OpenAI Responses API
+//! - [`GeminiAdapter`]     -- Google Gemini GenerateContent API
 //!
-//! Adapters translate between the normalized core types (`CoreRequest`,
-//! `CoreResponse`, `CoreEvent`) and the provider-specific wire types. They
+//! Adapters translate between the normalized core types ([`CoreRequest`],
+//! [`CoreResponse`], [`CoreEvent`]) and the provider-specific wire types. They
 //! never import client adapters, route handlers, or server state.
 
 pub mod anthropic;
@@ -52,6 +52,7 @@ pub enum ProviderProtocol {
 
 impl ProviderProtocol {
     /// Returns the canonical string name for this protocol.
+    #[must_use]
     pub fn name(self) -> &'static str {
         match self {
             Self::OpenAiChatCompletions => "openai-chat",
@@ -62,6 +63,7 @@ impl ProviderProtocol {
     }
 
     /// Parse a protocol name string (case-insensitive).
+    #[must_use]
     pub fn parse(name: &str) -> Option<Self> {
         match name.to_ascii_lowercase().as_str() {
             "openai-chat" => Some(Self::OpenAiChatCompletions),
@@ -138,6 +140,7 @@ pub enum ProviderAdapter {
 
 impl ProviderAdapter {
     /// Returns the protocol this adapter handles.
+    #[must_use]
     pub fn protocol(&self) -> ProviderProtocol {
         match self {
             Self::OpenAiChat(_) => ProviderProtocol::OpenAiChatCompletions,
@@ -249,6 +252,7 @@ impl ProviderAdapterRegistry {
     }
 
     /// Returns the canonical protocol names.
+    #[must_use]
     pub fn protocol_names(&self) -> Vec<&'static str> {
         self.adapters.keys().map(|p| p.name()).collect()
     }
@@ -284,8 +288,16 @@ pub(crate) fn expand_url_template(
 ) -> Result<String, ProviderError> {
     let model = &target.upstream_model;
     // Reject model names containing path traversal or other unsafe characters.
+    // Reject model names containing path traversal or other unsafe characters.
+    // Additionally reject `.` and `..` exactly (path traversal patterns).
+    if model == ".." || model == "." {
+        return Err(ProviderError::InvalidConfig(format!(
+            "upstream_model {:?} is a path traversal pattern; refusing to interpolate into URL",
+            model
+        )));
+    }
     if !model.chars().all(|c| c.is_alphanumeric() || c == '.' || c == '-' || c == '_') {
-        return Err(ProviderError::SseFraming(format!(
+        return Err(ProviderError::InvalidConfig(format!(
             "upstream_model {:?} contains unsafe characters; refusing to interpolate into URL",
             model
         )));
@@ -346,7 +358,7 @@ pub(crate) fn build_proxy_request(
     ProxyRequest {
         url,
         auth: AuthHeaders {
-            style: target.auth_style.clone(),
+            style: target.auth_style,
             api_key: target.api_key.clone(),
         },
         body,

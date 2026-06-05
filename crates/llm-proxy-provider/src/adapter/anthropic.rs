@@ -30,15 +30,10 @@ use crate::sse::SseFrame;
 /// large enough for most use cases while staying within typical model limits.
 const ANTHROPIC_DEFAULT_MAX_TOKENS: i32 = 4096;
 
-// NOTE: The current sanitize/desanitize approach applies encoding to all
-// names with disallowed characters and unconditionally decodes `_0xHH_`
-// patterns during desanitization.  This means a tool name that naturally
-// contains `_0xHH_` (e.g. `parse_0xff_value`) will be falsely decoded.
-//
-// A proper fix would store a per-request reverse map (HashMap<String, String>)
-// of names that were actually rewritten, and only decode those.  The
-// `_changed` flag from `sanitize_tool_name` is already computed but discarded.
-// This is a known limitation tracked for a future phase.
+// The sanitize/desanitize approach uses a sentinel prefix `__llmp_` to mark
+// names that were actually rewritten.  Only names carrying this sentinel are
+// decoded during desanitization, which prevents false-positive decoding of
+// tool names that naturally contain `_0xHH_` patterns (e.g. `parse_0xff_value`).
 
 // Anthropic `tool_use_id` must match `^[A-Za-z0-9_]{0,256}$`.
 static INVALID_TOOL_USE_ID_CHAR: LazyLock<regex::Regex> =
@@ -49,11 +44,18 @@ static INVALID_TOOL_USE_ID_CHAR: LazyLock<regex::Regex> =
 /// Disallowed characters are encoded as `_0xHH_` where HH is the hex byte value.
 /// This ensures two different tool names (e.g. `my.tool` and `my_tool`) produce
 /// different sanitized names (`my_0x2e_tool` vs `my_tool`), avoiding collisions.
-/// Truncates to 128 chars if needed. Returns the sanitized name and whether it was
-/// actually rewritten (i.e., differs from the original).
+///
+/// When encoding is applied, a sentinel prefix `__llmp_` is prepended so that
+/// [`desanitize_tool_name`] can distinguish genuinely encoded names from tool names
+/// that naturally contain `_0xHH_` patterns (e.g. `parse_0xff_value`).
+///
+/// Truncates to 128 chars if needed (avoiding partial `_0xHH_` sequences).
+/// Returns the sanitized name and whether it was actually rewritten.
 fn sanitize_tool_name(name: &str) -> (String, bool) {
     use std::fmt::Write;
-    let mut result = String::with_capacity(name.len() * 3);
+    let sentinel = "__llmp_";
+    let max_len = 128;
+    let mut result = String::with_capacity(name.len() * 3 + sentinel.len());
     let mut changed = false;
 
     for ch in name.chars() {
@@ -68,14 +70,38 @@ fn sanitize_tool_name(name: &str) -> (String, bool) {
         }
     }
 
-    // Truncate to 128 chars if needed (char-boundary safe).
-    if result.len() > 128 {
-        let mut end = 128;
+    // If encoding was applied, prepend the sentinel.
+    if changed {
+        result.insert_str(0, sentinel);
+    }
+
+    // Truncate to max_len if needed, avoiding partial _0xHH_ sequences.
+    if result.len() > max_len {
+        let mut end = max_len;
+        while !result.is_char_boundary(end) && end > 0 {
+            end -= 1;
+        }
+        // Scan backward: if we cut in the middle of a `_0xHH_` sequence,
+        // truncate before the opening `_` instead.
+        if end >= 5 {
+            // Check if we're inside a potential _0xHH_ pattern.
+            if let Some(pos) = result[..end].rfind("_0x") {
+                let seq_end = pos + 6; // _0xHH_ is 6 bytes
+                if seq_end > end {
+                    // The _0xHH_ sequence straddles the cut point.
+                    // Truncate before the opening `_` instead.
+                    end = pos;
+                }
+            }
+        }
+        // Final char-boundary check after adjustment.
         while !result.is_char_boundary(end) && end > 0 {
             end -= 1;
         }
         result.truncate(end);
-        changed = true;
+        if result.is_empty() {
+            return ("tool".to_owned(), true);
+        }
     }
 
     // Guarantee non-empty.
@@ -90,19 +116,28 @@ fn sanitize_tool_name(name: &str) -> (String, bool) {
 ///
 /// Uses a sentinel prefix `__llmp_` to distinguish genuinely encoded names from
 /// tool names that happen to contain `_0x` naturally (e.g. `parse_0xff_value`).
-/// Only names that were actually rewritten by [`sanitize_tool_name`] during
-/// encoding carry this sentinel and will be decoded.
+/// Only names that carry the `__llmp_` sentinel are decoded; names without it
+/// are returned as-is, preventing false-positive decoding.
 fn desanitize_tool_name(name: &str) -> std::borrow::Cow<'_, str> {
-    if !name.contains("_0x") {
+    const SENTINEL: &str = "__llmp_";
+
+    // Only decode names that carry the sentinel prefix.
+    if !name.starts_with(SENTINEL) {
         return std::borrow::Cow::Borrowed(name);
     }
 
-    let mut result = Vec::<u8>::with_capacity(name.len());
-    let bytes = name.as_bytes();
+    // Strip the sentinel before decoding.
+    let stripped = &name[SENTINEL.len()..];
+    if !stripped.contains("_0x") {
+        return std::borrow::Cow::Owned(stripped.to_owned());
+    }
+
+    let mut result = Vec::<u8>::with_capacity(stripped.len());
+    let bytes = stripped.as_bytes();
     let mut i = 0;
 
     while i < bytes.len() {
-        // Pattern: _0xHH_ (6 bytes at offsets i..i+5).
+        // Pattern: _0xHH_ (6 bytes at offsets i..=i+5).
         // Need at least 6 bytes remaining: i + 5 must be a valid index.
         if bytes[i] == b'_'
             && i + 5 < bytes.len()
@@ -144,7 +179,7 @@ fn hex_byte(hi: u8, lo: u8) -> Option<u8> {
 }
 
 /// Parse a single ASCII hex digit into its numeric value.
-fn hex_digit(b: u8) -> Option<u8> {
+const fn hex_digit(b: u8) -> Option<u8> {
     match b {
         b'0'..=b'9' => Some(b - b'0'),
         b'a'..=b'f' => Some(b - b'a' + 10),
@@ -183,7 +218,8 @@ pub struct AnthropicAdapter;
 
 impl AnthropicAdapter {
     /// Create a new Anthropic adapter.
-    pub fn new() -> Self {
+    #[must_use]
+    pub const fn new() -> Self {
         Self
     }
 }
@@ -216,6 +252,9 @@ pub struct AnthropicStreamDecoder {
     current_block_index: Option<usize>,
     current_block_kind: ContentKind,
     tool_blocks: Vec<usize>,
+    /// Tracks which tool blocks have already received a `ToolCallStop` via
+    /// `content_block_stop`, so `finish()` does not emit duplicates.
+    tool_blocks_closed: Vec<bool>,
     stop_sent: bool,
 }
 
@@ -229,7 +268,11 @@ impl ProviderStreamDecoder for AnthropicStreamDecoder {
         let event: MessageEvent = match serde_json::from_str(data) {
             Ok(e) => e,
             Err(_) => {
-                tracing::warn!(data, "malformed Anthropic event, skipping");
+                let truncated = if data.len() > 200 { &data[..200] } else { data };
+                tracing::warn!(
+                    data = truncated,
+                    "malformed Anthropic event, skipping"
+                );
                 return Ok(vec![]);
             }
         };
@@ -279,6 +322,7 @@ impl ProviderStreamDecoder for AnthropicStreamDecoder {
                         "tool_use" => {
                             self.current_block_kind = ContentKind::ToolUse;
                             self.tool_blocks.push(idx);
+                            self.tool_blocks_closed.push(false);
                             let id = block.id.clone().unwrap_or_default();
                             let name = block.name.clone().unwrap_or_default();
                             // Reverse-map sanitized tool names back to originals,
@@ -343,6 +387,15 @@ impl ProviderStreamDecoder for AnthropicStreamDecoder {
                 let idx = event.index.unwrap_or(0);
                 if self.current_block_kind == ContentKind::ToolUse {
                     events.push(CoreEvent::ToolCallStop { index: idx });
+                    // Mark this tool block as closed so finish() won't re-emit.
+                    let tool_idx = self
+                        .tool_blocks
+                        .iter()
+                        .position(|&i| i == idx)
+                        .unwrap_or(0);
+                    if tool_idx < self.tool_blocks_closed.len() {
+                        self.tool_blocks_closed[tool_idx] = true;
+                    }
                 }
                 self.current_block_index = None;
                 self.current_block_kind = ContentKind::Text;
@@ -391,9 +444,24 @@ impl ProviderStreamDecoder for AnthropicStreamDecoder {
             }
             "error" => {
                 if let Some(ref err) = event.error {
+                    let kind = match err.r#type.as_str() {
+                        "rate_limit_error" => {
+                            llm_proxy_protocol::core::CoreStreamErrorKind::RateLimit
+                        }
+                        "authentication_error" => {
+                            llm_proxy_protocol::core::CoreStreamErrorKind::Authentication
+                        }
+                        "invalid_request_error" => {
+                            llm_proxy_protocol::core::CoreStreamErrorKind::InvalidRequest
+                        }
+                        "permission_error" => {
+                            llm_proxy_protocol::core::CoreStreamErrorKind::Permission
+                        }
+                        _ => llm_proxy_protocol::core::CoreStreamErrorKind::Upstream,
+                    };
                     events.push(CoreEvent::Error {
                         error: llm_proxy_protocol::core::CoreStreamError::new(
-                            llm_proxy_protocol::core::CoreStreamErrorKind::Upstream,
+                            kind,
                             err.message.clone(),
                         ),
                     });
@@ -418,9 +486,12 @@ impl ProviderStreamDecoder for AnthropicStreamDecoder {
             });
         }
 
-        // Close any open tool blocks.
-        for &idx in &self.tool_blocks {
-            events.push(CoreEvent::ToolCallStop { index: idx });
+        // Close any tool blocks that were NOT already closed by content_block_stop.
+        for (i, &idx) in self.tool_blocks.iter().enumerate() {
+            let closed = self.tool_blocks_closed.get(i).copied().unwrap_or(false);
+            if !closed {
+                events.push(CoreEvent::ToolCallStop { index: idx });
+            }
         }
 
         if !self.stop_sent {
@@ -739,6 +810,7 @@ impl AnthropicAdapter {
             current_block_index: None,
             current_block_kind: ContentKind::Text,
             tool_blocks: Vec::new(),
+            tool_blocks_closed: Vec::new(),
             stop_sent: false,
         })
     }
@@ -1839,6 +1911,164 @@ mod tests {
             CoreContent::RedactedThinking { .. } => {}
             other => panic!("expected RedactedThinking, got {:?}", other),
         }
+    }
+
+    // -- Additional tests: sentinel, false-positive, upstream model, malformed, etc --
+
+    #[test]
+    fn desanitize_sentinel_prevents_false_positive() {
+        // A tool name that naturally contains _0xHH_ should NOT be decoded.
+        let natural_name = "parse_0xff_value";
+        // This name was never sanitized, so it should be returned as-is.
+        assert_eq!(desanitize_tool_name(natural_name), natural_name);
+    }
+
+    #[test]
+    fn sanitize_desanitize_roundtrip_with_sentinel() {
+        let original = "my.tool+name";
+        let (sanitized, changed) = sanitize_tool_name(original);
+        assert!(changed, "should have changed");
+        assert!(sanitized.starts_with("__llmp_"), "sanitized name should have sentinel");
+        let restored = desanitize_tool_name(&sanitized);
+        assert_eq!(restored, original);
+    }
+
+    #[test]
+    fn sanitize_no_change_no_sentinel() {
+        let original = "get_weather";
+        let (sanitized, changed) = sanitize_tool_name(original);
+        assert!(!changed, "should not have changed");
+        assert!(!sanitized.starts_with("__llmp_"), "unchanged name should not have sentinel");
+        assert_eq!(sanitized, original);
+    }
+
+    #[test]
+    fn encode_uses_upstream_model() {
+        let mut target = make_target();
+        target.upstream_model = "claude-sonnet-4-20250514-alias".into();
+        let core = make_core_request(vec![CoreMessage {
+            role: CoreRole::User,
+            content: vec![CoreContent::Text {
+                text: "hi".into(),
+                cache: None,
+            }],
+        }]);
+        let adapter = AnthropicAdapter::new();
+        let proxy_req = adapter.encode_request(&core, &target).unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&proxy_req.body).unwrap();
+        assert_eq!(body["model"], "claude-sonnet-4-20250514-alias");
+    }
+
+    #[test]
+    fn decode_malformed_json_returns_error() {
+        let target = make_target();
+        let adapter = AnthropicAdapter::new();
+        let result = adapter.decode_response(b"not valid json {{{", &target);
+        assert!(result.is_err(), "malformed JSON should produce an error");
+    }
+
+    #[test]
+    fn decode_empty_bytes_returns_error() {
+        let target = make_target();
+        let adapter = AnthropicAdapter::new();
+        let result = adapter.decode_response(b"", &target);
+        assert!(result.is_err(), "empty bytes should produce an error");
+    }
+
+    #[test]
+    fn encode_empty_messages() {
+        let core = make_core_request(vec![]);
+        let adapter = AnthropicAdapter::new();
+        let target = make_target();
+        let proxy_req = adapter.encode_request(&core, &target).unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&proxy_req.body).unwrap();
+        // Should produce a valid request with empty messages array.
+        assert_eq!(body["messages"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn stream_error_maps_rate_limit() {
+        let target = make_target();
+        let adapter = AnthropicAdapter::new();
+        let mut decoder = adapter.new_stream_decoder(&target);
+
+        let frame = make_frame(
+            r#"{"type":"error","error":{"type":"rate_limit_error","message":"Too many requests"}}"#,
+        );
+        let events = decoder.decode_frame(&frame).unwrap();
+        let error_event = events.iter().find(|e| matches!(e, CoreEvent::Error { .. }));
+        assert!(error_event.is_some());
+        if let CoreEvent::Error { error } = error_event.unwrap() {
+            assert_eq!(error.kind, llm_proxy_protocol::core::CoreStreamErrorKind::RateLimit);
+        }
+    }
+
+    #[test]
+    fn stream_error_maps_authentication() {
+        let target = make_target();
+        let adapter = AnthropicAdapter::new();
+        let mut decoder = adapter.new_stream_decoder(&target);
+
+        let frame = make_frame(
+            r#"{"type":"error","error":{"type":"authentication_error","message":"Invalid API key"}}"#,
+        );
+        let events = decoder.decode_frame(&frame).unwrap();
+        let error_event = events.iter().find(|e| matches!(e, CoreEvent::Error { .. }));
+        assert!(error_event.is_some());
+        if let CoreEvent::Error { error } = error_event.unwrap() {
+            assert_eq!(error.kind, llm_proxy_protocol::core::CoreStreamErrorKind::Authentication);
+        }
+    }
+
+    #[test]
+    fn stream_finish_reason_only_chunk() {
+        let target = make_target();
+        let adapter = AnthropicAdapter::new();
+        let mut decoder = adapter.new_stream_decoder(&target);
+
+        // A chunk that only has message_stop with no prior content.
+        let frames = vec![
+            make_frame(r#"{"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","content":[],"model":"claude","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":0}}}"#),
+            make_frame(r#"{"type":"message_stop"}"#),
+        ];
+
+        let mut all_events = Vec::new();
+        for frame in &frames {
+            all_events.extend(decoder.decode_frame(frame).unwrap());
+        }
+
+        assert!(all_events.iter().any(|e| matches!(e, CoreEvent::MessageStart { .. })));
+        assert!(all_events.iter().any(|e| matches!(e, CoreEvent::MessageStop { .. })),
+            "message_stop event must not be silently dropped");
+    }
+
+    #[test]
+    fn stream_no_duplicate_tool_call_stop() {
+        // Verify that finish() does NOT emit duplicate ToolCallStop for tool
+        // blocks that already received ToolCallStop during decode_frame().
+        let target = make_target();
+        let adapter = AnthropicAdapter::new();
+        let mut decoder = adapter.new_stream_decoder(&target);
+
+        let frames = vec![
+            make_frame(r#"{"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","content":[],"model":"claude","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":0}}}"#),
+            make_frame(r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_1","name":"get_weather"}}"#),
+            make_frame(r#"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{}"}}"#),
+            make_frame(r#"{"type":"content_block_stop","index":0}"#),
+        ];
+
+        let mut all_events = Vec::new();
+        for frame in &frames {
+            all_events.extend(decoder.decode_frame(frame).unwrap());
+        }
+        all_events.extend(decoder.finish().unwrap());
+
+        // Count ToolCallStop events -- should be exactly 1.
+        let tool_call_stop_count = all_events
+            .iter()
+            .filter(|e| matches!(e, CoreEvent::ToolCallStop { .. }))
+            .count();
+        assert_eq!(tool_call_stop_count, 1, "ToolCallStop should be emitted exactly once");
     }
 
     // -- Source guard ---------------------------------------------------------

@@ -73,7 +73,11 @@ impl ProviderStreamDecoder for ResponsesStreamDecoder {
         let chunk: ResponsesChunk = match serde_json::from_str(data) {
             Ok(c) => c,
             Err(_) => {
-                tracing::warn!(data, "malformed Responses chunk, skipping");
+                let truncated = if data.len() > 200 { &data[..200] } else { data };
+                tracing::warn!(
+                    data = truncated,
+                    "malformed Responses chunk, skipping"
+                );
                 return Ok(vec![]);
             }
         };
@@ -255,9 +259,30 @@ impl ProviderStreamDecoder for ResponsesStreamDecoder {
                     .and_then(|e| e.get("message").and_then(|m| m.as_str()))
                     .unwrap_or("response failed")
                     .to_owned();
+                // Map error code to more specific CoreStreamErrorKind when available.
+                let kind = chunk
+                    .error
+                    .as_ref()
+                    .and_then(|e| e.get("code").and_then(|c| c.as_str()))
+                    .map(|code| match code {
+                        "rate_limit_exceeded" | "429" => {
+                            llm_proxy_protocol::core::CoreStreamErrorKind::RateLimit
+                        }
+                        "invalid_request_error" | "400" => {
+                            llm_proxy_protocol::core::CoreStreamErrorKind::InvalidRequest
+                        }
+                        "authentication_error" | "401" => {
+                            llm_proxy_protocol::core::CoreStreamErrorKind::Authentication
+                        }
+                        "server_error" | "502" | "503" => {
+                            llm_proxy_protocol::core::CoreStreamErrorKind::Upstream
+                        }
+                        _ => llm_proxy_protocol::core::CoreStreamErrorKind::Upstream,
+                    })
+                    .unwrap_or(llm_proxy_protocol::core::CoreStreamErrorKind::Upstream);
                 events.push(CoreEvent::Error {
                     error: llm_proxy_protocol::core::CoreStreamError::new(
-                        llm_proxy_protocol::core::CoreStreamErrorKind::Upstream,
+                        kind,
                         message,
                     ),
                 });
@@ -324,6 +349,15 @@ impl ResponsesAdapter {
 
         // System prompt as first developer message.
         if !core.system.is_empty() {
+            // Warn about non-text system content blocks (consistent with other adapters).
+            for c in &core.system {
+                if !matches!(c, CoreContent::Text { .. }) {
+                    tracing::warn!(
+                        ?c,
+                        "Responses: dropping non-Text system content block during encode"
+                    );
+                }
+            }
             let system_text: String = core
                 .system
                 .iter()
@@ -457,6 +491,38 @@ impl ResponsesAdapter {
             tool_choice: None,
         };
 
+        // Warn about sampling fields that the Responses API does not support.
+        if core.sampling.temperature.is_some() {
+            tracing::warn!(
+                "Responses: temperature specified but not forwarded; \
+                 the Responses API does not support this parameter"
+            );
+        }
+        if core.sampling.top_p.is_some() {
+            tracing::warn!(
+                "Responses: top_p specified but not forwarded; \
+                 the Responses API does not support this parameter"
+            );
+        }
+        if core.sampling.max_tokens.is_some() {
+            tracing::warn!(
+                "Responses: max_tokens specified but not forwarded; \
+                 the Responses API does not support this parameter"
+            );
+        }
+        if core.sampling.stop.as_ref().is_some_and(|s| !s.is_empty()) {
+            tracing::warn!(
+                "Responses: stop sequences specified but not forwarded; \
+                 the Responses API does not support this parameter"
+            );
+        }
+        if core.metadata.user_id.is_some() {
+            tracing::warn!(
+                "Responses: user_id specified but not forwarded; \
+                 the Responses API does not support this parameter"
+            );
+        }
+
         // Forward tool_choice if present.  Omit unknown variants instead of
         // sending null (per the plan's lossy translation rules).
         if let Some(ref tc) = core.tool_choice {
@@ -544,10 +610,11 @@ impl ResponsesAdapter {
         }
 
         let has_tool_use = content.iter().any(|c| matches!(c, CoreContent::ToolUse { .. }));
-        let stop_reason = if has_tool_use {
-            StopReason::ToolUse
-        } else {
-            StopReason::EndTurn
+        let stop_reason = match resp.status.as_deref() {
+            Some("failed") | Some("expired") => StopReason::Error,
+            Some("incomplete") => StopReason::MaxTokens,
+            _ if has_tool_use => StopReason::ToolUse,
+            _ => StopReason::EndTurn,
         };
 
         let usage = build_responses_usage(&resp.usage);
@@ -766,6 +833,7 @@ mod tests {
                 input_tokens: 100,
                 output_tokens: 50,
             },
+            status: None,
         };
         let bytes = serde_json::to_vec(&resp).unwrap();
         let adapter = ResponsesAdapter;
@@ -798,6 +866,7 @@ mod tests {
                 input_tokens: 200,
                 output_tokens: 80,
             },
+            status: None,
         };
         let bytes = serde_json::to_vec(&resp).unwrap();
         let adapter = ResponsesAdapter;
@@ -840,6 +909,7 @@ mod tests {
                 input_tokens: 10,
                 output_tokens: 5,
             },
+            status: None,
         };
         let bytes = serde_json::to_vec(&resp).unwrap();
         let adapter = ResponsesAdapter;
@@ -1132,6 +1202,7 @@ mod tests {
                 input_tokens: 10,
                 output_tokens: 5,
             },
+            status: None,
         };
         let bytes = serde_json::to_vec(&resp).unwrap();
         let adapter = ResponsesAdapter;
@@ -1162,6 +1233,108 @@ mod tests {
             let body: ResponsesRequest = serde_json::from_slice(&proxy_req.body).unwrap();
             assert_eq!(body.tool_choice.unwrap()["type"], expected_type);
         }
+    }
+
+    // -- Additional tests: upstream model alias, malformed decode, etc --
+
+    #[test]
+    fn encode_uses_upstream_model() {
+        let mut target = make_target();
+        target.upstream_model = "gpt-4o-2024-08-06-alias".into();
+        let core = make_core_request(vec![CoreMessage {
+            role: CoreRole::User,
+            content: vec![CoreContent::Text { text: "hi".into(), cache: None }],
+        }]);
+        let adapter = ResponsesAdapter;
+        let proxy_req = adapter.encode_request(&core, &target).unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&proxy_req.body).unwrap();
+        assert_eq!(body["model"], "gpt-4o-2024-08-06-alias");
+    }
+
+    #[test]
+    fn encode_empty_messages() {
+        let core = make_core_request(vec![]);
+        let adapter = ResponsesAdapter;
+        let target = make_target();
+        let proxy_req = adapter.encode_request(&core, &target).unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&proxy_req.body).unwrap();
+        // Should produce a valid request with empty input array.
+        assert_eq!(body["input"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn decode_malformed_json_returns_error() {
+        let target = make_target();
+        let adapter = ResponsesAdapter;
+        let result = adapter.decode_response(b"not valid json {{{", &target);
+        assert!(result.is_err(), "malformed JSON should produce an error");
+    }
+
+    #[test]
+    fn decode_empty_bytes_returns_error() {
+        let target = make_target();
+        let adapter = ResponsesAdapter;
+        let result = adapter.decode_response(b"", &target);
+        assert!(result.is_err(), "empty bytes should produce an error");
+    }
+
+    #[test]
+    fn stream_response_failed_error_mapping() {
+        let target = make_target();
+        let adapter = ResponsesAdapter;
+        let mut decoder = adapter.new_stream_decoder(&target);
+
+        let frame = make_frame(
+            r#"{"type":"response.failed","error":{"code":"rate_limit_exceeded","message":"Too many requests"}}"#,
+        );
+        let events = decoder.decode_frame(&frame).unwrap();
+        let error_event = events.iter().find(|e| matches!(e, CoreEvent::Error { .. }));
+        assert!(error_event.is_some(), "response.failed should produce an Error event");
+        if let CoreEvent::Error { error } = error_event.unwrap() {
+            assert_eq!(error.kind, llm_proxy_protocol::core::CoreStreamErrorKind::RateLimit);
+        }
+    }
+
+    #[test]
+    fn decode_status_failed_gives_error_stop_reason() {
+        let target = make_target();
+        let resp = ResponsesResponse {
+            id: "resp_fail".into(),
+            object: "response".into(),
+            created: 0,
+            model: "gpt-4o".into(),
+            output: vec![],
+            usage: ResponsesUsage {
+                input_tokens: 0,
+                output_tokens: 0,
+            },
+            status: Some("failed".into()),
+        };
+        let bytes = serde_json::to_vec(&resp).unwrap();
+        let adapter = ResponsesAdapter;
+        let core_resp = adapter.decode_response(&bytes, &target).unwrap();
+        assert_eq!(core_resp.stop_reason, StopReason::Error);
+    }
+
+    #[test]
+    fn decode_status_incomplete_gives_max_tokens_stop_reason() {
+        let target = make_target();
+        let resp = ResponsesResponse {
+            id: "resp_inc".into(),
+            object: "response".into(),
+            created: 0,
+            model: "gpt-4o".into(),
+            output: vec![],
+            usage: ResponsesUsage {
+                input_tokens: 0,
+                output_tokens: 0,
+            },
+            status: Some("incomplete".into()),
+        };
+        let bytes = serde_json::to_vec(&resp).unwrap();
+        let adapter = ResponsesAdapter;
+        let core_resp = adapter.decode_response(&bytes, &target).unwrap();
+        assert_eq!(core_resp.stop_reason, StopReason::MaxTokens);
     }
 
     // -- Source guard ---------------------------------------------------------

@@ -121,7 +121,7 @@ impl std::fmt::Debug for ProviderConfig {
 // ---------------------------------------------------------------------------
 
 /// How the API key is sent in HTTP headers.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum AuthStyle {
     /// `Authorization: Bearer <key>`

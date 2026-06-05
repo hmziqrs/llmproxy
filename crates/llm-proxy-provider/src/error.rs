@@ -51,6 +51,10 @@ pub enum ProviderError {
     /// The upstream provider returned an empty response (no choices, no candidates).
     #[error("empty response from upstream: {0}")]
     EmptyResponse(String),
+
+    /// Invalid configuration or input (e.g. unsafe model name for URL interpolation).
+    #[error("invalid configuration: {0}")]
+    InvalidConfig(String),
 }
 
 /// Maximum length for upstream API error bodies stored in [`ProviderError::Api`].
@@ -148,6 +152,24 @@ impl ProviderError {
         Self::Api {
             status,
             body: sanitize_api_error_body(body_text),
+        }
+    }
+
+    /// Classify the HTTP status code of a [`ProviderError::Api`] into a
+    /// [`llm_proxy_protocol::core::CoreStreamErrorKind`].
+    ///
+    /// Returns `None` for non-`Api` variants.
+    pub fn api_error_kind(&self) -> Option<llm_proxy_protocol::core::CoreStreamErrorKind> {
+        match self {
+            Self::Api { status, .. } => Some(match *status {
+                400 => llm_proxy_protocol::core::CoreStreamErrorKind::InvalidRequest,
+                401 => llm_proxy_protocol::core::CoreStreamErrorKind::Authentication,
+                403 => llm_proxy_protocol::core::CoreStreamErrorKind::Permission,
+                429 => llm_proxy_protocol::core::CoreStreamErrorKind::RateLimit,
+                500 | 502 | 503 => llm_proxy_protocol::core::CoreStreamErrorKind::Upstream,
+                _ => llm_proxy_protocol::core::CoreStreamErrorKind::Upstream,
+            }),
+            _ => None,
         }
     }
 }
