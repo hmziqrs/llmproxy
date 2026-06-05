@@ -7,12 +7,13 @@ use axum::{
     body::Body,
     http::{Request, StatusCode},
 };
-use llm_proxy_core::{Config, FallbackHandler};
-use llm_proxy_provider::OpenCodeClient;
+use llm_proxy_core::{Config, FallbackHandler, ProviderRegistry};
+use llm_proxy_provider::{OpenCodeClient, ProviderAdapterRegistry, ProxyClient};
 use llm_proxy_server::{AppState, BuildInfo, build_router};
 use serde_json::{Value, json};
 use tower::ServiceExt;
 
+#[allow(deprecated)]
 fn state() -> AppState {
     let config = Config::default();
     AppState::new(
@@ -25,6 +26,36 @@ fn state() -> AppState {
         },
         OpenCodeClient::new(Arc::new(Config::default())),
         FallbackHandler::new(3, Duration::from_secs(30)),
+    )
+}
+
+/// Build AppState in TOML new-runtime mode for integration testing.
+fn toml_state() -> AppState {
+    use llm_proxy_core::{AppConfig, ServerConfig};
+    use std::collections::HashMap;
+
+    let app_config = AppConfig {
+        server: ServerConfig {
+            bind: "127.0.0.1:3456".parse().unwrap(),
+            request_timeout: Duration::from_secs(300),
+            log_level: "info".to_owned(),
+            hot_reload: false,
+            server_name: "toml-test-proxy".to_owned(),
+        },
+        models: HashMap::new(),
+    };
+    let registry = ProviderRegistry::from_providers(vec![]).expect("empty registry");
+    AppState::from_toml(
+        app_config,
+        registry,
+        ProviderAdapterRegistry::builtin(),
+        ProxyClient::new(),
+        BuildInfo {
+            name: "test",
+            version: "0.0.0",
+            target: "test",
+            git_sha: "test",
+        },
     )
 }
 
@@ -419,4 +450,75 @@ async fn messages_oversized_body_returns_payload_too_large() {
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+// -- TOML mode integration tests -------------------------------------------
+
+/// TOML mode: /health returns ok with empty circuit_breakers map.
+#[tokio::test]
+async fn toml_health_returns_ok_with_empty_circuit_breakers() {
+    let app = build_router(toml_state());
+    let req = Request::builder()
+        .uri("/health")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: Value = serde_json::from_slice(
+        &axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(body["status"], "ok");
+    // TOML mode has no legacy state, so circuit_breakers must be empty.
+    assert!(
+        body["circuit_breakers"].as_object().unwrap().is_empty(),
+        "circuit_breakers should be empty in TOML mode, got: {}",
+        body["circuit_breakers"]
+    );
+    // server_name comes from AppConfig.
+    assert_eq!(body["service"], "toml-test-proxy");
+}
+
+/// TOML mode: /version returns build info with AppConfig server name.
+#[tokio::test]
+async fn toml_version_returns_app_config_server_name() {
+    let app = build_router(toml_state());
+    let req = Request::builder()
+        .uri("/version")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: Value = serde_json::from_slice(
+        &axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    // name comes from AppConfig.server.server_name, not legacy Config.
+    assert_eq!(body["name"], "toml-test-proxy");
+    assert_eq!(body["version"], "0.0.0");
+    assert_eq!(body["target"], "test");
+    assert_eq!(body["git_sha"], "test");
+}
+
+/// TOML mode: /ready returns ready.
+#[tokio::test]
+async fn toml_ready_returns_ready() {
+    let app = build_router(toml_state());
+    let req = Request::builder()
+        .uri("/ready")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: Value = serde_json::from_slice(
+        &axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(body["status"], "ready");
 }

@@ -943,9 +943,13 @@ fn load_toml_state(
     let mut app_config: AppConfig =
         load_app_config(path).with_context(|| format!("loading TOML config from {}", path.display()))?;
 
-    // Apply CLI port override by patching the bind address port.
+    // Apply CLI port override. We clone the bind address first so the
+    // AppConfig object remains a faithful representation of what was loaded
+    // from disk (important for future hot-reload diffing).
     if let Some(p) = port_override {
-        app_config.server.bind.set_port(p);
+        let mut bind = app_config.server.bind;
+        bind.set_port(p);
+        app_config.server.bind = bind;
     }
 
     // Load provider files from providers/ directory next to the main config.
@@ -1015,14 +1019,13 @@ fn load_json_state(
         .with_context(|| format!("invalid bind address {}:{}", config.host, config.port))?;
     config.bind = bind_addr;
 
-    let config_arc = Arc::new(config);
-    let client = OpenCodeClient::new(Arc::clone(&config_arc));
+    let client = OpenCodeClient::new(Arc::new(config.clone()));
     let fallback_handler = FallbackHandler::new(3, std::time::Duration::from_secs(30));
 
     info!(config = %path.display(), "loaded JSON config (legacy mode)");
 
     Ok(AppState::from_legacy(
-        Arc::try_unwrap(config_arc).unwrap_or_else(|arc| (*arc).clone()),
+        config,
         build_info(),
         client,
         fallback_handler,
