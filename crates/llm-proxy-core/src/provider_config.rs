@@ -91,7 +91,9 @@ pub struct ProviderConfig {
     /// WHY `skip_serializing`: prevents credentials from leaking through
     /// serialization paths (e.g. debug logs, API responses, config dumps).
     /// Round-tripping a `ProviderFile` through serialize/deserialize will
-    /// produce a config with an empty `api_key` -- this is intentional.
+    /// FAIL because `skip_serializing` omits `api_key` and `api_key` is a
+    /// required field. This is intentional -- credentials should never
+    /// round-trip through serialization.
     #[serde(skip_serializing)]
     pub api_key: String,
     /// Authentication header style.
@@ -184,7 +186,7 @@ pub struct ModelRoute {
 /// This enum is `#[non_exhaustive]` to allow adding new validation variants in
 /// future phases (e.g. Phase 6 cross-file validation) without breaking changes
 /// for downstream `match` expressions.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 #[non_exhaustive]
 pub enum ConfigValidationError {
     /// A provider-local model references an adapter that does not exist
@@ -287,9 +289,9 @@ pub enum ConfigValidationError {
 /// Validate a single [`ProviderConfig`].
 ///
 /// Checks:
-/// - provider name is non-empty
+/// - provider name is non-empty (whitespace-only names are rejected)
 /// - `api_key` is non-empty (after interpolation) and no unresolved `${VAR}` patterns remain
-/// - all adapter names, protocol names, and endpoints are non-empty
+/// - all adapter names, protocol names, and endpoints are non-empty (whitespace-only values are rejected)
 /// - all provider-local model keys and their adapter references are non-empty
 /// - every provider-local model points to an existing adapter
 ///
@@ -314,8 +316,8 @@ pub fn validate_provider_config(
 ) -> Result<(), ConfigValidationError> {
     let name = &provider.name;
 
-    // Provider name must be non-empty.
-    if name.is_empty() {
+    // Provider name must be non-empty (after trimming whitespace).
+    if name.trim().is_empty() {
         return Err(ConfigValidationError::EmptyProviderName);
     }
 
@@ -334,18 +336,18 @@ pub fn validate_provider_config(
 
     // Adapter validation.
     for (adapter_name, adapter_cfg) in &provider.adapters {
-        if adapter_name.is_empty() {
+        if adapter_name.trim().is_empty() {
             return Err(ConfigValidationError::EmptyAdapterName {
                 provider: name.clone(),
             });
         }
-        if adapter_cfg.protocol.is_empty() {
+        if adapter_cfg.protocol.trim().is_empty() {
             return Err(ConfigValidationError::EmptyProtocol {
                 provider: name.clone(),
                 adapter: adapter_name.clone(),
             });
         }
-        if adapter_cfg.endpoint.is_empty() {
+        if adapter_cfg.endpoint.trim().is_empty() {
             return Err(ConfigValidationError::EmptyEndpoint {
                 provider: name.clone(),
                 adapter: adapter_name.clone(),
@@ -364,12 +366,12 @@ pub fn validate_provider_config(
 
     // Provider-local model validation.
     for (model_key, model_cfg) in &provider.models {
-        if model_key.is_empty() {
+        if model_key.trim().is_empty() {
             return Err(ConfigValidationError::EmptyProviderModelKey {
                 provider: name.clone(),
             });
         }
-        if model_cfg.adapter.is_empty() {
+        if model_cfg.adapter.trim().is_empty() {
             return Err(ConfigValidationError::EmptyAdapterInModel {
                 provider: name.clone(),
                 model: model_key.clone(),
@@ -389,7 +391,8 @@ pub fn validate_provider_config(
 
 /// Validate the model routing table in [`AppConfig`].
 ///
-/// Checks that route keys and provider names are non-empty.
+/// Checks that route keys and provider names are non-empty (whitespace-only
+/// values are rejected).
 ///
 /// # Errors
 ///
@@ -398,10 +401,10 @@ pub fn validate_provider_config(
 /// within a route.
 pub fn validate_model_routes(models: &HashMap<String, ModelRoute>) -> Result<(), ConfigValidationError> {
     for (key, route) in models {
-        if key.is_empty() {
+        if key.trim().is_empty() {
             return Err(ConfigValidationError::EmptyRouteKey);
         }
-        if route.provider.is_empty() {
+        if route.provider.trim().is_empty() {
             return Err(ConfigValidationError::EmptyRouteProvider {
                 key: key.clone(),
             });
@@ -1718,13 +1721,12 @@ endpoint = "https://example.com/v1/chat/completions"
         assert_eq!(cfg.api_key, "alpha:beta");
     }
 
-    // -- Whitespace-only provider name passes validation (non-empty check) ----
+    // -- Whitespace-only provider name fails validation -------------------------
 
     #[test]
-    fn whitespace_only_provider_name_passes_validation() {
-        // Current validation uses .is_empty(), not .trim().is_empty().
-        // This test documents that behavior: whitespace-only names are
-        // considered non-empty.
+    fn whitespace_only_provider_name_fails_validation() {
+        // Validation uses .trim().is_empty(), so whitespace-only names are
+        // rejected as semantically empty.
         let cfg = ProviderConfig {
             name: "   ".to_owned(),
             api_key: "key".to_owned(),
@@ -1734,15 +1736,20 @@ endpoint = "https://example.com/v1/chat/completions"
         };
         let result = validate_provider_config(&cfg, None);
         assert!(
-            result.is_ok(),
-            "whitespace-only provider name should pass current validation (is_empty check), got: {result:?}"
+            result.is_err(),
+            "whitespace-only provider name should fail validation, got: {result:?}"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("provider name is empty"),
+            "expected empty provider name error, got: {err}"
         );
     }
 
-    // -- Whitespace-only adapter name passes validation -------------------------
+    // -- Whitespace-only adapter name fails validation --------------------------
 
     #[test]
-    fn whitespace_only_adapter_name_passes_validation() {
+    fn whitespace_only_adapter_name_fails_validation() {
         let cfg = ProviderConfig {
             name: "test".to_owned(),
             api_key: "key".to_owned(),
@@ -1762,8 +1769,13 @@ endpoint = "https://example.com/v1/chat/completions"
         };
         let result = validate_provider_config(&cfg, None);
         assert!(
-            result.is_ok(),
-            "whitespace-only adapter name should pass current validation, got: {result:?}"
+            result.is_err(),
+            "whitespace-only adapter name should fail validation, got: {result:?}"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("adapter name is empty"),
+            "expected empty adapter name error, got: {err}"
         );
     }
 
@@ -1863,6 +1875,433 @@ server_name = "${_LLM_PROXY_APP_EMPTY_VAR}"
         assert!(
             err.contains("resolved to an empty value"),
             "expected empty env var error, got: {err}"
+        );
+    }
+
+    // -- Whitespace-only whitespace-only endpoint fails validation ----------------
+
+    #[test]
+    fn whitespace_only_endpoint_fails_validation() {
+        let cfg = ProviderConfig {
+            name: "test".to_owned(),
+            api_key: "key".to_owned(),
+            auth_style: AuthStyle::Bearer,
+            adapters: {
+                let mut m = HashMap::new();
+                m.insert(
+                    "chat".to_owned(),
+                    ProviderAdapterConfig {
+                        protocol: "openai_chat_completions".to_owned(),
+                        endpoint: "   ".to_owned(),
+                    },
+                );
+                m
+            },
+            models: HashMap::new(),
+        };
+        let result = validate_provider_config(&cfg, None);
+        assert!(
+            result.is_err(),
+            "whitespace-only endpoint should fail validation, got: {result:?}"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("empty endpoint"),
+            "expected empty endpoint error, got: {err}"
+        );
+    }
+
+    // -- Whitespace-only protocol fails validation --------------------------------
+
+    #[test]
+    fn whitespace_only_protocol_fails_validation() {
+        let cfg = ProviderConfig {
+            name: "test".to_owned(),
+            api_key: "key".to_owned(),
+            auth_style: AuthStyle::Bearer,
+            adapters: {
+                let mut m = HashMap::new();
+                m.insert(
+                    "chat".to_owned(),
+                    ProviderAdapterConfig {
+                        protocol: "   ".to_owned(),
+                        endpoint: "https://example.com".to_owned(),
+                    },
+                );
+                m
+            },
+            models: HashMap::new(),
+        };
+        let result = validate_provider_config(&cfg, None);
+        assert!(
+            result.is_err(),
+            "whitespace-only protocol should fail validation, got: {result:?}"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("empty protocol"),
+            "expected empty protocol error, got: {err}"
+        );
+    }
+
+    // -- Whitespace-only route key fails validation --------------------------------
+
+    #[test]
+    fn whitespace_only_route_key_fails_validation() {
+        let mut models = HashMap::new();
+        models.insert(
+            "   ".to_owned(),
+            ModelRoute {
+                provider: "opencode-go".to_owned(),
+                upstream_model: None,
+            },
+        );
+        let result = validate_model_routes(&models);
+        assert!(
+            result.is_err(),
+            "whitespace-only route key should fail validation, got: {result:?}"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("route key is empty"),
+            "expected empty route key error, got: {err}"
+        );
+    }
+
+    // -- Whitespace-only route provider fails validation ---------------------------
+
+    #[test]
+    fn whitespace_only_route_provider_fails_validation() {
+        let mut models = HashMap::new();
+        models.insert(
+            "my-model".to_owned(),
+            ModelRoute {
+                provider: "   ".to_owned(),
+                upstream_model: None,
+            },
+        );
+        let result = validate_model_routes(&models);
+        assert!(
+            result.is_err(),
+            "whitespace-only route provider should fail validation, got: {result:?}"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("empty provider"),
+            "expected empty route provider error, got: {err}"
+        );
+    }
+
+    // -- Whitespace-only adapter reference in model fails validation ---------------
+
+    #[test]
+    fn whitespace_only_adapter_in_model_fails_validation() {
+        let cfg = ProviderConfig {
+            name: "test".to_owned(),
+            api_key: "key".to_owned(),
+            auth_style: AuthStyle::Bearer,
+            adapters: {
+                let mut m = HashMap::new();
+                m.insert(
+                    "chat".to_owned(),
+                    ProviderAdapterConfig {
+                        protocol: "openai_chat_completions".to_owned(),
+                        endpoint: "https://example.com".to_owned(),
+                    },
+                );
+                m
+            },
+            models: {
+                let mut m = HashMap::new();
+                m.insert(
+                    "my-model".to_owned(),
+                    ProviderModelConfig {
+                        adapter: "   ".to_owned(),
+                    },
+                );
+                m
+            },
+        };
+        let result = validate_provider_config(&cfg, None);
+        assert!(
+            result.is_err(),
+            "whitespace-only adapter reference should fail validation, got: {result:?}"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("empty adapter reference"),
+            "expected empty adapter reference error, got: {err}"
+        );
+    }
+
+    // -- Whitespace-only api_key passes validation ---------------------------------
+    //
+    // Unlike names/identifiers, api_key validation uses .is_empty() (not
+    // .trim().is_empty()) because an api_key of all-spaces could theoretically
+    // be intentional (though unlikely). The plan only requires non-empty.
+
+    #[test]
+    fn whitespace_only_api_key_passes_validation() {
+        let cfg = ProviderConfig {
+            name: "test".to_owned(),
+            api_key: "   ".to_owned(),
+            auth_style: AuthStyle::Bearer,
+            adapters: HashMap::new(),
+            models: HashMap::new(),
+        };
+        let result = validate_provider_config(&cfg, None);
+        assert!(
+            result.is_ok(),
+            "whitespace-only api_key should pass current validation (is_empty check), got: {result:?}"
+        );
+    }
+
+    // -- Empty TOML adapter name key via file --------------------------------------
+
+    #[test]
+    fn empty_toml_adapter_name_key_via_file_fails() {
+        let _env = clean_env();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("provider.toml");
+        std::fs::write(
+            &path,
+            r#"
+[provider]
+name = "test"
+api_key = "key"
+auth_style = "bearer"
+
+[provider.adapters.'']
+protocol = "openai_chat_completions"
+endpoint = "https://example.com/v1/chat/completions"
+
+[provider.models]
+"#,
+        )
+        .expect("write");
+
+        let result = load_provider_config(&path, None);
+        assert!(result.is_err(), "expected error for empty adapter name key");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("adapter name is empty"),
+            "expected empty adapter name error, got: {err}"
+        );
+    }
+
+    // -- Invalid UTF-8 in TOML file fails ------------------------------------------
+
+    #[test]
+    fn invalid_utf8_in_app_config_fails() {
+        let _env = clean_env();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        // Write invalid UTF-8 bytes (BOM-like but corrupted).
+        std::fs::write(&path, b"\xff\xfe invalid utf8 content").expect("write");
+
+        let result = load_app_config(&path);
+        assert!(result.is_err(), "expected error for invalid UTF-8");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("failed to read config"),
+            "expected config load error for invalid UTF-8, got: {err}"
+        );
+    }
+
+    #[test]
+    fn invalid_utf8_in_provider_config_fails() {
+        let _env = clean_env();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("provider.toml");
+        std::fs::write(&path, b"\xff\xfe invalid utf8 content").expect("write");
+
+        let result = load_provider_config(&path, None);
+        assert!(result.is_err(), "expected error for invalid UTF-8");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("failed to read config"),
+            "expected config load error for invalid UTF-8, got: {err}"
+        );
+    }
+
+    // -- App config with empty models map passes -----------------------------------
+
+    #[test]
+    fn load_app_config_empty_models_map_passes() {
+        let _env = clean_env();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[server]
+bind = "127.0.0.1:3456"
+request_timeout = "300s"
+log_level = "info"
+hot_reload = false
+server_name = "llm-proxy"
+
+[models]
+"#,
+        )
+        .expect("write");
+
+        let cfg = load_app_config(&path).expect("load");
+        assert!(cfg.models.is_empty(), "empty models map should parse successfully");
+    }
+
+    // -- Minimal valid provider config (name + api_key + auth_style only) ----------
+
+    #[test]
+    fn minimal_valid_provider_config_passes() {
+        let cfg = ProviderConfig {
+            name: "test".to_owned(),
+            api_key: "key".to_owned(),
+            auth_style: AuthStyle::Bearer,
+            adapters: HashMap::new(),
+            models: HashMap::new(),
+        };
+        let result = validate_provider_config(&cfg, None);
+        assert!(
+            result.is_ok(),
+            "minimal provider config should pass validation, got: {result:?}"
+        );
+    }
+
+    // -- Duplicate env var references in same file ---------------------------------
+
+    #[test]
+    fn duplicate_env_var_references_in_same_file() {
+        let _env = clean_env();
+        let _g = EnvVarGuard::set("_LLM_PROXY_DUP_VAR", "shared-value");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("provider.toml");
+        let mut f = std::fs::File::create(&path).expect("create");
+        write!(
+            f,
+            r#"
+[provider]
+name = "test"
+api_key = "${{_LLM_PROXY_DUP_VAR}}"
+auth_style = "bearer"
+
+[provider.adapters.chat]
+protocol = "openai_chat_completions"
+endpoint = "${{_LLM_PROXY_DUP_VAR}}/v1/chat/completions"
+
+[provider.models]
+"test-model" = {{ adapter = "chat" }}
+"#
+        )
+        .expect("write");
+
+        let cfg = load_provider_config(&path, None).expect("load");
+        assert_eq!(cfg.api_key, "shared-value");
+        assert_eq!(cfg.adapters["chat"].endpoint, "shared-value/v1/chat/completions");
+    }
+
+    // -- Env var interpolation in provider name ------------------------------------
+
+    #[test]
+    fn env_var_interpolation_in_provider_name() {
+        let _env = clean_env();
+        let _g = EnvVarGuard::set("_LLM_PROXY_PROVIDER_NAME_VAR", "dynamic-provider");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("provider.toml");
+        let mut f = std::fs::File::create(&path).expect("create");
+        write!(
+            f,
+            r#"
+[provider]
+name = "${{_LLM_PROXY_PROVIDER_NAME_VAR}}"
+api_key = "static-key"
+auth_style = "bearer"
+
+[provider.adapters.chat]
+protocol = "openai_chat_completions"
+endpoint = "https://example.com/v1/chat/completions"
+
+[provider.models]
+"test-model" = {{ adapter = "chat" }}
+"#
+        )
+        .expect("write");
+
+        let cfg = load_provider_config(&path, None).expect("load");
+        assert_eq!(cfg.name, "dynamic-provider");
+    }
+
+    // -- Env var interpolation in adapter name -------------------------------------
+
+    #[test]
+    fn env_var_interpolation_in_adapter_name() {
+        let _env = clean_env();
+        let _g = EnvVarGuard::set("_LLM_PROXY_ADAPTER_NAME_VAR", "dynamic-adapter");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("provider.toml");
+        let mut f = std::fs::File::create(&path).expect("create");
+        write!(
+            f,
+            r#"
+[provider]
+name = "test"
+api_key = "static-key"
+auth_style = "bearer"
+
+[provider.adapters."${{_LLM_PROXY_ADAPTER_NAME_VAR}}"]
+protocol = "openai_chat_completions"
+endpoint = "https://example.com/v1/chat/completions"
+
+[provider.models."test-model"]
+adapter = "${{_LLM_PROXY_ADAPTER_NAME_VAR}}"
+"#
+        )
+        .expect("write");
+
+        let cfg = load_provider_config(&path, None).expect("load");
+        assert!(cfg.adapters.contains_key("dynamic-adapter"));
+        assert_eq!(cfg.models["test-model"].adapter, "dynamic-adapter");
+    }
+
+    // -- Whitespace-only provider model key fails validation -----------------------
+
+    #[test]
+    fn whitespace_only_provider_model_key_fails_validation() {
+        let cfg = ProviderConfig {
+            name: "test".to_owned(),
+            api_key: "key".to_owned(),
+            auth_style: AuthStyle::Bearer,
+            adapters: {
+                let mut m = HashMap::new();
+                m.insert(
+                    "chat".to_owned(),
+                    ProviderAdapterConfig {
+                        protocol: "openai_chat_completions".to_owned(),
+                        endpoint: "https://example.com".to_owned(),
+                    },
+                );
+                m
+            },
+            models: {
+                let mut m = HashMap::new();
+                m.insert(
+                    "   ".to_owned(),
+                    ProviderModelConfig {
+                        adapter: "chat".to_owned(),
+                    },
+                );
+                m
+            },
+        };
+        let result = validate_provider_config(&cfg, None);
+        assert!(
+            result.is_err(),
+            "whitespace-only model key should fail validation, got: {result:?}"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("model key is empty"),
+            "expected empty model key error, got: {err}"
         );
     }
 }

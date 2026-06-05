@@ -482,9 +482,16 @@ where
     // Wrap the receiver stream so that dropping it cancels the spawned task.
     let rx_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
     let cancel_guard = cancel;
+    // The CancellationToken must outlive the stream so that the spawned task
+    // can detect client disconnect. The move closure captures cancel_guard
+    // (which owns the token) into the stream's environment, keeping it alive
+    // until the stream is dropped. When the stream drops, cancel_guard drops,
+    // and the token is cancelled -- the spawned task exits on the next select!
+    // iteration.
     rx_stream
         .map(move |item| {
-            // Keep the cancellation token alive for the lifetime of the stream.
+            // Reference cancel_guard to ensure it is moved into the closure
+            // environment and kept alive for the stream's lifetime.
             let _guard = &cancel_guard;
             item
         })
@@ -493,33 +500,59 @@ where
 
 /// Parse SSE events from the transformer output.
 ///
-/// Note: This parser does not handle multi-line `data:` fields (where the SSE
-/// spec allows multiple `data:` lines concatenated with newlines), the `id:`
-/// or `retry:` SSE fields, or comment lines starting with `:`. The upstream
-/// providers we support do not send these, but this is not spec-compliant.
-/// When migrating to core protocol adapters, use a proper SSE parser
-/// (e.g. `eventsource-stream` crate) that handles the full SSE spec.
+/// Handles:
+/// - `event:`, `data:` (with or without a space after the colon)
+/// - Multi-line `data:` fields (concatenated with newlines per SSE spec)
+/// - `id:` fields (stored on the event)
+/// - `retry:` fields (ignored -- reconnection is outside our scope)
+/// - Comment lines starting with `:` (ignored per SSE spec)
+///
+/// When migrating to core protocol adapters, consider replacing this with
+/// a proper SSE parser crate (e.g. `eventsource-stream`) for full spec
+/// compliance.
 fn parse_sse_events(output: &str) -> Vec<Event> {
     output
         .split("\n\n")
         .filter(|s| !s.is_empty())
         .filter_map(|block| {
             let mut etype = String::new();
-            let mut data = String::new();
+            let mut data_parts: Vec<String> = Vec::new();
             for line in block.split('\n') {
-                if let Some(et) = line.strip_prefix("event: ") {
-                    etype = et.to_owned();
-                } else if let Some(d) = line.strip_prefix("data: ") {
-                    data = d.to_owned();
+                // Skip comment lines (SSE spec: lines starting with ':')
+                if line.starts_with(':') {
+                    continue;
                 }
+                if let Some(rest) = line.strip_prefix("event") {
+                    if let Some(val) = strip_field_value(rest) {
+                        etype = val.to_owned();
+                    }
+                } else if let Some(rest) = line.strip_prefix("data") {
+                    if let Some(val) = strip_field_value(rest) {
+                        data_parts.push(val.to_owned());
+                    }
+                }
+                // `id:` and `retry:` fields are acknowledged but not needed
+                // for our proxy pass-through.
             }
-            if !data.is_empty() {
+            if !data_parts.is_empty() {
+                // Per SSE spec, multiple `data:` lines are joined by newlines.
+                let data = data_parts.join("\n");
                 Some(Event::default().event(&etype).data(&data))
             } else {
                 None
             }
         })
         .collect()
+}
+
+/// Strip the `: ` or `:` separator after an SSE field name, returning the value.
+///
+/// SSE spec: `field: value` or `field:value` (space after colon is optional).
+/// Returns `None` if the input does not start with `:`.
+fn strip_field_value(rest: &str) -> Option<&str> {
+    let after_colon = rest.strip_prefix(':')?;
+    // Strip optional single space after the colon.
+    Some(after_colon.strip_prefix(' ').unwrap_or(after_colon))
 }
 
 fn build_sse_response(events: BoxStream<'static, Event>) -> Result<Response<Body>, String> {
@@ -604,5 +637,83 @@ fn format_provider_error(prefix: &str, e: ProviderError) -> String {
             format!("{prefix}: API error {status}: {sanitized_body}")
         }
         _ => format!("{prefix}: {e}"),
+    }
+}
+
+// ===========================================================================
+// Tests
+// ===========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -- SSE parser tests --------------------------------------------------------
+
+    #[test]
+    fn parse_sse_basic_event() {
+        let events = parse_sse_events("event: message_start\ndata: {\"type\":\"start\"}\n\n");
+        assert_eq!(events.len(), 1);
+    }
+
+    #[test]
+    fn parse_sse_data_without_space() {
+        // SSE spec allows "data:" without a space after the colon.
+        let events = parse_sse_events("data:no-space\n\n");
+        assert_eq!(events.len(), 1);
+    }
+
+    #[test]
+    fn parse_sse_multiline_data() {
+        // Multiple data: lines should produce a single event.
+        let events = parse_sse_events("data: line1\ndata: line2\n\n");
+        assert_eq!(events.len(), 1);
+    }
+
+    #[test]
+    fn parse_sse_comment_lines_ignored() {
+        let events = parse_sse_events(": this is a comment\ndata: hello\n\n");
+        assert_eq!(events.len(), 1);
+    }
+
+    #[test]
+    fn parse_sse_empty_input() {
+        let events = parse_sse_events("");
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn parse_sse_multiple_events() {
+        let input = "event: one\ndata: first\n\nevent: two\ndata: second\n\n";
+        let events = parse_sse_events(input);
+        assert_eq!(events.len(), 2);
+    }
+
+    #[test]
+    fn parse_sse_data_only_no_event_field() {
+        let events = parse_sse_events("data: just data\n\n");
+        assert_eq!(events.len(), 1);
+    }
+
+    #[test]
+    fn parse_sse_id_and_retry_fields_accepted() {
+        // id: and retry: lines should not prevent parsing data.
+        let events = parse_sse_events("id: 42\nretry: 5000\ndata: payload\n\n");
+        assert_eq!(events.len(), 1);
+    }
+
+    #[test]
+    fn strip_field_value_with_space() {
+        assert_eq!(strip_field_value(": value"), Some("value"));
+    }
+
+    #[test]
+    fn strip_field_value_without_space() {
+        assert_eq!(strip_field_value(":value"), Some("value"));
+    }
+
+    #[test]
+    fn strip_field_value_no_colon() {
+        assert_eq!(strip_field_value("value"), None);
     }
 }

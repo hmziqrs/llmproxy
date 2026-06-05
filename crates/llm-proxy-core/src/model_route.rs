@@ -31,7 +31,7 @@ pub struct ProviderTarget {
 ///
 /// This enum is `#[non_exhaustive]` to allow adding new error variants in
 /// future phases without breaking downstream `match` expressions.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 #[non_exhaustive]
 pub enum ModelRouteError {
     /// The requested model name is not present in the routing table.
@@ -48,11 +48,6 @@ pub enum ModelRouteError {
 /// Looks up the model name in the routing table. If found, returns the
 /// provider name and effective upstream model name. If `upstream_model` is
 /// not specified in the route, the requested model name is used as-is.
-///
-/// # Errors
-///
-/// Returns [`ModelRouteError::UnknownModel`] if the model name is not in
-/// the routing table.
 ///
 /// # Errors
 ///

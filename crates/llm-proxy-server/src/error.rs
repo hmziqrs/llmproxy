@@ -25,6 +25,9 @@ pub enum ApiError {
     /// Duplicate request.
     #[error("duplicate request: {0}")]
     Duplicate(String),
+    /// Missing or invalid authentication.
+    #[error("unauthorized: {0}")]
+    Unauthorized(String),
     /// Anything else.
     #[error("internal error: {0}")]
     Internal(String),
@@ -129,6 +132,16 @@ impl ApiError {
                     },
                 }),
             ),
+            Self::Unauthorized(msg) => (
+                StatusCode::UNAUTHORIZED,
+                Json(AnthropicErrorBody {
+                    r#type: "error",
+                    error: AnthropicErrorDetail {
+                        r#type: "authentication_error".to_owned(),
+                        message: msg.clone(),
+                    },
+                }),
+            ),
             Self::Internal(msg) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(AnthropicErrorBody {
@@ -156,5 +169,42 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let (status, body) = self.to_anthropic_response();
         (status, body).into_response()
+    }
+}
+
+// ===========================================================================
+// Tests
+// ===========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unauthorized_maps_to_401() {
+        let err = ApiError::Unauthorized("missing x-api-key".to_owned());
+        let (status, body) = err.to_anthropic_response();
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body.error.r#type, "authentication_error");
+        assert_eq!(body.error.message, "missing x-api-key");
+    }
+
+    #[test]
+    fn unauthorized_into_response() {
+        let err = ApiError::Unauthorized("bad key".to_owned());
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn all_variants_into_response() {
+        // Smoke test: every variant can produce a response.
+        let _ = ApiError::BadRequest("test".into()).into_response();
+        let _ = ApiError::RateLimited("test".into()).into_response();
+        let _ = ApiError::Upstream("test".into()).into_response();
+        let _ = ApiError::UpstreamTimeout("test".into()).into_response();
+        let _ = ApiError::Duplicate("test".into()).into_response();
+        let _ = ApiError::Unauthorized("test".into()).into_response();
+        let _ = ApiError::Internal("test".into()).into_response();
     }
 }

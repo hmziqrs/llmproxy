@@ -150,14 +150,14 @@ output.
 In `model_route.rs`:
 
 ```rust
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ProviderTarget {
     pub provider: String,
     pub requested_model: String,
     pub upstream_model: String,
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum ModelRouteError {
     #[error("unknown model: {0}")]
     UnknownModel(String),

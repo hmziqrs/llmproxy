@@ -100,4 +100,33 @@ mod tests {
     fn find_unresolved_returns_none_when_resolved() {
         assert_eq!(find_unresolved_env_var("no vars here"), None);
     }
+
+    // -- Non-matching patterns are left as-is ------------------------------------
+
+    #[test]
+    fn empty_braces_not_interpolated() {
+        let result = interpolate_env_vars("key = ${}");
+        assert_eq!(result, "key = ${}", "empty braces should not be interpolated");
+    }
+
+    #[test]
+    fn hyphenated_var_not_interpolated() {
+        let result = interpolate_env_vars("key = ${my-var}");
+        assert_eq!(result, "key = ${my-var}", "hyphenated var should not be interpolated");
+    }
+
+    #[test]
+    fn dotted_var_not_interpolated() {
+        let result = interpolate_env_vars("key = ${my.var}");
+        assert_eq!(result, "key = ${my.var}", "dotted var should not be interpolated");
+    }
+
+    #[test]
+    fn numeric_only_var_not_interpolated() {
+        let result = interpolate_env_vars("key = ${123}");
+        // ${123} does match [A-Za-z0-9_]+ since digits are allowed.
+        // This is documented behavior: the regex allows numeric-only names.
+        // If 123 is not set, it stays as-is.
+        assert_eq!(result, "key = ${123}");
+    }
 }
