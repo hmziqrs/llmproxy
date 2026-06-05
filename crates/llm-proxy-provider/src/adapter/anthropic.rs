@@ -268,7 +268,7 @@ impl ProviderStreamDecoder for AnthropicStreamDecoder {
         let event: MessageEvent = match serde_json::from_str(data) {
             Ok(e) => e,
             Err(_) => {
-                let truncated = if data.len() > 200 { &data[..200] } else { data };
+                let truncated = super::truncate_str_safe(data, 200);
                 tracing::warn!(
                     data = truncated,
                     "malformed Anthropic event, skipping"
@@ -583,8 +583,14 @@ impl AnthropicAdapter {
                     }));
                 }
                 CoreRole::System => {
-                    // Merge system messages into the system field.
-                    // Skip here; should have been handled by client adapter.
+                    // System messages should have been extracted into the
+                    // `system` field by the client adapter.  If one reaches
+                    // here it means the client adapter did not separate it.
+                    tracing::warn!(
+                        role = "system",
+                        "Anthropic adapter received system-role message in messages; \
+                         dropping because Anthropic does not support system role in messages"
+                    );
                 }
                 CoreRole::Tool => {
                     // Tool results come through user role in Anthropic.
@@ -633,20 +639,21 @@ impl AnthropicAdapter {
             })
             .collect();
 
-        // Tool choice.
-        let tool_choice = core.tool_choice.as_ref().map(|tc| match tc {
-            CoreToolChoice::Auto => serde_json::json!({"type": "auto"}),
-            CoreToolChoice::Any => serde_json::json!({"type": "any"}),
-            CoreToolChoice::None => serde_json::json!({"type": "none"}),
+        // Tool choice.  Unknown variants are omitted (None) rather than sent as
+        // JSON null, which would cause the Anthropic API to reject the request.
+        let tool_choice = core.tool_choice.as_ref().and_then(|tc| match tc {
+            CoreToolChoice::Auto => Some(serde_json::json!({"type": "auto"})),
+            CoreToolChoice::Any => Some(serde_json::json!({"type": "any"})),
+            CoreToolChoice::None => Some(serde_json::json!({"type": "none"})),
             CoreToolChoice::Tool { name } => {
                 let (sanitized, _) = sanitize_tool_name(name);
-                serde_json::json!({
+                Some(serde_json::json!({
                     "type": "tool",
                     "name": sanitized
-                })
+                }))
             }
-            CoreToolChoice::Raw(v) => v.clone(),
-            _ => serde_json::json!(null),
+            CoreToolChoice::Raw(v) => Some(v.clone()),
+            _ => None,
         });
 
         // Build the full request as JSON to avoid #[non_exhaustive] struct literal issues.

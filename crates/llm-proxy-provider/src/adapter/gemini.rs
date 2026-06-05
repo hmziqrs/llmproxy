@@ -81,7 +81,7 @@ impl ProviderStreamDecoder for GeminiStreamDecoder {
         let chunk: GeminiStreamChunk = match serde_json::from_str(data) {
             Ok(c) => c,
             Err(_) => {
-                let truncated = if data.len() > 200 { &data[..200] } else { data };
+                let truncated = super::truncate_str_safe(data, 200);
                 tracing::warn!(
                     data = truncated,
                     "malformed Gemini chunk, skipping"

@@ -288,7 +288,6 @@ pub(crate) fn expand_url_template(
 ) -> Result<String, ProviderError> {
     let model = &target.upstream_model;
     // Reject model names containing path traversal or other unsafe characters.
-    // Reject model names containing path traversal or other unsafe characters.
     // Additionally reject `.` and `..` exactly (path traversal patterns).
     if model == ".." || model == "." {
         return Err(ProviderError::InvalidConfig(format!(
@@ -376,6 +375,23 @@ pub(crate) fn response_model_ref(target: &ProviderAdapterTarget) -> ModelRef {
     ModelRef {
         requested: target.requested_model.clone(),
         upstream,
+    }
+}
+
+/// Truncate a string to `max_len` bytes, respecting UTF-8 char boundaries.
+///
+/// If the string is longer than `max_len`, finds the nearest char boundary at
+/// or before `max_len`. This prevents panics when slicing strings containing
+/// multi-byte UTF-8 characters (e.g. CJK text, emoji).
+pub(crate) fn truncate_str_safe(s: &str, max_len: usize) -> &str {
+    if s.len() <= max_len {
+        s
+    } else {
+        let mut end = max_len;
+        while !s.is_char_boundary(end) && end > 0 {
+            end -= 1;
+        }
+        &s[..end]
     }
 }
 
@@ -627,6 +643,39 @@ mod tests {
             !prod.contains("llm_proxy_server"),
             "adapter must not import server crate"
         );
+    }
+
+    // -- truncate_str_safe ---------------------------------------------------
+
+    #[test]
+    fn truncate_str_safe_ascii_within_limit() {
+        assert_eq!(truncate_str_safe("hello", 10), "hello");
+    }
+
+    #[test]
+    fn truncate_str_safe_ascii_at_boundary() {
+        assert_eq!(truncate_str_safe("hello world", 5), "hello");
+    }
+
+    #[test]
+    fn truncate_str_safe_multibyte_no_panic() {
+        // Japanese 'あ' is 3 bytes.  If max_len lands mid-character, we must
+        // back up to the previous char boundary.
+        let s = "あいうえお"; // 15 bytes total
+        // max_len=4 lands inside 'い' (bytes 3-5), so we back up to byte 3.
+        let truncated = truncate_str_safe(s, 4);
+        assert_eq!(truncated, "あ"); // Only first char (bytes 0-2) fits
+        assert!(truncated.len() <= 4);
+    }
+
+    #[test]
+    fn truncate_str_safe_empty_string() {
+        assert_eq!(truncate_str_safe("", 200), "");
+    }
+
+    #[test]
+    fn truncate_str_safe_zero_max_len() {
+        assert_eq!(truncate_str_safe("hello", 0), "");
     }
 
     // -- Helpers --------------------------------------------------------------

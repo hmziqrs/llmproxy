@@ -73,7 +73,7 @@ impl ProviderStreamDecoder for ResponsesStreamDecoder {
         let chunk: ResponsesChunk = match serde_json::from_str(data) {
             Ok(c) => c,
             Err(_) => {
-                let truncated = if data.len() > 200 { &data[..200] } else { data };
+                let truncated = super::truncate_str_safe(data, 200);
                 tracing::warn!(
                     data = truncated,
                     "malformed Responses chunk, skipping"
