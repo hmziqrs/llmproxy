@@ -66,7 +66,7 @@ impl IntoResponse for ApiErrorWithRequestId {
         );
         response.headers_mut().insert(
             "x-request-id",
-            self.request_id.parse().unwrap_or_else(|_| "unknown".parse().unwrap()),
+            self.request_id.parse().unwrap_or_else(|_| HeaderValue::from_static("unknown")),
         );
         response
     }

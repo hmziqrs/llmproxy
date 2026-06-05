@@ -588,8 +588,23 @@ fn cmd_validate(config_path: Option<PathBuf>) -> Result<()> {
 
     println!("validating config: {}", path.display());
 
+    let extension = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    match extension {
+        "toml" => cmd_validate_toml(&path),
+        "json" => cmd_validate_json(&path),
+        _ => {
+            bail!(
+                "unsupported config file extension: {:?} (expected .toml or .json)",
+                path.extension().map(|e| e.to_string_lossy()).unwrap_or_else(|| std::borrow::Cow::Borrowed("(none)"))
+            );
+        }
+    }
+}
+
+/// Validate a JSON config file and print settings.
+fn cmd_validate_json(path: &std::path::Path) -> Result<()> {
     let config =
-        Config::load(&path).with_context(|| format!("loading config from {}", path.display()))?;
+        Config::load(path).with_context(|| format!("loading config from {}", path.display()))?;
 
     // Print settings summary.
     println!();
@@ -597,11 +612,11 @@ fn cmd_validate(config_path: Option<PathBuf>) -> Result<()> {
     println!("  host:              {}", config.host);
     println!("  port:              {}", config.port);
     println!(
-        "  api_key:           {}...",
+        "  api_key:           {}",
         if config.api_key.is_empty() {
             "(empty)"
         } else {
-            "***"
+            "(set)"
         }
     );
     println!("  hot_reload:        {}", config.hot_reload);
@@ -672,6 +687,58 @@ fn cmd_validate(config_path: Option<PathBuf>) -> Result<()> {
     println!("=== Logging ===");
     println!("  level:    {}", config.logging.level);
     println!("  requests: {}", config.logging.requests);
+
+    println!();
+    println!("Config is valid!");
+    Ok(())
+}
+
+/// Validate a TOML config file and print settings.
+fn cmd_validate_toml(path: &std::path::Path) -> Result<()> {
+    use llm_proxy_core::{AppConfig, ProviderRegistry, load_app_config};
+
+    let app_config: AppConfig =
+        load_app_config(path).with_context(|| format!("loading TOML config from {}", path.display()))?;
+
+    // Print settings summary.
+    println!();
+    println!("=== Server Configuration ===");
+    println!("  bind:            {}", app_config.server.bind);
+    println!("  request_timeout: {}s", app_config.server.request_timeout.as_secs());
+    println!("  log_level:       {}", app_config.server.log_level);
+    println!("  hot_reload:      {}", app_config.server.hot_reload);
+    println!("  server_name:     {}", app_config.server.server_name);
+
+    // Load and validate providers.
+    let providers_dir = path.parent().unwrap_or(std::path::Path::new(".")).join("providers");
+    let registry = if providers_dir.exists() {
+        ProviderRegistry::load_from_dir(&providers_dir)
+            .with_context(|| format!("loading providers from {}", providers_dir.display()))?
+    } else {
+        ProviderRegistry::from_providers(vec![])
+            .with_context(|| "building empty provider registry")?
+    };
+
+    // Validate provider protocols against builtin adapters.
+    let adapter_registry = ProviderAdapterRegistry::builtin();
+    let known_protocols = adapter_registry.protocol_names();
+    registry
+        .validate_protocols(known_protocols)
+        .with_context(|| "validating provider protocols")?;
+
+    println!();
+    println!("=== Providers ({} loaded) ===", registry.len());
+    if registry.is_empty() {
+        println!("  (none)");
+    }
+
+    if !app_config.models.is_empty() {
+        println!();
+        println!("=== Model Mappings ===");
+        for (name, model) in &app_config.models {
+            println!("  [{name}] provider={}", model.provider);
+        }
+    }
 
     println!();
     println!("Config is valid!");
@@ -970,7 +1037,7 @@ fn load_toml_state(
     };
 
     // Validate all provider protocols against the builtin adapter set.
-    let known_protocols: Vec<&str> = adapter_registry.protocol_names();
+    let known_protocols = adapter_registry.protocol_names();
     registry
         .validate_protocols(&known_protocols)
         .with_context(|| "validating provider protocols")?;

@@ -313,12 +313,12 @@ async fn try_streaming_model(
             handle_anthropic_streaming(client, req, model, request_id).await
         }
         EndpointType::ChatCompletions => {
-            handle_openai_streaming(client, req, model).await
+            handle_openai_streaming(client, req, model, request_id).await
         }
         EndpointType::Responses => {
-            handle_responses_streaming(client, req, model).await
+            handle_responses_streaming(client, req, model, request_id).await
         }
-        EndpointType::Gemini => handle_gemini_streaming(client, req, model).await,
+        EndpointType::Gemini => handle_gemini_streaming(client, req, model, request_id).await,
     }
 }
 
@@ -362,6 +362,7 @@ async fn handle_openai_streaming(
     client: &OpenCodeClient,
     req: &MessageRequest,
     model: &ModelConfig,
+    request_id: &str,
 ) -> Result<Response<Body>, String> {
     let openai_req = transform_request(req, model).map_err(|e| format!("tf: {e}"))?;
     let stream = client
@@ -376,7 +377,7 @@ async fn handle_openai_streaming(
         }
     });
 
-    build_sse_response(events)
+    build_sse_response(events, request_id)
 }
 
 // -- Responses streaming via channel --------------------------------------
@@ -385,6 +386,7 @@ async fn handle_responses_streaming(
     client: &OpenCodeClient,
     req: &MessageRequest,
     model: &ModelConfig,
+    request_id: &str,
 ) -> Result<Response<Body>, String> {
     let r = transform_to_responses(req, model).map_err(|e| format!("tf: {e}"))?;
     let stream = client
@@ -399,7 +401,7 @@ async fn handle_responses_streaming(
         }
     });
 
-    build_sse_response(events)
+    build_sse_response(events, request_id)
 }
 
 // -- Gemini streaming via channel -----------------------------------------
@@ -408,6 +410,7 @@ async fn handle_gemini_streaming(
     client: &OpenCodeClient,
     req: &MessageRequest,
     model: &ModelConfig,
+    request_id: &str,
 ) -> Result<Response<Body>, String> {
     let r = transform_to_gemini(req, model).map_err(|e| format!("tf: {e}"))?;
     let stream = client
@@ -422,7 +425,7 @@ async fn handle_gemini_streaming(
         }
     });
 
-    build_sse_response(events)
+    build_sse_response(events, request_id)
 }
 
 // -- SSE helpers ----------------------------------------------------------
@@ -435,9 +438,11 @@ async fn handle_gemini_streaming(
 ///
 /// A [`tokio_util::sync::CancellationToken`] is used to abort the upstream
 /// stream reader when the client disconnects.  When the SSE receiver (the
-/// returned `BoxStream`) is dropped, a drop-guard triggers the cancellation
-/// token, which causes the spawned task to exit on the next iteration and
-/// release the upstream HTTP connection.
+/// returned `BoxStream`) is dropped, the [`tokio_util::sync::DropGuard`]
+/// returned by [`CancellationToken::drop_guard`] is dropped, which calls
+/// [`CancellationToken::cancel()`]. This causes the spawned task to detect
+/// cancellation via `cancel_clone.cancelled()` on the next `select!` iteration
+/// and release the upstream HTTP connection.
 ///
 /// The `TimeoutLayer` in the router still applies to the full response
 /// lifetime including SSE streams. For streaming routes, consider exempting
@@ -503,14 +508,14 @@ where
     });
 
     // Wrap the receiver stream so that dropping it cancels the spawned task.
+    // `cancel.drop_guard()` returns a DropGuard that calls `cancel.cancel()`
+    // when dropped. The guard is moved into the stream's .map() closure so it
+    // lives as long as the stream. When the client disconnects and the stream
+    // is dropped, the DropGuard fires, cancelling the token. The spawned task
+    // detects this via `cancel_clone.cancelled()` on the next select! iteration
+    // and exits cleanly.
     let rx_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
-    let cancel_guard = cancel;
-    // The CancellationToken must outlive the stream so that the spawned task
-    // can detect client disconnect. The move closure captures cancel_guard
-    // (which owns the token) into the stream's environment, keeping it alive
-    // until the stream is dropped. When the stream drops, cancel_guard drops,
-    // and the token is cancelled -- the spawned task exits on the next select!
-    // iteration.
+    let cancel_guard = cancel.drop_guard();
     rx_stream
         .map(move |item| {
             // Reference cancel_guard to ensure it is moved into the closure
@@ -573,7 +578,7 @@ fn parse_sse_events(output: &str) -> Vec<Event> {
         .collect()
 }
 
-fn build_sse_response(events: BoxStream<'static, Event>) -> Result<Response<Body>, String> {
+fn build_sse_response(events: BoxStream<'static, Event>, request_id: &str) -> Result<Response<Body>, String> {
     let sse = Sse::new(events.map(Ok::<_, std::convert::Infallible>))
         .keep_alive(KeepAlive::new().interval(HEARTBEAT_INTERVAL));
     let response = sse.into_response();
@@ -588,6 +593,10 @@ fn build_sse_response(events: BoxStream<'static, Event>) -> Result<Response<Body
     parts
         .headers
         .insert("X-Accel-Buffering", "no".parse().expect("static header value is always valid"));
+    parts.headers.insert(
+        "x-request-id",
+        request_id.parse().unwrap_or_else(|_| "unknown".parse().unwrap()),
+    );
     Ok(Response::from_parts(parts, body))
 }
 

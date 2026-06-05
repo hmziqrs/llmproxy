@@ -6,11 +6,13 @@ use llm_proxy_core::{
     AppConfig, Config, Counter, FallbackHandler, Metrics, ProviderRegistry,
 };
 use llm_proxy_provider::{OpenCodeClient, ProviderAdapterRegistry, ProxyClient};
+#[allow(unused_imports)]
 use tracing::warn;
 
 use crate::middleware::{RateLimiter, RequestDeduplicator, RequestIdGenerator};
 
 /// Default bind address used when no config is available.
+#[allow(dead_code)]
 fn default_bind() -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], 3456))
 }
@@ -55,8 +57,8 @@ impl ModelRouter {
     }
 
     /// Get the fallback chain for a scenario.
-    pub(crate) fn fallback_chain(&self, scenario: &str) -> Option<&Vec<llm_proxy_core::ModelConfig>> {
-        self.config.fallbacks.get(scenario)
+    pub(crate) fn fallback_chain(&self, scenario: &str) -> Option<&[llm_proxy_core::ModelConfig]> {
+        self.config.fallbacks.get(scenario).map(Vec::as_slice)
     }
 }
 
@@ -75,10 +77,7 @@ impl ModelRouter {
 ///
 /// Fields are `pub(crate)` to prevent external crates from depending on legacy
 /// internals. Route handlers within the server crate access them through
-/// [`AppState::legacy()`].
-///
-/// `pub(crate)` visibility prevents external crates from depending on a type
-/// that will be deleted in Phase 11.
+/// [`AppState::legacy()`]. This type will be deleted in Phase 11.
 ///
 /// Manual `Debug` impl ensures the redaction chain is self-documenting:
 /// delegates to `Config`'s manual Debug (which redacts `api_key`) rather than
@@ -155,6 +154,7 @@ impl std::fmt::Debug for LegacyState {
 /// that contains secrets, the redaction chain breaks silently. The test
 /// `app_state_debug_does_not_leak_api_key` provides regression coverage.
 #[derive(Clone)]
+#[non_exhaustive]
 pub struct AppState {
     /// New TOML application config. `None` in JSON compatibility mode.
     pub(crate) app_config: Option<Arc<AppConfig>>,
@@ -295,12 +295,23 @@ impl AppState {
             ActiveMode::Toml(ac) => ac.server.request_timeout,
             ActiveMode::Legacy(ls) => ls.config.request_timeout,
             ActiveMode::None => {
-                warn!("AppState has neither app_config nor legacy; returning default 60s timeout. \
-                       This indicates an invalid construction and should be investigated.");
-                // TODO: Remove this fallback when AppState transitions to the final
-                // target state (non-optional app_config). This branch is only reachable
-                // via direct struct construction in defense-in-depth test code.
-                Duration::from_secs(60)
+                // This branch is unreachable via constructors (from_legacy and
+                // from_toml always set exactly one mode). The fallback exists as
+                // defense-in-depth for direct struct construction in test code.
+                // If this is reached in production, it indicates a bug.
+                #[cfg(debug_assertions)]
+                {
+                    unreachable!(
+                        "AppState has neither app_config nor legacy; \
+                         this indicates invalid construction"
+                    );
+                }
+                #[cfg(not(debug_assertions))]
+                {
+                    warn!("AppState has neither app_config nor legacy; returning default 60s timeout. \
+                           This indicates an invalid construction and should be investigated.");
+                    Duration::from_secs(60)
+                }
             }
         }
     }
@@ -314,9 +325,19 @@ impl AppState {
             ActiveMode::Toml(ac) => &ac.server.server_name,
             ActiveMode::Legacy(ls) => &ls.config.server_name,
             ActiveMode::None => {
-                warn!("AppState has neither app_config nor legacy; returning default server name. \
-                       This indicates an invalid construction and should be investigated.");
-                "llm-proxy"
+                #[cfg(debug_assertions)]
+                {
+                    unreachable!(
+                        "AppState has neither app_config nor legacy; \
+                         this indicates invalid construction"
+                    );
+                }
+                #[cfg(not(debug_assertions))]
+                {
+                    warn!("AppState has neither app_config nor legacy; returning default server name. \
+                           This indicates an invalid construction and should be investigated.");
+                    "llm-proxy"
+                }
             }
         }
     }
@@ -355,9 +376,19 @@ impl AppState {
             ActiveMode::Toml(ac) => ac.server.bind,
             ActiveMode::Legacy(ls) => ls.config.bind,
             ActiveMode::None => {
-                warn!("AppState has neither app_config nor legacy; returning default bind address. \
-                       This indicates an invalid construction and should be investigated.");
-                default_bind()
+                #[cfg(debug_assertions)]
+                {
+                    unreachable!(
+                        "AppState has neither app_config nor legacy; \
+                         this indicates invalid construction"
+                    );
+                }
+                #[cfg(not(debug_assertions))]
+                {
+                    warn!("AppState has neither app_config nor legacy; returning default bind address. \
+                           This indicates an invalid construction and should be investigated.");
+                    default_bind()
+                }
             }
         }
     }
@@ -395,6 +426,8 @@ impl AppState {
     /// - `from_legacy` must not set `app_config` or `providers`.
     /// - `from_toml` must not set `legacy`.
     /// - At least one of `app_config` or `legacy` must be set.
+    /// - `app_config` and `providers` must both be `Some` or both be `None`
+    ///   (TOML mode couples them together).
     #[cfg(debug_assertions)]
     fn validate_invariants(&self, source: &str) {
         if self.app_config.is_some() || self.providers.is_some() {
@@ -412,6 +445,10 @@ impl AppState {
         debug_assert!(
             self.app_config.is_some() || self.legacy.is_some(),
             "AppState invariant violation ({source}): neither app_config nor legacy is set"
+        );
+        debug_assert!(
+            self.app_config.is_some() == self.providers.is_some(),
+            "AppState invariant violation ({source}): app_config and providers must both be Some or both be None"
         );
     }
 
@@ -889,6 +926,10 @@ mod tests {
             !debug_output.contains("sk-toml-secret-key-99999"),
             "Debug output must not contain the actual api_key in TOML mode, got: {debug_output}"
         );
+        assert!(
+            debug_output.contains("[REDACTED]"),
+            "Debug output must show [REDACTED] for api_key in TOML mode, got: {debug_output}"
+        );
     }
 
     // -- Legacy convenience new() still works --------------------------------
@@ -927,25 +968,27 @@ mod tests {
         let protocol_names = state.provider_adapters.protocol_names();
         assert!(protocol_names.len() >= 4, "expected at least 4 builtin adapters, got {len}", len = protocol_names.len());
         // Verify specific known protocol names are present for stronger coverage.
-        let names: Vec<&str> = protocol_names;
-        assert!(names.contains(&"openai_chat_completions"), "missing openai_chat_completions adapter");
-        assert!(names.contains(&"anthropic_messages"), "missing anthropic_messages adapter");
+        assert!(protocol_names.contains(&"openai_chat_completions"), "missing openai_chat_completions adapter");
+        assert!(protocol_names.contains(&"anthropic_messages"), "missing anthropic_messages adapter");
     }
 
     // -- Default timeout when neither mode configured ------------------------
     //
     // NOTE: This test directly constructs an AppState with both app_config=None
-    // and legacy=None, which is an invalid mixed state per the plan's invariant.
+    // and legacy=None, which is an invalid state per the plan's invariant.
     // This is intentional defense-in-depth testing: the helper methods have
     // fallback branches that should never be reached via constructors, but
-    // exist as a safety net. Fields are pub(crate) so only crate-internal code
-    // (including tests) can construct this state.
+    // exist as a safety net in release builds. In debug builds, the ActiveMode::None
+    // branch panics with unreachable!(), so this test only runs in release mode.
+    // Fields are pub(crate) so only crate-internal code (including tests) can
+    // construct this state.
 
     #[test]
+    #[cfg_attr(debug_assertions, ignore = "ActiveMode::None panics in debug builds")]
     fn default_timeout_when_no_config() {
         // Build an AppState manually without app_config or legacy.
         // This exercises the fallback branch in helper methods that can only
-        // be reached via direct struct construction, not via constructors.
+        // be reached via direct struct construction in release builds, not via constructors.
         let state = AppState {
             app_config: None,
             providers: None,
@@ -1234,5 +1277,65 @@ mod tests {
             make_build_info(),
         );
         assert_eq!(state.server_name(), "");
+    }
+
+    // -- Unicode server_name ---------------------------------------------------
+
+    #[test]
+    fn unicode_server_name_is_returned_verbatim() {
+        let mut cfg = make_app_config();
+        cfg.server.server_name = "代理服务器-ünïcödé".to_owned();
+        let state = AppState::from_toml(
+            cfg,
+            make_provider_registry(),
+            ProviderAdapterRegistry::builtin(),
+            ProxyClient::new(),
+            make_build_info(),
+        );
+        assert_eq!(state.server_name(), "代理服务器-ünïcödé");
+    }
+
+    #[test]
+    fn very_long_server_name_is_returned() {
+        let mut cfg = make_app_config();
+        let long_name = "x".repeat(10_000);
+        cfg.server.server_name = long_name.clone();
+        let state = AppState::from_toml(
+            cfg,
+            make_provider_registry(),
+            ProviderAdapterRegistry::builtin(),
+            ProxyClient::new(),
+            make_build_info(),
+        );
+        assert_eq!(state.server_name(), long_name);
+    }
+
+    // -- Partial field construction defense-in-depth --------------------------
+
+    // Verify that app_config=Some with providers=None is caught by invariant
+    // validation in debug builds. This is a direct struct construction that
+    // bypasses constructors -- the coupling invariant is checked by
+    // validate_invariants.
+    #[test]
+    #[cfg_attr(debug_assertions, ignore = "exercises debug_assert in validate_invariants")]
+    fn partial_toml_construction_app_config_without_providers() {
+        // In release mode, this constructs an invalid state; the test verifies
+        // that the helpers do not panic (they fall through to ActiveMode::Toml).
+        // In debug mode, validate_invariants would catch this, so we skip.
+        let state = AppState {
+            app_config: Some(Arc::new(make_app_config())),
+            providers: None,
+            provider_adapters: Arc::new(ProviderAdapterRegistry::builtin()),
+            proxy_client: Arc::new(ProxyClient::new()),
+            legacy: None,
+            build: Arc::new(make_build_info()),
+            token_counter: Arc::new(Counter::new()),
+            metrics: Arc::new(Metrics::new()),
+            rate_limiter: Arc::new(RateLimiter::new(DEFAULT_RATE_LIMIT_RPM)),
+            request_dedup: Arc::new(RequestDeduplicator::new()),
+            request_id_gen: Arc::new(RequestIdGenerator::new()),
+        };
+        // Should still dispatch to TOML mode since app_config is Some.
+        assert_eq!(state.server_name(), "test-proxy");
     }
 }

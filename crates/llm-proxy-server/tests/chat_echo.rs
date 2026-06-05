@@ -13,10 +13,9 @@ use llm_proxy_server::{AppState, BuildInfo, build_router};
 use serde_json::{Value, json};
 use tower::ServiceExt;
 
-#[allow(deprecated)]
 fn state() -> AppState {
     let config = Config::default();
-    AppState::new(
+    AppState::from_legacy(
         config,
         BuildInfo {
             name: "test",
@@ -26,6 +25,8 @@ fn state() -> AppState {
         },
         OpenCodeClient::new(Arc::new(Config::default())),
         FallbackHandler::new(3, Duration::from_secs(30)),
+        ProviderAdapterRegistry::builtin(),
+        ProxyClient::new(),
     )
 }
 
