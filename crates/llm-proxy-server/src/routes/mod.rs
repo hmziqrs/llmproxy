@@ -22,30 +22,36 @@ const MAX_BODY_BYTES: usize = 32 * 1024 * 1024; // 32 MiB
 
 /// Build the full router.
 ///
-/// Middleware order, from outermost to innermost:
-/// 1. `TraceLayer`  — logs every request and response, measures latency.
-/// 2. `TimeoutLayer` — cancels requests exceeding `config.request_timeout`.
-/// 3. `DefaultBodyLimit` — caps the request body for JSON extractors.
+/// Middleware order (outermost to innermost per group):
 ///
-/// `ServiceBuilder` makes the *first* `.layer()` the outermost, so the
-/// layers are listed here in the same outer-to-inner order. `TraceLayer`
-/// must be outermost for it to observe requests later layers reject
-/// (timeouts, oversized bodies).
+/// **Lightweight routes** (`/health`, `/ready`, `/version`):
+/// 1. `TraceLayer` -- logs every request and response, measures latency.
 ///
-/// Note: `TimeoutLayer` applies to the entire response lifetime, including
-/// streaming. The configured `request_timeout` must be set high enough for
-/// long-running LLM streaming responses (the default is 60s, which may be
-/// too aggressive for streaming). Consider exempting streaming routes or
-/// using a per-route timeout approach in future phases.
+/// **API routes** (`/v1/*`):
+/// 1. `TraceLayer` -- logs every request and response, measures latency.
+/// 2. `TimeoutLayer` -- cancels requests exceeding `config.request_timeout`.
+/// 3. `DefaultBodyLimit` -- caps the request body for JSON extractors.
 ///
-/// Note: The `TimeoutLayer` also applies globally to lightweight endpoints
-/// (`/health`, `/ready`, `/version`). While harmless (they respond instantly),
-/// a 408 timeout on a health check is technically wrong. Consider applying
-/// `TimeoutLayer` only to `/v1/*` routes using a nested Router with per-route
-/// middleware.
+/// `TimeoutLayer` is scoped to `/v1/*` only. Lightweight health/readiness
+/// endpoints respond instantly and must not be subject to a 408 timeout,
+/// which would confuse orchestrators (Kubernetes, load balancers).
+///
+/// Note: `TimeoutLayer` still applies to streaming SSE responses within the
+/// `/v1/*` group. The configured `request_timeout` must be set high enough
+/// for long-running LLM streaming responses. Consider exempting streaming
+/// routes specifically in a future phase.
 pub fn router(state: AppState) -> Router {
     let timeout = state.config.request_timeout;
-    let middleware = ServiceBuilder::new()
+
+    // Lightweight routes: tracing only, no timeout or body limit.
+    let lightweight = Router::new()
+        .route("/health", get(health))
+        .route("/ready", get(ready))
+        .route("/version", get(version))
+        .layer(TraceLayer::new_for_http());
+
+    // API routes: tracing + timeout + body limit.
+    let api_middleware = ServiceBuilder::new()
         .layer(TraceLayer::new_for_http())
         .layer(TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,
@@ -53,14 +59,15 @@ pub fn router(state: AppState) -> Router {
         ))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES));
 
-    Router::new()
-        .route("/health", get(health))
-        .route("/ready", get(ready))
-        .route("/version", get(version))
+    let api = Router::new()
         .route("/v1/messages", post(handle_messages))
         .route("/v1/messages/count_tokens", post(count_tokens))
+        .layer(api_middleware);
+
+    Router::new()
+        .merge(lightweight)
+        .merge(api)
         .fallback(not_found)
-        .layer(middleware)
         .with_state(state)
 }
 

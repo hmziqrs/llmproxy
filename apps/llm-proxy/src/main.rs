@@ -623,8 +623,8 @@ fn cmd_validate(config_path: Option<PathBuf>) -> Result<()> {
         if !model.reasoning_effort.is_empty() {
             println!("     reasoning_effort={}", model.reasoning_effort);
         }
-        if let Some(thinking) = &model.thinking {
-            println!("     thinking={thinking}");
+        if let Some(_thinking) = &model.thinking {
+            println!("     thinking=(configured)");
         }
         if model.context_threshold > 0 {
             println!("     context_threshold={}", model.context_threshold);

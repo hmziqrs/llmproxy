@@ -62,6 +62,7 @@ impl MessageRequest {
     /// "system": "You are helpful"
     /// "system": [{"type":"text","text":"You are helpful","cache_control":...}]
     /// ```
+    #[must_use]
     pub fn system_text(&self) -> String {
         match &self.system {
             None => String::new(),
@@ -158,8 +159,13 @@ pub struct Metadata {
 ///
 /// The `content` field can be either a plain string or an array of
 /// [`ContentBlock`].
+///
+/// Note: `deny_unknown_fields` is intentionally omitted here even though the
+/// parent `MessageRequest` has it. New Anthropic message-level fields (e.g. a
+/// future `metadata` field on individual messages) should be tolerated rather
+/// than causing deserialization failures at this layer. The parent struct's
+/// `deny_unknown_fields` already guards against truly unknown top-level fields.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct Message {
     /// The role of the message author (`"user"` or `"assistant"`).
@@ -177,6 +183,7 @@ impl Message {
     /// "content": "hello"
     /// "content": [{"type":"text","text":"hello"}]
     /// ```
+    #[must_use]
     pub fn content_blocks(&self) -> Vec<ContentBlock> {
         if self.content.is_null() {
             return Vec::new();
@@ -280,6 +287,7 @@ pub struct ContentBlock {
 
 impl ContentBlock {
     /// Create a text content block with the given string.
+    #[must_use]
     pub fn new_text(text: String) -> Self {
         ContentBlock {
             r#type: "text".to_owned(),
@@ -298,6 +306,7 @@ impl ContentBlock {
     }
 
     /// Create a tool_use content block.
+    #[must_use]
     pub fn new_tool_use(id: String, name: String, input: serde_json::Value) -> Self {
         ContentBlock {
             r#type: "tool_use".to_owned(),
@@ -316,6 +325,7 @@ impl ContentBlock {
     }
 
     /// Create a thinking content block.
+    #[must_use]
     pub fn new_thinking(thinking: String) -> Self {
         ContentBlock {
             r#type: "thinking".to_owned(),
@@ -337,6 +347,7 @@ impl ContentBlock {
     ///
     /// For `"tool_result"` blocks returns `tool_use_id`; for all others
     /// (notably `"tool_use"`) returns `id`.
+    #[must_use]
     pub fn get_tool_id(&self) -> String {
         if self.r#type == "tool_result" {
             self.tool_use_id.clone().unwrap_or_default()
@@ -349,6 +360,7 @@ impl ContentBlock {
     ///
     /// The `content` field can be a plain string or an array of content
     /// blocks. Falls back to the deprecated `output` field.
+    #[must_use]
     pub fn text_content(&self) -> String {
         // Try the content field first.
         if let Some(ref val) = self.content {
@@ -550,8 +562,13 @@ pub struct ToolResult {
 // ---------------------------------------------------------------------------
 
 /// A response from the Anthropic Messages API.
+///
+/// Note: `deny_unknown_fields` is intentionally omitted because this is an
+/// outbound-only type -- the proxy constructs it internally and serializes
+/// it to clients. It is never deserialized from external input. Omitting
+/// `deny_unknown_fields` is consistent with other outbound response types
+/// (`ChatCompletionResponse`, `ResponsesResponse`, `GeminiResponse`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct MessageResponse {
     /// Unique message identifier.

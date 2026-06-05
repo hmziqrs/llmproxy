@@ -141,8 +141,12 @@ pub struct ChatMessage {
 // ---------------------------------------------------------------------------
 
 /// Request body for `POST /v1/chat/completions`.
+///
+/// Note: `deny_unknown_fields` is intentionally omitted because this is an
+/// outbound-only type -- the proxy constructs it internally via
+/// `transform_request()` and sends it to upstream providers. It is never
+/// deserialized from external input, so strict field checking is unnecessary.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ChatCompletionRequest {
     /// Model identifier (e.g. `"gpt-4o"`, `"glm-5.1"`).
     pub model: String,

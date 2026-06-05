@@ -52,6 +52,7 @@ fn is_thinking_disabled(thinking: &serde_json::Value) -> bool {
 /// Returns `true` when any assistant message in `messages` contains thinking
 /// content -- either as a dedicated `thinking`-typed block, or attached as a
 /// non-empty `thinking` field on a `tool_use` block.
+#[must_use]
 pub fn has_thinking_blocks(messages: &[Message]) -> bool {
     for msg in messages {
         if msg.role != "assistant" {
@@ -228,7 +229,10 @@ fn resolve_thinking_and_effort(
         }
 
         // 5. No config, no history: leave both unset.
-        (false, false, false, false) => {}
+        (false, false, false, false) => {
+            // No thinking configuration and no history of thinking blocks.
+            // Leave both `thinking` and `reasoning_effort` unset.
+        }
     }
 }
 
@@ -482,6 +486,40 @@ fn transform_assistant_message(
 }
 
 // ---------------------------------------------------------------------------
+// Tool choice mapping
+// ---------------------------------------------------------------------------
+
+/// Maps an Anthropic tool_choice value to the OpenAI equivalent.
+///
+/// Anthropic formats:
+/// - `{"type": "auto"}` -> OpenAI `{"type": "auto"}`
+/// - `{"type": "any"}` -> OpenAI `{"type": "required"}`
+/// - `{"type": "tool", "name": "..."}` -> OpenAI `{"type": "function", "function": {"name": "..."}}`
+/// - `{"type": "none"}` -> OpenAI `{"type": "none"}`
+///
+/// Unknown types are forwarded as-is (best-effort passthrough).
+fn map_tool_choice(tc: &serde_json::Value) -> serde_json::Value {
+    let tc_type = tc.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    match tc_type {
+        "auto" => serde_json::json!({"type": "auto"}),
+        "any" => serde_json::json!({"type": "required"}),
+        "none" => serde_json::json!({"type": "none"}),
+        "tool" => {
+            if let Some(name) = tc.get("name").and_then(|v| v.as_str()) {
+                serde_json::json!({
+                    "type": "function",
+                    "function": {"name": name}
+                })
+            } else {
+                // "tool" without a name -- fall back to "required".
+                serde_json::json!({"type": "required"})
+            }
+        }
+        _ => tc.clone(),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tool transformation
 // ---------------------------------------------------------------------------
 
@@ -645,8 +683,11 @@ pub fn transform_request(
     }
 
     // Map tool_choice if present.
+    // Anthropic uses {"type": "auto"} / {"type": "any"} / {"type": "tool", "name": "..."}
+    // OpenAI uses {"type": "auto"} / {"type": "required"} / {"type": "none"} / specific function.
+    // The raw JSON is forwarded, so Anthropic-specific values like "any" are mapped here.
     if let Some(ref tc) = anthropic_req.tool_choice {
-        openai_req.tool_choice = Some(tc.clone());
+        openai_req.tool_choice = Some(map_tool_choice(tc));
     }
 
     Ok(openai_req)
@@ -862,6 +903,7 @@ pub fn transform_to_gemini(
 /// | 404   | `not_found_error`         |
 /// | 429   | `rate_limit_error`        |
 /// | 500+  | `api_error`               |
+#[must_use]
 pub fn transform_error_response(status_code: u16, message: &str) -> serde_json::Value {
     let error_type = match status_code {
         400 => "invalid_request_error",
@@ -1630,4 +1672,75 @@ mod tests {
     //
     // Do not fill all fixture gaps in Phase 0. Record the gaps so later
     // phases add the right adapter fixtures.
+
+    // -- Edge case tests for tool_use / tool_result with missing fields -----------
+
+    /// Phase 0: tool_use block with missing 'id' field falls back to empty string.
+    #[test]
+    fn tool_use_missing_id_defaults_to_empty_string() {
+        let messages = vec![Message {
+            role: "assistant".to_owned(),
+            content: serde_json::json!([
+                {"type": "tool_use", "name": "my_tool", "input": {}}
+            ]),
+        }];
+        let req = make_request(messages);
+        let model = make_model("gpt-4o");
+        let result = transform_request(&req, &model).unwrap();
+        // The tool_use has no 'id', so get_tool_id() returns "".
+        let tc = &result.messages[0].tool_calls[0];
+        assert!(tc.id.is_none() || tc.id.as_deref() == Some(""));
+    }
+
+    /// Phase 0: tool_result block with missing 'tool_use_id' falls back to empty string.
+    #[test]
+    fn tool_result_missing_tool_use_id_defaults_to_empty_string() {
+        let messages = vec![Message {
+            role: "user".to_owned(),
+            content: serde_json::json!([
+                {"type": "tool_result", "content": "result text"}
+            ]),
+        }];
+        let req = make_request(messages);
+        let model = make_model("gpt-4o");
+        let result = transform_request(&req, &model).unwrap();
+        // tool_result without tool_use_id -> tool_call_id is Some("").
+        assert_eq!(result.messages[0].tool_call_id.as_deref(), Some(""));
+    }
+
+    /// Phase 0: tool_use block with absent 'input' field defaults to "{}".
+    #[test]
+    fn tool_use_absent_input_defaults_to_empty_json() {
+        let messages = vec![Message {
+            role: "assistant".to_owned(),
+            content: serde_json::json!([
+                {"type": "tool_use", "id": "tu_1", "name": "my_tool"}
+            ]),
+        }];
+        let req = make_request(messages);
+        let model = make_model("gpt-4o");
+        let result = transform_request(&req, &model).unwrap();
+        let tc = &result.messages[0].tool_calls[0];
+        assert_eq!(tc.function.as_ref().unwrap().arguments.as_deref(), Some("{}"));
+    }
+
+    // -- Empty messages tests for Gemini and Responses ----------------------------
+
+    /// Phase 0: transform_to_gemini with empty messages produces empty contents.
+    #[test]
+    fn gemini_empty_messages_produces_empty_contents() {
+        let req = make_request(vec![]);
+        let model = make_model("gemini-2.5-flash");
+        let result = transform_to_gemini(&req, &model).unwrap();
+        assert!(result.contents.is_empty());
+    }
+
+    /// Phase 0: transform_to_responses with empty messages produces empty inputs.
+    #[test]
+    fn responses_empty_messages_produces_empty_inputs() {
+        let req = make_request(vec![]);
+        let model = make_model("gpt-4o");
+        let result = transform_to_responses(&req, &model).unwrap();
+        assert!(result.input.is_empty());
+    }
 }

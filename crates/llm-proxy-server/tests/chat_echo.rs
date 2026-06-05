@@ -146,7 +146,8 @@ async fn messages_valid_json_parses_and_validates() {
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
     let status = resp.status();
-    let resp_body: Value = serde_json::from_slice(
+    // Parse response body to verify it is valid JSON.
+    let _resp_body: Value = serde_json::from_slice(
         &axum::body::to_bytes(resp.into_body(), 64 * 1024)
             .await
             .unwrap(),
@@ -156,22 +157,23 @@ async fn messages_valid_json_parses_and_validates() {
     // Route must be registered (not 404).
     assert_ne!(status, StatusCode::NOT_FOUND, "route must be registered");
 
-    // If the response is an error, it must NOT be a JSON parse error.
-    // Valid errors are: upstream failure (502), rate limit (429), duplicate (409),
-    // or internal routing errors (500). A 400 with invalid JSON would indicate
-    // the request body was malformed, which it is not.
-    if status == StatusCode::BAD_REQUEST {
-        let error_type = resp_body["error"]["type"].as_str().unwrap_or("");
-        // The assertion checks that valid JSON does not trigger a shape error.
-        // If a future code change makes the server return 400 with
-        // invalid_request_error for a valid request (a regression), this guard
-        // would catch it.
-        assert_ne!(
-            error_type,
-            "invalid_request_error",
-            "valid Anthropic JSON should not produce invalid_request_error"
-        );
-    }
+    // The request body is valid Anthropic JSON, so it must parse and route
+    // successfully. Valid downstream errors are: upstream failure (502),
+    // rate limit (429), duplicate (409), internal routing (500), or auth (401).
+    // A 400 with invalid_request_error would indicate the request body was
+    // malformed, which it is not.
+    let valid_error_statuses = [
+        StatusCode::BAD_GATEWAY,          // 502 - upstream failure
+        StatusCode::INTERNAL_SERVER_ERROR, // 500 - routing error
+        StatusCode::UNAUTHORIZED,          // 401 - auth failure
+        StatusCode::TOO_MANY_REQUESTS,     // 429 - rate limit
+        StatusCode::CONFLICT,              // 409 - duplicate
+        StatusCode::OK,                    // 200 - success (unlikely without real upstream)
+    ];
+    assert!(
+        valid_error_statuses.contains(&status),
+        "valid Anthropic JSON should produce a downstream error (502/500/401/429/409), got {status}"
+    );
 }
 
 /// Phase 0 guardrail: POST /v1/messages with invalid (non-JSON) body returns
@@ -380,4 +382,41 @@ async fn messages_invalid_utf8_returns_bad_request() {
         "expected 4xx for invalid UTF-8, got {}",
         resp.status()
     );
+}
+
+/// Phase 0: POST /v1/messages with empty body (0 bytes) returns 400.
+#[tokio::test]
+async fn messages_empty_body_returns_bad_request() {
+    let app = build_router(state());
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/messages")
+        .header("content-type", "application/json")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body: Value = serde_json::from_slice(
+        &axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+}
+
+/// Phase 0: POST /v1/messages with oversized body (> 32 MiB) returns 413.
+#[tokio::test]
+async fn messages_oversized_body_returns_payload_too_large() {
+    let app = build_router(state());
+    // 33 MiB body (exceeds the 32 MiB limit).
+    let oversized_body = "X".repeat(33 * 1024 * 1024);
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/messages")
+        .header("content-type", "application/json")
+        .body(Body::from(oversized_body))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
 }

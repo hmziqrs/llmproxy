@@ -18,8 +18,11 @@ use serde::{Deserialize, Serialize};
 // ---------------------------------------------------------------------------
 
 /// Top-level request body for the Responses API.
+///
+/// Note: `deny_unknown_fields` is intentionally omitted because this is an
+/// outbound-only type -- the proxy constructs it internally via
+/// `transform_to_responses()` and sends it to upstream providers.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ResponsesRequest {
     /// Model identifier (e.g. `"gpt-4o"`).
     pub model: String,

@@ -25,7 +25,7 @@ use llm_proxy_protocol::{
         stream::StreamProxy,
     },
 };
-use llm_proxy_provider::{EndpointType, OpenCodeClient, classify_endpoint};
+use llm_proxy_provider::{EndpointType, OpenCodeClient, ProviderError, classify_endpoint};
 use tracing::{error, info, warn};
 
 use crate::error::ApiError;
@@ -45,9 +45,12 @@ pub async fn handle_messages(
     let client_ip = get_client_ip(&headers, None);
     if !state.rate_limiter.is_allowed(&client_ip) {
         state.metrics.record_rate_limited();
-        return Err(ApiError::RateLimited(format!(
-            "rate limit exceeded for {client_ip}"
-        )));
+        // Note: client_ip is intentionally excluded from the client-facing
+        // error message to avoid leaking internal network topology. The IP
+        // is logged server-side for rate-limit monitoring.
+        return Err(ApiError::RateLimited(
+            "rate limit exceeded".to_owned(),
+        ));
     }
 
     if state.request_dedup.is_duplicate(&body) {
@@ -187,11 +190,11 @@ async fn handle_non_streaming(
     } else {
         metrics.record_failure();
         error!(request_id = %request_id, error = %result.error.as_deref().unwrap_or("unknown"), attempted = result.attempted, "all models failed");
-        Err(ApiError::Upstream(
+        Err(ApiError::Upstream(sanitize_upstream_error(
             result
                 .error
                 .unwrap_or_else(|| "all models failed".to_owned()),
-        ))
+        )))
     }
 }
 
@@ -203,14 +206,10 @@ async fn execute_non_streaming_request(
     match classify_endpoint(&model.model_id) {
         EndpointType::Anthropic => {
             let b = serde_json::to_vec(req).map_err(|e| format!("ser: {e}"))?;
-            // Note: ProviderError (especially reqwest::Error via the Http variant)
-            // may include the full URL in its Display output, which could contain
-            // sensitive query parameters. Consider sanitizing reqwest::Error before
-            // formatting into user-facing strings.
             let resp = client
                 .send_anthropic_request(&b, false, model)
                 .await
-                .map_err(|e| format!("anth: {e}"))?;
+                .map_err(|e| format_provider_error("anth", e))?;
             Ok(resp
                 .bytes()
                 .await
@@ -222,7 +221,7 @@ async fn execute_non_streaming_request(
             let resp = client
                 .chat_completion_non_streaming(&model.model_id, r, model)
                 .await
-                .map_err(|e| format!("chat: {e}"))?;
+                .map_err(|e| format_provider_error("chat", e))?;
             let a = transform_response(&resp, &model.model_id).map_err(|e| format!("resp: {e}"))?;
             serde_json::to_vec(&a).map_err(|e| format!("ser: {e}"))
         }
@@ -231,7 +230,7 @@ async fn execute_non_streaming_request(
             let resp = client
                 .responses_completion_non_streaming(&model.model_id, r, model)
                 .await
-                .map_err(|e| format!("resp: {e}"))?;
+                .map_err(|e| format_provider_error("resp", e))?;
             let a = transform_responses_response(&resp, &model.model_id)
                 .map_err(|e| format!("resp: {e}"))?;
             serde_json::to_vec(&a).map_err(|e| format!("ser: {e}"))
@@ -241,7 +240,7 @@ async fn execute_non_streaming_request(
             let resp = client
                 .gemini_completion_non_streaming(&model.model_id, r, model)
                 .await
-                .map_err(|e| format!("gem: {e}"))?;
+                .map_err(|e| format_provider_error("gem", e))?;
             let a = transform_gemini_response(&resp, &model.model_id)
                 .map_err(|e| format!("resp: {e}"))?;
             serde_json::to_vec(&a).map_err(|e| format!("ser: {e}"))
@@ -273,10 +272,10 @@ async fn handle_streaming(
             }
         }
     }
-    Err(ApiError::Upstream(format!(
+    Err(ApiError::Upstream(sanitize_upstream_error(format!(
         "all streaming models failed: {}",
         last_error.unwrap_or_default()
-    )))
+    ))))
 }
 
 async fn try_streaming_model(
@@ -313,7 +312,7 @@ async fn handle_anthropic_streaming(
     let resp = client
         .send_anthropic_request(&b, true, model)
         .await
-        .map_err(|e| format!("stream: {e}"))?;
+        .map_err(|e| format_provider_error("stream", e))?;
     let body = Body::from_stream(
         resp.bytes_stream()
             .map(|r| r.map_err(std::io::Error::other)),
@@ -339,7 +338,7 @@ async fn handle_openai_streaming(
     let stream = client
         .get_streaming_body(&model.model_id, openai_req, model)
         .await
-        .map_err(|e| format!("stream: {e}"))?;
+        .map_err(|e| format_provider_error("stream", e))?;
     let model_id = model.model_id.clone();
 
     let events = spawn_proxy_task(stream, model_id, |proxy, line, out| {
@@ -362,7 +361,7 @@ async fn handle_responses_streaming(
     let stream = client
         .get_responses_streaming_body(&model.model_id, r, model)
         .await
-        .map_err(|e| format!("stream: {e}"))?;
+        .map_err(|e| format_provider_error("stream", e))?;
     let model_id = model.model_id.clone();
 
     let events = spawn_proxy_task(stream, model_id, |proxy, line, out| {
@@ -385,7 +384,7 @@ async fn handle_gemini_streaming(
     let stream = client
         .get_gemini_streaming_body(&model.model_id, r, model)
         .await
-        .map_err(|e| format!("stream: {e}"))?;
+        .map_err(|e| format_provider_error("stream", e))?;
     let model_id = model.model_id.clone();
 
     let events = spawn_proxy_task(stream, model_id, |proxy, line, out| {
@@ -515,4 +514,69 @@ fn build_sse_response(events: BoxStream<'static, Event>) -> Result<Response<Body
         .headers
         .insert("X-Accel-Buffering", "no".parse().expect("static header value is always valid"));
     Ok(Response::from_parts(parts, body))
+}
+
+// ---------------------------------------------------------------------------
+// Upstream error sanitization
+// ---------------------------------------------------------------------------
+
+/// Maximum length for upstream error messages returned to clients.
+const MAX_UPSTREAM_ERROR_LEN: usize = 512;
+
+/// Sanitize an upstream error message before returning it to the client.
+///
+/// Truncates to [`MAX_UPSTREAM_ERROR_LEN`] bytes and strips patterns that
+/// may contain sensitive information (API key prefixes, full URLs with query
+/// parameters). The full unsanitized message should be logged server-side
+/// before calling this function.
+fn sanitize_upstream_error(msg: String) -> String {
+    // Strip common API key prefixes that may appear in upstream error bodies.
+    let sanitized = msg
+        .replace("sk-", "***")
+        .replace("sk_live_", "***")
+        .replace("sk_test_", "***")
+        .replace("key-", "***");
+
+    // Truncate to prevent leaking large upstream responses.
+    if sanitized.len() > MAX_UPSTREAM_ERROR_LEN {
+        // Find a safe truncation point (don't split a multi-byte char).
+        let mut end = MAX_UPSTREAM_ERROR_LEN;
+        while !sanitized.is_char_boundary(end) && end > 0 {
+            end -= 1;
+        }
+        format!("{}...[truncated]", &sanitized[..end])
+    } else {
+        sanitized
+    }
+}
+
+/// Format a [`ProviderError`] for client-facing error messages, sanitizing
+/// sensitive data (URLs with query parameters, API key fragments).
+///
+/// The full error is logged server-side before this function is called, so
+/// no diagnostic information is lost.
+fn format_provider_error(prefix: &str, e: ProviderError) -> String {
+    match &e {
+        ProviderError::Http(reqwest_err) => {
+            // reqwest::Error Display includes the full URL, which may contain
+            // sensitive query parameters (e.g. ?key=... for Gemini). Redact
+            // the URL while preserving the status/code information.
+            let msg = format!("{reqwest_err}");
+            let sanitized = match reqwest_err.url() {
+                Some(url) => {
+                    // Replace the full URL with just the origin (scheme + host).
+                    let redacted = format!("{}://{}", url.scheme(), url.host_str().unwrap_or("redacted"));
+                    msg.replace(url.as_str(), &redacted)
+                }
+                None => msg,
+            };
+            format!("{prefix}: {sanitized}")
+        }
+        ProviderError::Api { status, body } => {
+            // Truncate API error body and strip key patterns.
+            let sanitized_body = sanitize_upstream_error(body.clone());
+            format!("{prefix}: API error {status}: {sanitized_body}")
+        }
+        _ => format!("{prefix}: {e}"),
+    }
 }

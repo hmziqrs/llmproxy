@@ -463,13 +463,11 @@ fn apply_defaults(cfg: &mut Config) {
 // ---------------------------------------------------------------------------
 
 /// Validate that required configuration fields are present.
-fn validate(cfg: &Config, path: &Path) -> Result<(), crate::error::CoreError> {
+fn validate(cfg: &Config, _path: &Path) -> Result<(), crate::error::CoreError> {
     if cfg.api_key.is_empty() {
         return Err(crate::error::CoreError::ConfigValidation {
-            message: format!(
-                "api_key is required (set via config file {} or OC_GO_CC_API_KEY env var)",
-                path.display(),
-            ),
+            message: "api_key is required (set via config file or OC_GO_CC_API_KEY env var)"
+                .to_owned(),
         });
     }
     Ok(())

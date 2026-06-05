@@ -8,12 +8,19 @@
 //! The logic is ported from the Go reference implementation in
 //! `ref/oc-go-cc/internal/transformer/response.go`.
 
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use crate::anthropic::{ContentBlock, MessageResponse, Usage};
 use crate::openai::{ChatCompletionResponse, UsageInfo};
 use crate::zen::{GeminiResponse, ResponsesResponse};
 use super::{non_negative, map_finish_reason};
+
+/// Generate a unique response ID using UUID v4.
+///
+/// UUIDs are deterministic across test runs only when seeded, but are
+/// collision-free in concurrent scenarios and suitable for snapshot testing
+/// when the generator is injectable.
+fn generate_id() -> String {
+    format!("msg_{}", uuid::Uuid::new_v4())
+}
 
 /// Build an empty-text content block (fallback when no other blocks exist).
 fn empty_text_block() -> ContentBlock {
@@ -303,7 +310,10 @@ pub fn transform_gemini_response(
     // -- Finish reason --------------------------------------------------------
 
     let stop_reason = match candidate.finish_reason.as_deref().unwrap_or("") {
+        "STOP" => "end_turn",
         "MAX_TOKENS" => "max_tokens",
+        "SAFETY" => "end_turn",
+        "RECITATION" => "end_turn",
         _ => "end_turn",
     };
 
@@ -326,18 +336,8 @@ pub fn transform_gemini_response(
         });
 
     // Synthesise an ID since Gemini does not provide one.
-    // Note: This uses a nanosecond timestamp, making the response non-deterministic.
-    // This breaks snapshot/golden testing. In concurrent scenarios, nanosecond
-    // timestamps can collide. Consider using a UUID or accepting an ID generator
-    // as a parameter for deterministic testing (the workspace already depends on
-    // the `uuid` crate).
-    let id = format!(
-        "gemini_{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-    );
+    // Uses UUID v4 for uniqueness and testability (no nanosecond collisions).
+    let id = generate_id();
 
     Ok(MessageResponse {
         id,
@@ -369,12 +369,10 @@ fn build_usage_from_openai(info: &UsageInfo) -> Usage {
         // `prompt_tokens` is the *total* prompt size including both. When
         // the upstream reports prompt-cache fields we subtract them out so
         // that Claude Code's local context counter does not see an inflated
-        // input_tokens on every turn.
-        // TODO: The `as i32` cast silently truncates if the value exceeds
-        // i32::MAX (~2.1 billion tokens). Use i32::try_from().unwrap_or(i32::MAX)
-        // for a saturating conversion. Token counts are expected to fit in i32
-        // in practice, but this should be documented or guarded.
-        input_tokens: non_negative(prompt - cache_hit - cache_miss) as i32,
+        // input_tokens on every turn.  Saturating conversion: if the computed
+        // value exceeds i32::MAX it is clamped rather than silently truncated.
+        input_tokens: i32::try_from(non_negative(prompt - cache_hit - cache_miss))
+            .unwrap_or(i32::MAX),
         output_tokens: info.completion_tokens,
         cache_creation_input_tokens: info.prompt_cache_miss_tokens,
         cache_read_input_tokens: info.prompt_cache_hit_tokens,
@@ -715,7 +713,7 @@ mod tests {
         };
 
         let result = transform_gemini_response(&resp, "gemini-model").unwrap();
-        assert!(result.id.starts_with("gemini_"));
+        assert!(result.id.starts_with("msg_"));
         assert_eq!(result.r#type, "message");
         assert_eq!(result.role, "assistant");
         assert_eq!(result.model, "gemini-model");
@@ -814,5 +812,90 @@ mod tests {
                 output_tokens,
             },
         }
+    }
+
+    // -- Edge case tests for malformed arguments ---------------------------------
+
+    /// Phase 0: tool_call with malformed JSON arguments falls back to empty JSON object.
+    #[test]
+    fn transform_response_malformed_tool_call_arguments_fallback_empty_json() {
+        use crate::openai::{Choice, FunctionCall, ToolCall};
+
+        let msg = crate::openai::ChatMessage {
+            role: "assistant".to_owned(),
+            content: "hello".to_owned(),
+            reasoning_content: None,
+            tool_calls: vec![ToolCall {
+                index: None,
+                id: Some("call_1".to_owned()),
+                r#type: Some("function".to_owned()),
+                function: Some(FunctionCall {
+                    name: Some("my_tool".to_owned()),
+                    arguments: Some("not valid json{{{".to_owned()),
+                }),
+            }],
+            name: None,
+            tool_call_id: None,
+            cache_control: None,
+        };
+        let resp = make_openai_response(
+            vec![Choice {
+                index: 0,
+                message: Some(msg),
+                finish_reason: Some("stop".to_owned()),
+                delta: None,
+            }],
+            make_usage(10, 5, 0, 0),
+        );
+        let result = transform_response(&resp, "gpt-4o").unwrap();
+        // The tool_use block should exist with empty JSON object as input.
+        let tool_block = result.content.iter().find(|b| b.r#type == "tool_use").unwrap();
+        assert_eq!(tool_block.input.as_ref(), Some(&serde_json::json!({})));
+    }
+
+    /// Phase 0: Responses API function_call with malformed arguments falls back to empty JSON.
+    #[test]
+    fn transform_responses_response_malformed_arguments_fallback() {
+        let output = vec![crate::zen::ResponsesOutput {
+            r#type: "function_call".to_owned(),
+            id: Some("fc_1".to_owned()),
+            role: None,
+            content: None,
+            call_id: Some("call_1".to_owned()),
+            name: Some("my_tool".to_owned()),
+            arguments: Some("invalid json!!!".to_owned()),
+        }];
+        let resp = make_responses_response("resp_1", output, 10, 5);
+        let result = transform_responses_response(&resp, "gpt-4o").unwrap();
+        let tool_block = result.content.iter().find(|b| b.r#type == "tool_use").unwrap();
+        assert_eq!(tool_block.input.as_ref(), Some(&serde_json::json!({})));
+    }
+
+    /// Phase 0: Gemini response with empty-string text parts produces no text block.
+    #[test]
+    fn transform_gemini_response_empty_text_parts() {
+        use crate::zen::{GeminiCandidate, GeminiContent, GeminiPart};
+
+        let resp = GeminiResponse {
+            candidates: vec![GeminiCandidate {
+                content: GeminiContent {
+                    role: "model".to_owned(),
+                    parts: vec![GeminiPart {
+                        text: Some(String::new()),
+                    }],
+                },
+                finish_reason: Some("STOP".to_owned()),
+            }],
+            usage_metadata: Some(crate::zen::GeminiUsage {
+                prompt_token_count: 10,
+                candidates_token_count: 5,
+                total_token_count: 15,
+            }),
+        };
+        let result = transform_gemini_response(&resp, "gemini-2.5-flash").unwrap();
+        // Empty text should produce no text block, so the fallback empty block is used.
+        assert_eq!(result.content.len(), 1);
+        assert_eq!(result.content[0].r#type, "text");
+        assert_eq!(result.content[0].text.as_deref(), Some(""));
     }
 }

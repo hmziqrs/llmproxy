@@ -2091,6 +2091,7 @@ dependencies = [
  "llm-proxy-core",
  "serde",
  "serde_json",
+ "uuid",
 ]
 
 [[package]]

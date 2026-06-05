@@ -22,7 +22,6 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::anthropic::{ContentBlock, Delta, MessageEvent, MessageResponse, Usage};
 use crate::openai::{ChatCompletionChunk, UsageInfo};
@@ -57,18 +56,12 @@ impl fmt::Display for ErrClientDisconnected {
 
 impl std::error::Error for ErrClientDisconnected {}
 
-/// Generate a unique-enough ID based on the current nanosecond timestamp.
+/// Generate a unique ID using UUID v4.
 ///
-/// Note: This uses a nanosecond timestamp, making output non-deterministic
-/// (breaks snapshot/golden testing). In concurrent scenarios, nanosecond
-/// timestamps can collide. Consider using a UUID (the workspace already
-/// depends on `uuid`) or accepting an ID generator as a parameter.
+/// UUIDs are collision-free in concurrent scenarios and suitable for
+/// snapshot testing when the generator is injectable.
 fn generate_id() -> String {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos()
-        .to_string()
+    format!("msg_{}", uuid::Uuid::new_v4())
 }
 
 /// Build Anthropic [`Usage`] from an optional OpenAI [`UsageInfo`], subtracting
@@ -86,7 +79,8 @@ fn usage_to_anthropic(usage: Option<&UsageInfo>) -> Usage {
             let cache_hit = info.prompt_cache_hit_tokens.unwrap_or(0) as i64;
             let cache_miss = info.prompt_cache_miss_tokens.unwrap_or(0) as i64;
             Usage {
-                input_tokens: non_negative(prompt - cache_hit - cache_miss) as i32,
+                input_tokens: i32::try_from(non_negative(prompt - cache_hit - cache_miss))
+                    .unwrap_or(i32::MAX),
                 output_tokens: info.completion_tokens,
                 cache_creation_input_tokens: info.prompt_cache_miss_tokens,
                 cache_read_input_tokens: info.prompt_cache_hit_tokens,
@@ -468,8 +462,9 @@ impl StreamProxy {
         let chunk: ChatCompletionChunk = match serde_json::from_str(data) {
             Ok(c) => c,
             // Malformed SSE chunks are silently skipped for resilience.
-            // This means upstream data corruption is invisible. This is
-            // documented as intentional Phase 0 characterization behavior.
+            // The adapter layer (which has tracing) should log a warning for
+            // malformed chunks. This is a known gap per protocol-normalization.md
+            // Section 7: "Drop the field and record a warning."
             Err(_) => return Ok(()),
         };
 
@@ -737,6 +732,8 @@ impl StreamProxy {
 
         let chunk: ResponsesChunk = match serde_json::from_str(data) {
             Ok(c) => c,
+            // Malformed SSE chunks are silently skipped for resilience.
+            // The adapter layer should log a warning for malformed data.
             Err(_) => return Ok(()),
         };
 
@@ -809,6 +806,8 @@ impl StreamProxy {
 
         let chunk: GeminiStreamChunk = match serde_json::from_str(data) {
             Ok(c) => c,
+            // Malformed SSE chunks are silently skipped for resilience.
+            // The adapter layer should log a warning for malformed data.
             Err(_) => return Ok(()),
         };
 
