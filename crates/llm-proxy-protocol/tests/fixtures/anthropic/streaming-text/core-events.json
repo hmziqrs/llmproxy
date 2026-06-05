@@ -1,0 +1,7 @@
+[
+  { "MessageStart": { "id": "msg_1", "model": { "requested": "claude-sonnet-4-20250514", "upstream": null } } },
+  { "TextDelta": { "index": 0, "text": "Hello" } },
+  { "TextDelta": { "index": 0, "text": " world" } },
+  { "UsageDelta": { "usage": { "input_tokens": 10, "output_tokens": 5, "reasoning_tokens": null, "cache_creation_input_tokens": null, "cache_read_input_tokens": null, "provenance": "ProviderReported" } } },
+  { "MessageStop": { "stop_reason": "EndTurn", "stop_sequence": null } }
+]

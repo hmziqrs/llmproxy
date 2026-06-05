@@ -1,0 +1,7 @@
+{
+  "model": { "requested": "claude-sonnet-4-20250514", "upstream": null },
+  "system": [{ "Text": { "text": "You are a helpful assistant.", "cache": null } }],
+  "messages": [
+    { "role": "User", "content": [{ "Text": { "text": "Hi", "cache": null } }] }
+  ]
+}

@@ -203,6 +203,7 @@ impl Message {
                 thinking: None,
                 signature: None,
                 source: None,
+                cache_control: None,
             }];
         }
         // Try array of content blocks.
@@ -283,6 +284,9 @@ pub struct ContentBlock {
     /// Image source (for `"image"` blocks).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<ImageSource>,
+    /// Cache control directive (for `"text"` blocks, but potentially others).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<CacheControl>,
 }
 
 impl ContentBlock {
@@ -302,6 +306,7 @@ impl ContentBlock {
             thinking: None,
             signature: None,
             source: None,
+            cache_control: None,
         }
     }
 
@@ -321,6 +326,7 @@ impl ContentBlock {
             thinking: None,
             signature: None,
             source: None,
+            cache_control: None,
         }
     }
 
@@ -340,6 +346,7 @@ impl ContentBlock {
             thinking: Some(thinking),
             signature: None,
             source: None,
+            cache_control: None,
         }
     }
 
@@ -405,9 +412,14 @@ impl Serialize for ContentBlock {
 
         match self.r#type.as_str() {
             "text" => {
-                let mut map = serializer.serialize_map(Some(2))?;
+                let has_cache = self.cache_control.is_some();
+                let len = if has_cache { 3 } else { 2 };
+                let mut map = serializer.serialize_map(Some(len))?;
                 map.serialize_entry("type", &self.r#type)?;
                 map.serialize_entry("text", self.text.as_deref().unwrap_or(""))?;
+                if let Some(ref cc) = self.cache_control {
+                    map.serialize_entry("cache_control", cc)?;
+                }
                 map.end()
             }
             "tool_use" => {
@@ -487,6 +499,8 @@ impl Serialize for ContentBlock {
                     signature: Option<String>,
                     #[serde(skip_serializing_if = "Option::is_none")]
                     source: Option<ImageSource>,
+                    #[serde(skip_serializing_if = "Option::is_none")]
+                    cache_control: Option<CacheControl>,
                 }
 
                 let all = AllFields {
@@ -502,6 +516,7 @@ impl Serialize for ContentBlock {
                     thinking: self.thinking.clone(),
                     signature: self.signature.clone(),
                     source: self.source.clone(),
+                    cache_control: self.cache_control.clone(),
                 };
                 all.serialize(serializer)
             }
@@ -651,6 +666,9 @@ pub struct Delta {
     /// Stop reason (on the final delta).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop_reason: Option<String>,
+    /// Stop sequence (on the final delta).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_sequence: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -899,11 +917,38 @@ mod tests {
             thinking: None,
             signature: None,
             source: None,
+            cache_control: None,
         };
         let json = serde_json::to_value(&block).unwrap();
         assert_eq!(json["type"], "text");
         assert_eq!(json["text"], "hello");
         assert_eq!(json.as_object().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn serialize_text_block_with_cache_control() {
+        let block = ContentBlock {
+            r#type: "text".into(),
+            text: Some("hello".into()),
+            id: None,
+            tool_use_id: None,
+            name: None,
+            input: None,
+            output: None,
+            content: None,
+            is_error: None,
+            thinking: None,
+            signature: None,
+            source: None,
+            cache_control: Some(CacheControl {
+                r#type: "ephemeral".into(),
+            }),
+        };
+        let json = serde_json::to_value(&block).unwrap();
+        assert_eq!(json["type"], "text");
+        assert_eq!(json["text"], "hello");
+        assert_eq!(json["cache_control"]["type"], "ephemeral");
+        assert_eq!(json.as_object().unwrap().len(), 3);
     }
 
     #[test]
@@ -921,6 +966,7 @@ mod tests {
             thinking: None,
             signature: None,
             source: None,
+            cache_control: None,
         };
         let json = serde_json::to_value(&block).unwrap();
         assert_eq!(json["type"], "tool_use");
@@ -945,6 +991,7 @@ mod tests {
             thinking: None,
             signature: None,
             source: None,
+            cache_control: None,
         };
         let json = serde_json::to_value(&block).unwrap();
         assert_eq!(json["type"], "tool_result");
@@ -968,6 +1015,7 @@ mod tests {
             thinking: Some("hmm...".into()),
             signature: Some("sig_abc".into()),
             source: None,
+            cache_control: None,
         };
         let json = serde_json::to_value(&block).unwrap();
         assert_eq!(json["type"], "thinking");
@@ -993,6 +1041,7 @@ mod tests {
             thinking: None,
             signature: None,
             source: None,
+            cache_control: None,
         };
         assert_eq!(block.text_content(), "result text");
     }
@@ -1016,6 +1065,7 @@ mod tests {
             thinking: None,
             signature: None,
             source: None,
+            cache_control: None,
         };
         assert_eq!(block.text_content(), "part onepart two");
     }
@@ -1035,6 +1085,7 @@ mod tests {
             thinking: None,
             signature: None,
             source: None,
+            cache_control: None,
         };
         assert_eq!(block.text_content(), "legacy output");
     }
@@ -1077,6 +1128,7 @@ mod tests {
             thinking: None,
             signature: None,
             source: None,
+            cache_control: None,
         }
     }
 
@@ -1099,6 +1151,7 @@ mod tests {
             thinking: None,
             signature: None,
             source: None,
+            cache_control: None,
         };
         assert_eq!(block.text_content(), "");
     }

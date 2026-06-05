@@ -46,6 +46,7 @@ fn new_tool_use_response_block(
         thinking: None,
         signature: None,
         source: None,
+            cache_control: None,
     }
 }
 
@@ -64,6 +65,7 @@ fn new_thinking_response_block(thinking: String) -> ContentBlock {
         is_error: None,
         signature: None,
         source: None,
+            cache_control: None,
     }
 }
 
@@ -82,6 +84,7 @@ fn new_text_response_block(text: String) -> ContentBlock {
         thinking: None,
         signature: None,
         source: None,
+            cache_control: None,
     }
 }
 

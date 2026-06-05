@@ -2091,6 +2091,8 @@ dependencies = [
  "llm-proxy-core",
  "serde",
  "serde_json",
+ "thiserror",
+ "tracing",
  "uuid",
 ]
 

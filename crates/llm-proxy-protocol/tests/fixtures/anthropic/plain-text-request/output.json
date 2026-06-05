@@ -1,0 +1,10 @@
+{
+  "id": "msg_test",
+  "type": "message",
+  "role": "assistant",
+  "content": [{ "type": "text", "text": "I am doing well!" }],
+  "model": "claude-sonnet-4-20250514",
+  "stop_reason": "end_turn",
+  "stop_sequence": null,
+  "usage": { "input_tokens": 10, "output_tokens": 20 }
+}
