@@ -675,7 +675,7 @@ endpoint = "https://opencode.ai/zen/v1/messages"
 
 [provider.adapters.gemini]
 protocol = "gemini_generate_content"
-endpoint = "https://opencode.ai/zen/v1/models/{{{{model}}}}:generateContent"
+endpoint = "https://opencode.ai/zen/v1/models/{{model}}:generateContent"
 
 [provider.models]
 "gpt-5.4" = {{ adapter = "responses" }}
@@ -693,6 +693,7 @@ endpoint = "https://opencode.ai/zen/v1/models/{{{{model}}}}:generateContent"
         assert_eq!(cfg.adapters["responses"].protocol, "openai_responses");
         assert_eq!(cfg.adapters["anthropic"].protocol, "anthropic_messages");
         assert_eq!(cfg.adapters["gemini"].protocol, "gemini_generate_content");
+        assert_eq!(cfg.adapters["gemini"].endpoint, "https://opencode.ai/zen/v1/models/{model}:generateContent");
         assert_eq!(cfg.models.len(), 3);
         assert_eq!(cfg.models["gpt-5.4"].adapter, "responses");
     }

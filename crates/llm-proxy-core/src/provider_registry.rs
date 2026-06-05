@@ -43,7 +43,7 @@ use crate::provider_config::{AuthStyle, ProviderConfig, load_provider_config};
 /// `endpoint` is the raw endpoint or URL template from provider TOML. It is
 /// **not** a route-built final URL. Provider adapters own endpoint URL shape,
 /// including Gemini `{model}` expansion.
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 #[non_exhaustive]
 pub struct ProviderAdapterTargetConfig {
     /// Provider name (identifies the provider config).
@@ -102,15 +102,16 @@ pub struct ProviderRegistry {
 
 impl ProviderRegistry {
     /// Load all provider TOML files from a directory.
+    #[must_use = "load_from_dir returns a Result that must be checked"]
     ///
-    /// Reads every `*.toml` file in `path`, parses each as a [`ProviderFile`],
+    /// Reads every `*.toml` file in `path`, parses each as a [`crate::provider_config::ProviderFile`],
     /// and indexes them by provider name. Returns an error if:
     ///
     /// - the directory cannot be read,
     /// - any TOML file cannot be parsed or fails validation,
     /// - two files declare the same provider name (duplicate).
     ///
-    /// Protocol validation is performed separately via [`validate_protocols`]
+    /// Protocol validation is performed separately via [`Self::validate_protocols`]
     /// after loading, typically by passing `ProviderAdapterRegistry::protocol_names()`.
     ///
     /// # Errors
@@ -144,9 +145,11 @@ impl ProviderRegistry {
             let file_path = entry.path();
 
             // Skip non-regular files (directories, pipes, sockets, etc.).
-            // Note: symlinks pointing to regular files are followed (is_file()
-            // returns true for them). The config directory trust boundary is
-            // documented in provider_config.rs.
+            // Security note: symlinks pointing to regular files ARE followed
+            // (DirEntry::file_type().is_file() returns true for them). This
+            // means write access to the config directory implies trust: a
+            // malicious symlink could point to arbitrary files. The config
+            // directory trust boundary is documented in provider_config.rs.
             if let Ok(ft) = entry.file_type() {
                 if !ft.is_file() {
                     tracing::debug!(
@@ -193,6 +196,7 @@ impl ProviderRegistry {
     ///
     /// Returns [`CoreError::ProviderResolution`] if duplicate provider names
     /// are found in the input map.
+    #[must_use = "from_providers returns a Result that must be checked"]
     pub fn from_providers(
         providers: impl IntoIterator<Item = ProviderConfig>,
     ) -> Result<Self, CoreError> {
@@ -849,7 +853,7 @@ endpoint = "https://example.com/v1/chat/completions"
                     "gemini".to_owned(),
                     make_adapter(
                         "gemini_generate_content",
-                        "https://multi.example.com/v1/models/{{model}}:generateContent",
+                        "https://multi.example.com/v1/models/{model}:generateContent",
                     ),
                 );
                 m
@@ -882,6 +886,7 @@ endpoint = "https://example.com/v1/chat/completions"
             .expect("resolve gemini");
         assert_eq!(r3.adapter_name, "gemini");
         assert_eq!(r3.protocol, "gemini_generate_content");
+        assert_eq!(r3.endpoint, "https://multi.example.com/v1/models/{model}:generateContent");
     }
 
     // -- resolution errors carry actionable messages ---------------------------
@@ -1477,5 +1482,190 @@ endpoint = "https://a.example.com/v1/chat/completions"
 
         let registry = ProviderRegistry::load_from_dir(dir.path()).expect("load");
         assert!(registry.is_empty(), "directory named .toml should be skipped");
+    }
+
+    // -- Send+Sync static assertion for ProviderRegistry -------------------------
+
+    #[test]
+    fn provider_registry_is_send_sync() {
+        fn check<T: Send + Sync>() {}
+        check::<ProviderRegistry>();
+        check::<ProviderAdapterTargetConfig>();
+    }
+
+    // -- Whitespace-only provider name in resolve_adapter_target -----------------
+
+    #[test]
+    fn resolve_adapter_target_whitespace_only_provider_name_yields_unknown_provider_error() {
+        let _env = clean_env();
+
+        let registry = ProviderRegistry::from_providers(vec![make_provider(
+            "real-provider",
+            {
+                let mut m = HashMap::new();
+                m.insert(
+                    "chat".to_owned(),
+                    make_adapter("openai_chat_completions", "https://example.com"),
+                );
+                m
+            },
+            {
+                let mut m = HashMap::new();
+                m.insert("model-a".to_owned(), make_model("chat"));
+                m
+            },
+        )])
+        .expect("registry");
+
+        let target = make_target("   ", "model-a", "model-a");
+        let result = registry.resolve_adapter_target(&target);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("unknown provider"),
+            "expected unknown provider error for whitespace-only name, got: {err}"
+        );
+    }
+
+    // -- Whitespace-only upstream_model in resolve_adapter_target ----------------
+
+    #[test]
+    fn resolve_adapter_target_whitespace_only_upstream_model_yields_missing_model_error() {
+        let _env = clean_env();
+
+        let registry = ProviderRegistry::from_providers(vec![make_provider(
+            "test",
+            {
+                let mut m = HashMap::new();
+                m.insert(
+                    "chat".to_owned(),
+                    make_adapter("openai_chat_completions", "https://example.com"),
+                );
+                m
+            },
+            {
+                let mut m = HashMap::new();
+                m.insert("real-model".to_owned(), make_model("chat"));
+                m
+            },
+        )])
+        .expect("registry");
+
+        let target = make_target("test", "whatever", "   ");
+        let result = registry.resolve_adapter_target(&target);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("no model mapping"),
+            "expected missing model error for whitespace-only upstream_model, got: {err}"
+        );
+    }
+
+    // -- Unicode model/provider names resolve correctly --------------------------
+
+    #[test]
+    fn unicode_provider_and_model_names_resolve() {
+        let _env = clean_env();
+
+        let registry = ProviderRegistry::from_providers(vec![make_provider(
+            "プロバイダー",
+            {
+                let mut m = HashMap::new();
+                m.insert(
+                    "chat".to_owned(),
+                    make_adapter("openai_chat_completions", "https://example.com/v1"),
+                );
+                m
+            },
+            {
+                let mut m = HashMap::new();
+                m.insert("モデル-🤖".to_owned(), make_model("chat"));
+                m
+            },
+        )])
+        .expect("registry");
+
+        let target = make_target("プロバイダー", "モデル-🤖", "モデル-🤖");
+        let resolved = registry.resolve_adapter_target(&target).expect("resolve");
+        assert_eq!(resolved.provider_name, "プロバイダー");
+        assert_eq!(resolved.upstream_model, "モデル-🤖");
+    }
+
+    // -- Very long model name as registry key -----------------------------------
+
+    #[test]
+    fn very_long_model_name_resolves_in_registry() {
+        let _env = clean_env();
+
+        let long_name = "a".repeat(10_000);
+        let registry = ProviderRegistry::from_providers(vec![make_provider(
+            "test",
+            {
+                let mut m = HashMap::new();
+                m.insert(
+                    "chat".to_owned(),
+                    make_adapter("openai_chat_completions", "https://example.com"),
+                );
+                m
+            },
+            {
+                let mut m = HashMap::new();
+                m.insert(long_name.clone(), make_model("chat"));
+                m
+            },
+        )])
+        .expect("registry");
+
+        let target = make_target("test", &long_name, &long_name);
+        let resolved = registry.resolve_adapter_target(&target).expect("resolve");
+        assert_eq!(resolved.upstream_model, long_name);
+    }
+
+    // -- Special characters in model/adapter names work as HashMap keys ----------
+
+    #[test]
+    fn special_characters_in_names_resolve() {
+        let _env = clean_env();
+
+        let registry = ProviderRegistry::from_providers(vec![make_provider(
+            "test",
+            {
+                let mut m = HashMap::new();
+                m.insert(
+                    "a.dapt/er".to_owned(),
+                    make_adapter("openai_chat_completions", "https://example.com"),
+                );
+                m
+            },
+            {
+                let mut m = HashMap::new();
+                m.insert("model.with.dots/and:colons".to_owned(), make_model("a.dapt/er"));
+                m
+            },
+        )])
+        .expect("registry");
+
+        let target = make_target("test", "alias", "model.with.dots/and:colons");
+        let resolved = registry.resolve_adapter_target(&target).expect("resolve");
+        assert_eq!(resolved.adapter_name, "a.dapt/er");
+        assert_eq!(resolved.upstream_model, "model.with.dots/and:colons");
+    }
+
+    // -- ProviderAdapterTargetConfig Clone round-trip ----------------------------
+
+    #[test]
+    fn provider_adapter_target_config_clone_round_trip() {
+        let original = ProviderAdapterTargetConfig {
+            provider_name: "test".to_owned(),
+            adapter_name: "chat".to_owned(),
+            protocol: "openai_chat_completions".to_owned(),
+            endpoint: "https://example.com".to_owned(),
+            auth_style: AuthStyle::Bearer,
+            api_key: "sk-secret".to_owned(),
+            requested_model: "gpt-4o".to_owned(),
+            upstream_model: "gpt-4o".to_owned(),
+        };
+        let cloned = original.clone();
+        assert_eq!(cloned, original, "cloned ProviderAdapterTargetConfig should equal original");
     }
 }
