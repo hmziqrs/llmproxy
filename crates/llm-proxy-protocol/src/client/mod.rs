@@ -22,7 +22,22 @@ pub mod openai_chat;
 ///
 /// Every adapter returns this type so that route handlers can map errors to
 /// appropriate HTTP responses without depending on adapter-specific error types.
+///
+/// # HTTP status mapping
+///
+/// Route handlers should translate `ProtocolError` variants into HTTP responses
+/// as follows:
+///
+/// - `InvalidRequest` -> 400 Bad Request
+/// - `Encode` -> 500 Internal Server Error (or 502 Bad Gateway if the cause
+///   is upstream data that cannot be represented in the client protocol)
+/// - `Decode` -> 400 Bad Request (malformed client input)
+///
+/// `ProtocolError` does not carry an HTTP status code directly because the
+/// route handler may need to override the status based on context (e.g.
+/// streaming vs non-streaming, request-phase vs response-phase).
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum ProtocolError {
     /// The client request could not be decoded into core types.
     #[error("invalid request: {0}")]
@@ -33,4 +48,9 @@ pub enum ProtocolError {
     /// An error occurred while decoding the client protocol into core types.
     #[error("decode error: {0}")]
     Decode(String),
+    /// A content block was dropped because the client protocol does not support
+    /// it, but the omission is safe (e.g. Document/Audio/Video in Anthropic
+    /// responses). The block was already logged with a `tracing::warn!`.
+    #[error("skippable encode: {0}")]
+    EncodeSkippable(String),
 }

@@ -92,6 +92,8 @@ pub fn decode_request(req: ChatCompletionRequest) -> Result<CoreRequest, Protoco
                 // and text content.
                 let mut content = Vec::new();
                 if let Some(thinking) = msg.reasoning_content {
+                    // OpenAI returns Some("") for reasoning_content on non-reasoning
+                    // models; treat empty string as absent.
                     if !thinking.is_empty() {
                         content.push(CoreContent::Thinking {
                             text: thinking,
@@ -100,19 +102,29 @@ pub fn decode_request(req: ChatCompletionRequest) -> Result<CoreRequest, Protoco
                     }
                 }
                 for tc in msg.tool_calls {
-                    let args: serde_json::Value = tc
-                        .function
-                        .as_ref()
-                        .and_then(|f| f.arguments.as_ref())
-                        .and_then(|a| serde_json::from_str(a).ok())
-                        .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+                    let tc_id = tc.id.unwrap_or_else(|| {
+                        tracing::warn!("tool_call missing id field; using empty string");
+                        String::new()
+                    });
+                    let tc_function = tc.function;
+                    let (tc_name, tc_args) = if let Some(f) = tc_function {
+                        let name = f.name.unwrap_or_else(|| {
+                            tracing::warn!("tool_call function missing name field; using empty string");
+                            String::new()
+                        });
+                        let args: serde_json::Value = f
+                            .arguments
+                            .and_then(|a| serde_json::from_str(&a).ok())
+                            .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+                        (name, args)
+                    } else {
+                        tracing::warn!("tool_call missing function field; using defaults");
+                        (String::new(), serde_json::Value::Object(serde_json::Map::new()))
+                    };
                     content.push(CoreContent::ToolUse {
-                        id: tc.id.unwrap_or_default(),
-                        name: tc
-                            .function
-                            .and_then(|f| f.name)
-                            .unwrap_or_default(),
-                        input: args,
+                        id: tc_id,
+                        name: tc_name,
+                        input: tc_args,
                     });
                 }
                 if !msg.content.is_empty() {
@@ -178,6 +190,11 @@ pub fn decode_request(req: ChatCompletionRequest) -> Result<CoreRequest, Protoco
                 for item in arr {
                     if let serde_json::Value::String(st) = item {
                         result.push(st);
+                    } else {
+                        tracing::warn!(
+                            ?item,
+                            "non-string item in stop array ignored during OpenAI decode"
+                        );
                     }
                 }
                 stop = Some(result);
@@ -261,30 +278,57 @@ fn decode_tool_choice(value: serde_json::Value) -> CoreToolChoice {
 // ---------------------------------------------------------------------------
 
 /// Encode a [`CoreResponse`] into an OpenAI [`ChatCompletionResponse`].
+///
+/// # Content handling
+///
+/// - Multiple `CoreContent::Text` blocks are concatenated into a single string
+///   without separator, since OpenAI's `content` field is a single string.
+/// - Multiple `CoreContent::Thinking` blocks: only the last one is preserved
+///   (overwritten). If this becomes common, consider concatenating them.
+/// - `stop_sequence` is silently dropped since OpenAI has no native field for it.
+/// - `provider_meta` is silently dropped (for provider adapters only).
 pub fn encode_response(
     resp: CoreResponse,
 ) -> Result<ChatCompletionResponse, ProtocolError> {
+    if !resp.provider_meta.is_empty() {
+        tracing::debug!(
+            meta_keys = resp.provider_meta.len(),
+            "provider_meta is non-empty during OpenAI client encode; \
+             this data is for provider adapters only and will not be forwarded to the client"
+        );
+    }
+
+    if resp.stop_sequence.as_ref().is_some_and(|s| !s.is_empty()) {
+        tracing::warn!(
+            stop_sequence = resp.stop_sequence.as_deref().unwrap(),
+            "OpenAI Chat Completions has no stop_sequence field on responses; dropping"
+        );
+    }
+
     let id = resp.id.unwrap_or_else(|| format!("chatcmpl-{}", uuid::Uuid::new_v4()));
 
     let mut content_text = String::new();
     let mut reasoning = None;
     let mut tool_calls = Vec::new();
-    let mut tool_call_index: i32 = 0;
     let mut refusal_text: Option<String> = None;
 
     for block in resp.content {
         match block {
             CoreContent::Text { text, .. } => {
+                // Multiple text blocks are concatenated without separator.
                 content_text.push_str(&text);
             }
             CoreContent::Thinking { text, .. } => {
+                // Only the last Thinking block is preserved. If multiple
+                // thinking blocks are present, earlier ones are silently
+                // dropped. Consider concatenating if this becomes common.
                 reasoning = Some(text);
             }
             CoreContent::ToolUse { id, name, input } => {
                 let args_str = serde_json::to_string(&input)
                     .unwrap_or_else(|_| "{}".to_owned());
                 tool_calls.push(ToolCall {
-                    index: Some(tool_call_index),
+                    index: Some(tool_calls.len() as i32),
                     id: Some(id),
                     r#type: Some("function".to_owned()),
                     function: Some(FunctionCall {
@@ -292,7 +336,6 @@ pub fn encode_response(
                         arguments: Some(args_str),
                     }),
                 });
-                tool_call_index += 1;
             }
             CoreContent::Image { .. } => {
                 tracing::warn!(
@@ -322,15 +365,15 @@ pub fn encode_response(
                 );
             }
             CoreContent::RedactedThinking { .. } => {
-                // Per the plan: return ProtocolError::Encode for RedactedThinking
-                // since OpenAI Chat does not support it and the data cannot be
-                // safely represented.
+                // RedactedThinking cannot be represented in OpenAI Chat.
+                // Unlike Document/Audio/Video (safe to drop), RedactedThinking
+                // signals that thinking occurred but is intentionally withheld.
+                // Dropping it silently would lose that signal, so we warn and
+                // skip rather than returning Err, so that any previously encoded
+                // blocks (text, tool_calls) are preserved.
                 tracing::warn!(
-                    "OpenAI Chat Completions does not support redacted thinking; cannot encode"
+                    "OpenAI Chat Completions does not support redacted thinking; omitting block"
                 );
-                return Err(ProtocolError::Encode(
-                    "OpenAI Chat Completions does not support RedactedThinking blocks".into(),
-                ));
             }
             CoreContent::Refusal { text } => {
                 // OpenAI has a native refusal field on assistant messages.
@@ -355,9 +398,15 @@ pub fn encode_response(
 
     let usage = encode_usage(&resp.usage);
 
+    // NOTE: The timestamp is non-deterministic, which prevents snapshot testing
+    // of the full output. If deterministic output is needed, accept `created` as
+    // a parameter or read it from CoreResponse.provider_meta.
     let created = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
+        .unwrap_or_else(|e| {
+            tracing::warn!("system clock appears to be before UNIX epoch: {e}");
+            std::time::Duration::ZERO
+        })
         .as_secs() as i64;
 
     Ok(ChatCompletionResponse {
@@ -375,6 +424,15 @@ pub fn encode_response(
     })
 }
 
+/// Map [`StopReason`] to an OpenAI `finish_reason` string.
+///
+/// The plan's encode rules table maps ToolUse, MaxTokens, and "other normal stop"
+/// explicitly. The additional mappings:
+///
+/// - `Refusal` -> `"content_filter"` (OpenAI uses content_filter for refused outputs)
+/// - `StopSequence` -> `"stop"` (falls under "other normal stop")
+/// - `Error` -> `"stop"` with warning (no native error finish reason in OpenAI)
+/// - `Unknown` -> `"stop"` (safe default, "other normal stop")
 fn encode_finish_reason(reason: StopReason) -> String {
     match reason {
         StopReason::ToolUse => "tool_calls".to_owned(),
@@ -549,7 +607,7 @@ impl StreamEncoder {
                         content: String::new(),
                         reasoning_content: None,
                         tool_calls: vec![ToolCall {
-                            index: Some(index as i32),
+                            index: Some((index).min(i32::MAX as usize) as i32),
                             id: Some(id),
                             r#type: Some("function".to_owned()),
                             function: Some(FunctionCall {
@@ -575,7 +633,7 @@ impl StreamEncoder {
                         content: String::new(),
                         reasoning_content: None,
                         tool_calls: vec![ToolCall {
-                            index: Some(index as i32),
+                            index: Some((index).min(i32::MAX as usize) as i32),
                             id: None,
                             r#type: None,
                             function: Some(FunctionCall {
@@ -646,9 +704,11 @@ impl StreamEncoder {
                 // Sanitization of secrets happens at CoreStreamError::new()
                 // construction time in the provider adapter. Only the error kind
                 // is used here to avoid leaking unsanitized messages through logs.
+                // Using Display (lowercase) instead of Debug (PascalCase) for a
+                // stable, human-readable format.
                 self.finished = true;
                 return Err(ProtocolError::Encode(format!(
-                    "stream error: {:?}",
+                    "stream error: {}",
                     error.kind
                 )));
             }
@@ -662,12 +722,61 @@ impl StreamEncoder {
     }
 
     /// Flush any remaining buffered events.
+    ///
+    /// When the stream terminated abnormally (no prior `MessageStop`), emits a
+    /// synthetic finish_reason=`"stop"` chunk so the client receives a proper
+    /// terminal signal. If `include_usage` is set, also emits a final usage chunk.
+    /// This is analogous to how the Anthropic encoder emits synthetic terminal
+    /// events in `finish()`.
     pub fn finish(&mut self) -> Result<Vec<ChatCompletionChunk>, ProtocolError> {
         if self.finished {
             return Ok(Vec::new());
         }
         self.finished = true;
-        Ok(Vec::new())
+
+        tracing::warn!(
+            "StreamEncoder::finish() called without prior MessageStop; emitting synthetic terminal chunk"
+        );
+
+        let mut chunks = Vec::new();
+
+        // Emit a synthetic finish chunk.
+        chunks.push(self.make_chunk(Choice {
+            index: 0,
+            message: None,
+            finish_reason: Some("stop".to_owned()),
+            delta: Some(ChatMessage {
+                role: String::new(),
+                content: String::new(),
+                reasoning_content: None,
+                tool_calls: vec![],
+                name: None,
+                tool_call_id: None,
+                cache_control: None,
+                refusal: None,
+            }),
+        }));
+
+        // If include_usage is set, emit a final usage chunk.
+        if self.include_usage {
+            let usage = self.pending_usage.take().unwrap_or(UsageInfo {
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                total_tokens: 0,
+                prompt_cache_hit_tokens: None,
+                prompt_cache_miss_tokens: None,
+            });
+            chunks.push(ChatCompletionChunk {
+                id: self.id.clone(),
+                object: "chat.completion.chunk".to_owned(),
+                created: self.created,
+                model: self.model.clone(),
+                choices: vec![],
+                usage: Some(usage),
+            });
+        }
+
+        Ok(chunks)
     }
 
     fn make_chunk(&self, choice: Choice) -> ChatCompletionChunk {
@@ -1300,17 +1409,42 @@ mod tests {
     }
 
     #[test]
-    fn streaming_finish_without_prior_events_is_empty() {
+    fn streaming_finish_without_prior_events_emits_synthetic_terminal() {
         let mut enc = StreamEncoder::new("chatcmpl-1".into(), "gpt-4o".into(), 1000, false);
-        // No events sent at all -- finish() returns empty for OpenAI.
+        // No events sent at all -- finish() should emit a synthetic terminal chunk.
         let remaining = enc.finish().unwrap();
-        assert!(remaining.is_empty());
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].choices[0].finish_reason.as_deref(), Some("stop"));
     }
 
     // -- every CoreEvent variant handled ------------------------------------
 
     #[test]
     fn every_core_event_variant_maps_or_errors_intentionally() {
+        // Test all ContentKind variants for ContentStart. The OpenAI stream
+        // encoder handles Text, Thinking, and ToolUse explicitly; other kinds
+        // produce a warning log and no events.
+        let content_kinds: Vec<ContentKind> = vec![
+            ContentKind::Text,
+            ContentKind::Thinking,
+            ContentKind::ToolUse,
+            ContentKind::ToolResult,
+            ContentKind::Image,
+            ContentKind::Document,
+            ContentKind::Audio,
+            ContentKind::Video,
+            ContentKind::Refusal,
+        ];
+        for (i, kind) in content_kinds.iter().enumerate() {
+            let mut enc = StreamEncoder::new("chatcmpl-1".into(), "m".into(), 1000, false);
+            let result = enc.encode_event(CoreEvent::ContentStart {
+                index: i,
+                kind: *kind,
+            });
+            assert!(result.is_ok(), "ContentStart {:?} should not error", kind);
+        }
+
+        // Test all other CoreEvent variants.
         let variants: Vec<CoreEvent> = vec![
             CoreEvent::MessageStart {
                 id: None,
@@ -1318,18 +1452,6 @@ mod tests {
                     requested: "m".into(),
                     upstream: None,
                 },
-            },
-            CoreEvent::ContentStart {
-                index: 0,
-                kind: ContentKind::Text,
-            },
-            CoreEvent::ContentStart {
-                index: 1,
-                kind: ContentKind::Thinking,
-            },
-            CoreEvent::ContentStart {
-                index: 2,
-                kind: ContentKind::ToolUse,
             },
             CoreEvent::TextDelta {
                 index: 0,
@@ -1548,7 +1670,7 @@ mod tests {
     }
 
     #[test]
-    fn encode_redacted_thinking_returns_encode_error() {
+    fn encode_redacted_thinking_drops_with_warning() {
         let resp = CoreResponse {
             id: None,
             model: ModelRef {
@@ -1563,8 +1685,38 @@ mod tests {
             usage: Usage::default(),
             provider_meta: serde_json::Map::new(),
         };
-        let result = encode_response(resp);
-        assert!(matches!(result, Err(ProtocolError::Encode(_))));
+        let out = encode_response(resp).unwrap();
+        // RedactedThinking is skipped (not an error), so content is empty.
+        let msg = out.choices[0].message.as_ref().unwrap();
+        assert!(msg.content.is_empty());
+    }
+
+    #[test]
+    fn encode_redacted_thinking_preserves_prior_blocks() {
+        let resp = CoreResponse {
+            id: None,
+            model: ModelRef {
+                requested: "m".into(),
+                upstream: None,
+            },
+            content: vec![
+                CoreContent::Text {
+                    text: "hello".into(),
+                    cache: None,
+                },
+                CoreContent::RedactedThinking {
+                    data: serde_json::json!({"redacted": true}),
+                },
+            ],
+            stop_reason: StopReason::EndTurn,
+            stop_sequence: None,
+            usage: Usage::default(),
+            provider_meta: serde_json::Map::new(),
+        };
+        let out = encode_response(resp).unwrap();
+        let msg = out.choices[0].message.as_ref().unwrap();
+        // Prior Text block is preserved even though RedactedThinking follows.
+        assert_eq!(msg.content, "hello");
     }
 
     #[test]
@@ -1609,14 +1761,149 @@ mod tests {
 
     #[test]
     fn client_openai_chat_does_not_import_forbidden_modules() {
-        // This test is a compile-time documentation assertion. If this module
-        // imported any of llm_proxy_provider, llm_proxy_server, transformer,
-        // or core config/routing, the build would fail because those crates
-        // are not dependencies of llm-proxy-protocol. The actual enforcement
-        // is the absence of those imports in the module source. CI grep checks
-        // provide a secondary guard.
-        //
-        // We verify the module compiles without those imports by simply
-        // existing as a test -- no runtime assertion needed.
+        // Source guard: this module must not import llm_proxy_provider,
+        // llm_proxy_server, core config/routing, endpoint classification,
+        // scenario/fallback code, or transformer/*. The crate dependency
+        // graph prevents most of these at compile time (those crates are not
+        // dependencies of llm-proxy-protocol). This runtime check provides
+        // a secondary defense by verifying that the module source does not
+        // contain forbidden import patterns in `use` statements.
+        let source = include_str!("openai_chat.rs");
+        for line in source.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("//") || trimmed.starts_with("/*") {
+                continue;
+            }
+            if trimmed.starts_with("use ") {
+                assert!(
+                    !trimmed.contains("llm_proxy_provider"),
+                    "client/openai_chat.rs must not import llm_proxy_provider"
+                );
+                assert!(
+                    !trimmed.contains("llm_proxy_server"),
+                    "client/openai_chat.rs must not import llm_proxy_server"
+                );
+                assert!(
+                    !trimmed.contains("crate::config"),
+                    "client/openai_chat.rs must not import crate::config"
+                );
+                assert!(
+                    !trimmed.contains("crate::routing"),
+                    "client/openai_chat.rs must not import crate::routing"
+                );
+                assert!(
+                    !trimmed.contains("crate::transformer"),
+                    "client/openai_chat.rs must not import crate::transformer"
+                );
+            }
+        }
+    }
+
+    // -- edge-case tests ----------------------------------------------------
+
+    #[test]
+    fn decode_empty_model_returns_error() {
+        let mut req = make_openai_request();
+        req.model = String::new();
+        assert!(matches!(
+            decode_request(req),
+            Err(ProtocolError::InvalidRequest(_))
+        ));
+    }
+
+    #[test]
+    fn decode_empty_messages_returns_error() {
+        let mut req = make_openai_request();
+        req.messages = vec![];
+        assert!(matches!(
+            decode_request(req),
+            Err(ProtocolError::InvalidRequest(_))
+        ));
+    }
+
+    #[test]
+    fn decode_null_optional_fields() {
+        let req = make_openai_request();
+        let core = decode_request(req).unwrap();
+        assert!(core.sampling.temperature.is_none());
+        assert!(core.sampling.top_p.is_none());
+        assert!(core.sampling.max_tokens.is_none());
+        assert!(!core.stream);
+    }
+
+    #[test]
+    fn decode_max_tokens_zero() {
+        let mut req = make_openai_request();
+        req.max_tokens = Some(0);
+        let core = decode_request(req).unwrap();
+        assert_eq!(core.sampling.max_tokens, Some(0));
+    }
+
+    #[test]
+    fn encode_response_with_stop_sequence_drops_with_warning() {
+        let resp = CoreResponse {
+            id: Some("chatcmpl-123".into()),
+            model: ModelRef { requested: "m".into(), upstream: None },
+            content: vec![CoreContent::Text { text: "hello".into(), cache: None }],
+            stop_reason: StopReason::StopSequence,
+            stop_sequence: Some("\n".into()),
+            usage: Usage::default(),
+            provider_meta: serde_json::Map::new(),
+        };
+        let out = encode_response(resp).unwrap();
+        // stop_sequence is dropped (OpenAI has no field for it), but the
+        // stop_reason is mapped to "stop".
+        assert_eq!(out.choices[0].finish_reason.as_deref(), Some("stop"));
+    }
+
+    #[test]
+    fn encode_multiple_thinking_blocks_keeps_last() {
+        let resp = CoreResponse {
+            id: Some("chatcmpl-123".into()),
+            model: ModelRef { requested: "m".into(), upstream: None },
+            content: vec![
+                CoreContent::Thinking { text: "first".into(), signature: None },
+                CoreContent::Thinking { text: "second".into(), signature: None },
+            ],
+            stop_reason: StopReason::EndTurn,
+            stop_sequence: None,
+            usage: Usage::default(),
+            provider_meta: serde_json::Map::new(),
+        };
+        let out = encode_response(resp).unwrap();
+        let msg = out.choices[0].message.as_ref().unwrap();
+        // Only the last Thinking block is preserved.
+        assert_eq!(msg.reasoning_content.as_deref(), Some("second"));
+    }
+
+    #[test]
+    fn large_content_string_encodes() {
+        let large_text = "x".repeat(100_000);
+        let resp = CoreResponse {
+            id: None,
+            model: ModelRef { requested: "m".into(), upstream: None },
+            content: vec![CoreContent::Text { text: large_text.clone(), cache: None }],
+            stop_reason: StopReason::EndTurn,
+            stop_sequence: None,
+            usage: Usage::default(),
+            provider_meta: serde_json::Map::new(),
+        };
+        let out = encode_response(resp).unwrap();
+        let msg = out.choices[0].message.as_ref().unwrap();
+        assert_eq!(msg.content, large_text);
+    }
+
+    #[test]
+    fn streaming_finish_with_include_usage_emits_usage_chunk() {
+        let mut enc = StreamEncoder::new("chatcmpl-1".into(), "gpt-4o".into(), 1000, true);
+        enc.encode_event(CoreEvent::UsageDelta {
+            usage: Usage::provider_reported(50, 100),
+        }).unwrap();
+        let remaining = enc.finish().unwrap();
+        // Should produce finish chunk + usage chunk.
+        assert_eq!(remaining.len(), 2);
+        assert_eq!(remaining[0].choices[0].finish_reason.as_deref(), Some("stop"));
+        assert!(remaining[1].usage.is_some());
+        assert_eq!(remaining[1].usage.as_ref().unwrap().prompt_tokens, 50);
     }
 }

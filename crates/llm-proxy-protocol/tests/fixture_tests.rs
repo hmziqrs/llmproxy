@@ -8,7 +8,7 @@ use llm_proxy_protocol::client::{
     anthropic as anthropic_adapter, openai_chat as openai_adapter,
 };
 use llm_proxy_protocol::core::{
-    CoreContent, CoreResponse, ModelRef, StopReason, Usage, UsageProvenance,
+    CoreContent, CoreEvent, CoreResponse, ModelRef, StopReason, Usage, UsageProvenance,
 };
 use llm_proxy_protocol::openai::ChatCompletionRequest;
 
@@ -31,7 +31,6 @@ fn read_fixture(dir: &Path, name: &str) -> serde_json::Value {
 }
 
 /// Read a fixture file as raw string.
-#[expect(dead_code)]
 fn read_fixture_raw(dir: &Path, name: &str) -> String {
     let path = dir.join(name);
     fs::read_to_string(&path)
@@ -443,7 +442,7 @@ fn openai_malformed_fixture() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn all_anthropo_non_stream_fixtures_have_required_files() {
+fn all_anthropic_non_stream_fixtures_have_required_files() {
     let cases = [
         "plain-text-request",
         "system-prompt",
@@ -536,5 +535,89 @@ fn all_streaming_fixtures_have_required_files() {
             dir.join("output.sse").exists(),
             "{adapter}/{case}/output.sse is missing"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Streaming fixture validation tests
+// ---------------------------------------------------------------------------
+
+/// Verify that the core-events.json fixture can be deserialized into CoreEvent
+/// values. This is a basic validation that streaming fixtures are well-formed.
+/// Full encode/decode round-trip tests (parsing input.sse, feeding through
+/// StreamEncoder, comparing with output.sse) are deferred to a later audit cycle.
+#[test]
+fn streaming_core_events_json_is_valid() {
+    let streaming_cases = [
+        ("anthropic", "streaming-text"),
+        ("anthropic", "streaming-tool"),
+        ("anthropic", "streaming-usage"),
+        ("anthropic", "streaming-error"),
+        ("anthropic", "streaming-ping"),
+        ("openai_chat", "streaming-text"),
+        ("openai_chat", "streaming-tool"),
+        ("openai_chat", "streaming-usage"),
+        ("openai_chat", "streaming-error"),
+        ("openai_chat", "streaming-ping"),
+    ];
+    for (adapter, case) in &streaming_cases {
+        let dir = Path::new(FIXTURE_ROOT).join(adapter).join(case);
+        let raw = read_fixture_raw(&dir, "core-events.json");
+        let events: Vec<CoreEvent> = serde_json::from_str(&raw)
+            .unwrap_or_else(|e| panic!("failed to parse {adapter}/{case}/core-events.json: {e}"));
+        assert!(
+            !events.is_empty(),
+            "{adapter}/{case}/core-events.json should contain at least one event"
+        );
+    }
+}
+
+/// Verify that input.sse and output.sse fixture files contain valid
+/// SSE-formatted data when non-empty. Empty files are allowed for cases where
+/// the protocol produces no output (e.g. OpenAI ping is a no-op).
+#[test]
+fn streaming_sse_fixtures_are_well_formed() {
+    let streaming_cases = [
+        ("anthropic", "streaming-text"),
+        ("anthropic", "streaming-tool"),
+        ("anthropic", "streaming-usage"),
+        ("anthropic", "streaming-error"),
+        ("anthropic", "streaming-ping"),
+        ("openai_chat", "streaming-text"),
+        ("openai_chat", "streaming-tool"),
+        ("openai_chat", "streaming-usage"),
+        ("openai_chat", "streaming-error"),
+        ("openai_chat", "streaming-ping"),
+    ];
+    for (adapter, case) in &streaming_cases {
+        let dir = Path::new(FIXTURE_ROOT).join(adapter).join(case);
+
+        // input.sse should always have content (it represents client input).
+        let input = read_fixture_raw(&dir, "input.sse");
+        assert!(
+            !input.is_empty(),
+            "{adapter}/{case}/input.sse should not be empty"
+        );
+        let input_has_sse = input.lines().any(|line| {
+            line.starts_with("data:") || line.starts_with("event:")
+        });
+        assert!(
+            input_has_sse,
+            "{adapter}/{case}/input.sse should contain SSE-formatted lines"
+        );
+
+        // output.sse may be empty or whitespace-only when the protocol produces
+        // no output for the given input (e.g. OpenAI Ping is a no-op).
+        let output = read_fixture_raw(&dir, "output.sse");
+        let output_trimmed = output.trim();
+        if !output_trimmed.is_empty() {
+            let output_has_sse = output_trimmed.lines().any(|line| {
+                line.starts_with("data:") || line.starts_with("event:")
+            });
+            assert!(
+                output_has_sse,
+                "{adapter}/{case}/output.sse should contain SSE-formatted lines (or be empty/whitespace-only)"
+            );
+        }
     }
 }

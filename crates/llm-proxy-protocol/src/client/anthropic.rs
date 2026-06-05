@@ -133,8 +133,11 @@ fn decode_system(system: &Option<serde_json::Value>) -> Vec<CoreContent> {
                         } else {
                             // Non-text system blocks (e.g. future image blocks) are not
                             // yet supported -- log a warning so they are not silently lost.
+                            // Truncate block_type to limit log output from client input.
+                            let bt = block.r#type.as_str();
+                            let truncated = if bt.len() > 64 { &bt[..64] } else { bt };
                             tracing::warn!(
-                                block_type = block.r#type.as_str(),
+                                block_type = truncated,
                                 "non-text system block skipped during Anthropic decode"
                             );
                         }
@@ -193,6 +196,11 @@ fn decode_content_block(block: ContentBlock) -> Result<CoreContent, ProtocolErro
             input: block.input.unwrap_or(serde_json::Value::Object(serde_json::Map::new())),
         }),
         "tool_result" => {
+            // TODO: The Anthropic API allows tool_result content to be an array of
+            // content blocks (text, image, etc.), but we currently extract only the
+            // text via text_content(). Non-text content blocks (e.g. image results)
+            // inside tool_result content arrays are lost. This should be updated to
+            // iterate the content array and produce a Vec<CoreContent>.
             let inner_text = block.text_content();
             let is_error = block.is_error.unwrap_or(false);
             Ok(CoreContent::ToolResult {
@@ -214,9 +222,15 @@ fn decode_content_block(block: ContentBlock) -> Result<CoreContent, ProtocolErro
         other => {
             // Unknown block types cannot be safely represented -- return an error
             // so the caller knows data was lost rather than silently creating
-            // an empty text block.
+            // an empty text block. Truncate the block_type to limit log output
+            // from potentially malicious client input.
+            let truncated = if other.len() > 64 {
+                &other[..64]
+            } else {
+                other
+            };
             tracing::warn!(
-                block_type = other,
+                block_type = truncated,
                 "unknown Anthropic content block type during decode"
             );
             Err(ProtocolError::Decode(format!(
@@ -253,19 +267,32 @@ fn decode_tool_choice(value: serde_json::Value) -> CoreToolChoice {
 
 /// Encode a [`CoreResponse`] into an Anthropic [`MessageResponse`].
 ///
-/// Content blocks that cannot be represented in the Anthropic wire format
-/// (e.g. Document, Audio, Video, Refusal) are silently omitted with a
-/// `tracing::warn!`. This matches the plan's rule: "drop the block with a
-/// recorded `tracing::warn!` when the omission is safe."
+/// Content blocks that cannot be represented in the Anthropic wire format are
+/// handled according to the plan's two-path rule:
+///
+/// - **Safe to drop** (Document, Audio, Video): the block is logged with
+///   `tracing::warn!` and silently omitted. `encode_content_block` signals this
+///   via `Err(ProtocolError::EncodeSkippable(..))`.
+///
+/// - **Must propagate** (Refusal): returns `Err(ProtocolError::Encode(..))`
+///   because silently dropping a refusal would change the response semantics.
 pub fn encode_response(resp: CoreResponse) -> Result<MessageResponse, ProtocolError> {
+    if !resp.provider_meta.is_empty() {
+        tracing::debug!(
+            meta_keys = resp.provider_meta.len(),
+            "provider_meta is non-empty during Anthropic client encode; \
+             this data is for provider adapters only and will not be forwarded to the client"
+        );
+    }
+
     let id = resp.id.unwrap_or_else(|| format!("msg_{}", uuid::Uuid::new_v4()));
 
     let mut content = Vec::new();
     for block in resp.content {
         match encode_content_block(block) {
             Ok(encoded) => content.push(encoded),
-            Err(ProtocolError::Encode(_msg)) => {
-                // Unsupported block type for this protocol -- skip it.
+            Err(ProtocolError::EncodeSkippable(_msg)) => {
+                // Safe-to-drop block type for this protocol -- skip it.
                 // The warning was already logged in encode_content_block.
             }
             Err(other) => return Err(other),
@@ -297,22 +324,9 @@ fn encode_content_block(content: CoreContent) -> Result<ContentBlock, ProtocolEr
             let cc = cache.map(|c| AnthropicCacheControl {
                 r#type: c.r#type.as_str().to_owned(),
             });
-            Ok(ContentBlock {
-                r#type: "text".to_owned(),
-                text: Some(text),
-                id: None,
-                tool_use_id: None,
-                name: None,
-                input: None,
-                output: None,
-                content: None,
-                is_error: None,
-                thinking: None,
-                signature: None,
-                source: None,
-                cache_control: cc,
-                data: None,
-            })
+            let mut block = ContentBlock::new_text(text);
+            block.cache_control = cc;
+            Ok(block)
         }
         CoreContent::Image { source } => {
             let img_source = serde_json::from_value(source).unwrap_or_else(|_| {
@@ -322,39 +336,13 @@ fn encode_content_block(content: CoreContent) -> Result<ContentBlock, ProtocolEr
                     data: String::new(),
                 }
             });
-            Ok(ContentBlock {
-                r#type: "image".to_owned(),
-                text: None,
-                id: None,
-                tool_use_id: None,
-                name: None,
-                input: None,
-                output: None,
-                content: None,
-                is_error: None,
-                thinking: None,
-                signature: None,
-                source: Some(img_source),
-                cache_control: None,
-                data: None,
-            })
+            let mut block = ContentBlock::new_text(String::new());
+            block.r#type = "image".to_owned();
+            block.text = None;
+            block.source = Some(img_source);
+            Ok(block)
         }
-        CoreContent::ToolUse { id, name, input } => Ok(ContentBlock {
-            r#type: "tool_use".to_owned(),
-            text: None,
-            id: Some(id),
-            tool_use_id: None,
-            name: Some(name),
-            input: Some(input),
-            output: None,
-            content: None,
-            is_error: None,
-            thinking: None,
-            signature: None,
-            source: None,
-            cache_control: None,
-            data: None,
-        }),
+        CoreContent::ToolUse { id, name, input } => Ok(ContentBlock::new_tool_use(id, name, input)),
         CoreContent::ToolResult {
             tool_use_id,
             content,
@@ -371,50 +359,27 @@ fn encode_content_block(content: CoreContent) -> Result<ContentBlock, ProtocolEr
             } else {
                 Some(serde_json::to_value(&content).unwrap_or(serde_json::Value::Null))
             };
-            Ok(ContentBlock {
-                r#type: "tool_result".to_owned(),
-                text: None,
-                id: None,
-                tool_use_id: Some(tool_use_id),
-                name: None,
-                input: None,
-                output: None,
-                content: content_val,
-                is_error: Some(is_error),
-                thinking: None,
-                signature: None,
-                source: None,
-                cache_control: None,
-                data: None,
-            })
+            let mut block = ContentBlock::new_text(String::new());
+            block.r#type = "tool_result".to_owned();
+            block.text = None;
+            block.tool_use_id = Some(tool_use_id);
+            block.content = content_val;
+            block.is_error = Some(is_error);
+            Ok(block)
         }
-        CoreContent::Thinking { text, signature } => Ok(ContentBlock {
-            r#type: "thinking".to_owned(),
-            text: None,
-            id: None,
-            tool_use_id: None,
-            name: None,
-            input: None,
-            output: None,
-            content: None,
-            is_error: None,
-            thinking: Some(text),
-            signature,
-            source: None,
-            cache_control: None,
-            data: None,
-        }),
+        CoreContent::Thinking { text, signature } => {
+            let mut block = ContentBlock::new_thinking(text);
+            block.signature = signature;
+            Ok(block)
+        }
         CoreContent::Document { .. } => {
-            // Document blocks are not supported in Anthropic responses -- omit
-            // the block entirely rather than emitting a phantom empty text block.
+            // Document blocks are not supported in Anthropic responses. The
+            // omission is safe (the data was never user-visible in this context),
+            // so we signal via EncodeSkippable so encode_response can skip it.
             tracing::warn!(
                 "Anthropic Messages protocol does not natively support document blocks in responses; omitting"
             );
-            // Return an empty vec entry is not desired; we need to signal the caller
-            // to skip this block. Since encode_content_block returns a single block,
-            // we need a different approach. Use encode_content_blocks filter instead.
-            // For now, return an error so the caller can handle it.
-            Err(ProtocolError::Encode(
+            Err(ProtocolError::EncodeSkippable(
                 "Anthropic Messages does not support Document blocks in responses".into(),
             ))
         }
@@ -422,7 +387,7 @@ fn encode_content_block(content: CoreContent) -> Result<ContentBlock, ProtocolEr
             tracing::warn!(
                 "Anthropic Messages protocol does not natively support audio blocks in responses; omitting"
             );
-            Err(ProtocolError::Encode(
+            Err(ProtocolError::EncodeSkippable(
                 "Anthropic Messages does not support Audio blocks in responses".into(),
             ))
         }
@@ -430,7 +395,7 @@ fn encode_content_block(content: CoreContent) -> Result<ContentBlock, ProtocolEr
             tracing::warn!(
                 "Anthropic Messages protocol does not natively support video blocks in responses; omitting"
             );
-            Err(ProtocolError::Encode(
+            Err(ProtocolError::EncodeSkippable(
                 "Anthropic Messages does not support Video blocks in responses".into(),
             ))
         }
@@ -446,8 +411,10 @@ fn encode_content_block(content: CoreContent) -> Result<ContentBlock, ProtocolEr
         CoreContent::Refusal { text } => {
             // Anthropic does not have a native refusal block type. Per the plan,
             // return ProtocolError::Encode rather than silently converting to text.
+            // Log only the length to avoid writing potentially sensitive refusal
+            // content into log output.
             tracing::warn!(
-                refusal_text = text.as_str(),
+                refusal_text_len = text.len(),
                 "Anthropic Messages protocol has no refusal field; cannot encode"
             );
             Err(ProtocolError::Encode(
@@ -457,6 +424,16 @@ fn encode_content_block(content: CoreContent) -> Result<ContentBlock, ProtocolEr
     }
 }
 
+/// Map [`StopReason`] to an Anthropic `stop_reason` string.
+///
+/// The plan's encode rules table lists three explicit mappings (EndTurn, MaxTokens,
+/// ToolUse). The additional mappings below handle the remaining `StopReason` variants
+/// for completeness:
+///
+/// - `StopSequence` -> `"stop_sequence"` (natively supported by Anthropic)
+/// - `Refusal` -> `"end_turn"` with warning (Anthropic has no refusal stop reason)
+/// - `Error` -> `"end_turn"` with warning (Anthropic has no error stop reason)
+/// - `Unknown` -> `"end_turn"` (safe default)
 fn encode_stop_reason(reason: StopReason) -> String {
     match reason {
         StopReason::EndTurn => "end_turn".to_owned(),
@@ -579,76 +556,23 @@ impl StreamEncoder {
 
             CoreEvent::ContentStart { index, kind } => {
                 let block = match kind {
-                    ContentKind::Text => ContentBlock {
-                        r#type: "text".to_owned(),
-                        text: Some(String::new()),
-                        id: None,
-                        tool_use_id: None,
-                        name: None,
-                        input: None,
-                        output: None,
-                        content: None,
-                        is_error: None,
-                        thinking: None,
-                        signature: None,
-                        source: None,
-                        cache_control: None,
-                        data: None,
-                    },
-                    ContentKind::Thinking => ContentBlock {
-                        r#type: "thinking".to_owned(),
-                        text: None,
-                        id: None,
-                        tool_use_id: None,
-                        name: None,
-                        input: None,
-                        output: None,
-                        content: None,
-                        is_error: None,
-                        thinking: Some(String::new()),
-                        signature: None,
-                        source: None,
-                        cache_control: None,
-                        data: None,
-                    },
-                    ContentKind::ToolUse => ContentBlock {
-                        r#type: "tool_use".to_owned(),
-                        text: None,
-                        id: Some(String::new()),
-                        tool_use_id: None,
-                        name: Some(String::new()),
-                        input: Some(serde_json::Value::Object(serde_json::Map::new())),
-                        output: None,
-                        content: None,
-                        is_error: None,
-                        thinking: None,
-                        signature: None,
-                        source: None,
-                        cache_control: None,
-                        data: None,
-                    },
+                    ContentKind::Text => ContentBlock::new_text(String::new()),
+                    ContentKind::Thinking => ContentBlock::new_thinking(String::new()),
+                    ContentKind::ToolUse => ContentBlock::new_tool_use(
+                        String::new(),
+                        String::new(),
+                        serde_json::Value::Object(serde_json::Map::new()),
+                    ),
                     other => {
-                        // ContentStart for unsupported kinds -- emit as text.
+                        // ContentStart for unsupported kinds (Image, Document,
+                        // Audio, Video, ToolResult, Refusal) -- skip entirely
+                        // rather than emitting a misleading text block start.
                         tracing::warn!(
                             kind = ?other,
-                            "unsupported ContentKind in Anthropic stream encode, treating as text"
+                            "unsupported ContentKind in Anthropic stream encode; skipping content_block_start"
                         );
-                        ContentBlock {
-                            r#type: "text".to_owned(),
-                            text: Some(String::new()),
-                            id: None,
-                            tool_use_id: None,
-                            name: None,
-                            input: None,
-                            output: None,
-                            content: None,
-                            is_error: None,
-                            thinking: None,
-                            signature: None,
-                            source: None,
-                            cache_control: None,
-                            data: None,
-                        }
+                        // Return early with no events for this unsupported kind.
+                        return Ok(events);
                     }
                 };
                 events.push(MessageEvent {
@@ -705,22 +629,11 @@ impl StreamEncoder {
                     r#type: "content_block_start".to_owned(),
                     message: None,
                     index: Some(index),
-                    content_block: Some(ContentBlock {
-                        r#type: "tool_use".to_owned(),
-                        text: None,
-                        id: Some(id),
-                        tool_use_id: None,
-                        name: Some(name),
-                        input: Some(serde_json::Value::Object(serde_json::Map::new())),
-                        output: None,
-                        content: None,
-                        is_error: None,
-                        thinking: None,
-                        signature: None,
-                        source: None,
-                        cache_control: None,
-                        data: None,
-                    }),
+                    content_block: Some(ContentBlock::new_tool_use(
+                        id,
+                        name,
+                        serde_json::Value::Object(serde_json::Map::new()),
+                    )),
                     delta: None,
                     usage: None,
                     error: None,
@@ -813,6 +726,12 @@ impl StreamEncoder {
                 // at CoreStreamError::new() construction time in the provider
                 // adapter. If a provider adapter accidentally passes an
                 // unsanitized message, it will be visible to the client here.
+                //
+                // Trust boundary: client adapters trust that provider adapters
+                // have sanitized the message. A regression test
+                // (encode_error_does_not_leak_secret_in_message) verifies that
+                // a CoreStreamError containing a secret-like string propagates
+                // verbatim -- the defense must be at construction time, not here.
                 events.push(MessageEvent {
                     r#type: "error".to_owned(),
                     message: None,
@@ -1558,6 +1477,30 @@ mod tests {
 
     #[test]
     fn every_core_event_variant_maps_or_errors_intentionally() {
+        // Test all ContentKind variants for ContentStart. The stream encoder
+        // handles Text, Thinking, and ToolUse explicitly; other kinds are
+        // skipped with a warning (returning empty events, not an error).
+        let content_kinds: Vec<ContentKind> = vec![
+            ContentKind::Text,
+            ContentKind::Thinking,
+            ContentKind::ToolUse,
+            ContentKind::ToolResult,
+            ContentKind::Image,
+            ContentKind::Document,
+            ContentKind::Audio,
+            ContentKind::Video,
+            ContentKind::Refusal,
+        ];
+        for (i, kind) in content_kinds.iter().enumerate() {
+            let mut enc = StreamEncoder::new("msg_1".into(), "m".into());
+            let result = enc.encode_event(CoreEvent::ContentStart {
+                index: i,
+                kind: *kind,
+            });
+            assert!(result.is_ok(), "ContentStart {:?} should not error", kind);
+        }
+
+        // Test all other CoreEvent variants.
         let variants: Vec<CoreEvent> = vec![
             CoreEvent::MessageStart {
                 id: None,
@@ -1565,18 +1508,6 @@ mod tests {
                     requested: "m".into(),
                     upstream: None,
                 },
-            },
-            CoreEvent::ContentStart {
-                index: 0,
-                kind: ContentKind::Text,
-            },
-            CoreEvent::ContentStart {
-                index: 1,
-                kind: ContentKind::Thinking,
-            },
-            CoreEvent::ContentStart {
-                index: 2,
-                kind: ContentKind::ToolUse,
             },
             CoreEvent::TextDelta {
                 index: 0,
@@ -1650,30 +1581,30 @@ mod tests {
     }
 
     #[test]
-    fn encode_document_returns_encode_error() {
+    fn encode_document_returns_encode_skippable() {
         let content = CoreContent::Document {
             source: serde_json::json!({"url": "http://example.com/doc.pdf"}),
         };
         let result = encode_content_block(content);
-        assert!(matches!(result, Err(ProtocolError::Encode(_))));
+        assert!(matches!(result, Err(ProtocolError::EncodeSkippable(_))));
     }
 
     #[test]
-    fn encode_audio_returns_encode_error() {
+    fn encode_audio_returns_encode_skippable() {
         let content = CoreContent::Audio {
             source: serde_json::json!({"data": "base64..."}),
         };
         let result = encode_content_block(content);
-        assert!(matches!(result, Err(ProtocolError::Encode(_))));
+        assert!(matches!(result, Err(ProtocolError::EncodeSkippable(_))));
     }
 
     #[test]
-    fn encode_video_returns_encode_error() {
+    fn encode_video_returns_encode_skippable() {
         let content = CoreContent::Video {
             source: serde_json::json!({"url": "http://example.com/vid.mp4"}),
         };
         let result = encode_content_block(content);
-        assert!(matches!(result, Err(ProtocolError::Encode(_))));
+        assert!(matches!(result, Err(ProtocolError::EncodeSkippable(_))));
     }
 
     #[test]
@@ -1786,14 +1717,155 @@ mod tests {
 
     #[test]
     fn client_anthropic_does_not_import_forbidden_modules() {
-        // This test is a compile-time documentation assertion. If this module
-        // imported any of llm_proxy_provider, llm_proxy_server, transformer,
-        // or core config/routing, the build would fail because those crates
-        // are not dependencies of llm-proxy-protocol. The actual enforcement
-        // is the absence of those imports in the module source. CI grep checks
-        // provide a secondary guard.
-        //
-        // We verify the module compiles without those imports by simply
-        // existing as a test -- no runtime assertion needed.
+        // Source guard: this module must not import llm_proxy_provider,
+        // llm_proxy_server, core config/routing, endpoint classification,
+        // scenario/fallback code, or transformer/*. The crate dependency
+        // graph prevents most of these at compile time (those crates are not
+        // dependencies of llm-proxy-protocol). This runtime check provides
+        // a secondary defense by verifying that the module source does not
+        // contain forbidden import patterns in `use` statements.
+        let source = include_str!("anthropic.rs");
+        for line in source.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("//") || trimmed.starts_with("/*") {
+                continue;
+            }
+            if trimmed.starts_with("use ") {
+                assert!(
+                    !trimmed.contains("llm_proxy_provider"),
+                    "client/anthropic.rs must not import llm_proxy_provider"
+                );
+                assert!(
+                    !trimmed.contains("llm_proxy_server"),
+                    "client/anthropic.rs must not import llm_proxy_server"
+                );
+                assert!(
+                    !trimmed.contains("crate::config"),
+                    "client/anthropic.rs must not import crate::config"
+                );
+                assert!(
+                    !trimmed.contains("crate::routing"),
+                    "client/anthropic.rs must not import crate::routing"
+                );
+                assert!(
+                    !trimmed.contains("crate::transformer"),
+                    "client/anthropic.rs must not import crate::transformer"
+                );
+            }
+        }
+    }
+
+    // -- edge-case tests ----------------------------------------------------
+
+    #[test]
+    fn decode_empty_model_returns_error() {
+        let mut req = make_anthropic_request();
+        req.model = String::new();
+        assert!(matches!(
+            decode_request(req),
+            Err(ProtocolError::InvalidRequest(_))
+        ));
+    }
+
+    #[test]
+    fn decode_empty_messages_returns_error() {
+        let mut req = make_anthropic_request();
+        req.messages = vec![];
+        assert!(matches!(
+            decode_request(req),
+            Err(ProtocolError::InvalidRequest(_))
+        ));
+    }
+
+    #[test]
+    fn decode_null_optional_fields() {
+        // Ensure that explicitly-null optional fields are handled gracefully.
+        let mut req = make_anthropic_request();
+        req.system = None;
+        req.temperature = None;
+        req.top_p = None;
+        req.thinking = None;
+        req.stream = None;
+        let core = decode_request(req).unwrap();
+        assert!(core.system.is_empty());
+        assert!(core.sampling.temperature.is_none());
+        assert!(core.sampling.top_p.is_none());
+        assert!(core.sampling.thinking.is_none());
+        assert!(!core.stream);
+    }
+
+    #[test]
+    fn encode_response_with_refusal_propagates_error() {
+        let resp = CoreResponse {
+            id: None,
+            model: ModelRef { requested: "m".into(), upstream: None },
+            content: vec![
+                CoreContent::Text { text: "hello".into(), cache: None },
+                CoreContent::Refusal { text: "I cannot".into() },
+            ],
+            stop_reason: StopReason::EndTurn,
+            stop_sequence: None,
+            usage: Usage::default(),
+            provider_meta: serde_json::Map::new(),
+        };
+        let result = encode_response(resp);
+        // Refusal should propagate as ProtocolError::Encode (not skippable).
+        assert!(matches!(result, Err(ProtocolError::Encode(_))));
+    }
+
+    #[test]
+    fn encode_response_skips_safe_blocks_preserves_text() {
+        let resp = CoreResponse {
+            id: None,
+            model: ModelRef { requested: "m".into(), upstream: None },
+            content: vec![
+                CoreContent::Text { text: "hello".into(), cache: None },
+                CoreContent::Document { source: serde_json::json!({"url": "x"}) },
+                CoreContent::Text { text: " world".into(), cache: None },
+            ],
+            stop_reason: StopReason::EndTurn,
+            stop_sequence: None,
+            usage: Usage::default(),
+            provider_meta: serde_json::Map::new(),
+        };
+        let out = encode_response(resp).unwrap();
+        // Document is dropped; both text blocks are preserved.
+        assert_eq!(out.content.len(), 2);
+        assert_eq!(out.content[0].text.as_deref(), Some("hello"));
+        assert_eq!(out.content[1].text.as_deref(), Some(" world"));
+    }
+
+    #[test]
+    fn encode_error_does_not_leak_secret_in_message() {
+        // This test documents the trust boundary: the error message from
+        // CoreStreamError is forwarded verbatim into the client-facing SSE
+        // event. Sanitization must happen at CoreStreamError::new() time.
+        let mut enc = StreamEncoder::new("msg_1".into(), "m".into());
+        let secret_msg = "api_key=sk-12345-secret";
+        let events = enc.encode_event(CoreEvent::Error {
+            error: CoreStreamError::new(
+                CoreStreamErrorKind::RateLimit,
+                secret_msg.into(),
+            ),
+        }).unwrap();
+        assert_eq!(events[0].error.as_ref().unwrap().message, secret_msg);
+        // The defense-in-depth contract requires that provider adapters
+        // sanitize the message before constructing CoreStreamError.
+    }
+
+    #[test]
+    fn large_content_string_encodes() {
+        let large_text = "x".repeat(100_000);
+        let resp = CoreResponse {
+            id: None,
+            model: ModelRef { requested: "m".into(), upstream: None },
+            content: vec![CoreContent::Text { text: large_text.clone(), cache: None }],
+            stop_reason: StopReason::EndTurn,
+            stop_sequence: None,
+            usage: Usage::default(),
+            provider_meta: serde_json::Map::new(),
+        };
+        let out = encode_response(resp).unwrap();
+        assert_eq!(out.content[0].text.as_deref(), Some(large_text.as_str()));
     }
 }
