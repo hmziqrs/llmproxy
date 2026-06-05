@@ -19,6 +19,9 @@ pub enum ApiError {
     /// Upstream provider error.
     #[error("upstream error: {0}")]
     Upstream(String),
+    /// Upstream provider timed out.
+    #[error("upstream timeout: {0}")]
+    UpstreamTimeout(String),
     /// Duplicate request.
     #[error("duplicate request: {0}")]
     Duplicate(String),
@@ -98,6 +101,16 @@ impl ApiError {
             ),
             Self::Upstream(msg) => (
                 StatusCode::BAD_GATEWAY,
+                Json(AnthropicErrorBody {
+                    r#type: "error",
+                    error: AnthropicErrorDetail {
+                        r#type: "api_error".to_owned(),
+                        message: msg.clone(),
+                    },
+                }),
+            ),
+            Self::UpstreamTimeout(msg) => (
+                StatusCode::GATEWAY_TIMEOUT,
                 Json(AnthropicErrorBody {
                     r#type: "error",
                     error: AnthropicErrorDetail {

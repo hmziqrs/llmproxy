@@ -53,6 +53,15 @@ pub enum ModelRouteError {
 ///
 /// Returns [`ModelRouteError::UnknownModel`] if the model name is not in
 /// the routing table.
+///
+/// # Errors
+///
+/// Returns [`ModelRouteError::UnknownModel`] if `requested_model` is not a
+/// key in the `routes` map.
+// WHY: Using the default hasher is sufficient for config-sized route tables.
+// A generic `<S: BuildHasher>` parameter would add API complexity for no
+// measurable benefit in this crate.
+#[allow(clippy::implicit_hasher)]
 pub fn resolve_model_route(
     routes: &HashMap<String, ModelRoute>,
     requested_model: &str,
@@ -182,5 +191,18 @@ mod tests {
         let t2 = resolve_model_route(&routes, "claude-4").expect("resolve claude");
         assert_ne!(t1.provider, t2.provider);
         assert_ne!(t1.upstream_model, t2.upstream_model);
+    }
+
+    // -- Empty string model name returns UnknownModel --------------------------
+
+    #[test]
+    fn resolve_model_route_empty_string_returns_unknown_model() {
+        let routes = make_routes();
+        let result = resolve_model_route(&routes, "");
+        assert!(result.is_err());
+        assert!(
+            matches!(result.unwrap_err(), ModelRouteError::UnknownModel(ref m) if m.is_empty()),
+            "expected UnknownModel with empty string"
+        );
     }
 }

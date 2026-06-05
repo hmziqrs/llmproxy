@@ -28,9 +28,10 @@ const MAX_BODY_BYTES: usize = 32 * 1024 * 1024; // 32 MiB
 /// 1. `TraceLayer` -- logs every request and response, measures latency.
 ///
 /// **API routes** (`/v1/*`):
-/// 1. `TraceLayer` -- logs every request and response, measures latency.
-/// 2. `TimeoutLayer` -- cancels requests exceeding `config.request_timeout`.
-/// 3. `DefaultBodyLimit` -- caps the request body for JSON extractors.
+/// 1. `DefaultBodyLimit` -- caps the request body for JSON extractors (runs
+///    first so oversized payloads are rejected before the timeout starts).
+/// 2. `TraceLayer` -- logs every request and response, measures latency.
+/// 3. `TimeoutLayer` -- cancels requests exceeding `config.request_timeout`.
 ///
 /// `TimeoutLayer` is scoped to `/v1/*` only. Lightweight health/readiness
 /// endpoints respond instantly and must not be subject to a 408 timeout,
@@ -51,14 +52,20 @@ pub fn router(state: AppState) -> Router {
         .route("/version", get(version))
         .layer(TraceLayer::new_for_http());
 
-    // API routes: tracing + timeout + body limit.
+    // API routes: body limit + tracing + timeout.
+    //
+    // ServiceBuilder applies layers in reverse order (innermost first), so
+    // listing DefaultBodyLimit first makes it the outermost layer: the body
+    // size check runs immediately before the timeout starts ticking. This
+    // ensures a very large upload on a slow connection gets a 413 Payload Too
+    // Large response rather than a 408 Request Timeout.
     let api_middleware = ServiceBuilder::new()
+        .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .layer(TraceLayer::new_for_http())
         .layer(TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,
             timeout,
-        ))
-        .layer(DefaultBodyLimit::max(MAX_BODY_BYTES));
+        ));
 
     let api = Router::new()
         .route("/v1/messages", post(handle_messages))

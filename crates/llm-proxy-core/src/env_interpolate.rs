@@ -14,6 +14,9 @@ static ENV_VAR_RE: OnceLock<Regex> = OnceLock::new();
 
 /// Return the shared compiled regex for `${VAR_NAME}` patterns.
 pub(crate) fn env_var_regex() -> &'static Regex {
+    // SAFETY: this regex is a compile-time constant that is syntactically valid.
+    // Failure here indicates a programming error in the regex literal, not a
+    // runtime condition.
     ENV_VAR_RE.get_or_init(|| Regex::new(r"\$\{([A-Za-z0-9_]+)\}").expect("env var regex is valid"))
 }
 
