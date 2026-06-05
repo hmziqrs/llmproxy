@@ -176,14 +176,13 @@ fn openai_error_response(error: RouteError) -> Response<Body> {
 
 /// Map an upstream HTTP status to the status we return to the client.
 ///
-/// Upstream 4xx errors become 502 Bad Gateway because they indicate a problem
+/// Upstream >= 400 errors become 502 Bad Gateway because they indicate a problem
 /// between the proxy and the upstream provider, not a client error. The one
-/// exception is 429 (rate limit) which we propagate as-is.
+/// exception is 429 (rate limit) which we propagate as-is so clients can
+/// implement their own back-off strategies.
 fn map_upstream_status(upstream: StatusCode) -> StatusCode {
     match upstream.as_u16() {
         429 => StatusCode::TOO_MANY_REQUESTS,
-        400 => StatusCode::BAD_REQUEST,
-        401 | 403 => StatusCode::BAD_GATEWAY,
         _ => StatusCode::BAD_GATEWAY,
     }
 }
@@ -274,10 +273,10 @@ mod tests {
     // -- map_upstream_status ---------------------------------------------------
 
     #[test]
-    fn upstream_400_maps_to_400() {
+    fn upstream_400_maps_to_502() {
         assert_eq!(
             map_upstream_status(StatusCode::BAD_REQUEST),
-            StatusCode::BAD_REQUEST
+            StatusCode::BAD_GATEWAY
         );
     }
 
@@ -332,6 +331,63 @@ mod tests {
             .get(header::CONTENT_TYPE)
             .expect("content-type header");
         assert_eq!(ct, "application/json");
+    }
+
+    // -- Response body JSON structure -----------------------------------------
+
+    #[tokio::test]
+    async fn anthropic_invalid_request_body_has_correct_structure() {
+        let err = RouteError::InvalidRequest("bad input".into());
+        let response = route_error_response(ClientProtocol::Anthropic, err);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .expect("body");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("valid JSON");
+        assert_eq!(json["type"], "error");
+        assert_eq!(json["error"]["type"], "invalid_request_error");
+        assert_eq!(json["error"]["message"], "bad input");
+    }
+
+    #[tokio::test]
+    async fn anthropic_unknown_model_body_has_correct_structure() {
+        let err = RouteError::UnknownModel("gpt-99".into());
+        let response = route_error_response(ClientProtocol::Anthropic, err);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .expect("body");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("valid JSON");
+        assert_eq!(json["type"], "error");
+        assert_eq!(json["error"]["type"], "invalid_request_error");
+        assert!(json["error"]["message"].as_str().unwrap().contains("gpt-99"));
+    }
+
+    #[tokio::test]
+    async fn anthropic_upstream_500_body_has_correct_structure() {
+        let err = RouteError::Upstream {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            body: "upstream error".into(),
+        };
+        let response = route_error_response(ClientProtocol::Anthropic, err);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .expect("body");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("valid JSON");
+        assert_eq!(json["type"], "error");
+        assert_eq!(json["error"]["type"], "api_error");
+        assert_eq!(json["error"]["message"], "upstream error");
+    }
+
+    #[tokio::test]
+    async fn anthropic_internal_body_has_correct_structure() {
+        let err = RouteError::Internal("config missing".into());
+        let response = route_error_response(ClientProtocol::Anthropic, err);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .expect("body");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("valid JSON");
+        assert_eq!(json["type"], "error");
+        assert_eq!(json["error"]["type"], "api_error");
+        assert_eq!(json["error"]["message"], "config missing");
     }
 
     // -- ClientProtocol equality -----------------------------------------------

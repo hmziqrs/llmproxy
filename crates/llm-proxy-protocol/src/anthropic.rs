@@ -115,6 +115,7 @@ impl MessageRequest {
 
 /// A content block inside the `system` array.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SystemContentBlock {
     /// Block type, typically `"text"`.
     #[serde(rename = "type")]
@@ -133,6 +134,7 @@ pub struct SystemContentBlock {
 
 /// Cache control directives for prompt caching.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CacheControl {
     /// Cache control type, typically `"ephemeral"`.
     #[serde(rename = "type")]
@@ -575,6 +577,7 @@ impl Serialize for ContentBlock {
 
 /// An image source embedded in a content block.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ImageSource {
     /// Source type, typically `"base64"`.
     #[serde(rename = "type")]
@@ -591,6 +594,7 @@ pub struct ImageSource {
 
 /// A tool definition for function calling.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Tool {
     /// The tool name.
     pub name: String,
@@ -607,6 +611,7 @@ pub struct Tool {
 
 /// The result of executing a tool call.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ToolResult {
     /// The tool call ID this result corresponds to.
     pub tool_use_id: String,
@@ -754,6 +759,7 @@ pub struct MessageEvent {
 
 /// An error returned by the Anthropic API.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ApiError {
     /// Error type (e.g. `"invalid_request_error"`).
     #[serde(rename = "type")]

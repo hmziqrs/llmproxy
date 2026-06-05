@@ -52,7 +52,7 @@ async fn handle_messages_inner(
         .map_err(|e| RouteError::InvalidRequest(format!("invalid JSON: {e}")))?;
 
     req.validate()
-        .map_err(|e| RouteError::InvalidRequest(e))?;
+        .map_err(RouteError::InvalidRequest)?;
 
     // Decode the Anthropic request into a core request.
     let core = anthropic::decode_request(req)

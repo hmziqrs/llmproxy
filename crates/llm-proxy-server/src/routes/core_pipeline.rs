@@ -14,6 +14,7 @@ use axum::response::IntoResponse;
 use bytes::Bytes;
 use futures::stream::{BoxStream, StreamExt};
 use llm_proxy_core::model_route::{ModelRouteError, resolve_model_route};
+use llm_proxy_core::Metrics;
 use llm_proxy_protocol::client::anthropic;
 use llm_proxy_protocol::client::anthropic::StreamEncoder;
 use llm_proxy_protocol::core::{CoreEvent, CoreRequest};
@@ -153,17 +154,18 @@ pub(crate) async fn handle_core_once(
     core: CoreRequest,
     client_protocol: ClientProtocol,
 ) -> Result<Response<Body>, RouteError> {
-    let is_streaming = core.stream;
-    state.metrics.record_request(is_streaming);
+    state.metrics.record_request(false);
 
     info!(
         request_id = %ctx.request_id,
         model = %core.model.requested,
-        streaming = is_streaming,
+        streaming = false,
         "processing request"
     );
 
-    let (target, adapter) = resolve_target(&state, &core)?;
+    let (target, adapter) = resolve_target(&state, &core).inspect_err(|_| {
+        state.metrics.record_failure();
+    })?;
 
     info!(
         request_id = %ctx.request_id,
@@ -173,21 +175,33 @@ pub(crate) async fn handle_core_once(
     );
 
     // Encode the core request into a provider-specific HTTP request.
+    // All encode errors map to Internal per the plan's error behavior spec:
+    // the core pipeline has already validated the request at this point, so
+    // any encode failure is a proxy/adapter issue, not a client error.
     let proxy_req: ProxyRequest = adapter
         .encode_request(&core, &target)
-        .map_err(|e| RouteError::Internal(format!("encode error: {e}")))?;
+        .map_err(|e| {
+            state.metrics.record_failure();
+            RouteError::Internal(format!("encode error: {e}"))
+        })?;
 
     // Send to upstream.
     let response_bytes = state
         .proxy_client
         .send(proxy_req)
         .await
-        .map_err(map_provider_error)?;
+        .map_err(|e| {
+            state.metrics.record_failure();
+            map_provider_error(e)
+        })?;
 
     // Decode the provider response into a CoreResponse.
     let core_resp = adapter
         .decode_response(&response_bytes, &target)
-        .map_err(|e| RouteError::ProviderDecode(format!("decode response: {e}")))?;
+        .map_err(|e| {
+            state.metrics.record_failure();
+            RouteError::ProviderDecode(format!("decode response: {e}"))
+        })?;
 
     // Encode into the client-specific response.
     let latency = ctx.start.elapsed();
@@ -219,12 +233,11 @@ pub(crate) async fn handle_core_once(
 
     let mut response = Response::builder()
         .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "application/json")
         .header("x-request-id", &ctx.request_id)
         .body(Body::from(response_body))
         .expect("static header values are valid");
 
-    // Ensure content-type is set (defense-in-depth).
+    // Set content-type explicitly (defense-in-depth).
     response.headers_mut().insert(
         header::CONTENT_TYPE,
         axum::http::HeaderValue::from_static("application/json"),
@@ -261,7 +274,9 @@ pub(crate) async fn handle_core_stream(
         "processing streaming request"
     );
 
-    let (target, adapter) = resolve_target(&state, &core)?;
+    let (target, adapter) = resolve_target(&state, &core).inspect_err(|_| {
+        state.metrics.record_failure();
+    })?;
 
     info!(
         request_id = %ctx.request_id,
@@ -271,16 +286,24 @@ pub(crate) async fn handle_core_stream(
     );
 
     // Encode the core request into a provider-specific HTTP request.
+    // All encode errors map to Internal per the plan's error behavior spec:
+    // the core pipeline has already validated the request at this point.
     let proxy_req: ProxyRequest = adapter
         .encode_request(&core, &target)
-        .map_err(|e| RouteError::Internal(format!("encode error: {e}")))?;
+        .map_err(|e| {
+            state.metrics.record_failure();
+            RouteError::Internal(format!("encode error: {e}"))
+        })?;
 
     // Open the streaming connection.
     let byte_stream = state
         .proxy_client
         .send_stream(proxy_req)
         .await
-        .map_err(map_provider_error)?;
+        .map_err(|e| {
+            state.metrics.record_failure();
+            map_provider_error(e)
+        })?;
 
     // Create a provider stream decoder.
     let provider_decoder = adapter.new_stream_decoder(&target);
@@ -293,7 +316,6 @@ pub(crate) async fn handle_core_stream(
 
     let request_id = ctx.request_id.clone();
     let upstream_model = target.upstream_model.clone();
-    let metrics = Arc::clone(&state.metrics);
 
     // Build the output SSE stream.
     let output_stream = build_sse_output_stream(
@@ -303,6 +325,11 @@ pub(crate) async fn handle_core_stream(
         client_encoder,
         client_protocol,
         request_id.clone(),
+        StreamMetrics {
+            metrics: Arc::clone(&state.metrics),
+            upstream_model: upstream_model.clone(),
+            start: ctx.start,
+        },
     );
 
     // Wrap in an axum SSE response.
@@ -315,17 +342,14 @@ pub(crate) async fn handle_core_stream(
     // Add custom headers.
     parts.headers.insert(
         "X-Accel-Buffering",
-        "no".parse().expect("static header value is always valid"),
+        axum::http::HeaderValue::from_static("no"),
     );
     parts.headers.insert(
         "x-request-id",
         request_id
             .parse()
-            .unwrap_or_else(|_| "unknown".parse().expect("fallback is valid")),
+            .unwrap_or_else(|_| axum::http::HeaderValue::from_static("unknown")),
     );
-
-    // Record successful stream start.
-    metrics.record_success(&upstream_model, ctx.start.elapsed());
 
     info!(
         request_id = %ctx.request_id,
@@ -340,7 +364,15 @@ pub(crate) async fn handle_core_stream(
 // SSE output stream builder
 // ---------------------------------------------------------------------------
 
+/// Context for tracking metrics during a streaming response.
+struct StreamMetrics {
+    metrics: Arc<Metrics>,
+    upstream_model: String,
+    start: Instant,
+}
+
 /// Build a stream that converts provider byte chunks into client SSE events.
+#[allow(clippy::too_many_arguments)]
 fn build_sse_output_stream(
     byte_stream: std::pin::Pin<Box<dyn futures::Stream<Item = Result<Bytes, llm_proxy_provider::error::ProviderError>> + Send + 'static>>,
     mut provider_decoder: Box<dyn ProviderStreamDecoder + Send>,
@@ -348,6 +380,7 @@ fn build_sse_output_stream(
     mut client_encoder: StreamEncoder,
     client_protocol: ClientProtocol,
     request_id: String,
+    stream_metrics: StreamMetrics,
 ) -> BoxStream<'static, Event> {
     let (tx, rx) = tokio::sync::mpsc::channel::<Event>(256);
     let cancel = tokio_util::sync::CancellationToken::new();
@@ -356,11 +389,13 @@ fn build_sse_output_stream(
     tokio::spawn(async move {
         let mut stream = byte_stream;
         let mut first_byte_sent = false;
+        let mut stream_succeeded = false;
 
         loop {
             tokio::select! {
                 _ = cancel_clone.cancelled() => {
                     // Client disconnected; abort upstream stream.
+                    stream_metrics.metrics.record_failure();
                     return;
                 }
                 chunk = stream.next() => {
@@ -383,6 +418,7 @@ fn build_sse_output_stream(
                                             &format!("stream framing error: {e}"),
                                         ).await;
                                     }
+                                    stream_metrics.metrics.record_failure();
                                     break;
                                 }
                             };
@@ -404,6 +440,7 @@ fn build_sse_output_stream(
                                                 &format!("provider decode error: {e}"),
                                             ).await;
                                         }
+                                        stream_metrics.metrics.record_failure();
                                         break;
                                     }
                                 };
@@ -417,6 +454,7 @@ fn build_sse_output_stream(
                                     for event in client_events {
                                         first_byte_sent = true;
                                         if tx.send(event).await.is_err() {
+                                            stream_metrics.metrics.record_failure();
                                             return;
                                         }
                                     }
@@ -437,6 +475,7 @@ fn build_sse_output_stream(
                                     &format!("upstream error: {e}"),
                                 ).await;
                             }
+                            stream_metrics.metrics.record_failure();
                             break;
                         }
                         None => break,
@@ -445,7 +484,47 @@ fn build_sse_output_stream(
             }
         }
 
-        // Finalize: call provider decoder finish() then client encoder finish().
+        // Finalize: call sse_framer.finish() first to flush any trailing partial
+        // SSE frame that arrived without a terminating blank line.
+        match sse_framer.finish() {
+            Ok(trailing_frames) => {
+                for frame in &trailing_frames {
+                    let core_events = match provider_decoder.decode_frame(frame) {
+                        Ok(events) => events,
+                        Err(e) => {
+                            warn!(
+                                request_id = %request_id,
+                                error = %e,
+                                "provider decode error on trailing frame"
+                            );
+                            break;
+                        }
+                    };
+                    for core_event in core_events {
+                        let client_events = encode_core_event(
+                            &mut client_encoder,
+                            &client_protocol,
+                            core_event,
+                        );
+                        for event in client_events {
+                            if tx.send(event).await.is_err() {
+                                stream_metrics.metrics.record_failure();
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(
+                    request_id = %request_id,
+                    error = %e,
+                    "SSE framer finish error"
+                );
+            }
+        }
+
+        // Then finalize: call provider decoder finish() to emit any remaining events.
         match provider_decoder.finish() {
             Ok(final_events) => {
                 for core_event in final_events {
@@ -456,6 +535,7 @@ fn build_sse_output_stream(
                     );
                     for event in client_events {
                         if tx.send(event).await.is_err() {
+                            stream_metrics.metrics.record_failure();
                             return;
                         }
                     }
@@ -475,12 +555,16 @@ fn build_sse_output_stream(
             Ok(final_msg_events) => {
                 for me in final_msg_events {
                     if let Ok(json) = serde_json::to_string(&me) {
-                        let event = Event::default().data(json);
+                        let event = Event::default()
+                            .event(&me.r#type)
+                            .data(json);
                         if tx.send(event).await.is_err() {
+                            stream_metrics.metrics.record_failure();
                             return;
                         }
                     }
                 }
+                stream_succeeded = true;
             }
             Err(e) => {
                 warn!(
@@ -488,7 +572,16 @@ fn build_sse_output_stream(
                     error = %e,
                     "client encoder finish error"
                 );
+                stream_metrics.metrics.record_failure();
             }
+        }
+
+        // Record metrics after stream completes.
+        if stream_succeeded {
+            stream_metrics.metrics.record_success(
+                &stream_metrics.upstream_model,
+                stream_metrics.start.elapsed(),
+            );
         }
     });
 
@@ -504,6 +597,11 @@ fn build_sse_output_stream(
 }
 
 /// Encode a single [`CoreEvent`] using the appropriate client stream encoder.
+///
+/// TODO(Phase 9): Dispatch on `client_protocol` to choose the correct encoder.
+/// Currently always delegates to the Anthropic `StreamEncoder`. When Phase 9
+/// adds OpenAI Chat support, this function must match on `client_protocol` and
+/// use the appropriate encoder for each protocol.
 fn encode_core_event(
     client_encoder: &mut StreamEncoder,
     _client_protocol: &ClientProtocol,
@@ -514,7 +612,10 @@ fn encode_core_event(
             .into_iter()
             .filter_map(|me| {
                 let json = serde_json::to_string(&me).ok()?;
-                Some(Event::default().data(json))
+                // The Anthropic SSE protocol requires the `event:` field
+                // (e.g. `event: message_start`, `event: content_block_delta`).
+                // Without it, Anthropic client SDKs cannot dispatch events.
+                Some(Event::default().event(&me.r#type).data(json))
             })
             .collect(),
         Err(e) => {
@@ -525,6 +626,9 @@ fn encode_core_event(
 }
 
 /// Emit an error event into the stream, then let the encoder finish.
+///
+/// TODO(Phase 9): Dispatch on `client_protocol` to choose the correct encoder.
+/// Currently always delegates to the Anthropic `StreamEncoder`.
 async fn emit_stream_error(
     client_encoder: &mut StreamEncoder,
     tx: &tokio::sync::mpsc::Sender<Event>,
@@ -549,7 +653,9 @@ async fn emit_stream_error(
         Ok(final_msg_events) => {
             for me in final_msg_events {
                 if let Ok(json) = serde_json::to_string(&me) {
-                    let event = Event::default().data(json);
+                    let event = Event::default()
+                        .event(&me.r#type)
+                        .data(json);
                     if tx.send(event).await.is_err() {
                         return;
                     }

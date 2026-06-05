@@ -58,7 +58,7 @@ async fn count_tokens_inner(
         .map_err(|e| RouteError::InvalidRequest(format!("invalid JSON: {e}")))?;
 
     req.validate()
-        .map_err(|e| RouteError::InvalidRequest(e))?;
+        .map_err(RouteError::InvalidRequest)?;
 
     // Decode through the Anthropic client adapter to get a CoreRequest.
     // This validates the request shape and normalises it.
@@ -66,6 +66,17 @@ async fn count_tokens_inner(
         .map_err(core_pipeline::protocol_error_to_route)?;
 
     // Extract text content from core messages for token counting.
+    //
+    // NOTE: This estimate intentionally only counts text from `CoreContent::Text`
+    // blocks. The following are NOT counted:
+    //   - Tool definitions (`core.tools`) -- their name, description, and
+    //     input_schema text fields are excluded.
+    //   - Non-text content blocks (images, documents, etc.).
+    //   - Tool result content blocks.
+    //   - System prompt non-text blocks.
+    //
+    // TODO(future): Extend counting to include tool definitions, tool_use blocks,
+    // and tool_result blocks for a more accurate estimate.
     let system_text: String = core
         .system
         .iter()
@@ -94,14 +105,21 @@ async fn count_tokens_inner(
                     }
                 })
                 .collect();
-            MessageContent::new(
-                match msg.role {
-                    llm_proxy_protocol::core::CoreRole::User => "user",
-                    llm_proxy_protocol::core::CoreRole::Assistant => "assistant",
-                    _ => "user",
-                },
-                text,
-            )
+            let role_name = match msg.role {
+                llm_proxy_protocol::core::CoreRole::User => "user",
+                llm_proxy_protocol::core::CoreRole::Assistant => "assistant",
+                llm_proxy_protocol::core::CoreRole::System => "system",
+                llm_proxy_protocol::core::CoreRole::Tool => "tool",
+                // Handle future unknown variants gracefully.
+                _ => {
+                    tracing::warn!(
+                        role = ?msg.role,
+                        "unknown CoreRole variant in token count, mapping to 'user'"
+                    );
+                    "user"
+                }
+            };
+            MessageContent::new(role_name, text)
         })
         .collect();
 

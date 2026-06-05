@@ -40,8 +40,10 @@ pub struct BuildInfo {
 /// `pub(crate)` visibility: not re-exported from `lib.rs` and will be deleted
 /// in Phase 11 when the JSON legacy path is removed.
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // Phase 11 deletion candidate; only used in tests.
 pub(crate) struct ModelRouter {
     /// Reference to the config for model lookup.
+    #[allow(dead_code)] // Phase 11 deletion candidate; only used in tests.
     config: Arc<Config>,
 }
 
@@ -52,11 +54,13 @@ impl ModelRouter {
     }
 
     /// Resolve the model config for a given scenario name.
+    #[allow(dead_code)] // Phase 11 deletion candidate; only used in tests.
     pub(crate) fn resolve(&self, scenario: &str) -> Option<llm_proxy_core::ModelConfig> {
         self.config.models.get(scenario).cloned()
     }
 
     /// Get the fallback chain for a scenario.
+    #[allow(dead_code)] // Phase 11 deletion candidate; only used in tests.
     pub(crate) fn fallback_chain(&self, scenario: &str) -> Option<&[llm_proxy_core::ModelConfig]> {
         self.config.fallbacks.get(scenario).map(Vec::as_slice)
     }

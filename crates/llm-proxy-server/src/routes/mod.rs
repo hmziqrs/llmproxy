@@ -1,7 +1,7 @@
 use axum::{
     Router,
     extract::DefaultBodyLimit,
-    http::StatusCode,
+    http::{HeaderValue, StatusCode, header},
     response::IntoResponse,
     routing::{get, post},
 };
@@ -82,6 +82,9 @@ pub fn router(state: AppState) -> Router {
 }
 
 async fn not_found() -> impl IntoResponse {
+    // Note: This fallback returns an Anthropic-shaped error for ALL unmatched
+    // routes. When Phase 9 adds OpenAI Chat routes, consider making this
+    // protocol-aware based on path prefix (e.g. /v1/chat/* returns OpenAI errors).
     let body = serde_json::json!({
         "type": "error",
         "error": {
@@ -89,5 +92,10 @@ async fn not_found() -> impl IntoResponse {
             "message": "not found"
         }
     });
-    (StatusCode::NOT_FOUND, axum::Json(body))
+    let mut response = (StatusCode::NOT_FOUND, axum::Json(body)).into_response();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    response
 }
