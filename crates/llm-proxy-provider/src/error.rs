@@ -47,6 +47,10 @@ pub enum ProviderError {
     /// malformed SSE structure such as unterminated frames after stream end.
     #[error("SSE framing error: {0}")]
     SseFraming(String),
+
+    /// The upstream provider returned an empty response (no choices, no candidates).
+    #[error("empty response from upstream: {0}")]
+    EmptyResponse(String),
 }
 
 /// Maximum length for upstream API error bodies stored in [`ProviderError::Api`].

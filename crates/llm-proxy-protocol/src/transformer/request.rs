@@ -768,6 +768,7 @@ pub fn transform_to_responses(
         },
         tools: Vec::new(),
         reasoning: None,
+        tool_choice: None,
     };
 
     // Transform tools if present.
@@ -807,6 +808,7 @@ pub fn transform_to_gemini(
             parts: vec![GeminiPart {
                 text: Some(format!("[System Instruction] {}", system_text)),
                 function_call: None,
+                function_response: None,
             }],
         });
         contents.push(GeminiContent {
@@ -814,6 +816,7 @@ pub fn transform_to_gemini(
             parts: vec![GeminiPart {
                 text: Some("Understood. I will follow these instructions.".to_owned()),
                 function_call: None,
+                function_response: None,
             }],
         });
     }
@@ -841,6 +844,7 @@ pub fn transform_to_gemini(
                                 tool_content
                             )),
                             function_call: None,
+                            function_response: None,
                         }],
                     });
                 }
@@ -860,7 +864,7 @@ pub fn transform_to_gemini(
             };
             contents.push(GeminiContent {
                 role: role.to_owned(),
-                parts: vec![GeminiPart { text: Some(text), function_call: None }],
+                parts: vec![GeminiPart { text: Some(text), function_call: None, function_response: None }],
             });
         }
     }
@@ -875,6 +879,7 @@ pub fn transform_to_gemini(
     // Set generation config.
     let mut gen_config = GeminiGenerationConfig {
         temperature: None,
+        top_p: None,
         max_output_tokens: None,
     };
 

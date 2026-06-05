@@ -120,7 +120,11 @@ pub struct ChatMessage {
     #[serde(default)]
     pub content: String,
     /// Chain-of-thought text emitted by reasoning models.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    ///
+    /// Some OpenAI-compatible providers (e.g. DeepSeek) use the `reasoning`
+    /// field name instead of `reasoning_content`. The `serde` alias ensures
+    /// both names deserialize into this field.
+    #[serde(alias = "reasoning", skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
     /// Tool calls emitted by an assistant message.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

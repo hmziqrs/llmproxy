@@ -10,7 +10,7 @@
 
 use llm_proxy_protocol::core::{
     ContentKind, CoreContent, CoreEvent, CoreRequest, CoreResponse, CoreRole,
-    ModelRef, StopReason, Usage, UsageProvenance,
+    CoreToolChoice, ModelRef, StopReason, Usage, UsageProvenance,
 };
 use llm_proxy_protocol::zen::{
     ResponsesChunk, ResponsesInput, ResponsesReasoning,
@@ -26,7 +26,7 @@ use crate::sse::SseFrame;
 // ---------------------------------------------------------------------------
 
 /// Adapter for the OpenAI Responses API.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ResponsesAdapter;
 
 // ---------------------------------------------------------------------------
@@ -34,12 +34,30 @@ pub struct ResponsesAdapter;
 // ---------------------------------------------------------------------------
 
 /// Stateful stream decoder for Responses API SSE frames.
+///
+/// ## CoreEvent variants emitted
+///
+/// - `MessageStart` -- on `response.created` or `response.in_progress`
+/// - `ContentStart` -- on `response.output_text.delta` (text) or
+///   `response.output_item.added` with `function_call` (tool use)
+/// - `TextDelta` -- on `response.output_text.delta`
+/// - `ToolCallStart` -- on `response.output_item.added` with `function_call`
+/// - `ToolCallDelta` -- on `response.function_call_arguments.delta`
+/// - `ToolCallStop` -- on `response.function_call_arguments.done`
+/// - `UsageDelta` -- on `response.completed` or `response.done` with usage
+/// - `MessageStop` -- on `response.completed` or `response.done`
+/// - `Error` -- on `response.failed`
+///
+/// Intentionally never emitted: `Ping`, `ThinkingDelta` (the Responses API
+/// does not produce heartbeat or thinking-stream events).
 #[derive(Debug)]
 pub struct ResponsesStreamDecoder {
     model_ref: ModelRef,
     started: bool,
     content_index: usize,
     content_started: bool,
+    /// Whether a ToolCallStart has been emitted for the current function call.
+    tool_call_started: bool,
     stop_sent: bool,
 }
 
@@ -76,16 +94,27 @@ impl ProviderStreamDecoder for ResponsesStreamDecoder {
                         if output.r#type == "message" {
                             if let Some(ref content_blocks) = output.content {
                                 for content in content_blocks {
-                                    if content.r#type == "output_text" {
-                                        if !self.content_started {
-                                            self.content_started = true;
-                                            events.push(CoreEvent::ContentStart {
-                                                index: self.content_index,
-                                                kind: ContentKind::Text,
-                                            });
-                                        }
+                                    if content.r#type == "output_text" && !self.content_started {
+                                        self.content_started = true;
+                                        events.push(CoreEvent::ContentStart {
+                                            index: self.content_index,
+                                            kind: ContentKind::Text,
+                                        });
                                     }
                                 }
+                            }
+                        } else if output.r#type == "function_call" {
+                            // Emit ToolCallStart for new function calls.
+                            if !self.tool_call_started {
+                                self.close_content_if_open(&mut events);
+                                self.tool_call_started = true;
+                                let call_id = output.call_id.clone().unwrap_or_default();
+                                let name = output.name.clone().unwrap_or_default();
+                                events.push(CoreEvent::ToolCallStart {
+                                    index: self.content_index,
+                                    id: call_id,
+                                    name,
+                                });
                             }
                         }
                     }
@@ -117,6 +146,17 @@ impl ProviderStreamDecoder for ResponsesStreamDecoder {
             "response.function_call_arguments.delta" => {
                 if let Some(ref delta) = chunk.delta {
                     if !delta.is_empty() {
+                        // If no ToolCallStart was emitted yet (e.g. missed
+                        // response.output_item.added), emit one now.
+                        if !self.tool_call_started {
+                            self.close_content_if_open(&mut events);
+                            self.tool_call_started = true;
+                            events.push(CoreEvent::ToolCallStart {
+                                index: self.content_index,
+                                id: String::new(),
+                                name: String::new(),
+                            });
+                        }
                         events.push(CoreEvent::ToolCallDelta {
                             index: self.content_index,
                             args_delta: delta.clone(),
@@ -125,10 +165,19 @@ impl ProviderStreamDecoder for ResponsesStreamDecoder {
                 }
             }
             "response.function_call_arguments.done" => {
-                // Tool call complete.
+                // If ToolCallStart was never emitted, emit one now before stop.
+                if !self.tool_call_started {
+                    self.close_content_if_open(&mut events);
+                    events.push(CoreEvent::ToolCallStart {
+                        index: self.content_index,
+                        id: String::new(),
+                        name: String::new(),
+                    });
+                }
                 events.push(CoreEvent::ToolCallStop {
                     index: self.content_index,
                 });
+                self.tool_call_started = false;
                 self.content_index += 1;
             }
             "response.completed" => {
@@ -176,6 +225,20 @@ impl ProviderStreamDecoder for ResponsesStreamDecoder {
                         stop_sequence: None,
                     });
                 }
+            }
+            "response.failed" => {
+                let message = chunk
+                    .error
+                    .as_ref()
+                    .and_then(|e| e.get("message").and_then(|m| m.as_str()))
+                    .unwrap_or("response failed")
+                    .to_owned();
+                events.push(CoreEvent::Error {
+                    error: llm_proxy_protocol::core::CoreStreamError::new(
+                        llm_proxy_protocol::core::CoreStreamErrorKind::Upstream,
+                        message,
+                    ),
+                });
             }
             _ => {
                 // Unknown event type; skip.
@@ -270,6 +333,17 @@ impl ResponsesAdapter {
                 })
                 .collect();
 
+            // Warn about dropped non-text content types.
+            for c in &msg.content {
+                if !matches!(c, CoreContent::Text { .. }) {
+                    tracing::warn!(
+                        role,
+                        ?c,
+                        "dropping unsupported content block during Responses encode"
+                    );
+                }
+            }
+
             input.push(ResponsesInput {
                 role: role.to_owned(),
                 content: if text.is_empty() {
@@ -288,7 +362,7 @@ impl ResponsesAdapter {
                 r#type: "function".to_owned(),
                 name: Some(t.name.clone()),
                 description: t.description.clone(),
-                parameters: Some(if t.input_schema.is_null() {
+                parameters: Some(if !t.input_schema.is_object() {
                     serde_json::json!({"type": "object", "properties": {}})
                 } else {
                     t.input_schema.clone()
@@ -305,13 +379,29 @@ impl ResponsesAdapter {
                 effort: Some(effort.clone()),
             });
 
-        let req = ResponsesRequest {
+        let mut req = ResponsesRequest {
             model: target.upstream_model.clone(),
             input,
             stream: if core.stream { Some(true) } else { None },
             tools,
             reasoning,
+            tool_choice: None,
         };
+
+        // Forward tool_choice if present.
+        if let Some(ref tc) = core.tool_choice {
+            req.tool_choice = Some(match tc {
+                CoreToolChoice::Auto => serde_json::json!({"type": "auto"}),
+                CoreToolChoice::Any => serde_json::json!({"type": "required"}),
+                CoreToolChoice::None => serde_json::json!({"type": "none"}),
+                CoreToolChoice::Tool { name } => serde_json::json!({
+                    "type": "function",
+                    "name": name
+                }),
+                CoreToolChoice::Raw(v) => v.clone(),
+                _ => serde_json::json!(null),
+            });
+        }
 
         let body = serde_json::to_vec(&req)?;
         let url = expand_url_template(&target.endpoint, target);
@@ -410,6 +500,7 @@ impl ResponsesAdapter {
             started: false,
             content_index: 0,
             content_started: false,
+            tool_call_started: false,
             stop_sent: false,
         })
     }
@@ -732,6 +823,85 @@ mod tests {
         let events = decoder.finish().unwrap();
         assert!(events.iter().any(|e| matches!(e, CoreEvent::MessageStart { .. })));
         assert!(events.iter().any(|e| matches!(e, CoreEvent::MessageStop { .. })));
+    }
+
+    // -- Stream tool call / malformed frame / response.failed tests -----------
+
+    #[test]
+    fn stream_tool_call_decoding() {
+        let target = make_target();
+        let adapter = ResponsesAdapter;
+        let mut decoder = adapter.new_stream_decoder(&target);
+
+        let frames = vec![
+            make_frame(r#"{"type":"response.created","id":"resp_1"}"#),
+            make_frame(r#"{"type":"response.output_item.added","output":[{"type":"function_call","call_id":"call_abc","name":"get_weather"}]}"#),
+            make_frame(r#"{"type":"response.function_call_arguments.delta","delta":"{\"city\":"}"#),
+            make_frame(r#"{"type":"response.function_call_arguments.delta","delta":"\"SF\"}"}"#),
+            make_frame(r#"{"type":"response.function_call_arguments.done"}"#),
+            make_frame(r#"{"type":"response.completed","usage":{"input_tokens":20,"output_tokens":10}}"#),
+        ];
+
+        let mut all_events = Vec::new();
+        for frame in &frames {
+            all_events.extend(decoder.decode_frame(frame).unwrap());
+        }
+
+        assert!(all_events.iter().any(|e| matches!(e, CoreEvent::ToolCallStart { .. })),
+            "expected ToolCallStart");
+        assert!(all_events.iter().any(|e| matches!(e, CoreEvent::ToolCallDelta { .. })),
+            "expected ToolCallDelta");
+        assert!(all_events.iter().any(|e| matches!(e, CoreEvent::ToolCallStop { .. })),
+            "expected ToolCallStop");
+        assert!(all_events.iter().any(|e| matches!(e, CoreEvent::MessageStop { .. })),
+            "expected MessageStop with ToolUse");
+    }
+
+    #[test]
+    fn stream_malformed_frame_skipped() {
+        let target = make_target();
+        let adapter = ResponsesAdapter;
+        let mut decoder = adapter.new_stream_decoder(&target);
+
+        let frame = make_frame("not valid json {{{");
+        let events = decoder.decode_frame(&frame).unwrap();
+        // Malformed frame should return empty (no MessageStart yet since type is unknown).
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn stream_response_failed() {
+        let target = make_target();
+        let adapter = ResponsesAdapter;
+        let mut decoder = adapter.new_stream_decoder(&target);
+
+        let frame = make_frame(r#"{"type":"response.failed","error":{"message":"rate limit exceeded"}}"#);
+        let events = decoder.decode_frame(&frame).unwrap();
+
+        assert!(events.iter().any(|e| matches!(e, CoreEvent::Error { .. })),
+            "response.failed must emit CoreEvent::Error");
+    }
+
+    // -- Encode: tool_choice forwarding test ----------------------------------
+
+    #[test]
+    fn encode_tool_choice_forwarded() {
+        let mut core = make_core_request(vec![CoreMessage {
+            role: CoreRole::User,
+            content: vec![CoreContent::Text {
+                text: "hi".into(),
+                cache: None,
+            }],
+        }]);
+        core.tool_choice = Some(CoreToolChoice::Auto);
+        let adapter = ResponsesAdapter;
+        let target = make_target();
+        let proxy_req = adapter.encode_request(&core, &target).unwrap();
+
+        let body: ResponsesRequest = serde_json::from_slice(&proxy_req.body).unwrap();
+        assert!(body.tool_choice.is_some(), "tool_choice must be forwarded");
+        let tc = body.tool_choice.unwrap();
+        assert_eq!(tc["type"], "auto");
     }
 
     // -- Source guard ---------------------------------------------------------

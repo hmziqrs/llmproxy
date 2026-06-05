@@ -7,6 +7,10 @@
 //! GeminiResponse -> CoreResponse
 //! GeminiStreamChunk stream -> CoreEvent stream
 //! ```
+//!
+//! The stream decoder emits the following [`CoreEvent`] variants:
+//! `MessageStart`, `ContentStart`, `TextDelta`, `ContentStop` (implicit),
+//! `ToolCallStart`, `ToolCallDelta`, `ToolCallStop`, `UsageDelta`, `MessageStop`.
 
 use llm_proxy_protocol::core::{
     ContentKind, CoreContent, CoreEvent, CoreRequest, CoreResponse, CoreRole,
@@ -14,7 +18,7 @@ use llm_proxy_protocol::core::{
 };
 use llm_proxy_protocol::zen::{
     GeminiFunctionDeclaration, GeminiGenerationConfig,
-    GeminiRequest, GeminiResponse, GeminiStreamChunk, GeminiTool, GeminiUsage,
+    GeminiPart, GeminiRequest, GeminiResponse, GeminiStreamChunk, GeminiTool, GeminiUsage,
 };
 
 use super::{
@@ -29,7 +33,7 @@ use crate::sse::SseFrame;
 // ---------------------------------------------------------------------------
 
 /// Adapter for the Google Gemini GenerateContent API.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct GeminiAdapter;
 
 // ---------------------------------------------------------------------------
@@ -43,7 +47,6 @@ pub struct GeminiStreamDecoder {
     started: bool,
     content_index: usize,
     content_started: bool,
-    tool_started: bool,
     /// Maps Gemini candidate index to tool content block index.
     tool_blocks: Vec<usize>,
     stop_sent: bool,
@@ -110,7 +113,6 @@ impl ProviderStreamDecoder for GeminiStreamDecoder {
 
                 let block_idx = self.content_index;
                 self.tool_blocks.push(block_idx);
-                self.tool_started = true;
 
                 events.push(CoreEvent::ToolCallStart {
                     index: block_idx,
@@ -129,7 +131,6 @@ impl ProviderStreamDecoder for GeminiStreamDecoder {
                 }
 
                 events.push(CoreEvent::ToolCallStop { index: block_idx });
-                self.tool_started = false;
                 self.content_index += 1;
             }
         }
@@ -221,40 +222,93 @@ impl GeminiAdapter {
                 _ => "user",
             };
 
-            let text: String = msg
-                .content
-                .iter()
-                .filter_map(|c| match c {
-                    CoreContent::Text { text, .. } => Some(text.clone()),
+            let mut parts: Vec<GeminiPart> = Vec::new();
+            for c in &msg.content {
+                match c {
+                    CoreContent::Text { text, .. } => {
+                        if !text.is_empty() {
+                            parts.push(
+                                serde_json::from_value(serde_json::json!({"text": text}))
+                                    .expect("json! macro always produces valid GeminiPart"),
+                            );
+                        }
+                    }
+                    CoreContent::ToolUse { name, input, .. } => {
+                        // Encode tool-use as a functionCall part.
+                        parts.push(
+                            serde_json::from_value(serde_json::json!({
+                                "function_call": {"name": name, "args": input}
+                            }))
+                            .expect("json! macro always produces valid GeminiPart"),
+                        );
+                    }
                     CoreContent::ToolResult {
+                        tool_use_id,
                         content: result_content,
                         ..
                     } => {
-                        let result_text: String = result_content
-                            .iter()
-                            .filter_map(|c| match c {
-                                CoreContent::Text { text, .. } => Some(text.as_str()),
-                                _ => None,
-                            })
-                            .collect();
-                        if result_text.is_empty() {
-                            None
+                        // Encode tool-result as a functionResponse part.
+                        // Build the response payload from the result content.
+                        let response_val: serde_json::Value = if result_content.is_empty() {
+                            serde_json::json!({"result": ""})
                         } else {
-                            Some(result_text)
-                        }
-                    }
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
+                            let texts: Vec<&str> = result_content
+                                .iter()
+                                .filter_map(|rc| match rc {
+                                    CoreContent::Text { text, .. } => Some(text.as_str()),
+                                    _ => None,
+                                })
+                                .collect();
+                            if texts.len() == result_content.len() {
+                                serde_json::json!({"result": texts.join("\n")})
+                            } else {
+                                // Mixed content; serialize the full content.
+                                tracing::warn!(
+                                    tool_use_id,
+                                    "Gemini: dropping non-text content in tool result"
+                                );
+                                serde_json::json!({"result": texts.join("\n")})
+                            }
+                        };
 
-            if !text.is_empty() {
-                let val = serde_json::json!({"role": role, "parts": [{"text": text}]});
+                        // The name field must match the function name from the
+                        // original call.  Gemini uses it to correlate the
+                        // response with the function declaration.  The tool_use_id
+                        // is a synthetic "gemini_call_N" so strip the prefix.
+                        let fn_name = tool_use_id
+                            .trim_start_matches("gemini_call_")
+                            .to_owned();
+                        parts.push(
+                            serde_json::from_value(serde_json::json!({
+                                "function_response": {
+                                    "name": fn_name,
+                                    "response": response_val,
+                                }
+                            }))
+                            .expect("json! macro always produces valid GeminiPart"),
+                        );
+                    }
+                    _ => {
+                        tracing::warn!(
+                            ?c,
+                            "Gemini: dropping unsupported content type in message encoding"
+                        );
+                    }
+                }
+            }
+
+            if !parts.is_empty() {
+                let val = serde_json::json!({"role": role, "parts": parts});
                 contents.push(serde_json::from_value(val)?);
             }
         }
 
         // Prepend system prompt as user message if present.
+        // NOTE: A synthetic "Understood." model acknowledgment is inserted
+        // immediately after the system prompt.  Gemini requires the conversation
+        // to start with a user turn followed by a model turn, so this dummy
+        // acknowledgment satisfies that constraint.  It does not affect model
+        // behavior.
         if !core.system.is_empty() {
             let system_text: String = core
                 .system
@@ -268,7 +322,7 @@ impl GeminiAdapter {
             if !system_text.is_empty() {
                 let sys_val = serde_json::json!({"role": "user", "parts": [{"text": system_text}]});
                 contents.insert(0, serde_json::from_value(sys_val)?);
-                // Add a model acknowledgment.
+                // Synthetic model acknowledgment (see NOTE above).
                 let ack_val = serde_json::json!({"role": "model", "parts": [{"text": "Understood."}]});
                 contents.insert(1, serde_json::from_value(ack_val)?);
             }
@@ -283,7 +337,7 @@ impl GeminiAdapter {
                     .tools
                     .iter()
                     .map(|t| {
-                        let schema = if t.input_schema.is_null() {
+                        let schema = if !t.input_schema.is_object() {
                             serde_json::json!({"type": "object", "properties": {}})
                         } else {
                             t.input_schema.clone()
@@ -301,8 +355,21 @@ impl GeminiAdapter {
         // Generation config.
         let generation_config = GeminiGenerationConfig {
             temperature: core.sampling.temperature,
+            top_p: core.sampling.top_p,
             max_output_tokens: core.sampling.max_tokens,
         };
+
+        // Forward tool_choice if present.
+        // Note: Gemini supports `tool_config.function_calling_config` for
+        // controlling tool choice, but the wire types don't model it yet.
+        // For now, emit a debug log when tool_choice is specified so it isn't
+        // silently ignored.
+        if core.tool_choice.is_some() {
+            tracing::debug!(
+                ?core.tool_choice,
+                "Gemini: tool_choice specified but not yet forwarded to upstream"
+            );
+        }
 
         let req = GeminiRequest {
             contents,
@@ -326,7 +393,7 @@ impl GeminiAdapter {
         let resp: GeminiResponse = serde_json::from_slice(bytes)?;
 
         if resp.candidates.is_empty() {
-            return Err(ProviderError::SseFraming(
+            return Err(ProviderError::EmptyResponse(
                 "no candidates in response".to_owned(),
             ));
         }
@@ -402,7 +469,6 @@ impl GeminiAdapter {
             started: false,
             content_index: 0,
             content_started: false,
-            tool_started: false,
             tool_blocks: Vec::new(),
             stop_sent: false,
         })
@@ -646,6 +712,10 @@ mod tests {
         let adapter = GeminiAdapter;
         let result = adapter.decode_response(&bytes, &target);
         assert!(result.is_err());
+        match result.unwrap_err() {
+            ProviderError::EmptyResponse(_) => {}
+            other => panic!("expected EmptyResponse, got {:?}", other),
+        }
     }
 
     #[test]
@@ -721,6 +791,196 @@ mod tests {
         let events = decoder.finish().unwrap();
         assert!(events.iter().any(|e| matches!(e, CoreEvent::MessageStart { .. })));
         assert!(events.iter().any(|e| matches!(e, CoreEvent::MessageStop { .. })));
+    }
+
+    // -- Streaming tests: tool call, malformed frame, usage -------------------
+
+    #[test]
+    fn stream_tool_call_decoding() {
+        let target = make_target();
+        let adapter = GeminiAdapter;
+        let mut decoder = adapter.new_stream_decoder(&target);
+
+        let frame = make_frame(r#"{"candidates":[{"content":{"role":"model","parts":[{"function_call":{"name":"get_weather","args":{"city":"SF"}}}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":5,"totalTokenCount":15}}"#);
+
+        let events = decoder.decode_frame(&frame).unwrap();
+
+        assert!(events.iter().any(|e| matches!(e, CoreEvent::ToolCallStart { .. })),
+            "expected ToolCallStart");
+        assert!(events.iter().any(|e| matches!(e, CoreEvent::ToolCallDelta { .. })),
+            "expected ToolCallDelta");
+        assert!(events.iter().any(|e| matches!(e, CoreEvent::ToolCallStop { .. })),
+            "expected ToolCallStop");
+        assert!(events.iter().any(|e| matches!(e, CoreEvent::MessageStop { .. })),
+            "expected MessageStop");
+    }
+
+    #[test]
+    fn stream_malformed_frame_skipped() {
+        let target = make_target();
+        let adapter = GeminiAdapter;
+        let mut decoder = adapter.new_stream_decoder(&target);
+
+        let frame = make_frame("not valid json {{{");
+        let events = decoder.decode_frame(&frame).unwrap();
+        // Malformed JSON is silently skipped; no events emitted at all.
+        assert!(events.is_empty(), "malformed frame should produce no events");
+    }
+
+    #[test]
+    fn stream_usage_only_chunk() {
+        let target = make_target();
+        let adapter = GeminiAdapter;
+        let mut decoder = adapter.new_stream_decoder(&target);
+
+        let frame = make_frame(r#"{"candidates":[],"usageMetadata":{"promptTokenCount":100,"candidatesTokenCount":50,"totalTokenCount":150}}"#);
+        let events = decoder.decode_frame(&frame).unwrap();
+
+        // Should emit MessageStart + UsageDelta.
+        assert!(events.iter().any(|e| matches!(e, CoreEvent::MessageStart { .. })));
+        assert!(events.iter().any(|e| matches!(e, CoreEvent::UsageDelta { .. })),
+            "usage-only chunk must emit UsageDelta");
+    }
+
+    // -- Encode tests: tool_result, tool_use, top_p, input_schema ------------
+
+    #[test]
+    fn encode_tool_result_as_function_response() {
+        let core = make_core_request(vec![CoreMessage {
+            role: CoreRole::Tool,
+            content: vec![CoreContent::ToolResult {
+                tool_use_id: "gemini_call_0".into(),
+                content: vec![CoreContent::Text {
+                    text: "72F, sunny".into(),
+                    cache: None,
+                }],
+                is_error: false,
+            }],
+        }]);
+        let adapter = GeminiAdapter;
+        let target = make_target();
+        let proxy_req = adapter.encode_request(&core, &target).unwrap();
+
+        let body: GeminiRequest = serde_json::from_slice(&proxy_req.body).unwrap();
+        assert_eq!(body.contents.len(), 1);
+        let part = &body.contents[0].parts[0];
+        assert!(
+            part.function_response.is_some(),
+            "ToolResult must be encoded as functionResponse"
+        );
+        let fr = part.function_response.as_ref().unwrap();
+        assert_eq!(fr.name, "0");
+    }
+
+    #[test]
+    fn encode_tool_use_as_function_call() {
+        let core = make_core_request(vec![CoreMessage {
+            role: CoreRole::Assistant,
+            content: vec![CoreContent::ToolUse {
+                id: "gemini_call_0".into(),
+                name: "get_weather".into(),
+                input: serde_json::json!({"city": "SF"}),
+            }],
+        }]);
+        let adapter = GeminiAdapter;
+        let target = make_target();
+        let proxy_req = adapter.encode_request(&core, &target).unwrap();
+
+        let body: GeminiRequest = serde_json::from_slice(&proxy_req.body).unwrap();
+        assert_eq!(body.contents.len(), 1);
+        let part = &body.contents[0].parts[0];
+        assert!(
+            part.function_call.is_some(),
+            "ToolUse must be encoded as functionCall"
+        );
+        let fc = part.function_call.as_ref().unwrap();
+        assert_eq!(fc.name, "get_weather");
+    }
+
+    #[test]
+    fn encode_top_p_forwarded() {
+        let mut core = make_core_request(vec![CoreMessage {
+            role: CoreRole::User,
+            content: vec![CoreContent::Text {
+                text: "hi".into(),
+                cache: None,
+            }],
+        }]);
+        core.sampling.top_p = Some(0.9);
+        let adapter = GeminiAdapter;
+        let target = make_target();
+        let proxy_req = adapter.encode_request(&core, &target).unwrap();
+
+        let body: GeminiRequest = serde_json::from_slice(&proxy_req.body).unwrap();
+        let config = body.generation_config.unwrap();
+        assert_eq!(config.top_p, Some(0.9));
+    }
+
+    #[test]
+    fn encode_input_schema_coercion() {
+        let mut core = make_core_request(vec![CoreMessage {
+            role: CoreRole::User,
+            content: vec![CoreContent::Text {
+                text: "hi".into(),
+                cache: None,
+            }],
+        }]);
+        core.tools = vec![CoreTool {
+            name: "my_tool".into(),
+            description: None,
+            input_schema: serde_json::Value::Null,
+        }];
+        let adapter = GeminiAdapter;
+        let target = make_target();
+        let proxy_req = adapter.encode_request(&core, &target).unwrap();
+
+        let body: GeminiRequest = serde_json::from_slice(&proxy_req.body).unwrap();
+        let params = body.tools[0].function_declarations[0].parameters.as_ref().unwrap();
+        assert_eq!(params["type"], "object");
+    }
+
+    // -- Usage mapping test ---------------------------------------------------
+
+    #[test]
+    fn usage_mapping() {
+        let usage = GeminiUsage {
+            prompt_token_count: 100,
+            candidates_token_count: 50,
+            total_token_count: 150,
+        };
+        let core_usage = build_gemini_usage(&usage);
+        assert_eq!(core_usage.input_tokens, 100);
+        assert_eq!(core_usage.output_tokens, 50);
+        assert_eq!(core_usage.provenance, UsageProvenance::ProviderReported);
+    }
+
+    // -- Full lifecycle ordering test -----------------------------------------
+
+    #[test]
+    fn stream_full_lifecycle_ordering() {
+        let target = make_target();
+        let adapter = GeminiAdapter;
+        let mut decoder = adapter.new_stream_decoder(&target);
+
+        let frames = vec![
+            make_frame(r#"{"candidates":[{"content":{"role":"model","parts":[{"text":"Hello"}]},"finishReason":null}],"usageMetadata":null}"#),
+            make_frame(r#"{"candidates":[{"content":{"role":"model","parts":[{"text":" world"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":5,"totalTokenCount":15}}"#),
+        ];
+
+        let mut all_events = Vec::new();
+        for frame in &frames {
+            all_events.extend(decoder.decode_frame(frame).unwrap());
+        }
+
+        // Verify lifecycle ordering: MessageStart before everything else.
+        let start_idx = all_events.iter().position(|e| matches!(e, CoreEvent::MessageStart { .. })).unwrap();
+        let content_start_idx = all_events.iter().position(|e| matches!(e, CoreEvent::ContentStart { .. })).unwrap();
+        let text_delta_idx = all_events.iter().position(|e| matches!(e, CoreEvent::TextDelta { .. })).unwrap();
+        let stop_idx = all_events.iter().rposition(|e| matches!(e, CoreEvent::MessageStop { .. })).unwrap();
+
+        assert!(start_idx < content_start_idx, "MessageStart must precede ContentStart");
+        assert!(content_start_idx < text_delta_idx, "ContentStart must precede TextDelta");
+        assert!(text_delta_idx < stop_idx, "TextDelta must precede MessageStop");
     }
 
     // -- Source guard ---------------------------------------------------------

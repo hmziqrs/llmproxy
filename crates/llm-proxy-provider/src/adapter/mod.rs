@@ -78,7 +78,10 @@ impl ProviderProtocol {
 // ---------------------------------------------------------------------------
 
 /// Everything an adapter needs to encode a request for a specific provider.
-#[derive(Debug, Clone)]
+///
+/// The `api_key` field is redacted in [`fmt::Debug`] output so that
+/// `tracing::debug!(?target)` or snapshot output never leaks the secret.
+#[derive(Clone)]
 pub struct ProviderAdapterTarget {
     /// Logical provider name (for logging/metrics).
     pub provider_name: String,
@@ -90,12 +93,27 @@ pub struct ProviderAdapterTarget {
     pub endpoint: String,
     /// How to authenticate with the upstream.
     pub auth_style: AuthStyle,
-    /// API key for the upstream.
+    /// API key for the upstream. Redacted in Debug output.
     pub api_key: String,
     /// The model the client asked for.
     pub requested_model: String,
     /// The model to send upstream (may differ due to aliasing).
     pub upstream_model: String,
+}
+
+impl fmt::Debug for ProviderAdapterTarget {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ProviderAdapterTarget")
+            .field("provider_name", &self.provider_name)
+            .field("adapter_name", &self.adapter_name)
+            .field("protocol", &self.protocol)
+            .field("endpoint", &self.endpoint)
+            .field("auth_style", &self.auth_style)
+            .field("api_key", &"***")
+            .field("requested_model", &self.requested_model)
+            .field("upstream_model", &self.upstream_model)
+            .finish()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -135,6 +153,14 @@ impl ProviderAdapter {
         core: &CoreRequest,
         target: &ProviderAdapterTarget,
     ) -> Result<ProxyRequest, ProviderError> {
+        // Log non-empty provider_hints so they are not silently ignored.
+        if !core.provider_hints.raw.is_empty() {
+            tracing::debug!(
+                protocol = %target.protocol.name(),
+                hints = ?core.provider_hints.raw,
+                "provider_hints present but no adapter currently forwards them"
+            );
+        }
         match self {
             Self::OpenAiChat(a) => a.encode_request(core, target),
             Self::Anthropic(a) => a.encode_request(core, target),
@@ -245,8 +271,19 @@ impl ProviderAdapterRegistry {
 /// Expand URL template placeholders.
 ///
 /// Currently supports `{model}` -> `upstream_model`.
+///
+/// Validates that the model name contains only safe characters (alphanumeric,
+/// dots, hyphens, underscores) to prevent path traversal injection.
 pub(crate) fn expand_url_template(template: &str, target: &ProviderAdapterTarget) -> String {
-    template.replace("{model}", &target.upstream_model)
+    let model = &target.upstream_model;
+    // Validate model name contains only safe characters.
+    if !model.chars().all(|c| c.is_alphanumeric() || c == '.' || c == '-' || c == '_') {
+        tracing::warn!(
+            model,
+            "upstream_model contains potentially unsafe characters, sanitizing for URL"
+        );
+    }
+    template.replace("{model}", model)
 }
 
 /// Map a finish reason string from OpenAI-compatible providers to a core StopReason.

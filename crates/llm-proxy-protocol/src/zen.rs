@@ -34,6 +34,9 @@ pub struct ResponsesRequest {
     pub tools: Vec<ResponsesTool>,
     /// Optional reasoning / chain-of-thought configuration.
     pub reasoning: Option<ResponsesReasoning>,
+    /// Controls which (if any) tool the model must call.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<serde_json::Value>,
 }
 
 /// A single message in the conversation input.
@@ -150,6 +153,8 @@ pub struct ResponsesChunk {
     pub output: Option<Vec<ResponsesOutput>>,
     /// Token usage (usually present on the final chunk).
     pub usage: Option<ResponsesUsage>,
+    /// Error object present on `response.failed` events.
+    pub error: Option<serde_json::Value>,
 }
 
 // ---------------------------------------------------------------------------
@@ -199,6 +204,9 @@ pub struct GeminiPart {
     /// Function call (present when the model invokes a tool).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub function_call: Option<GeminiFunctionCall>,
+    /// Function response (present when sending a tool result back to the model).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub function_response: Option<GeminiFunctionResponse>,
 }
 
 /// A function call emitted by the Gemini model.
@@ -211,11 +219,22 @@ pub struct GeminiFunctionCall {
     pub args: Option<serde_json::Value>,
 }
 
+/// A function response sent back to the model as a tool result.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GeminiFunctionResponse {
+    /// The name of the function that was called.
+    pub name: String,
+    /// The response payload from the function.
+    pub response: serde_json::Value,
+}
+
 /// Generation parameters for a Gemini request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GeminiGenerationConfig {
     /// Sampling temperature.
     pub temperature: Option<f64>,
+    /// Nucleus sampling threshold.
+    pub top_p: Option<f64>,
     /// Maximum number of tokens in the completion.
     pub max_output_tokens: Option<i32>,
 }

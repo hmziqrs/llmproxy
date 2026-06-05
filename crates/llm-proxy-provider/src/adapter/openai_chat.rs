@@ -29,7 +29,7 @@ use crate::sse::SseFrame;
 // ---------------------------------------------------------------------------
 
 /// Adapter for the OpenAI Chat Completions API.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct OpenAiChatAdapter;
 
 // ---------------------------------------------------------------------------
@@ -92,6 +92,8 @@ impl ProviderStreamDecoder for OpenAiChatStreamDecoder {
         let choice = &chunk.choices[0];
 
         // Handle reasoning content (both `reasoning_content` and `reasoning`).
+        // The serde alias on ChatMessage ensures both field names deserialize
+        // into `reasoning_content`.
         if let Some(reasoning) = choice
             .delta
             .as_ref()
@@ -542,7 +544,7 @@ impl OpenAiChatAdapter {
             serde_json::from_slice(bytes)?;
 
         if resp.choices.is_empty() {
-            return Err(ProviderError::SseFraming(
+            return Err(ProviderError::EmptyResponse(
                 "no choices in response".to_owned(),
             ));
         }
@@ -561,6 +563,15 @@ impl OpenAiChatAdapter {
                 content.push(CoreContent::Thinking {
                     text: reasoning.clone(),
                     signature: None,
+                });
+            }
+        }
+
+        // Refusal.
+        if let Some(ref refusal) = msg.refusal {
+            if !refusal.is_empty() {
+                content.push(CoreContent::Refusal {
+                    text: refusal.clone(),
                 });
             }
         }
@@ -1139,6 +1150,174 @@ mod tests {
         let events = decoder.finish().unwrap();
         assert_has_event(&events, "MessageStart");
         assert_has_event(&events, "MessageStop");
+    }
+
+    // -- Missing tests -------------------------------------------------------
+
+    #[test]
+    fn decode_thinking_response() {
+        let target = make_target();
+        let resp = llm_proxy_protocol::openai::ChatCompletionResponse {
+            id: "chatcmpl-test".into(),
+            object: "chat.completion".into(),
+            created: 0,
+            model: "deepseek-chat".into(),
+            choices: vec![Choice {
+                index: 0,
+                message: Some(ChatMessage {
+                    role: "assistant".into(),
+                    content: "answer".into(),
+                    reasoning_content: Some("Let me think...".into()),
+                    tool_calls: vec![],
+                    name: None,
+                    tool_call_id: None,
+                    cache_control: None,
+                    refusal: None,
+                }),
+                finish_reason: Some("stop".into()),
+                delta: None,
+            }],
+            usage: UsageInfo {
+                prompt_tokens: 10,
+                completion_tokens: 20,
+                total_tokens: 30,
+                prompt_cache_hit_tokens: None,
+                prompt_cache_miss_tokens: None,
+            },
+        };
+        let bytes = serde_json::to_vec(&resp).unwrap();
+        let adapter = OpenAiChatAdapter;
+        let core_resp = adapter.decode_response(&bytes, &target).unwrap();
+
+        let thinking = core_resp.content.iter().find(|c| matches!(c, CoreContent::Thinking { .. }));
+        assert!(thinking.is_some(), "expected Thinking content");
+    }
+
+    #[test]
+    fn decode_reasoning_alias_field() {
+        // Verify that the `reasoning` field alias works via serde.
+        let json = r#"{"role":"assistant","content":"hi","reasoning":"thinking tokens"}"#;
+        let msg: ChatMessage = serde_json::from_str(json).unwrap();
+        assert_eq!(msg.reasoning_content, Some("thinking tokens".to_owned()));
+    }
+
+    #[test]
+    fn decode_refusal_response() {
+        let target = make_target();
+        let resp = llm_proxy_protocol::openai::ChatCompletionResponse {
+            id: "chatcmpl-test".into(),
+            object: "chat.completion".into(),
+            created: 0,
+            model: "gpt-4o".into(),
+            choices: vec![Choice {
+                index: 0,
+                message: Some(ChatMessage {
+                    role: "assistant".into(),
+                    content: String::new(),
+                    reasoning_content: None,
+                    tool_calls: vec![],
+                    name: None,
+                    tool_call_id: None,
+                    cache_control: None,
+                    refusal: Some("I cannot help with that.".into()),
+                }),
+                finish_reason: Some("stop".into()),
+                delta: None,
+            }],
+            usage: UsageInfo {
+                prompt_tokens: 10,
+                completion_tokens: 5,
+                total_tokens: 15,
+                prompt_cache_hit_tokens: None,
+                prompt_cache_miss_tokens: None,
+            },
+        };
+        let bytes = serde_json::to_vec(&resp).unwrap();
+        let adapter = OpenAiChatAdapter;
+        let core_resp = adapter.decode_response(&bytes, &target).unwrap();
+
+        let refusal = core_resp.content.iter().find(|c| matches!(c, CoreContent::Refusal { .. }));
+        assert!(refusal.is_some(), "expected Refusal content");
+    }
+
+    #[test]
+    fn decode_empty_choices_returns_error() {
+        let target = make_target();
+        let resp = llm_proxy_protocol::openai::ChatCompletionResponse {
+            id: "test".into(),
+            object: "chat.completion".into(),
+            created: 0,
+            model: "gpt-4o".into(),
+            choices: vec![],
+            usage: UsageInfo {
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                total_tokens: 0,
+                prompt_cache_hit_tokens: None,
+                prompt_cache_miss_tokens: None,
+            },
+        };
+        let bytes = serde_json::to_vec(&resp).unwrap();
+        let adapter = OpenAiChatAdapter;
+        let result = adapter.decode_response(&bytes, &target);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            ProviderError::EmptyResponse(_) => {}
+            other => panic!("expected EmptyResponse, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn stream_usage_only_chunk() {
+        let target = make_target();
+        let adapter = OpenAiChatAdapter;
+        let mut decoder = adapter.new_stream_decoder(&target);
+
+        let frames = vec![
+            make_frame(r#"{"id":"c","object":"chat.completion.chunk","created":0,"model":"m","choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}"#),
+        ];
+
+        let mut all_events = Vec::new();
+        for frame in &frames {
+            all_events.extend(decoder.decode_frame(frame).unwrap());
+        }
+
+        assert!(all_events.iter().any(|e| matches!(e, CoreEvent::UsageDelta { .. })),
+            "usage-only chunk must emit UsageDelta, got: {:?}", all_events);
+    }
+
+    #[test]
+    fn stream_reasoning_alias() {
+        // Verify that streaming chunks with `reasoning` (not `reasoning_content`) work.
+        let target = make_target();
+        let adapter = OpenAiChatAdapter;
+        let mut decoder = adapter.new_stream_decoder(&target);
+
+        let frame = make_frame(
+            r#"{"id":"c","object":"chat.completion.chunk","created":0,"model":"m","choices":[{"index":0,"delta":{"reasoning":"thinking..."},"finish_reason":null}]}"#
+        );
+        let events = decoder.decode_frame(&frame).unwrap();
+        assert!(events.iter().any(|e| matches!(e, CoreEvent::ThinkingDelta { .. })),
+            "reasoning alias must produce ThinkingDelta");
+    }
+
+    // -- Source guard ---------------------------------------------------------
+
+    #[test]
+    fn adapter_source_no_forbidden_imports() {
+        let source = include_str!("openai_chat.rs");
+        let prod = source
+            .split_once("#[cfg(test)]")
+            .map(|(p, _)| p)
+            .unwrap_or(source);
+        assert!(
+            !prod.contains("llm_proxy_protocol::client"),
+            "adapter must not import client protocol types"
+        );
+        assert!(
+            !prod.contains("llm_proxy_server"),
+            "adapter must not import server crate"
+        );
     }
 
     // -- Helpers --------------------------------------------------------------

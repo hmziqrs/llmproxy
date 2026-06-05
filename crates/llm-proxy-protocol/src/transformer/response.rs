@@ -698,7 +698,7 @@ mod tests {
 
     #[test]
     fn transform_gemini_response_basic() {
-        use crate::zen::{GeminiCandidate, GeminiContent, GeminiPart, GeminiUsage};
+        use crate::zen::{GeminiCandidate, GeminiContent, GeminiUsage};
 
         let resp = GeminiResponse {
             candidates: vec![GeminiCandidate {
@@ -735,7 +735,7 @@ mod tests {
 
     #[test]
     fn transform_gemini_response_max_tokens() {
-        use crate::zen::{GeminiCandidate, GeminiContent, GeminiPart};
+        use crate::zen::{GeminiCandidate, GeminiContent};
 
         let resp = GeminiResponse {
             candidates: vec![GeminiCandidate {

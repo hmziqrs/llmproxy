@@ -22,35 +22,106 @@ use crate::error::ProviderError;
 use crate::sse::SseFrame;
 
 // ---------------------------------------------------------------------------
-// Tool name sanitization
+// Tool name sanitization (collision-safe, reversible)
 // ---------------------------------------------------------------------------
 
-/// Anthropic requires tool names matching `^[a-zA-Z0-9_-]{1,128}$`.
-/// This regex matches characters that are NOT in the allowed set.
-static INVALID_TOOL_NAME_CHAR: LazyLock<regex::Regex> =
-    LazyLock::new(|| regex::Regex::new(r"[^a-zA-Z0-9_-]").expect("valid regex"));
+/// Anthropic `tool_use_id` must match `^[A-Za-z0-9_]{0,256}$`.
+static INVALID_TOOL_USE_ID_CHAR: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"[^A-Za-z0-9_]").expect("valid regex"));
 
-/// Sanitize a tool name for the Anthropic API.
+/// Sanitize a tool name for the Anthropic API using collision-safe, reversible encoding.
 ///
-/// Replaces disallowed characters with underscores and truncates to 128 chars.
-fn sanitize_tool_name(name: &str) -> String {
-    let sanitized: String = INVALID_TOOL_NAME_CHAR
-        .replace_all(name, "_")
-        .into_owned();
-    let truncated = if sanitized.len() > 128 {
+/// Disallowed characters are encoded as `_0xHH_` where HH is the hex byte value.
+/// This ensures two different tool names (e.g. `my.tool` and `my_tool`) produce
+/// different sanitized names (`my_0x2e_tool` vs `my_tool`), avoiding collisions.
+/// Truncates to 128 chars if needed. Returns the sanitized name and whether it was
+/// actually rewritten (i.e., differs from the original).
+fn sanitize_tool_name(name: &str) -> (String, bool) {
+    let mut result = String::with_capacity(name.len() * 3);
+    let mut changed = false;
+
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+            result.push(ch);
+        } else {
+            // Encode as _0xHH_
+            for byte in ch.to_string().as_bytes() {
+                result.push_str(&format!("_0x{:02x}_", byte));
+            }
+            changed = true;
+        }
+    }
+
+    // Truncate to 128 chars if needed (char-boundary safe).
+    if result.len() > 128 {
         let mut end = 128;
+        while !result.is_char_boundary(end) && end > 0 {
+            end -= 1;
+        }
+        result.truncate(end);
+        changed = true;
+    }
+
+    // Guarantee non-empty.
+    if result.is_empty() {
+        return ("tool".to_owned(), name != "tool");
+    }
+
+    (result, changed)
+}
+
+/// Reverse a sanitized tool name back to the original by decoding `_0xHH_` patterns.
+fn desanitize_tool_name(name: &str) -> std::borrow::Cow<'_, str> {
+    if !name.contains("_0x") {
+        return std::borrow::Cow::Borrowed(name);
+    }
+
+    let mut result = String::with_capacity(name.len());
+    let mut chars = name.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch == '_' {
+            // Try to parse _0xHH_ pattern.  After consuming '_', the
+            // remaining pattern is "0xHH_" = 5 characters.
+            let rest: String = chars.by_ref().take(5).collect();
+            if rest.starts_with("0x") && rest.len() >= 4 {
+                // Parse hex byte.
+                if let Ok(byte_val) = u8::from_str_radix(&rest[2..4], 16) {
+                    result.push(byte_val as char);
+                    // The 5th char (rest[4]) should be '_'; if present it was
+                    // already consumed by take().  If the rest was shorter than
+                    // 5, we consumed everything available which is fine.
+                    continue;
+                }
+            }
+            // Not a valid pattern, put back the underscore and the rest.
+            result.push('_');
+            result.push_str(&rest);
+        } else {
+            result.push(ch);
+        }
+    }
+
+    std::borrow::Cow::Owned(result)
+}
+
+/// Sanitize a tool_use_id for the Anthropic API.
+///
+/// Replaces disallowed characters with underscores, truncates to 256 chars.
+fn sanitize_tool_use_id(id: &str) -> String {
+    let sanitized: String = INVALID_TOOL_USE_ID_CHAR
+        .replace_all(id, "_")
+        .into_owned();
+    if sanitized.len() > 256 {
+        let mut end = 256;
         while !sanitized.is_char_boundary(end) && end > 0 {
             end -= 1;
         }
-        &sanitized[..end]
+        sanitized[..end].to_owned()
+    } else if sanitized.is_empty() {
+        "tool_result".to_owned()
     } else {
-        &sanitized
-    };
-    // Guarantee non-empty.
-    if truncated.is_empty() {
-        "tool".to_owned()
-    } else {
-        truncated.to_owned()
+        sanitized
     }
 }
 
@@ -59,15 +130,13 @@ fn sanitize_tool_name(name: &str) -> String {
 // ---------------------------------------------------------------------------
 
 /// Adapter for the Anthropic Messages API.
-#[derive(Debug, Clone)]
-pub struct AnthropicAdapter {
-    _private: (),
-}
+#[derive(Debug, Clone, Default)]
+pub struct AnthropicAdapter;
 
 impl AnthropicAdapter {
     /// Create a new Anthropic adapter.
     pub fn new() -> Self {
-        Self { _private: () }
+        Self
     }
 }
 
@@ -76,6 +145,22 @@ impl AnthropicAdapter {
 // ---------------------------------------------------------------------------
 
 /// Stateful stream decoder for Anthropic SSE frames.
+///
+/// ## CoreEvent variants emitted
+///
+/// - `MessageStart` -- on `message_start`
+/// - `ContentStart` -- on `content_block_start` (Text, Thinking, or ToolUse)
+/// - `TextDelta` -- on `content_block_delta` with `text_delta`
+/// - `ThinkingDelta` -- on `content_block_delta` with `thinking_delta`
+/// - `ToolCallStart` -- on `content_block_start` with `tool_use`
+/// - `ToolCallDelta` -- on `content_block_delta` with `input_json_delta`
+/// - `ToolCallStop` -- on `content_block_stop` for tool_use blocks
+/// - `UsageDelta` -- on `message_delta` with usage
+/// - `MessageStop` -- on `message_delta` with stop_reason or `message_stop`
+/// - `Ping` -- on `ping`
+/// - `Error` -- on `error`
+///
+/// Intentionally never emitted: none (all variants are covered).
 #[derive(Debug)]
 pub struct AnthropicStreamDecoder {
     model_ref: ModelRef,
@@ -331,10 +416,13 @@ impl AnthropicAdapter {
                             "text": text,
                         });
                         if let Some(cc) = cache {
-                            block.as_object_mut().unwrap().insert(
-                                "cache_control".to_owned(),
-                                serde_json::json!({"type": cc.r#type}),
-                            );
+                            block
+                                .as_object_mut()
+                                .expect("json! macro always produces an object")
+                                .insert(
+                                    "cache_control".to_owned(),
+                                    serde_json::json!({"type": cc.r#type}),
+                                );
                         }
                         Some(block)
                     }
@@ -389,25 +477,29 @@ impl AnthropicAdapter {
             }
         }
 
-        // Tools -- build as JSON array.
+        // Tools -- build as JSON array with name sanitization.
         let tools: Vec<serde_json::Value> = core
             .tools
             .iter()
             .map(|t| {
-                let schema = if t.input_schema.is_null() {
+                // Coerce non-object input_schema to a default object schema.
+                let schema = if !t.input_schema.is_object() {
                     serde_json::json!({"type": "object", "properties": {}})
                 } else {
                     t.input_schema.clone()
                 };
+                let (sanitized_name, _changed) = sanitize_tool_name(&t.name);
                 let mut tool = serde_json::json!({
-                    "name": sanitize_tool_name(&t.name),
+                    "name": sanitized_name,
                     "input_schema": schema,
                 });
                 if let Some(ref desc) = t.description {
-                    tool.as_object_mut().unwrap().insert(
-                        "description".to_owned(),
-                        serde_json::Value::String(desc.clone()),
-                    );
+                    tool.as_object_mut()
+                        .expect("json! macro always produces an object")
+                        .insert(
+                            "description".to_owned(),
+                            serde_json::Value::String(desc.clone()),
+                        );
                 }
                 tool
             })
@@ -418,10 +510,13 @@ impl AnthropicAdapter {
             CoreToolChoice::Auto => serde_json::json!({"type": "auto"}),
             CoreToolChoice::Any => serde_json::json!({"type": "any"}),
             CoreToolChoice::None => serde_json::json!({"type": "none"}),
-            CoreToolChoice::Tool { name } => serde_json::json!({
-                "type": "tool",
-                "name": sanitize_tool_name(name)
-            }),
+            CoreToolChoice::Tool { name } => {
+                let (sanitized, _) = sanitize_tool_name(name);
+                serde_json::json!({
+                    "type": "tool",
+                    "name": sanitized
+                })
+            }
             CoreToolChoice::Raw(v) => v.clone(),
             _ => serde_json::json!(null),
         });
@@ -433,7 +528,9 @@ impl AnthropicAdapter {
             "messages": messages,
         });
 
-        let obj = req.as_object_mut().unwrap();
+        let obj = req
+            .as_object_mut()
+            .expect("json! macro always produces an object");
 
         if let Some(sys) = system {
             obj.insert("system".to_owned(), sys);
@@ -449,6 +546,15 @@ impl AnthropicAdapter {
         }
         if let Some(top_p) = core.sampling.top_p {
             obj.insert("top_p".to_owned(), serde_json::json!(top_p));
+        }
+        // Forward stop sequences.
+        if let Some(ref stop) = core.sampling.stop {
+            if !stop.is_empty() {
+                obj.insert(
+                    "stop_sequences".to_owned(),
+                    serde_json::to_value(stop).unwrap_or(serde_json::Value::Null),
+                );
+            }
         }
         if let Some(ref user_id) = core.metadata.user_id {
             obj.insert("metadata".to_owned(), serde_json::json!({"user_id": user_id}));
@@ -502,9 +608,12 @@ impl AnthropicAdapter {
                         .input
                         .clone()
                         .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+                    // Reverse-map sanitized tool names back to originals.
+                    let name = block.name.clone().unwrap_or_default();
+                    let original_name = desanitize_tool_name(&name).into_owned();
                     content.push(CoreContent::ToolUse {
                         id: block.id.clone().unwrap_or_default(),
-                        name: block.name.clone().unwrap_or_default(),
+                        name: original_name,
                         input,
                     });
                 }
@@ -632,16 +741,20 @@ fn encode_content_blocks(content: &[CoreContent]) -> serde_json::Value {
                         _ => None,
                     })
                     .collect::<String>();
+                let sanitized_id = sanitize_tool_use_id(tool_use_id);
                 let mut block = serde_json::json!({
                     "type": "tool_result",
-                    "tool_use_id": tool_use_id,
+                    "tool_use_id": sanitized_id,
                     "content": result_text,
                 });
                 if *is_error {
-                    block.as_object_mut().unwrap().insert(
-                        "is_error".to_owned(),
-                        serde_json::json!(true),
-                    );
+                    block
+                        .as_object_mut()
+                        .expect("json! macro always produces an object")
+                        .insert(
+                            "is_error".to_owned(),
+                            serde_json::json!(true),
+                        );
                 }
                 Some(block)
             }
@@ -651,7 +764,13 @@ fn encode_content_blocks(content: &[CoreContent]) -> serde_json::Value {
                     "source": source,
                 }))
             }
-            _ => None,
+            other => {
+                tracing::warn!(
+                    ?other,
+                    "dropping unsupported content block during Anthropic encode"
+                );
+                None
+            }
         })
         .collect();
 
@@ -681,20 +800,33 @@ fn encode_assistant_content(content: &[CoreContent]) -> serde_json::Value {
                     "thinking": text,
                 });
                 if let Some(sig) = signature {
-                    block.as_object_mut().unwrap().insert(
-                        "signature".to_owned(),
-                        serde_json::Value::String(sig.clone()),
-                    );
+                    block
+                        .as_object_mut()
+                        .expect("json! macro always produces an object")
+                        .insert(
+                            "signature".to_owned(),
+                            serde_json::Value::String(sig.clone()),
+                        );
                 }
                 Some(block)
             }
-            CoreContent::ToolUse { id, name, input } => Some(serde_json::json!({
-                "type": "tool_use",
-                "id": id,
-                "name": sanitize_tool_name(name),
-                "input": input,
-            })),
-            _ => None,
+            CoreContent::ToolUse { id, name, input } => {
+                let (sanitized_name, _) = sanitize_tool_name(name);
+                let sanitized_id = sanitize_tool_use_id(id);
+                Some(serde_json::json!({
+                    "type": "tool_use",
+                    "id": sanitized_id,
+                    "name": sanitized_name,
+                    "input": input,
+                }))
+            }
+            other => {
+                tracing::warn!(
+                    ?other,
+                    "dropping unsupported content block during Anthropic assistant encode"
+                );
+                None
+            }
         })
         .collect();
 
@@ -744,30 +876,69 @@ mod tests {
 
     #[test]
     fn sanitize_tool_name_valid() {
-        assert_eq!(sanitize_tool_name("get_weather"), "get_weather");
-        assert_eq!(sanitize_tool_name("my-tool-123"), "my-tool-123");
+        let (name, changed) = sanitize_tool_name("get_weather");
+        assert_eq!(name, "get_weather");
+        assert!(!changed);
+        let (name, changed) = sanitize_tool_name("my-tool-123");
+        assert_eq!(name, "my-tool-123");
+        assert!(!changed);
     }
 
     #[test]
-    fn sanitize_tool_name_replaces_dots() {
-        assert_eq!(sanitize_tool_name("my.tool.name"), "my_tool_name");
+    fn sanitize_tool_name_replaces_dots_collision_safe() {
+        // "my.tool.name" should NOT collide with "my_tool_name".
+        let (name1, changed1) = sanitize_tool_name("my.tool.name");
+        let (name2, changed2) = sanitize_tool_name("my_tool_name");
+        assert!(changed1);
+        assert!(!changed2);
+        assert_ne!(name1, name2, "collision-safe: different names must produce different sanitized names");
+        assert!(name1.contains("0x2e"), "dot should be encoded as _0x2e_");
+    }
+
+    #[test]
+    fn sanitize_tool_name_reversible() {
+        let original = "my.tool+name";
+        let (sanitized, _) = sanitize_tool_name(original);
+        let restored = desanitize_tool_name(&sanitized);
+        assert_eq!(restored, original);
     }
 
     #[test]
     fn sanitize_tool_name_truncates_long() {
         let long_name = "a".repeat(200);
-        let result = sanitize_tool_name(&long_name);
+        let (result, _) = sanitize_tool_name(&long_name);
         assert_eq!(result.len(), 128);
     }
 
     #[test]
     fn sanitize_tool_name_empty_becomes_tool() {
-        assert_eq!(sanitize_tool_name(""), "tool");
+        let (name, _) = sanitize_tool_name("");
+        assert_eq!(name, "tool");
     }
 
     #[test]
     fn sanitize_tool_name_special_chars() {
-        assert_eq!(sanitize_tool_name("get weather!@#"), "get_weather___");
+        let (name, changed) = sanitize_tool_name("get weather!@#");
+        assert!(changed);
+        // Spaces and special chars should be encoded, not simply replaced with _.
+        assert!(name.contains("0x"));
+    }
+
+    // -- Tool use ID sanitization tests ----------------------------------------
+
+    #[test]
+    fn sanitize_tool_use_id_valid() {
+        assert_eq!(sanitize_tool_use_id("toolu_123"), "toolu_123");
+    }
+
+    #[test]
+    fn sanitize_tool_use_id_replaces_dashes() {
+        assert_eq!(sanitize_tool_use_id("call-123"), "call_123");
+    }
+
+    #[test]
+    fn sanitize_tool_use_id_empty_becomes_default() {
+        assert_eq!(sanitize_tool_use_id(""), "tool_result");
     }
 
     // -- Encode tests --------------------------------------------------------
@@ -833,7 +1004,8 @@ mod tests {
         let body: serde_json::Value = serde_json::from_slice(&proxy_req.body).unwrap();
         let tools = body["tools"].as_array().unwrap();
         assert_eq!(tools.len(), 1);
-        assert_eq!(tools[0]["name"], "get_weather");
+        // Dots are encoded collision-safe as _0x2e_
+        assert!(tools[0]["name"].as_str().unwrap().contains("0x2e"));
     }
 
     #[test]
@@ -1184,6 +1356,198 @@ mod tests {
         assert_eq!(map_anthropic_stop_reason("stop_sequence"), StopReason::StopSequence);
         assert_eq!(map_anthropic_stop_reason("refusal"), StopReason::Refusal);
         assert_eq!(map_anthropic_stop_reason("unknown"), StopReason::Unknown);
+    }
+
+    // -- Missing tests: encode stop sequences, input_schema coercion ----------
+
+    #[test]
+    fn encode_stop_sequences() {
+        let mut core = make_core_request(vec![CoreMessage {
+            role: CoreRole::User,
+            content: vec![CoreContent::Text {
+                text: "hi".into(),
+                cache: None,
+            }],
+        }]);
+        core.sampling.stop = Some(vec!["END".into(), "STOP".into()]);
+        let adapter = AnthropicAdapter::new();
+        let target = make_target();
+        let proxy_req = adapter.encode_request(&core, &target).unwrap();
+
+        let body: serde_json::Value = serde_json::from_slice(&proxy_req.body).unwrap();
+        assert_eq!(
+            body["stop_sequences"],
+            serde_json::json!(["END", "STOP"])
+        );
+    }
+
+    #[test]
+    fn encode_input_schema_null_coerced_to_object() {
+        let mut core = make_core_request(vec![CoreMessage {
+            role: CoreRole::User,
+            content: vec![CoreContent::Text {
+                text: "hi".into(),
+                cache: None,
+            }],
+        }]);
+        core.tools = vec![CoreTool {
+            name: "my_tool".into(),
+            description: Some("test".into()),
+            input_schema: serde_json::Value::Null,
+        }];
+        let adapter = AnthropicAdapter::new();
+        let target = make_target();
+        let proxy_req = adapter.encode_request(&core, &target).unwrap();
+
+        let body: serde_json::Value = serde_json::from_slice(&proxy_req.body).unwrap();
+        let schema = &body["tools"].as_array().unwrap()[0]["input_schema"];
+        assert_eq!(schema["type"], "object");
+    }
+
+    #[test]
+    fn encode_input_schema_string_coerced_to_object() {
+        let mut core = make_core_request(vec![CoreMessage {
+            role: CoreRole::User,
+            content: vec![CoreContent::Text {
+                text: "hi".into(),
+                cache: None,
+            }],
+        }]);
+        core.tools = vec![CoreTool {
+            name: "my_tool".into(),
+            description: Some("test".into()),
+            input_schema: serde_json::json!("not an object"),
+        }];
+        let adapter = AnthropicAdapter::new();
+        let target = make_target();
+        let proxy_req = adapter.encode_request(&core, &target).unwrap();
+
+        let body: serde_json::Value = serde_json::from_slice(&proxy_req.body).unwrap();
+        let schema = &body["tools"].as_array().unwrap()[0]["input_schema"];
+        assert_eq!(schema["type"], "object");
+    }
+
+    // -- Missing tests: decode redacted thinking, stop_sequence, malformed frame --
+
+    #[test]
+    fn decode_redacted_thinking_response() {
+        let target = make_target();
+        let resp_json = serde_json::json!({
+            "id": "msg_test",
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "redacted_thinking", "data": "opaque"}],
+            "model": "claude-sonnet-4-20250514",
+            "stop_reason": "end_turn",
+            "stop_sequence": null,
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": 5,
+                "cache_creation_input_tokens": null,
+                "cache_read_input_tokens": null,
+            }
+        });
+        let bytes = serde_json::to_vec(&resp_json).unwrap();
+        let adapter = AnthropicAdapter::new();
+        let core_resp = adapter.decode_response(&bytes, &target).unwrap();
+
+        match &core_resp.content[0] {
+            CoreContent::RedactedThinking { .. } => {}
+            other => panic!("expected RedactedThinking, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn decode_stop_sequence_propagated() {
+        let target = make_target();
+        let resp_json = serde_json::json!({
+            "id": "msg_test",
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "text", "text": "hi"}],
+            "model": "claude-sonnet-4-20250514",
+            "stop_reason": "stop_sequence",
+            "stop_sequence": "END",
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": 5,
+                "cache_creation_input_tokens": null,
+                "cache_read_input_tokens": null,
+            }
+        });
+        let bytes = serde_json::to_vec(&resp_json).unwrap();
+        let adapter = AnthropicAdapter::new();
+        let core_resp = adapter.decode_response(&bytes, &target).unwrap();
+
+        assert_eq!(core_resp.stop_reason, StopReason::StopSequence);
+        assert_eq!(core_resp.stop_sequence, Some("END".to_owned()));
+    }
+
+    #[test]
+    fn stream_malformed_frame_skipped() {
+        let target = make_target();
+        let adapter = AnthropicAdapter::new();
+        let mut decoder = adapter.new_stream_decoder(&target);
+
+        let frame = make_frame("{not valid json}");
+        let events = decoder.decode_frame(&frame).unwrap();
+        assert!(events.is_empty());
+    }
+
+    // -- Missing test: usage-only chunk classification ------------------------
+
+    #[test]
+    fn stream_usage_only_chunk() {
+        let target = make_target();
+        let adapter = AnthropicAdapter::new();
+        let mut decoder = adapter.new_stream_decoder(&target);
+
+        // Send a message_delta with usage but no text content.
+        let frames = vec![
+            make_frame(r#"{"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","content":[],"model":"claude","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":0}}}"#),
+            make_frame(r#"{"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"input_tokens":0,"output_tokens":20}}"#),
+        ];
+
+        let mut all_events = Vec::new();
+        for frame in &frames {
+            all_events.extend(decoder.decode_frame(frame).unwrap());
+        }
+
+        // Usage should NOT be dropped just because there was no text.
+        assert!(all_events.iter().any(|e| matches!(e, CoreEvent::UsageDelta { .. })));
+        assert!(all_events.iter().any(|e| matches!(e, CoreEvent::MessageStop { .. })));
+    }
+
+    // -- Missing test: full lifecycle event ordering --------------------------
+
+    #[test]
+    fn stream_full_lifecycle_ordering() {
+        let target = make_target();
+        let adapter = AnthropicAdapter::new();
+        let mut decoder = adapter.new_stream_decoder(&target);
+
+        let frames = vec![
+            make_frame(r#"{"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","content":[],"model":"claude","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":0}}}"#),
+            make_frame(r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#),
+            make_frame(r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hi"}}"#),
+            make_frame(r#"{"type":"content_block_stop","index":0}"#),
+            make_frame(r#"{"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"input_tokens":0,"output_tokens":5}}"#),
+        ];
+
+        let mut all_events = Vec::new();
+        for frame in &frames {
+            all_events.extend(decoder.decode_frame(frame).unwrap());
+        }
+
+        // Verify ordering: MessageStart < ContentStart < TextDelta < MessageStop.
+        let msg_start_idx = all_events.iter().position(|e| matches!(e, CoreEvent::MessageStart { .. })).unwrap();
+        let content_start_idx = all_events.iter().position(|e| matches!(e, CoreEvent::ContentStart { .. })).unwrap();
+        let text_delta_idx = all_events.iter().position(|e| matches!(e, CoreEvent::TextDelta { .. })).unwrap();
+        let msg_stop_idx = all_events.iter().position(|e| matches!(e, CoreEvent::MessageStop { .. })).unwrap();
+
+        assert!(msg_start_idx < content_start_idx, "MessageStart must precede ContentStart");
+        assert!(content_start_idx < text_delta_idx, "ContentStart must precede TextDelta");
+        assert!(text_delta_idx < msg_stop_idx, "TextDelta must precede MessageStop");
     }
 
     // -- Source guard ---------------------------------------------------------
