@@ -1,0 +1,725 @@
+//! Protocol-neutral HTTP transport for upstream LLM providers.
+//!
+//! This module provides a thin transport layer that sends prepared bytes to a
+//! prepared URL with prepared auth headers. It knows nothing about protocol
+//! names, model IDs, or provider adapters.
+//!
+//! ## Neutrality guardrails
+//!
+//! The transport layer must not import or mention endpoint classification,
+//! provider model names, or protocol crate types. It only sends prepared
+//! bytes to a prepared URL with prepared auth headers.
+
+use std::fmt;
+use std::pin::Pin;
+
+use bytes::Bytes;
+use futures::Stream;
+use futures::TryStreamExt;
+use llm_proxy_core::AuthStyle;
+
+use crate::error::{ProviderError, sanitize_api_error_body};
+
+// ---------------------------------------------------------------------------
+// AuthHeaders
+// ---------------------------------------------------------------------------
+
+/// Authentication headers for an upstream request.
+///
+/// The `api_key` field is redacted in [`fmt::Debug`] output so that
+/// `tracing::debug!(?auth)` or snapshot output never leaks the secret.
+#[derive(Clone)]
+pub struct AuthHeaders {
+    /// Which header style to use for the API key.
+    pub style: AuthStyle,
+    /// The API key value. Redacted in Debug output.
+    pub api_key: String,
+}
+
+impl fmt::Debug for AuthHeaders {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AuthHeaders")
+            .field("style", &self.style)
+            .field("api_key", &"***")
+            .finish()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ProxyRequest
+// ---------------------------------------------------------------------------
+
+/// A protocol-neutral request to send to an upstream provider.
+///
+/// The transport sends `body` byte-for-byte. It does not serialize typed
+/// request structs.
+///
+/// The `auth.api_key` field is redacted in [`fmt::Debug`] output.
+#[derive(Clone)]
+pub struct ProxyRequest {
+    /// Full upstream URL.
+    pub url: String,
+    /// Authentication headers.
+    pub auth: AuthHeaders,
+    /// Raw request body bytes.
+    pub body: Vec<u8>,
+    /// Whether this is a streaming request (sets `Accept: text/event-stream`).
+    pub stream: bool,
+}
+
+impl fmt::Debug for ProxyRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ProxyRequest")
+            .field("url", &self.url)
+            .field("auth", &self.auth)
+            .field("body_len", &self.body.len())
+            .field("stream", &self.stream)
+            .finish()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ProxyClient
+// ---------------------------------------------------------------------------
+
+/// Protocol-neutral HTTP client for upstream LLM providers.
+///
+/// Owns a connection-pooled [`reqwest::Client`] and sends [`ProxyRequest`]
+/// instances without any knowledge of protocol names or model IDs.
+#[derive(Debug, Clone)]
+pub struct ProxyClient {
+    http: reqwest::Client,
+}
+
+impl ProxyClient {
+    /// Creates a new transport client with sensible connection pool defaults.
+    pub fn new() -> Self {
+        let http = reqwest::Client::builder()
+            .pool_max_idle_per_host(20)
+            .pool_idle_timeout(std::time::Duration::from_secs(90))
+            .build()
+            .expect("failed to build reqwest client");
+
+        Self { http }
+    }
+
+    /// Sends a non-streaming request and returns the response body bytes.
+    ///
+    /// - Always sets `Content-Type: application/json`.
+    /// - Does **not** set `Accept: text/event-stream`.
+    /// - Returns [`ProviderError::Api`] for HTTP status >= 400.
+    pub async fn send(&self, req: ProxyRequest) -> Result<Vec<u8>, ProviderError> {
+        let mut builder = self
+            .http
+            .post(&req.url)
+            .header("Content-Type", "application/json");
+
+        builder = apply_auth(builder, &req.auth);
+
+        let resp = builder.body(req.body).send().await?;
+
+        check_status(resp).await
+    }
+
+    /// Sends a streaming request and returns a byte stream.
+    ///
+    /// - Always sets `Content-Type: application/json`.
+    /// - Sets `Accept: text/event-stream`.
+    /// - Returns [`ProviderError::Api`] for HTTP status >= 400 **before**
+    ///   any byte stream is exposed.
+    /// - Stream item errors are wrapped as [`ProviderError`]; consumers never
+    ///   see raw `reqwest::Error`.
+    /// - Dropping the returned stream aborts the in-flight upstream request.
+    pub async fn send_stream(
+        &self,
+        req: ProxyRequest,
+    ) -> Result<
+        Pin<Box<dyn Stream<Item = Result<Bytes, ProviderError>> + Send + 'static>>,
+        ProviderError,
+    > {
+        let mut builder = self
+            .http
+            .post(&req.url)
+            .header("Content-Type", "application/json")
+            .header("Accept", "text/event-stream");
+
+        builder = apply_auth(builder, &req.auth);
+
+        let resp = builder.body(req.body).send().await?;
+
+        if resp.status().as_u16() >= 400 {
+            let status = resp.status().as_u16();
+            let body_text = resp.text().await.unwrap_or_default();
+            return Err(ProviderError::Api {
+                status,
+                body: sanitize_api_error_body(body_text),
+            });
+        }
+
+        // The stream future owns the reqwest response; dropping it drops the
+        // connection, which aborts the upstream request. Do not spawn a detached
+        // task that outlives the consumer.
+        let stream = resp.bytes_stream();
+        let mapped = stream.map_err(ProviderError::from);
+        Ok(Box::pin(mapped))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Apply authentication headers to a request builder based on [`AuthStyle`].
+fn apply_auth(
+    mut builder: reqwest::RequestBuilder,
+    auth: &AuthHeaders,
+) -> reqwest::RequestBuilder {
+    match auth.style {
+        AuthStyle::Bearer => {
+            builder = builder.header("Authorization", format!("Bearer {}", auth.api_key));
+        }
+        AuthStyle::XApiKey => {
+            builder = builder.header("x-api-key", &auth.api_key);
+        }
+        AuthStyle::Both => {
+            builder = builder.header("Authorization", format!("Bearer {}", auth.api_key));
+            builder = builder.header("x-api-key", &auth.api_key);
+        }
+    }
+    builder
+}
+
+/// Check response status and return body bytes or a [`ProviderError::Api`].
+async fn check_status(resp: reqwest::Response) -> Result<Vec<u8>, ProviderError> {
+    if resp.status().as_u16() >= 400 {
+        let status = resp.status().as_u16();
+        let body_text = resp.text().await.unwrap_or_default();
+        return Err(ProviderError::Api {
+            status,
+            body: sanitize_api_error_body(body_text),
+        });
+    }
+    let body = resp.bytes().await?;
+    Ok(body.to_vec())
+}
+
+// ===========================================================================
+// Tests
+// ===========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -----------------------------------------------------------------------
+    // Debug redaction tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn auth_headers_debug_redacts_api_key() {
+        let auth = AuthHeaders {
+            style: AuthStyle::Bearer,
+            api_key: "sk-super-secret-key-12345".to_owned(),
+        };
+        let debug_output = format!("{:?}", auth);
+        assert!(
+            !debug_output.contains("sk-super-secret-key-12345"),
+            "Debug output must not contain the api_key: {}",
+            debug_output
+        );
+        assert!(
+            debug_output.contains("***"),
+            "Debug output must contain redacted marker: {}",
+            debug_output
+        );
+    }
+
+    #[test]
+    fn proxy_request_debug_redacts_api_key() {
+        let req = ProxyRequest {
+            url: "https://api.example.com/v1/chat/completions".to_owned(),
+            auth: AuthHeaders {
+                style: AuthStyle::Bearer,
+                api_key: "sk-super-secret-key-12345".to_owned(),
+            },
+            body: br#"{"model":"gpt-5"}"#.to_vec(),
+            stream: false,
+        };
+        let debug_output = format!("{:?}", req);
+        assert!(
+            !debug_output.contains("sk-super-secret-key-12345"),
+            "Debug output must not contain the api_key: {}",
+            debug_output
+        );
+        assert!(
+            debug_output.contains("***"),
+            "Debug output must contain redacted marker: {}",
+            debug_output
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Transport integration tests (axum test server)
+    // -----------------------------------------------------------------------
+
+    use axum::Router;
+    use axum::body::Body;
+    use axum::extract::State;
+    use axum::http::{HeaderMap, StatusCode};
+    use axum::response::IntoResponse;
+    use axum::routing::post;
+    use futures::StreamExt;
+    use tokio::net::TcpListener;
+
+    /// A simple axum handler that echoes back the request body and headers.
+    async fn echo_handler(headers: HeaderMap, body: bytes::Bytes) -> impl IntoResponse {
+        let mut response_parts = Vec::new();
+
+        // Echo Content-Type
+        if let Some(ct) = headers.get("content-type") {
+            response_parts.push(format!("content-type: {}", ct.to_str().unwrap_or("?")));
+        }
+
+        // Echo Authorization
+        if let Some(auth) = headers.get("authorization") {
+            response_parts.push(format!("authorization: {}", auth.to_str().unwrap_or("?")));
+        }
+
+        // Echo x-api-key
+        if let Some(key) = headers.get("x-api-key") {
+            response_parts.push(format!("x-api-key: {}", key.to_str().unwrap_or("?")));
+        }
+
+        // Echo Accept
+        if let Some(accept) = headers.get("accept") {
+            response_parts.push(format!("accept: {}", accept.to_str().unwrap_or("?")));
+        }
+
+        // Echo body
+        let body_str = String::from_utf8_lossy(&body);
+        response_parts.push(format!("body: {}", body_str));
+
+        (StatusCode::OK, response_parts.join("\n"))
+    }
+
+    /// Handler that echoes request headers as a streaming SSE response.
+    async fn echo_stream_handler(headers: HeaderMap, body: bytes::Bytes) -> impl IntoResponse {
+        let mut events = Vec::new();
+
+        // Echo Content-Type
+        if let Some(ct) = headers.get("content-type") {
+            events.push(format!("data: {{\"content-type\": \"{}\"}}\n\n", ct.to_str().unwrap_or("?")));
+        }
+
+        // Echo Authorization
+        if let Some(auth) = headers.get("authorization") {
+            events.push(format!("data: {{\"authorization\": \"{}\"}}\n\n", auth.to_str().unwrap_or("?")));
+        }
+
+        // Echo x-api-key
+        if let Some(key) = headers.get("x-api-key") {
+            events.push(format!("data: {{\"x-api-key\": \"{}\"}}\n\n", key.to_str().unwrap_or("?")));
+        }
+
+        // Echo Accept
+        if let Some(accept) = headers.get("accept") {
+            events.push(format!("data: {{\"accept\": \"{}\"}}\n\n", accept.to_str().unwrap_or("?")));
+        }
+
+        // Echo body
+        let body_str = String::from_utf8_lossy(&body);
+        events.push(format!("data: {{\"body\": \"{}\"}}\n\n", body_str));
+
+        // Terminal frame
+        events.push("data: [DONE]\n\n".to_owned());
+
+        let stream = futures::stream::iter(events);
+        let body_stream = stream.map(|s| Ok::<_, std::convert::Infallible>(bytes::Bytes::from(s)));
+
+        (
+            StatusCode::OK,
+            [("Content-Type", "text/event-stream")],
+            Body::from_stream(body_stream),
+        )
+    }
+
+    /// Handler that returns a 400 error with a JSON body.
+    async fn error_handler(State(code): State<u16>) -> impl IntoResponse {
+        let body = format!(r#"{{"error": "upstream error", "status": {}}}"#, code);
+        (
+            StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_REQUEST),
+            body,
+        )
+    }
+
+    /// Spin up an ephemeral axum server, return its base URL.
+    async fn start_test_server(routes: Router) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base = format!("http://{}", addr);
+
+        tokio::spawn(async move {
+            axum::serve(listener, routes).await.unwrap();
+        });
+
+        // Give the server a moment to start accepting connections.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        base
+    }
+
+    #[tokio::test]
+    async fn bearer_header_set() {
+        let app = Router::new().route("/test", post(echo_handler));
+        let base = start_test_server(app).await;
+
+        let client = ProxyClient::new();
+        let req = ProxyRequest {
+            url: format!("{}/test", base),
+            auth: AuthHeaders {
+                style: AuthStyle::Bearer,
+                api_key: "test-key-123".to_owned(),
+            },
+            body: br#"{"hello":"world"}"#.to_vec(),
+            stream: false,
+        };
+
+        let resp = client.send(req).await.unwrap();
+        let text = String::from_utf8(resp).unwrap();
+        assert!(
+            text.contains("authorization: Bearer test-key-123"),
+            "Response must contain Bearer header: {}",
+            text
+        );
+    }
+
+    #[tokio::test]
+    async fn x_api_key_header_set() {
+        let app = Router::new().route("/test", post(echo_handler));
+        let base = start_test_server(app).await;
+
+        let client = ProxyClient::new();
+        let req = ProxyRequest {
+            url: format!("{}/test", base),
+            auth: AuthHeaders {
+                style: AuthStyle::XApiKey,
+                api_key: "test-key-456".to_owned(),
+            },
+            body: vec![],
+            stream: false,
+        };
+
+        let resp = client.send(req).await.unwrap();
+        let text = String::from_utf8(resp).unwrap();
+        assert!(
+            text.contains("x-api-key: test-key-456"),
+            "Response must contain x-api-key header: {}",
+            text
+        );
+    }
+
+    #[tokio::test]
+    async fn both_headers_set() {
+        let app = Router::new().route("/test", post(echo_handler));
+        let base = start_test_server(app).await;
+
+        let client = ProxyClient::new();
+        let req = ProxyRequest {
+            url: format!("{}/test", base),
+            auth: AuthHeaders {
+                style: AuthStyle::Both,
+                api_key: "test-key-789".to_owned(),
+            },
+            body: vec![],
+            stream: false,
+        };
+
+        let resp = client.send(req).await.unwrap();
+        let text = String::from_utf8(resp).unwrap();
+        assert!(
+            text.contains("authorization: Bearer test-key-789"),
+            "Response must contain Bearer header: {}",
+            text
+        );
+        assert!(
+            text.contains("x-api-key: test-key-789"),
+            "Response must contain x-api-key header: {}",
+            text
+        );
+    }
+
+    #[tokio::test]
+    async fn error_status_returns_provider_error_api() {
+        let app = Router::new()
+            .route("/test", post(error_handler))
+            .with_state(429u16);
+        let base = start_test_server(app).await;
+
+        let client = ProxyClient::new();
+        let req = ProxyRequest {
+            url: format!("{}/test", base),
+            auth: AuthHeaders {
+                style: AuthStyle::Bearer,
+                api_key: "key".to_owned(),
+            },
+            body: vec![],
+            stream: false,
+        };
+
+        let err = client.send(req).await.unwrap_err();
+        match err {
+            ProviderError::Api { status, body } => {
+                assert_eq!(status, 429);
+                assert!(body.contains("upstream error"));
+            }
+            other => panic!("expected ProviderError::Api, got: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn streaming_error_status_returns_provider_error_api() {
+        let app = Router::new()
+            .route("/test", post(error_handler))
+            .with_state(500u16);
+        let base = start_test_server(app).await;
+
+        let client = ProxyClient::new();
+        let req = ProxyRequest {
+            url: format!("{}/test", base),
+            auth: AuthHeaders {
+                style: AuthStyle::Bearer,
+                api_key: "key".to_owned(),
+            },
+            body: vec![],
+            stream: true,
+        };
+
+        let result = client.send_stream(req).await;
+        assert!(result.is_err(), "expected error for 500 status");
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("expected ProviderError::Api"),
+        };
+        match err {
+            ProviderError::Api { status, body } => {
+                assert_eq!(status, 500);
+                assert!(body.contains("upstream error"));
+            }
+            other => panic!("expected ProviderError::Api, got: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_request_sets_accept_event_stream() {
+        let app = Router::new().route("/test", post(echo_stream_handler));
+        let base = start_test_server(app).await;
+
+        let client = ProxyClient::new();
+        let req = ProxyRequest {
+            url: format!("{}/test", base),
+            auth: AuthHeaders {
+                style: AuthStyle::Bearer,
+                api_key: "key".to_owned(),
+            },
+            body: vec![],
+            stream: true,
+        };
+
+        let mut stream = client.send_stream(req).await.unwrap();
+
+        // Collect all events and look for the Accept header echo.
+        let mut found_accept = false;
+        while let Some(item) = stream.next().await {
+            let chunk = item.unwrap();
+            let text = String::from_utf8_lossy(&chunk);
+            if text.contains("text/event-stream") {
+                found_accept = true;
+            }
+        }
+        assert!(found_accept, "Stream response must show Accept: text/event-stream was set");
+    }
+
+    #[tokio::test]
+    async fn non_stream_request_does_not_set_accept_event_stream() {
+        let app = Router::new().route("/test", post(echo_handler));
+        let base = start_test_server(app).await;
+
+        let client = ProxyClient::new();
+        let req = ProxyRequest {
+            url: format!("{}/test", base),
+            auth: AuthHeaders {
+                style: AuthStyle::Bearer,
+                api_key: "key".to_owned(),
+            },
+            body: vec![],
+            stream: false,
+        };
+
+        let resp = client.send(req).await.unwrap();
+        let text = String::from_utf8(resp).unwrap();
+        assert!(
+            !text.contains("text/event-stream"),
+            "Non-stream request must NOT set Accept: text/event-stream: {}",
+            text
+        );
+    }
+
+    #[tokio::test]
+    async fn request_body_sent_byte_for_byte() {
+        let app = Router::new().route("/test", post(echo_handler));
+        let base = start_test_server(app).await;
+
+        let client = ProxyClient::new();
+        let original_body = br#"{"model":"gpt-5","messages":[{"role":"user","content":"hi"}]}"#;
+        let req = ProxyRequest {
+            url: format!("{}/test", base),
+            auth: AuthHeaders {
+                style: AuthStyle::Bearer,
+                api_key: "key".to_owned(),
+            },
+            body: original_body.to_vec(),
+            stream: false,
+        };
+
+        let resp = client.send(req).await.unwrap();
+        let text = String::from_utf8(resp).unwrap();
+        let expected = std::str::from_utf8(original_body).unwrap();
+        assert!(
+            text.contains(expected),
+            "Response must echo the exact request body: {}",
+            text
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_stream_aborts_upstream() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let counter_clone = counter.clone();
+
+        // A proper handler function that sends data slowly so we can drop mid-stream.
+        async fn slow_handler(
+            axum::extract::State(counter): axum::extract::State<Arc<AtomicUsize>>,
+        ) -> axum::response::Response {
+            let stream = futures::stream::unfold(0u32, move |i| {
+                let counter = counter.clone();
+                async move {
+                    if i >= 100 {
+                        None
+                    } else {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                        let chunk = format!("data: chunk {}\n\n", i);
+                        Some((Ok::<_, std::convert::Infallible>(bytes::Bytes::from(chunk)), i + 1))
+                    }
+                }
+            });
+            (
+                StatusCode::OK,
+                [("Content-Type", "text/event-stream")],
+                Body::from_stream(stream),
+            )
+                .into_response()
+        }
+
+        let app = Router::new()
+            .route("/test", post(slow_handler))
+            .with_state(counter_clone);
+        let base = start_test_server(app).await;
+
+        let client = ProxyClient::new();
+        let req = ProxyRequest {
+            url: format!("{}/test", base),
+            auth: AuthHeaders {
+                style: AuthStyle::Bearer,
+                api_key: "key".to_owned(),
+            },
+            body: vec![],
+            stream: true,
+        };
+
+        {
+            let mut stream = client.send_stream(req).await.unwrap();
+            // Read one item to confirm stream is working.
+            let _first = stream.next().await;
+            // Stream is dropped here when it goes out of scope.
+        }
+
+        // Wait a bit for the server to notice the disconnect.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // The counter should be well below 100 since we dropped early.
+        let count = counter.load(Ordering::SeqCst);
+        assert!(
+            count < 50,
+            "Dropping the stream should abort upstream; counter was {}",
+            count
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Source guard checks
+    // -----------------------------------------------------------------------
+
+    /// Return only the production (non-test) portion of the source file.
+    /// The guard tests check for forbidden identifiers in production code,
+    /// not in the test assertions that mention those identifiers by name.
+    fn prod_source() -> &'static str {
+        let source = include_str!("transport.rs");
+        // Split at the test module boundary.
+        source.split_once("#[cfg(test)]").map(|(prod, _)| prod).unwrap_or(source)
+    }
+
+    #[test]
+    fn transport_source_no_endpoint_classification() {
+        let source = prod_source();
+        assert!(
+            !source.contains("EndpointType"),
+            "transport.rs must not mention EndpointType"
+        );
+        assert!(
+            !source.contains("classify_endpoint"),
+            "transport.rs must not mention classify_endpoint"
+        );
+    }
+
+    #[test]
+    fn transport_source_no_provider_model() {
+        let source = prod_source();
+        assert!(
+            !source.contains("OpenCodeClient"),
+            "transport.rs must not mention OpenCodeClient"
+        );
+        assert!(
+            !source.contains("opencode_go"),
+            "transport.rs must not mention provider names"
+        );
+        assert!(
+            !source.contains("opencode_zen"),
+            "transport.rs must not mention provider names"
+        );
+        assert!(
+            !source.contains("is_anthropic_model"),
+            "transport.rs must not mention model classification"
+        );
+        assert!(
+            !source.contains("is_gemini_model"),
+            "transport.rs must not mention model classification"
+        );
+        assert!(
+            !source.contains("is_responses_model"),
+            "transport.rs must not mention model classification"
+        );
+    }
+
+    #[test]
+    fn transport_source_no_protocol_import() {
+        let source = prod_source();
+        assert!(
+            !source.contains("llm_proxy_protocol"),
+            "transport.rs must not import llm_proxy_protocol"
+        );
+    }
+}

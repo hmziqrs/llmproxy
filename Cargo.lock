@@ -2100,6 +2100,7 @@ dependencies = [
 name = "llm-proxy-provider"
 version = "0.1.0"
 dependencies = [
+ "axum",
  "bytes",
  "futures",
  "llm-proxy-core",
