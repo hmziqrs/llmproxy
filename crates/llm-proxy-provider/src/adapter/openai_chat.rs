@@ -1,0 +1,1164 @@
+//! OpenAI Chat Completions provider adapter.
+//!
+//! Translates between core types and the OpenAI Chat Completions wire format:
+//!
+//! ```text
+//! CoreRequest  -> ChatCompletionRequest
+//! ChatCompletionResponse -> CoreResponse
+//! ChatCompletionChunk stream -> CoreEvent stream
+//! ```
+
+use llm_proxy_protocol::core::{
+    ContentKind, CoreContent, CoreEvent, CoreRequest,
+    CoreResponse, CoreRole, CoreToolChoice, ModelRef, StopReason,
+};
+use llm_proxy_protocol::openai::{
+    ChatCompletionChunk, ChatCompletionRequest, ChatMessage,
+    FunctionCall, FunctionDef, StreamOptions, ToolCall, ToolDef,
+};
+
+use super::{
+    build_proxy_request, build_usage_from_openai, expand_url_template, map_openai_finish_reason,
+    response_model_ref, ProviderAdapterTarget, ProviderStreamDecoder,
+};
+use crate::error::ProviderError;
+use crate::sse::SseFrame;
+
+// ---------------------------------------------------------------------------
+// Adapter struct
+// ---------------------------------------------------------------------------
+
+/// Adapter for the OpenAI Chat Completions API.
+#[derive(Debug, Clone)]
+pub struct OpenAiChatAdapter;
+
+// ---------------------------------------------------------------------------
+// Stream decoder
+// ---------------------------------------------------------------------------
+
+/// Stateful stream decoder for OpenAI Chat Completions SSE frames.
+#[derive(Debug)]
+pub struct OpenAiChatStreamDecoder {
+    model_ref: ModelRef,
+    started: bool,
+    content_index: usize,
+    content_started: bool,
+    reasoning_started: bool,
+    /// Maps OpenAI tool-call index to our content block index.
+    tool_blocks: std::collections::HashMap<usize, usize>,
+    stop_sent: bool,
+}
+
+impl ProviderStreamDecoder for OpenAiChatStreamDecoder {
+    fn decode_frame(&mut self, frame: &SseFrame) -> Result<Vec<CoreEvent>, ProviderError> {
+        let data = frame.data.trim();
+        if data.is_empty() || data == "[DONE]" {
+            return Ok(vec![]);
+        }
+
+        let chunk: ChatCompletionChunk = match serde_json::from_str(data) {
+            Ok(c) => c,
+            Err(_) => {
+                tracing::warn!(data, "malformed OpenAI chunk, skipping");
+                return Ok(vec![]);
+            }
+        };
+
+        let mut events = Vec::new();
+
+        if !self.started {
+            self.started = true;
+            events.push(CoreEvent::MessageStart {
+                id: Some(chunk.id.clone()),
+                model: self.model_ref.clone(),
+            });
+        }
+
+        // Usage-only chunk (no choices).
+        if chunk.choices.is_empty() {
+            if let Some(ref usage) = chunk.usage {
+                events.push(CoreEvent::UsageDelta {
+                    usage: build_usage_from_openai(
+                        usage.prompt_tokens,
+                        usage.completion_tokens,
+                        usage.prompt_cache_hit_tokens,
+                        usage.prompt_cache_miss_tokens,
+                    ),
+                });
+            }
+            return Ok(events);
+        }
+
+        let choice = &chunk.choices[0];
+
+        // Handle reasoning content (both `reasoning_content` and `reasoning`).
+        if let Some(reasoning) = choice
+            .delta
+            .as_ref()
+            .and_then(|d| d.reasoning_content.as_ref())
+        {
+            if !reasoning.is_empty() {
+                self.close_text_if_open(&mut events);
+                if !self.reasoning_started {
+                    self.reasoning_started = true;
+                    events.push(CoreEvent::ContentStart {
+                        index: self.content_index,
+                        kind: ContentKind::Thinking,
+                    });
+                }
+                events.push(CoreEvent::ThinkingDelta {
+                    index: self.content_index,
+                    text: reasoning.clone(),
+                });
+            }
+        }
+
+        // Handle text content deltas.
+        if let Some(ref delta) = choice.delta {
+            if !delta.content.is_empty() {
+                self.close_reasoning_if_open(&mut events);
+                if !self.content_started {
+                    self.content_started = true;
+                    events.push(CoreEvent::ContentStart {
+                        index: self.content_index,
+                        kind: ContentKind::Text,
+                    });
+                }
+                events.push(CoreEvent::TextDelta {
+                    index: self.content_index,
+                    text: delta.content.clone(),
+                });
+            }
+        }
+
+        // Handle tool call deltas.
+        if let Some(ref delta) = choice.delta {
+            if !delta.tool_calls.is_empty() {
+                self.close_content_if_open(&mut events);
+
+                for tc in &delta.tool_calls {
+                    let oi = tc.index.unwrap_or(0) as usize;
+
+                    // New tool call?
+                    if !self.tool_blocks.contains_key(&oi) {
+                        let func_name = tc
+                            .function
+                            .as_ref()
+                            .and_then(|f| f.name.as_deref())
+                            .unwrap_or("");
+                        if func_name.is_empty() {
+                            continue;
+                        }
+
+                        let tool_id = tc
+                            .id
+                            .clone()
+                            .unwrap_or_else(|| format!("toolu_{}", uuid::Uuid::new_v4()));
+
+                        let block_idx = self.content_index;
+                        self.tool_blocks.insert(oi, block_idx);
+
+                        events.push(CoreEvent::ToolCallStart {
+                            index: block_idx,
+                            id: tool_id,
+                            name: func_name.to_owned(),
+                        });
+
+                        self.content_index += 1;
+                    }
+
+                    // Argument delta.
+                    if let Some(ref func) = tc.function {
+                        if let Some(ref args) = func.arguments {
+                            if !args.is_empty() {
+                                if let Some(&block_idx) = self.tool_blocks.get(&oi) {
+                                    events.push(CoreEvent::ToolCallDelta {
+                                        index: block_idx,
+                                        args_delta: args.clone(),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Handle finish reason.
+        if let Some(ref reason) = choice.finish_reason {
+            if !reason.is_empty() && !self.stop_sent {
+                self.close_content_if_open(&mut events);
+                self.close_tool_blocks(&mut events);
+
+                let stop_reason = map_openai_finish_reason(reason);
+
+                if let Some(ref usage) = chunk.usage {
+                    events.push(CoreEvent::UsageDelta {
+                        usage: build_usage_from_openai(
+                            usage.prompt_tokens,
+                            usage.completion_tokens,
+                            usage.prompt_cache_hit_tokens,
+                            usage.prompt_cache_miss_tokens,
+                        ),
+                    });
+                }
+
+                events.push(CoreEvent::MessageStop {
+                    stop_reason,
+                    stop_sequence: None,
+                });
+                self.stop_sent = true;
+            }
+        }
+
+        Ok(events)
+    }
+
+    fn finish(&mut self) -> Result<Vec<CoreEvent>, ProviderError> {
+        let mut events = Vec::new();
+
+        if !self.started {
+            self.started = true;
+            events.push(CoreEvent::MessageStart {
+                id: None,
+                model: self.model_ref.clone(),
+            });
+        }
+
+        self.close_content_if_open(&mut events);
+        self.close_tool_blocks(&mut events);
+
+        if !self.stop_sent {
+            let stop_reason = if !self.tool_blocks.is_empty() {
+                StopReason::ToolUse
+            } else {
+                StopReason::EndTurn
+            };
+            events.push(CoreEvent::MessageStop {
+                stop_reason,
+                stop_sequence: None,
+            });
+            self.stop_sent = true;
+        }
+
+        Ok(events)
+    }
+}
+
+impl OpenAiChatStreamDecoder {
+    fn close_text_if_open(&mut self, _events: &mut Vec<CoreEvent>) {
+        if self.content_started {
+            // No explicit ToolCallStop for text; content_stop is implied.
+            self.content_started = false;
+            self.content_index += 1;
+        }
+    }
+
+    fn close_reasoning_if_open(&mut self, _events: &mut Vec<CoreEvent>) {
+        if self.reasoning_started {
+            self.reasoning_started = false;
+            self.content_index += 1;
+        }
+    }
+
+    fn close_content_if_open(&mut self, _events: &mut Vec<CoreEvent>) {
+        if self.content_started {
+            self.content_started = false;
+            self.content_index += 1;
+        }
+        if self.reasoning_started {
+            self.reasoning_started = false;
+            self.content_index += 1;
+        }
+    }
+
+    fn close_tool_blocks(&mut self, events: &mut Vec<CoreEvent>) {
+        let mut indices: Vec<_> = self.tool_blocks.values().copied().collect();
+        indices.sort();
+        for idx in indices {
+            events.push(CoreEvent::ToolCallStop { index: idx });
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// OpenAiChatAdapter impl
+// ---------------------------------------------------------------------------
+
+impl OpenAiChatAdapter {
+    /// Encode a core request into an OpenAI Chat Completions request.
+    pub fn encode_request(
+        &self,
+        core: &CoreRequest,
+        target: &ProviderAdapterTarget,
+    ) -> Result<super::ProxyRequest, ProviderError> {
+        let mut messages = Vec::new();
+
+        // System messages.
+        for sys_content in &core.system {
+            if let CoreContent::Text { text, .. } = sys_content {
+                if !text.is_empty() {
+                    messages.push(ChatMessage {
+                        role: "system".to_owned(),
+                        content: text.clone(),
+                        reasoning_content: None,
+                        tool_calls: Vec::new(),
+                        name: None,
+                        tool_call_id: None,
+                        cache_control: None,
+                        refusal: None,
+                    });
+                }
+            }
+        }
+
+        // Conversation messages.
+        for msg in &core.messages {
+            match msg.role {
+                CoreRole::User => {
+                    let text = collect_text(&msg.content);
+                    if !text.is_empty() {
+                        messages.push(ChatMessage {
+                            role: "user".to_owned(),
+                            content: text,
+                            reasoning_content: None,
+                            tool_calls: Vec::new(),
+                            name: None,
+                            tool_call_id: None,
+                            cache_control: None,
+                            refusal: None,
+                        });
+                    }
+
+                    // Tool results become separate tool messages.
+                    for content in &msg.content {
+                        if let CoreContent::ToolResult {
+                            tool_use_id,
+                            content: result_content,
+                            ..
+                        } = content
+                        {
+                            let result_text = collect_text(result_content);
+                            messages.push(ChatMessage {
+                                role: "tool".to_owned(),
+                                content: result_text,
+                                reasoning_content: None,
+                                tool_calls: Vec::new(),
+                                name: None,
+                                tool_call_id: Some(tool_use_id.clone()),
+                                cache_control: None,
+                                refusal: None,
+                            });
+                        }
+                    }
+                }
+                CoreRole::Assistant => {
+                    let text = collect_text(&msg.content);
+                    let mut tool_calls = Vec::new();
+                    let mut reasoning_content: Option<String> = None;
+
+                    for content in &msg.content {
+                        match content {
+                            CoreContent::Thinking { text, .. } => {
+                                if !text.is_empty() {
+                                    reasoning_content = Some(
+                                        reasoning_content
+                                            .map(|mut r| {
+                                                r.push_str(text);
+                                                r
+                                            })
+                                            .unwrap_or_else(|| text.clone()),
+                                    );
+                                }
+                            }
+                            CoreContent::ToolUse { id, name, input } => {
+                                let arguments = serde_json::to_string(input)
+                                    .unwrap_or_else(|_| "{}".to_owned());
+                                tool_calls.push(ToolCall {
+                                    index: None,
+                                    id: if id.is_empty() {
+                                        None
+                                    } else {
+                                        Some(id.clone())
+                                    },
+                                    r#type: Some("function".to_owned()),
+                                    function: Some(FunctionCall {
+                                        name: if name.is_empty() {
+                                            None
+                                        } else {
+                                            Some(name.clone())
+                                        },
+                                        arguments: Some(arguments),
+                                    }),
+                                });
+                            }
+                            _ => {}
+                        }
+                    }
+
+                    messages.push(ChatMessage {
+                        role: "assistant".to_owned(),
+                        content: text,
+                        reasoning_content,
+                        tool_calls,
+                        name: None,
+                        tool_call_id: None,
+                        cache_control: None,
+                        refusal: None,
+                    });
+                }
+                CoreRole::System => {
+                    let text = collect_text(&msg.content);
+                    if !text.is_empty() {
+                        messages.push(ChatMessage {
+                            role: "system".to_owned(),
+                            content: text,
+                            reasoning_content: None,
+                            tool_calls: Vec::new(),
+                            name: None,
+                            tool_call_id: None,
+                            cache_control: None,
+                            refusal: None,
+                        });
+                    }
+                }
+                CoreRole::Tool => {
+                    let text = collect_text(&msg.content);
+                    let tool_use_id = msg
+                        .content
+                        .iter()
+                        .find_map(|c| match c {
+                            CoreContent::ToolResult { tool_use_id, .. } => Some(tool_use_id.clone()),
+                            _ => None,
+                        })
+                        .unwrap_or_default();
+                    messages.push(ChatMessage {
+                        role: "tool".to_owned(),
+                        content: text,
+                        reasoning_content: None,
+                        tool_calls: Vec::new(),
+                        name: None,
+                        tool_call_id: Some(tool_use_id),
+                        cache_control: None,
+                        refusal: None,
+                    });
+                }
+                _ => {
+                    // Handle future CoreRole variants as user messages.
+                    let text = collect_text(&msg.content);
+                    if !text.is_empty() {
+                        messages.push(ChatMessage {
+                            role: "user".to_owned(),
+                            content: text,
+                            reasoning_content: None,
+                            tool_calls: Vec::new(),
+                            name: None,
+                            tool_call_id: None,
+                            cache_control: None,
+                            refusal: None,
+                        });
+                    }
+                }
+            }
+        }
+
+        // Tools.
+        let tools: Vec<ToolDef> = core
+            .tools
+            .iter()
+            .map(|t| {
+                let schema = if t.input_schema.is_null() {
+                    serde_json::json!({"type": "object", "properties": {}})
+                } else {
+                    t.input_schema.clone()
+                };
+                ToolDef {
+                    r#type: "function".to_owned(),
+                    function: FunctionDef {
+                        name: t.name.clone(),
+                        description: t.description.clone(),
+                        parameters: Some(schema),
+                    },
+                }
+            })
+            .collect();
+
+        // Tool choice.
+        let tool_choice = core.tool_choice.as_ref().map(|tc| match tc {
+            CoreToolChoice::Auto => serde_json::json!({"type": "auto"}),
+            CoreToolChoice::Any => serde_json::json!({"type": "required"}),
+            CoreToolChoice::None => serde_json::json!({"type": "none"}),
+            CoreToolChoice::Tool { name } => serde_json::json!({
+                "type": "function",
+                "function": {"name": name}
+            }),
+            CoreToolChoice::Raw(v) => v.clone(),
+            _ => serde_json::json!(null),
+        });
+
+        let mut req = ChatCompletionRequest {
+            model: target.upstream_model.clone(),
+            messages,
+            stream: if core.stream { Some(true) } else { None },
+            temperature: core.sampling.temperature,
+            top_p: core.sampling.top_p,
+            max_tokens: core.sampling.max_tokens,
+            reasoning_effort: core.sampling.reasoning_effort.clone(),
+            thinking: core.sampling.thinking.clone(),
+            tools,
+            tool_choice,
+            stop: core.sampling.stop.as_ref().map(|v| {
+                if v.len() == 1 {
+                    serde_json::Value::String(v[0].clone())
+                } else {
+                    serde_json::to_value(v).unwrap_or(serde_json::Value::Null)
+                }
+            }),
+            stream_options: None,
+            user: core.metadata.user_id.clone(),
+            extra: serde_json::Map::new(),
+        };
+
+        // Add stream_options with include_usage for streaming.
+        if core.stream {
+            req.stream_options = Some(StreamOptions {
+                include_usage: Some(true),
+            });
+        }
+
+        let body = serde_json::to_vec(&req)?;
+        let url = expand_url_template(&target.endpoint, target);
+
+        Ok(build_proxy_request(body, target, core.stream, url))
+    }
+
+    /// Decode an OpenAI Chat Completions response body.
+    pub fn decode_response(
+        &self,
+        bytes: &[u8],
+        target: &ProviderAdapterTarget,
+    ) -> Result<CoreResponse, ProviderError> {
+        let resp: llm_proxy_protocol::openai::ChatCompletionResponse =
+            serde_json::from_slice(bytes)?;
+
+        if resp.choices.is_empty() {
+            return Err(ProviderError::SseFraming(
+                "no choices in response".to_owned(),
+            ));
+        }
+
+        let choice = &resp.choices[0];
+        let msg = choice
+            .message
+            .as_ref()
+            .ok_or_else(|| ProviderError::SseFraming("choice has no message".to_owned()))?;
+
+        let mut content = Vec::new();
+
+        // Reasoning -> Thinking.
+        if let Some(ref reasoning) = msg.reasoning_content {
+            if !reasoning.is_empty() {
+                content.push(CoreContent::Thinking {
+                    text: reasoning.clone(),
+                    signature: None,
+                });
+            }
+        }
+
+        // Tool calls -> ToolUse.
+        for tc in &msg.tool_calls {
+            let input = tc
+                .function
+                .as_ref()
+                .and_then(|f| f.arguments.as_ref())
+                .and_then(|args| serde_json::from_str::<serde_json::Value>(args).ok())
+                .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+
+            content.push(CoreContent::ToolUse {
+                id: tc.id.clone().unwrap_or_default(),
+                name: tc
+                    .function
+                    .as_ref()
+                    .and_then(|f| f.name.clone())
+                    .unwrap_or_default(),
+                input,
+            });
+        }
+
+        // Text content.
+        if !msg.content.is_empty() {
+            content.push(CoreContent::Text {
+                text: msg.content.clone(),
+                cache: None,
+            });
+        }
+
+        // Guarantee at least one content block.
+        if content.is_empty() {
+            content.push(CoreContent::Text {
+                text: String::new(),
+                cache: None,
+            });
+        }
+
+        let stop_reason = choice
+            .finish_reason
+            .as_deref()
+            .map(map_openai_finish_reason)
+            .unwrap_or(StopReason::Unknown);
+
+        let usage = build_usage_from_openai(
+            resp.usage.prompt_tokens,
+            resp.usage.completion_tokens,
+            resp.usage.prompt_cache_hit_tokens,
+            resp.usage.prompt_cache_miss_tokens,
+        );
+
+        Ok(CoreResponse {
+            id: Some(resp.id),
+            model: response_model_ref(target),
+            content,
+            stop_reason,
+            stop_sequence: None,
+            usage,
+            provider_meta: serde_json::Map::new(),
+        })
+    }
+
+    /// Create a new stream decoder.
+    pub fn new_stream_decoder(
+        &self,
+        target: &ProviderAdapterTarget,
+    ) -> Box<dyn ProviderStreamDecoder + Send> {
+        Box::new(OpenAiChatStreamDecoder {
+            model_ref: response_model_ref(target),
+            started: false,
+            content_index: 0,
+            content_started: false,
+            reasoning_started: false,
+            tool_blocks: std::collections::HashMap::new(),
+            stop_sent: false,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Collect all text from a list of content blocks.
+fn collect_text(content: &[CoreContent]) -> String {
+    content
+        .iter()
+        .filter_map(|c| match c {
+            CoreContent::Text { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+// ===========================================================================
+// Tests
+// ===========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use llm_proxy_core::AuthStyle;
+    use llm_proxy_protocol::core::{
+        CoreMessage, CoreRequest, CoreRole, CoreTool, CoreToolChoice, ModelRef, SamplingOptions,
+    };
+    use llm_proxy_protocol::openai::{Choice, UsageInfo};
+
+    fn make_target() -> ProviderAdapterTarget {
+        ProviderAdapterTarget {
+            provider_name: "test-openai".into(),
+            adapter_name: "openai-chat".into(),
+            protocol: super::super::ProviderProtocol::OpenAiChatCompletions,
+            endpoint: "https://api.openai.com/v1/chat/completions".into(),
+            auth_style: AuthStyle::Bearer,
+            api_key: "test-key".into(),
+            requested_model: "gpt-4o".into(),
+            upstream_model: "gpt-4o-2024-08-06".into(),
+        }
+    }
+
+    fn make_core_request(messages: Vec<CoreMessage>) -> CoreRequest {
+        CoreRequest {
+            model: ModelRef {
+                requested: "gpt-4o".into(),
+                upstream: None,
+            },
+            system: vec![],
+            messages,
+            tools: vec![],
+            tool_choice: None,
+            sampling: SamplingOptions::default(),
+            stream: false,
+            metadata: Default::default(),
+            provider_hints: Default::default(),
+        }
+    }
+
+    // -- encode_request tests ------------------------------------------------
+
+    #[test]
+    fn encode_text_request() {
+        let core = make_core_request(vec![CoreMessage {
+            role: CoreRole::User,
+            content: vec![CoreContent::Text {
+                text: "Hello".into(),
+                cache: None,
+            }],
+        }]);
+        let adapter = OpenAiChatAdapter;
+        let target = make_target();
+        let proxy_req = adapter.encode_request(&core, &target).unwrap();
+
+        let body: ChatCompletionRequest = serde_json::from_slice(&proxy_req.body).unwrap();
+        assert_eq!(body.model, "gpt-4o-2024-08-06");
+        assert_eq!(body.messages.len(), 1);
+        assert_eq!(body.messages[0].role, "user");
+        assert_eq!(body.messages[0].content, "Hello");
+    }
+
+    #[test]
+    fn encode_system_prompt() {
+        let mut core = make_core_request(vec![CoreMessage {
+            role: CoreRole::User,
+            content: vec![CoreContent::Text {
+                text: "hi".into(),
+                cache: None,
+            }],
+        }]);
+        core.system = vec![CoreContent::Text {
+            text: "You are helpful".into(),
+            cache: None,
+        }];
+        let adapter = OpenAiChatAdapter;
+        let target = make_target();
+        let proxy_req = adapter.encode_request(&core, &target).unwrap();
+
+        let body: ChatCompletionRequest = serde_json::from_slice(&proxy_req.body).unwrap();
+        assert_eq!(body.messages[0].role, "system");
+        assert_eq!(body.messages[0].content, "You are helpful");
+    }
+
+    #[test]
+    fn encode_tool_declarations() {
+        let mut core = make_core_request(vec![CoreMessage {
+            role: CoreRole::User,
+            content: vec![CoreContent::Text {
+                text: "hi".into(),
+                cache: None,
+            }],
+        }]);
+        core.tools = vec![CoreTool {
+            name: "get_weather".into(),
+            description: Some("Get weather".into()),
+            input_schema: serde_json::json!({"type": "object", "properties": {"city": {"type": "string"}}}),
+        }];
+        let adapter = OpenAiChatAdapter;
+        let target = make_target();
+        let proxy_req = adapter.encode_request(&core, &target).unwrap();
+
+        let body: ChatCompletionRequest = serde_json::from_slice(&proxy_req.body).unwrap();
+        assert_eq!(body.tools.len(), 1);
+        assert_eq!(body.tools[0].function.name, "get_weather");
+    }
+
+    #[test]
+    fn encode_tool_choice() {
+        let mut core = make_core_request(vec![CoreMessage {
+            role: CoreRole::User,
+            content: vec![CoreContent::Text {
+                text: "hi".into(),
+                cache: None,
+            }],
+        }]);
+        core.tool_choice = Some(CoreToolChoice::Auto);
+        let adapter = OpenAiChatAdapter;
+        let target = make_target();
+        let proxy_req = adapter.encode_request(&core, &target).unwrap();
+
+        let body: ChatCompletionRequest = serde_json::from_slice(&proxy_req.body).unwrap();
+        assert_eq!(body.tool_choice, Some(serde_json::json!({"type": "auto"})));
+    }
+
+    #[test]
+    fn encode_tool_result() {
+        let core = make_core_request(vec![
+            CoreMessage {
+                role: CoreRole::User,
+                content: vec![CoreContent::Text {
+                    text: "use tool".into(),
+                    cache: None,
+                }],
+            },
+            CoreMessage {
+                role: CoreRole::Assistant,
+                content: vec![CoreContent::ToolUse {
+                    id: "call_1".into(),
+                    name: "get_weather".into(),
+                    input: serde_json::json!({"city": "SF"}),
+                }],
+            },
+            CoreMessage {
+                role: CoreRole::User,
+                content: vec![CoreContent::ToolResult {
+                    tool_use_id: "call_1".into(),
+                    content: vec![CoreContent::Text {
+                        text: "72F sunny".into(),
+                        cache: None,
+                    }],
+                    is_error: false,
+                }],
+            },
+        ]);
+        let adapter = OpenAiChatAdapter;
+        let target = make_target();
+        let proxy_req = adapter.encode_request(&core, &target).unwrap();
+
+        let body: ChatCompletionRequest = serde_json::from_slice(&proxy_req.body).unwrap();
+        assert_eq!(body.messages.len(), 3);
+        assert_eq!(body.messages[0].role, "user");
+        assert_eq!(body.messages[1].role, "assistant");
+        assert_eq!(body.messages[1].tool_calls.len(), 1);
+        assert_eq!(body.messages[2].role, "tool");
+        assert_eq!(body.messages[2].tool_call_id, Some("call_1".to_owned()));
+        assert_eq!(body.messages[2].content, "72F sunny");
+    }
+
+    #[test]
+    fn encode_stream_sets_stream_options() {
+        let mut core = make_core_request(vec![CoreMessage {
+            role: CoreRole::User,
+            content: vec![CoreContent::Text {
+                text: "hi".into(),
+                cache: None,
+            }],
+        }]);
+        core.stream = true;
+        let adapter = OpenAiChatAdapter;
+        let target = make_target();
+        let proxy_req = adapter.encode_request(&core, &target).unwrap();
+
+        let body: ChatCompletionRequest = serde_json::from_slice(&proxy_req.body).unwrap();
+        assert_eq!(body.stream, Some(true));
+        assert!(body.stream_options.is_some());
+        assert_eq!(
+            body.stream_options.unwrap().include_usage,
+            Some(true)
+        );
+        assert!(proxy_req.stream);
+    }
+
+    #[test]
+    fn encode_uses_upstream_model() {
+        let core = make_core_request(vec![CoreMessage {
+            role: CoreRole::User,
+            content: vec![CoreContent::Text {
+                text: "hi".into(),
+                cache: None,
+            }],
+        }]);
+        let adapter = OpenAiChatAdapter;
+        let target = make_target();
+        let proxy_req = adapter.encode_request(&core, &target).unwrap();
+
+        let body: ChatCompletionRequest = serde_json::from_slice(&proxy_req.body).unwrap();
+        assert_eq!(body.model, "gpt-4o-2024-08-06");
+    }
+
+    #[test]
+    fn encode_sampling_options() {
+        let mut core = make_core_request(vec![CoreMessage {
+            role: CoreRole::User,
+            content: vec![CoreContent::Text {
+                text: "hi".into(),
+                cache: None,
+            }],
+        }]);
+        core.sampling = SamplingOptions {
+            temperature: Some(0.7),
+            top_p: Some(0.9),
+            max_tokens: Some(1024),
+            stop: Some(vec!["END".into()]),
+            ..Default::default()
+        };
+        let adapter = OpenAiChatAdapter;
+        let target = make_target();
+        let proxy_req = adapter.encode_request(&core, &target).unwrap();
+
+        let body: ChatCompletionRequest = serde_json::from_slice(&proxy_req.body).unwrap();
+        assert_eq!(body.temperature, Some(0.7));
+        assert_eq!(body.top_p, Some(0.9));
+        assert_eq!(body.max_tokens, Some(1024));
+        assert_eq!(body.stop, Some(serde_json::json!("END")));
+    }
+
+    // -- decode_response tests -----------------------------------------------
+
+    #[test]
+    fn decode_text_response() {
+        let target = make_target();
+        let resp = llm_proxy_protocol::openai::ChatCompletionResponse {
+            id: "chatcmpl-test".into(),
+            object: "chat.completion".into(),
+            created: 12345,
+            model: "gpt-4o-2024-08-06".into(),
+            choices: vec![Choice {
+                index: 0,
+                message: Some(ChatMessage {
+                    role: "assistant".into(),
+                    content: "hello world".into(),
+                    reasoning_content: None,
+                    tool_calls: vec![],
+                    name: None,
+                    tool_call_id: None,
+                    cache_control: None,
+                    refusal: None,
+                }),
+                finish_reason: Some("stop".into()),
+                delta: None,
+            }],
+            usage: UsageInfo {
+                prompt_tokens: 100,
+                completion_tokens: 50,
+                total_tokens: 150,
+                prompt_cache_hit_tokens: Some(10),
+                prompt_cache_miss_tokens: Some(20),
+            },
+        };
+        let bytes = serde_json::to_vec(&resp).unwrap();
+        let adapter = OpenAiChatAdapter;
+        let core_resp = adapter.decode_response(&bytes, &target).unwrap();
+
+        assert_eq!(core_resp.id, Some("chatcmpl-test".to_owned()));
+        assert_eq!(core_resp.model.requested, "gpt-4o");
+        assert_eq!(core_resp.stop_reason, StopReason::EndTurn);
+        assert_eq!(core_resp.usage.input_tokens, 70);
+        assert_eq!(core_resp.usage.output_tokens, 50);
+        assert_eq!(core_resp.content.len(), 1);
+        assert_eq!(
+            core_resp.content[0],
+            CoreContent::Text {
+                text: "hello world".into(),
+                cache: None,
+            }
+        );
+    }
+
+    #[test]
+    fn decode_tool_call_response() {
+        let target = make_target();
+        let resp = llm_proxy_protocol::openai::ChatCompletionResponse {
+            id: "chatcmpl-test".into(),
+            object: "chat.completion".into(),
+            created: 0,
+            model: "gpt-4o".into(),
+            choices: vec![Choice {
+                index: 0,
+                message: Some(ChatMessage {
+                    role: "assistant".into(),
+                    content: String::new(),
+                    reasoning_content: None,
+                    tool_calls: vec![ToolCall {
+                        index: None,
+                        id: Some("call_123".into()),
+                        r#type: Some("function".into()),
+                        function: Some(FunctionCall {
+                            name: Some("get_weather".into()),
+                            arguments: Some(r#"{"city":"SF"}"#.into()),
+                        }),
+                    }],
+                    name: None,
+                    tool_call_id: None,
+                    cache_control: None,
+                    refusal: None,
+                }),
+                finish_reason: Some("tool_calls".into()),
+                delta: None,
+            }],
+            usage: UsageInfo {
+                prompt_tokens: 200,
+                completion_tokens: 80,
+                total_tokens: 280,
+                prompt_cache_hit_tokens: None,
+                prompt_cache_miss_tokens: None,
+            },
+        };
+        let bytes = serde_json::to_vec(&resp).unwrap();
+        let adapter = OpenAiChatAdapter;
+        let core_resp = adapter.decode_response(&bytes, &target).unwrap();
+
+        assert_eq!(core_resp.stop_reason, StopReason::ToolUse);
+        let tool = &core_resp.content[0];
+        match tool {
+            CoreContent::ToolUse { id, name, input } => {
+                assert_eq!(id, "call_123");
+                assert_eq!(name, "get_weather");
+                assert_eq!(input["city"], "SF");
+            }
+            _ => panic!("expected ToolUse, got {:?}", tool),
+        }
+    }
+
+    #[test]
+    fn decode_response_preserves_requested_model() {
+        let target = make_target();
+        let resp = llm_proxy_protocol::openai::ChatCompletionResponse {
+            id: "test".into(),
+            object: "chat.completion".into(),
+            created: 0,
+            model: "gpt-4o-2024-08-06".into(),
+            choices: vec![Choice {
+                index: 0,
+                message: Some(ChatMessage {
+                    role: "assistant".into(),
+                    content: "hi".into(),
+                    reasoning_content: None,
+                    tool_calls: vec![],
+                    name: None,
+                    tool_call_id: None,
+                    cache_control: None,
+                    refusal: None,
+                }),
+                finish_reason: Some("stop".into()),
+                delta: None,
+            }],
+            usage: UsageInfo {
+                prompt_tokens: 10,
+                completion_tokens: 5,
+                total_tokens: 15,
+                prompt_cache_hit_tokens: None,
+                prompt_cache_miss_tokens: None,
+            },
+        };
+        let bytes = serde_json::to_vec(&resp).unwrap();
+        let adapter = OpenAiChatAdapter;
+        let core_resp = adapter.decode_response(&bytes, &target).unwrap();
+
+        assert_eq!(core_resp.model.requested, "gpt-4o");
+    }
+
+    // -- Streaming tests -----------------------------------------------------
+
+    #[test]
+    fn stream_text_decoding() {
+        let target = make_target();
+        let adapter = OpenAiChatAdapter;
+        let mut decoder = adapter.new_stream_decoder(&target);
+
+        let frames = vec![
+            make_frame(r#"{"id":"c","object":"chat.completion.chunk","created":0,"model":"m","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}"#),
+            make_frame(r#"{"id":"c","object":"chat.completion.chunk","created":0,"model":"m","choices":[{"index":0,"delta":{"content":"Hello"},"finish_reason":null}]}"#),
+            make_frame(r#"{"id":"c","object":"chat.completion.chunk","created":0,"model":"m","choices":[{"index":0,"delta":{"content":" world"},"finish_reason":null}]}"#),
+            make_frame(r#"{"id":"c","object":"chat.completion.chunk","created":0,"model":"m","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#),
+        ];
+
+        let mut all_events = Vec::new();
+        for frame in &frames {
+            all_events.extend(decoder.decode_frame(frame).unwrap());
+        }
+        all_events.extend(decoder.finish().unwrap());
+
+        assert_has_event(&all_events, "MessageStart");
+        assert_has_event(&all_events, "ContentStart");
+        assert!(all_events.iter().any(|e| matches!(
+            e,
+            CoreEvent::TextDelta { text, .. } if text == "Hello"
+        )));
+        assert!(all_events.iter().any(|e| matches!(
+            e,
+            CoreEvent::TextDelta { text, .. } if text == " world"
+        )));
+        assert_has_event(&all_events, "MessageStop");
+    }
+
+    #[test]
+    fn stream_tool_call_decoding() {
+        let target = make_target();
+        let adapter = OpenAiChatAdapter;
+        let mut decoder = adapter.new_stream_decoder(&target);
+
+        let frames = vec![
+            make_frame(r#"{"id":"c","object":"chat.completion.chunk","created":0,"model":"m","choices":[{"index":0,"delta":{"content":"calling"},"finish_reason":null}]}"#),
+            make_frame(r#"{"id":"c","object":"chat.completion.chunk","created":0,"model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"get_weather","arguments":""}}]},"finish_reason":null}]}"#),
+            make_frame(r#"{"id":"c","object":"chat.completion.chunk","created":0,"model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"city\":"}}]},"finish_reason":null}]}"#),
+            make_frame(r#"{"id":"c","object":"chat.completion.chunk","created":0,"model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"SF\"}"}}]},"finish_reason":null}]}"#),
+            make_frame(r#"{"id":"c","object":"chat.completion.chunk","created":0,"model":"m","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#),
+        ];
+
+        let mut all_events = Vec::new();
+        for frame in &frames {
+            all_events.extend(decoder.decode_frame(frame).unwrap());
+        }
+
+        assert!(all_events.iter().any(|e| matches!(
+            e,
+            CoreEvent::ToolCallStart { name, .. } if name == "get_weather"
+        )));
+        assert!(all_events
+            .iter()
+            .any(|e| matches!(e, CoreEvent::ToolCallDelta { .. })));
+        assert_has_event(&all_events, "ToolCallStop");
+        assert!(all_events
+            .iter()
+            .any(|e| matches!(e, CoreEvent::MessageStop { stop_reason: StopReason::ToolUse, .. })));
+    }
+
+    #[test]
+    fn stream_done_marker_ignored() {
+        let target = make_target();
+        let adapter = OpenAiChatAdapter;
+        let mut decoder = adapter.new_stream_decoder(&target);
+
+        let frame = make_frame("[DONE]");
+        let events = decoder.decode_frame(&frame).unwrap();
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn stream_malformed_frame_skipped() {
+        let target = make_target();
+        let adapter = OpenAiChatAdapter;
+        let mut decoder = adapter.new_stream_decoder(&target);
+
+        let frame = make_frame("{not valid json}");
+        let events = decoder.decode_frame(&frame).unwrap();
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn stream_finish_emits_lifecycle() {
+        let target = make_target();
+        let adapter = OpenAiChatAdapter;
+        let mut decoder = adapter.new_stream_decoder(&target);
+
+        let events = decoder.finish().unwrap();
+        assert_has_event(&events, "MessageStart");
+        assert_has_event(&events, "MessageStop");
+    }
+
+    // -- Helpers --------------------------------------------------------------
+
+    fn make_frame(data: &str) -> crate::sse::SseFrame {
+        crate::sse::SseFrame {
+            event: None,
+            id: None,
+            data: data.to_owned(),
+        }
+    }
+
+    fn assert_has_event(events: &[CoreEvent], name: &str) {
+        let found = match name {
+            "MessageStart" => events.iter().any(|e| matches!(e, CoreEvent::MessageStart { .. })),
+            "ContentStart" => events.iter().any(|e| matches!(e, CoreEvent::ContentStart { .. })),
+            "MessageStop" => events.iter().any(|e| matches!(e, CoreEvent::MessageStop { .. })),
+            "ToolCallStop" => events.iter().any(|e| matches!(e, CoreEvent::ToolCallStop { .. })),
+            _ => false,
+        };
+        assert!(found, "expected {} event, got: {:?}", name, events);
+    }
+}

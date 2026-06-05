@@ -705,12 +705,10 @@ mod tests {
                 content: GeminiContent {
                     role: "model".to_owned(),
                     parts: vec![
-                        GeminiPart {
-                            text: Some("Hello ".to_owned()),
-                        },
-                        GeminiPart {
-                            text: Some("world".to_owned()),
-                        },
+                        serde_json::from_value(serde_json::json!({"text": "Hello "}))
+                            .unwrap(),
+                        serde_json::from_value(serde_json::json!({"text": "world"}))
+                            .unwrap(),
                     ],
                 },
                 finish_reason: Some("STOP".to_owned()),
@@ -743,9 +741,7 @@ mod tests {
             candidates: vec![GeminiCandidate {
                 content: GeminiContent {
                     role: "model".to_owned(),
-                    parts: vec![GeminiPart {
-                        text: Some("truncated".to_owned()),
-                    }],
+                    parts: vec![serde_json::from_value(serde_json::json!({"text": "truncated"})).unwrap()],
                 },
                 finish_reason: Some("MAX_TOKENS".to_owned()),
             }],
@@ -766,7 +762,7 @@ mod tests {
             candidates: vec![GeminiCandidate {
                 content: GeminiContent {
                     role: "model".to_owned(),
-                    parts: vec![GeminiPart { text: None }],
+                    parts: vec![serde_json::from_value::<GeminiPart>(serde_json::json!({})).unwrap()],
                 },
                 finish_reason: None,
             }],
@@ -891,9 +887,7 @@ mod tests {
             candidates: vec![GeminiCandidate {
                 content: GeminiContent {
                     role: "model".to_owned(),
-                    parts: vec![GeminiPart {
-                        text: Some(String::new()),
-                    }],
+                    parts: vec![serde_json::from_value::<GeminiPart>(serde_json::json!({"text": ""})).unwrap()],
                 },
                 finish_reason: Some("STOP".to_owned()),
             }],

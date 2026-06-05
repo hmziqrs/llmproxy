@@ -185,10 +185,30 @@ pub struct GeminiContent {
 }
 
 /// A single content part inside a Gemini message.
+///
+/// Note: `deny_unknown_fields` is intentionally omitted because Gemini may
+/// return additional part types (e.g. `inline_data`, `file_data`) that the
+/// proxy does not model yet. Unknown fields are silently ignored rather than
+/// causing parse failures.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct GeminiPart {
     /// Text content of this part.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
+    /// Function call (present when the model invokes a tool).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub function_call: Option<GeminiFunctionCall>,
+}
+
+/// A function call emitted by the Gemini model.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GeminiFunctionCall {
+    /// The name of the function to call.
+    pub name: String,
+    /// The arguments to pass to the function.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub args: Option<serde_json::Value>,
 }
 
 /// Generation parameters for a Gemini request.
@@ -228,6 +248,7 @@ pub struct GeminiResponse {
     /// Candidate completions.
     pub candidates: Vec<GeminiCandidate>,
     /// Token usage metadata.
+    #[serde(rename = "usageMetadata")]
     pub usage_metadata: Option<GeminiUsage>,
 }
 
@@ -243,6 +264,7 @@ pub struct GeminiCandidate {
 
 /// Token usage metadata reported by the Gemini API.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct GeminiUsage {
     /// Number of tokens in the prompt.
     pub prompt_token_count: i32,
@@ -262,5 +284,6 @@ pub struct GeminiStreamChunk {
     /// Candidate completions in this chunk.
     pub candidates: Vec<GeminiCandidate>,
     /// Token usage metadata (usually present on the final chunk).
+    #[serde(rename = "usageMetadata")]
     pub usage_metadata: Option<GeminiUsage>,
 }

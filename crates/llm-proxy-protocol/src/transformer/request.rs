@@ -806,12 +806,14 @@ pub fn transform_to_gemini(
             role: "user".to_owned(),
             parts: vec![GeminiPart {
                 text: Some(format!("[System Instruction] {}", system_text)),
+                function_call: None,
             }],
         });
         contents.push(GeminiContent {
             role: "model".to_owned(),
             parts: vec![GeminiPart {
                 text: Some("Understood. I will follow these instructions.".to_owned()),
+                function_call: None,
             }],
         });
     }
@@ -838,6 +840,7 @@ pub fn transform_to_gemini(
                                 block.get_tool_id(),
                                 tool_content
                             )),
+                            function_call: None,
                         }],
                     });
                 }
@@ -857,7 +860,7 @@ pub fn transform_to_gemini(
             };
             contents.push(GeminiContent {
                 role: role.to_owned(),
-                parts: vec![GeminiPart { text: Some(text) }],
+                parts: vec![GeminiPart { text: Some(text), function_call: None }],
             });
         }
     }

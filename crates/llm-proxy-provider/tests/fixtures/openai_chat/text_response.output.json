@@ -1,0 +1,12 @@
+{
+  "id": "chatcmpl-abc123",
+  "model": "gpt-4o",
+  "content": [
+    { "type": "text", "text": "Hello! How can I help you?" }
+  ],
+  "stop_reason": "end_turn",
+  "usage": {
+    "input_tokens": 10,
+    "output_tokens": 8
+  }
+}

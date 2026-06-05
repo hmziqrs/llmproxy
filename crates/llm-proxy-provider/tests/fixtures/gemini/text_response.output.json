@@ -1,0 +1,11 @@
+{
+  "model": "gemini-2.5-pro",
+  "content": [
+    { "type": "text", "text": "Hello! How can I help you?" }
+  ],
+  "stop_reason": "end_turn",
+  "usage": {
+    "input_tokens": 10,
+    "output_tokens": 8
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "id": "msg_abc123",
+  "model": "claude-3-5-sonnet-20241022",
+  "content": [
+    { "type": "text", "text": "Hello! How can I help you?" }
+  ],
+  "stop_reason": "end_turn",
+  "usage": {
+    "input_tokens": 10,
+    "output_tokens": 8
+  }
+}

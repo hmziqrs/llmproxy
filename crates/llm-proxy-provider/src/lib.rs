@@ -3,11 +3,16 @@
 //! Manages HTTP connections to upstream LLM providers (OpenCode Go and Zen),
 //! with connection pooling, model-based endpoint routing, and streaming support.
 
+pub mod adapter;
 pub mod client;
 pub mod error;
 pub mod sse;
 pub mod transport;
 
+pub use adapter::{
+    AnthropicAdapter, GeminiAdapter, OpenAiChatAdapter, ProviderAdapter, ProviderAdapterRegistry,
+    ProviderAdapterTarget, ProviderProtocol, ProviderStreamDecoder, ResponsesAdapter,
+};
 pub use client::{
     EndpointType, OpenCodeClient, PROVIDER_OPENCODE_GO, PROVIDER_OPENCODE_ZEN,
     classify_endpoint, is_anthropic_model, is_gemini_model, is_responses_model, is_zen, provider,
