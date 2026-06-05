@@ -1,3 +1,14 @@
+//! OpenAI Chat Completions route (placeholder).
+//!
+//! Note: This route is **not mounted** in the router until Phase 9.
+//! The types defined here (`ChatRequest`, `ChatMessage`, `ChatResponse`, etc.)
+//! are placeholders that shadow the protocol crate types. When Phase 9 mounts
+//! this route, these types should be replaced by the protocol crate types
+//! (`llm_proxy_protocol::openai::*`) to avoid maintaining parallel type
+//! definitions.
+
+#![allow(dead_code)] // Intentionally unmounted until Phase 9.
+
 use axum::extract::State;
 use axum_serde::Sonic;
 use serde::{Deserialize, Serialize};

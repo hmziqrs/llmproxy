@@ -121,10 +121,15 @@ async fn unknown_route_returns_not_found() {
 // -- Route guardrails (Phase 0 characterization) ---------------------------
 
 /// Phase 0 guardrail: POST /v1/messages with valid Anthropic JSON must parse
-/// and validate the request shape. Any failure must be an upstream or auth
-/// error -- never a bad-JSON or request-shape error (400 with
-/// `invalid_request_error` for missing `model` / `messages` is acceptable;
-/// 400 with a JSON parse error is not).
+/// and validate the request shape. This test verifies that the route is
+/// registered and the request body parses successfully. Any failure must be
+/// an upstream or auth error -- never a bad-JSON or request-shape error.
+///
+/// Note: The assertion on `error_type != "invalid_request_error"` when status
+/// is 400 is a best-effort guard, not a guarantee. The Anthropic API itself
+/// returns `invalid_request_error` for valid JSON with semantic issues. The
+/// test specifically checks that the request parses and routes without a
+/// JSON/shape error, not that no 400 can ever occur.
 #[tokio::test]
 async fn messages_valid_json_parses_and_validates() {
     let app = build_router(state());
@@ -157,6 +162,10 @@ async fn messages_valid_json_parses_and_validates() {
     // the request body was malformed, which it is not.
     if status == StatusCode::BAD_REQUEST {
         let error_type = resp_body["error"]["type"].as_str().unwrap_or("");
+        // The assertion checks that valid JSON does not trigger a shape error.
+        // If a future code change makes the server return 400 with
+        // invalid_request_error for a valid request (a regression), this guard
+        // would catch it.
         assert_ne!(
             error_type,
             "invalid_request_error",
@@ -350,4 +359,25 @@ async fn messages_unknown_fields_returns_bad_request() {
     )
     .unwrap();
     assert_eq!(resp_body["error"]["type"], "invalid_request_error");
+}
+
+/// Phase 0: POST /v1/messages with invalid UTF-8 bytes returns 400.
+/// The server must not panic when receiving binary/non-UTF-8 body data.
+#[tokio::test]
+async fn messages_invalid_utf8_returns_bad_request() {
+    let app = build_router(state());
+    // Raw non-UTF-8 bytes.
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/messages")
+        .header("content-type", "application/json")
+        .body(Body::from(vec![0x80, 0x81, 0x82]))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    // The server should return a 400-level error, not panic (5xx).
+    assert!(
+        resp.status().is_client_error(),
+        "expected 4xx for invalid UTF-8, got {}",
+        resp.status()
+    );
 }

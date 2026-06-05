@@ -127,6 +127,18 @@ pub enum ProviderError {
     #[error("request failed: {0}")]
     Http(#[from] reqwest::Error),
     /// The upstream API returned an error status code.
+    ///
+    /// # Security note
+    ///
+    /// The `body` field stores the full upstream response body verbatim.
+    /// When upstream returns a 401/403 with an error message containing
+    /// hints about the API key (e.g. "invalid api_key: sk-..."), the body
+    /// is propagated as-is into error strings and eventually logged via
+    /// `error!()` or returned to the client. The `reqwest::Error` Display
+    /// format may also include the full URL with sensitive query parameters.
+    ///
+    /// Future phases should sanitize or truncate the body before storing it
+    /// (e.g. max 512 bytes, stripping patterns that look like API keys).
     #[error("API error {status}: {body}")]
     Api {
         /// HTTP status code.
@@ -141,6 +153,13 @@ pub enum ProviderError {
 // ---------------------------------------------------------------------------
 
 /// Resolved endpoint configuration (base URL + API key).
+///
+/// # Security note
+///
+/// This struct MUST NOT derive `Debug` or have a manual `Debug` impl that
+/// exposes `api_key` in plain text. The parent `OpenCodeClient` struct
+/// correctly redacts the key via `Config`'s `Debug` impl, but any future
+/// `Debug` addition here would immediately leak the key in log output.
 struct EndpointConfig {
     base_url: String,
     api_key: String,

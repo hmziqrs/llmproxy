@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize, Serializer};
 /// A request to the Anthropic Messages API.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct MessageRequest {
     /// The model identifier (e.g. "claude-sonnet-4-20250514").
     pub model: String,
@@ -159,6 +160,7 @@ pub struct Metadata {
 /// [`ContentBlock`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct Message {
     /// The role of the message author (`"user"` or `"assistant"`).
     pub role: String,
@@ -231,7 +233,12 @@ impl Message {
 /// must be tolerated so that future Anthropic API additions do not break
 /// deserialization. The `Serialize` impl handles unknown types via the
 /// catch-all arm.
+///
+/// Note: `#[non_exhaustive]` is applied to allow future field additions
+/// without breaking downstream code, since this struct represents an external
+/// protocol and all fields are public.
 #[derive(Debug, Clone, Deserialize)]
+#[non_exhaustive]
 pub struct ContentBlock {
     /// Block type discriminator.
     #[serde(rename = "type")]
@@ -545,6 +552,7 @@ pub struct ToolResult {
 /// A response from the Anthropic Messages API.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct MessageResponse {
     /// Unique message identifier.
     pub id: String,
@@ -573,6 +581,7 @@ pub struct MessageResponse {
 
 /// Token usage statistics returned with every response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct Usage {
     /// Number of tokens in the input prompt.
     pub input_tokens: i32,
@@ -608,6 +617,7 @@ pub struct ContentBlockDelta {
 
 /// A partial update in a streaming response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct Delta {
     /// Delta type (e.g. `"text_delta"`, `"thinking_delta"`, `"input_json_delta"`).
     #[serde(rename = "type", default, skip_serializing_if = "Option::is_none")]
@@ -632,6 +642,7 @@ pub struct Delta {
 
 /// A Server-Sent Event from the Anthropic streaming API.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct MessageEvent {
     /// Event type (e.g. `"message_start"`, `"content_block_start"`,
     /// `"content_block_delta"`, `"message_stop"`).
@@ -1050,5 +1061,28 @@ mod tests {
             signature: None,
             source: None,
         }
+    }
+
+    // -- text_content: empty string content -----------------------------------
+
+    /// Characterization: `text_content()` returns an empty string when
+    /// `content` is `Some(Value::String(""))`.
+    #[test]
+    fn text_content_from_empty_string_content() {
+        let block = ContentBlock {
+            r#type: "tool_result".into(),
+            text: None,
+            id: None,
+            tool_use_id: Some("tu_1".into()),
+            name: None,
+            input: None,
+            output: None,
+            content: Some(serde_json::Value::String(String::new())),
+            is_error: None,
+            thinking: None,
+            signature: None,
+            source: None,
+        };
+        assert_eq!(block.text_content(), "");
     }
 }

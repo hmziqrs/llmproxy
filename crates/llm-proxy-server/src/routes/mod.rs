@@ -37,6 +37,12 @@ const MAX_BODY_BYTES: usize = 32 * 1024 * 1024; // 32 MiB
 /// long-running LLM streaming responses (the default is 60s, which may be
 /// too aggressive for streaming). Consider exempting streaming routes or
 /// using a per-route timeout approach in future phases.
+///
+/// Note: The `TimeoutLayer` also applies globally to lightweight endpoints
+/// (`/health`, `/ready`, `/version`). While harmless (they respond instantly),
+/// a 408 timeout on a health check is technically wrong. Consider applying
+/// `TimeoutLayer` only to `/v1/*` routes using a nested Router with per-route
+/// middleware.
 pub fn router(state: AppState) -> Router {
     let timeout = state.config.request_timeout;
     let middleware = ServiceBuilder::new()

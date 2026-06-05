@@ -100,6 +100,10 @@ impl ApiError {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let (status, body) = self.to_anthropic_response();
+        // Note: Error responses do not include `x-request-id`. This is an
+        // observability gap -- the request ID is only added in the
+        // non-streaming success path. Consider adding it via response
+        // middleware or storing the request ID in response extensions.
         (status, body).into_response()
     }
 }

@@ -43,6 +43,15 @@ const DEFAULT_ZEN_GEMINI_BASE_URL: &str = "https://opencode.ai/zen/v1/models";
 /// Priority:
 /// 1. `OC_GO_CC_CONFIG` env var (explicit override)
 /// 2. `~/.config/oc-go-cc/config.json` (default)
+///
+/// # Trust boundary
+///
+/// The `OC_GO_CC_CONFIG` env var accepts arbitrary filesystem paths without
+/// sanitization. This is standard practice for env-var-driven config (the
+/// process owner controls env vars), but a compromised env var could direct
+/// the proxy to read an attacker-controlled file. The config file content is
+/// treated as trusted input (JSON with env-var interpolation). Deployments
+/// should ensure only privileged users can set this env var.
 fn resolve_config_path() -> PathBuf {
     if let Ok(path) = std::env::var("OC_GO_CC_CONFIG") {
         return PathBuf::from(path);
@@ -67,7 +76,10 @@ fn expand_home(path: &str) -> PathBuf {
 /// Replace `${ENV_VAR}` patterns in `input` with the value of the
 /// corresponding environment variable.  Unset variables are left as-is.
 fn interpolate_env_vars(input: &str) -> String {
-    let re = Regex::new(r"\$\{([A-Za-z0-9_]+)\}").expect("env var regex is valid");
+    // Compile the regex once rather than on every call.
+    use std::sync::OnceLock;
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| Regex::new(r"\$\{([A-Za-z0-9_]+)\}").expect("env var regex is valid"));
     re.replace_all(input, |caps: &regex::Captures<'_>| {
         let var_name = &caps[1];
         std::env::var(var_name).unwrap_or_else(|_| caps[0].to_owned())

@@ -360,6 +360,12 @@ fn transform_user_message(blocks: &[ContentBlock]) -> Result<Vec<ChatMessage>, S
                 // Images not supported in text-only models, skip.
                 text_parts.push("[Image]".to_owned());
             }
+            // TODO: Unrecognized content block types are silently dropped.
+            // The protocol crate intentionally does not depend on `tracing`,
+            // so no warning is emitted. The core protocol migration should
+            // log a warning via the adapter layer. This is a known gap per
+            // protocol-normalization.md Section 7: "Drop the field and
+            // record a warning."
             _ => {}
         }
     }
@@ -418,6 +424,9 @@ fn transform_assistant_message(
                         // Legacy behavior: serialization failure silently falls back
                         // to an empty JSON object. The core protocol migration should
                         // propagate this error instead of silently substituting.
+                        // TODO: Add tracing::warn! when the protocol crate gains a
+                        // tracing dependency, or propagate the error via a typed
+                        // TransformError enum.
                         serde_json::to_string(v).unwrap_or_else(|_| "{}".to_owned())
                     }
                     _ => "{}".to_owned(),
@@ -433,6 +442,10 @@ fn transform_assistant_message(
                     }),
                 });
             }
+            // TODO: Unrecognized assistant content block types are silently
+            // dropped. See the `_ => {}` arm in `transform_user_message` for
+            // the same known gap -- the protocol crate does not depend on
+            // `tracing` and cannot emit warnings.
             _ => {}
         }
     }
@@ -552,6 +565,15 @@ fn transform_tools_for_gemini(tools: &[crate::anthropic::Tool]) -> Vec<GeminiToo
 ///
 /// This is the primary transformation function used for most upstream
 /// providers (GLM, Kimi, MiMo, Qwen, DeepSeek, etc.).
+///
+/// Note: The Anthropic Messages API does not have a `stop` field; stop sequences
+/// are not forwarded in this transformation. The `ChatCompletionRequest.stop`
+/// field remains `None`.
+///
+/// Note: All public transformer functions return `Result<_, String>` instead of
+/// a typed error enum. This is a known unidiomatic pattern -- the core protocol
+/// migration should introduce a `TransformError` enum (with `thiserror`) for
+/// consistency with `CoreError` and `ProviderError`.
 pub fn transform_request(
     anthropic_req: &MessageRequest,
     model: &ModelConfig,
@@ -604,11 +626,14 @@ pub fn transform_request(
     // Legacy behavior: config-driven temperature/max_tokens overrides silently
     // discard client intent. The core protocol migration should preserve client
     // intent separately from config overrides.
+    // TODO: Add a debug-level tracing event when config overrides client intent,
+    // even in legacy code. Requires adding tracing dependency or deferring to
+    // the adapter layer.
     if model.temperature > 0.0 {
         openai_req.temperature = Some(model.temperature);
     }
     if model.max_tokens > 0 {
-        openai_req.max_tokens = Some(model.max_tokens as i32);
+        openai_req.max_tokens = Some(i32::try_from(model.max_tokens).unwrap_or(i32::MAX));
     }
 
     // Resolve thinking and reasoning_effort.
@@ -666,6 +691,10 @@ pub fn transform_to_responses(
                         content: Some(serde_json::Value::String(tool_content)),
                     });
                 }
+                // TODO: Unrecognized content block types (e.g. "image",
+                // "thinking") in the Responses API transformer are silently
+                // dropped. See the `_ => {}` arm in `transform_user_message`
+                // for the same known gap.
                 _ => {}
             }
         }
@@ -764,6 +793,9 @@ pub fn transform_to_gemini(
                         }],
                     });
                 }
+                // TODO: Unrecognized content block types in the Gemini
+                // transformer are silently dropped. See the `_ => {}` arm in
+                // `transform_user_message` for the same known gap.
                 _ => {}
             }
         }
@@ -1496,4 +1528,106 @@ mod tests {
             Some(serde_json::Value::String("72F and sunny".to_owned()))
         );
     }
+
+    // -- top_p forwarding ------------------------------------------------------
+
+    /// Characterization: top_p from the Anthropic request is forwarded to the
+    /// OpenAI request.
+    #[test]
+    fn transform_top_p_forwarded() {
+        let mut req = make_request(vec![user_msg("hi")]);
+        req.top_p = Some(0.9);
+        let model = make_model("glm-5.1");
+        let result = transform_request(&req, &model).unwrap();
+        assert_eq!(result.top_p, Some(0.9));
+    }
+
+    // -- transform_error_response: boundary status codes -----------------------
+
+    /// Characterization: status codes below 400 map to `api_error`.
+    #[test]
+    fn error_response_199_is_api_error() {
+        let val = transform_error_response(199, "info");
+        assert_eq!(val["error"]["type"], "api_error");
+    }
+
+    /// Characterization: status codes above 499 map to `api_error`.
+    #[test]
+    fn error_response_599_is_api_error() {
+        let val = transform_error_response(599, "bad");
+        assert_eq!(val["error"]["type"], "api_error");
+    }
+
+    // -- transform_tools: null schema gets default -----------------------------
+
+    /// Characterization: a tool with `input_schema: Value::Null` produces a
+    /// default `{"type": "object", "properties": {}}` schema.
+    #[test]
+    fn transform_tools_with_null_schema_gets_default() {
+        let mut req = make_request(vec![user_msg("hi")]);
+        req.tools = vec![crate::anthropic::Tool {
+            name: "my_tool".to_owned(),
+            description: None,
+            input_schema: serde_json::Value::Null,
+        }];
+        let model = make_model("glm-5.1");
+        let result = transform_request(&req, &model).unwrap();
+        assert_eq!(result.tools.len(), 1);
+        let params = result.tools[0].function.parameters.as_ref().unwrap();
+        assert_eq!(params["type"], "object");
+        assert!(params.get("properties").unwrap().as_object().unwrap().is_empty());
+    }
+
+    // -- max_tokens saturating cast -------------------------------------------
+
+    /// Characterization: a max_tokens value exceeding i32::MAX is clamped to
+    /// i32::MAX rather than wrapping to a negative number.
+    #[test]
+    fn transform_max_tokens_saturating_cast() {
+        let mut req = make_request(vec![user_msg("hi")]);
+        req.max_tokens = 0;
+        let mut model = make_model("glm-5.1");
+        model.max_tokens = i64::MAX;
+        let result = transform_request(&req, &model).unwrap();
+        assert_eq!(result.max_tokens, Some(i32::MAX));
+    }
+
+    // =========================================================================
+    // Phase 0: Test inventory -- recorded fixture gaps
+    // =========================================================================
+    //
+    // The following gaps are recorded per the plan's test inventory section.
+    // Phase 2, Phase 5, and Phase 12 should add the right adapter fixtures:
+    //
+    // 1. Streaming tool calls for Responses API:
+    //    `process_responses_chunk` does not handle
+    //    `response.function_call_arguments.delta` events.
+    //
+    // 2. Streaming function calls for Gemini:
+    //    `process_gemini_chunk` only handles text parts, not function call
+    //    parts in the Gemini response.
+    //
+    // 3. Image content blocks:
+    //    Images are replaced with `[Image]` placeholders. Full image
+    //    passthrough requires core protocol support.
+    //
+    // 4. Redacted thinking blocks:
+    //    The `redacted_thinking` content type is not modeled.
+    //
+    // 5. Refusal content types:
+    //    OpenAI `refusal` fields on messages are not forwarded.
+    //
+    // 6. Snapshot/golden fixtures:
+    //    No snapshot tests exist for any adapter. These should be added
+    //    when the core protocol architecture is in place.
+    //
+    // 7. Disconnect behavior:
+    //    No test simulates an actual client disconnect mid-stream (dropping
+    //    the response body while SSE events are being written).
+    //
+    // 8. Upstream stream errors:
+    //    No test simulates an HTTP 500 mid-stream from the upstream provider.
+    //
+    // Do not fill all fixture gaps in Phase 0. Record the gaps so later
+    // phases add the right adapter fixtures.
 }

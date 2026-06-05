@@ -63,6 +63,11 @@ pub async fn handle_messages(
     req.validate().map_err(ApiError::BadRequest)?;
 
     let is_streaming = req.stream.unwrap_or(false);
+    // Note: Metrics are recorded after rate-limit and dedup checks, so
+    // rate-limited and duplicate requests are not counted. The metric name
+    // `requests_received` suggests all inbound traffic but actually counts
+    // only requests that proceed to processing. Consider renaming to
+    // `requests_processed` for accuracy, or moving the call before rate-limit.
     state.metrics.record_request(is_streaming);
 
     info!(request_id = %request_id, model = %req.model, streaming = is_streaming, "processing request");
@@ -86,9 +91,9 @@ pub async fn handle_messages(
     };
 
     if is_streaming {
-        handle_streaming(state, request_id, req, fallback_chain, start).await
+        handle_streaming(&state, request_id, req, fallback_chain, start).await
     } else {
-        handle_non_streaming(state, request_id, req, fallback_chain, start).await
+        handle_non_streaming(&state, request_id, req, fallback_chain, start).await
     }
 }
 
@@ -144,7 +149,7 @@ fn build_scenario_config(config: &llm_proxy_core::Config) -> ScenarioConfig {
 }
 
 async fn handle_non_streaming(
-    state: AppState,
+    state: &AppState,
     request_id: String,
     req: MessageRequest,
     models: Vec<ModelConfig>,
@@ -198,6 +203,10 @@ async fn execute_non_streaming_request(
     match classify_endpoint(&model.model_id) {
         EndpointType::Anthropic => {
             let b = serde_json::to_vec(req).map_err(|e| format!("ser: {e}"))?;
+            // Note: ProviderError (especially reqwest::Error via the Http variant)
+            // may include the full URL in its Display output, which could contain
+            // sensitive query parameters. Consider sanitizing reqwest::Error before
+            // formatting into user-facing strings.
             let resp = client
                 .send_anthropic_request(&b, false, model)
                 .await
@@ -241,7 +250,7 @@ async fn execute_non_streaming_request(
 }
 
 async fn handle_streaming(
-    state: AppState,
+    state: &AppState,
     request_id: String,
     req: MessageRequest,
     models: Vec<ModelConfig>,
@@ -249,7 +258,7 @@ async fn handle_streaming(
 ) -> Result<Response<Body>, ApiError> {
     let mut last_error: Option<String> = None;
     for model in &models {
-        match try_streaming_model(&state, &req, model).await {
+        match try_streaming_model(state, &req, model).await {
             Ok(response) => {
                 state
                     .metrics
@@ -285,6 +294,16 @@ async fn try_streaming_model(
 
 // -- Anthropic streaming: raw pipe ----------------------------------------
 
+/// Note: The Anthropic passthrough path does not include keep-alive/heartbeat
+/// events. Non-Anthropic streaming paths use `build_sse_response` which
+/// includes a 3-second `KeepAlive` interval. Anthropic's own SSE stream
+/// includes heartbeat events natively, so this is intentionally omitted.
+/// If the upstream is slow, the client may time out.
+///
+/// Note: The Anthropic passthrough path does not include `x-request-id` in
+/// the response headers. The non-streaming path adds it. For ops consistency,
+/// streaming responses should also carry the request ID -- this is deferred
+/// to a future phase when response middleware is introduced.
 async fn handle_anthropic_streaming(
     client: &OpenCodeClient,
     req: &MessageRequest,
@@ -383,6 +402,24 @@ async fn handle_gemini_streaming(
 /// Spawn a background task that reads chunks from the upstream byte stream,
 /// processes them through a StreamProxy, and sends SSE Events through a
 /// channel. Returns the receiving end as a BoxStream.
+///
+/// # Cancel-safety note
+///
+/// The spawned task is detached (`tokio::spawn` without storing the `JoinHandle`).
+/// When the client disconnects, the `mpsc::Receiver` is dropped and the task
+/// detects this via `tx.send().is_err()`. However, the upstream HTTP response
+/// body (the `reqwest` stream) is held alive inside the spawned task until it
+/// naturally completes or errors. There is no mechanism to abort the upstream
+/// request when the client goes away.
+///
+/// Future phases should either:
+/// - Pass a `CancellationToken` into the spawned task and cancel it when the
+///   SSE stream is dropped (using `tokio::pin!` + abort-on-drop pattern).
+/// - Use `tokio::spawn`'s `JoinHandle` with `AbortHandle` to cancel the task.
+///
+/// Additionally, the `TimeoutLayer` in the router applies to the full response
+/// lifetime including SSE streams. For streaming routes, consider exempting
+/// them from the global timeout or using per-route middleware.
 fn spawn_proxy_task<S, F>(stream: S, model_id: String, process: F) -> BoxStream<'static, Event>
 where
     S: futures::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send + 'static,
@@ -432,6 +469,14 @@ where
     tokio_stream::wrappers::ReceiverStream::new(rx).boxed()
 }
 
+/// Parse SSE events from the transformer output.
+///
+/// Note: This parser does not handle multi-line `data:` fields (where the SSE
+/// spec allows multiple `data:` lines concatenated with newlines), the `id:`
+/// or `retry:` SSE fields, or comment lines starting with `:`. The upstream
+/// providers we support do not send these, but this is not spec-compliant.
+/// When migrating to core protocol adapters, use a proper SSE parser
+/// (e.g. `eventsource-stream` crate) that handles the full SSE spec.
 fn parse_sse_events(output: &str) -> Vec<Event> {
     output
         .split("\n\n")
@@ -465,9 +510,9 @@ fn build_sse_response(events: BoxStream<'static, Event>) -> Result<Response<Body
     // Only add the extra headers not covered by the Sse wrapper.
     parts
         .headers
-        .insert(header::CONNECTION, "keep-alive".parse().unwrap());
+        .insert(header::CONNECTION, "keep-alive".parse().expect("static header value is always valid"));
     parts
         .headers
-        .insert("X-Accel-Buffering", "no".parse().unwrap());
+        .insert("X-Accel-Buffering", "no".parse().expect("static header value is always valid"));
     Ok(Response::from_parts(parts, body))
 }

@@ -10,6 +10,10 @@ use crate::state::AppState;
 #[derive(Serialize)]
 pub(crate) struct TokenCountResponse {
     input_tokens: usize,
+    /// Non-standard extension: `token_count` duplicates `input_tokens`.
+    /// The Anthropic Messages API `count_tokens` endpoint returns only
+    /// `input_tokens`. This extra field is retained for backward
+    /// compatibility with existing clients.
     token_count: usize,
 }
 

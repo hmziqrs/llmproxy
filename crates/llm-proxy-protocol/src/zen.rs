@@ -64,8 +64,11 @@ pub struct ResponsesReasoning {
 }
 
 /// Non-streaming response from the Responses API.
+///
+/// Note: `deny_unknown_fields` is intentionally omitted on upstream response
+/// types. Providers may add fields that the proxy does not model; unknown
+/// fields are silently ignored rather than causing parse failures.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ResponsesResponse {
     /// Unique response identifier.
     pub id: String,
@@ -121,8 +124,17 @@ pub struct ResponsesUsage {
 }
 
 /// A single chunk in a streaming Responses API response.
+///
+/// Note: `deny_unknown_fields` is intentionally omitted on streaming chunk
+/// types. Upstream providers may add new event fields at any time; unknown
+/// fields are silently ignored rather than causing chunk drops. The `delta`
+/// field carries incremental text for `response.output_text.delta` events.
+/// For `response.function_call_arguments.delta` events, the delta is also a
+/// string -- this is a known gap: the stream transformer does not currently
+/// handle function call streaming for the Responses API (see
+/// `responses_function_call_stream` test). Phase 2/5/12 should add the right
+/// adapter fixtures for this.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ResponsesChunk {
     /// Chunk type discriminator.
     #[serde(rename = "type")]
@@ -142,6 +154,12 @@ pub struct ResponsesChunk {
 // ---------------------------------------------------------------------------
 
 /// Top-level request body for the Gemini generate-content endpoint.
+///
+/// Note: `deny_unknown_fields` is intentionally omitted for outbound-only
+/// request structs. The proxy constructs these internally and never
+/// deserializes them from external input, so unknown field protection
+/// provides no benefit and would be overly restrictive if the proxy adds
+/// passthrough fields in the future.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GeminiRequest {
     /// Conversation contents to send to the model.
@@ -198,8 +216,11 @@ pub struct GeminiFunctionDeclaration {
 }
 
 /// Non-streaming response from the Gemini generate-content endpoint.
+///
+/// Note: `deny_unknown_fields` is intentionally omitted on upstream response
+/// types. Providers may add fields that the proxy does not model; unknown
+/// fields are silently ignored rather than causing parse failures.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct GeminiResponse {
     /// Candidate completions.
     pub candidates: Vec<GeminiCandidate>,
@@ -229,8 +250,11 @@ pub struct GeminiUsage {
 }
 
 /// A single chunk in a streaming Gemini response.
+///
+/// Note: `deny_unknown_fields` is intentionally omitted on streaming chunk
+/// types. Upstream providers may add new fields at any time; unknown fields
+/// are silently ignored rather than causing chunk drops.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct GeminiStreamChunk {
     /// Candidate completions in this chunk.
     pub candidates: Vec<GeminiCandidate>,

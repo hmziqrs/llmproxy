@@ -34,6 +34,13 @@ use super::{non_negative, map_finish_reason};
 // ---------------------------------------------------------------------------
 
 /// Returned when the client disconnects mid-stream.
+///
+/// Note: This type is currently only used in tests. It is preserved for future
+/// use when the core protocol migration adds proper cancel-safety via
+/// `CancellationToken`. If the protocol crate gains a `thiserror` dependency,
+/// replace the manual trait impls with derive macros.
+#[derive(Clone)]
+#[non_exhaustive]
 pub struct ErrClientDisconnected;
 
 impl fmt::Debug for ErrClientDisconnected {
@@ -51,6 +58,11 @@ impl fmt::Display for ErrClientDisconnected {
 impl std::error::Error for ErrClientDisconnected {}
 
 /// Generate a unique-enough ID based on the current nanosecond timestamp.
+///
+/// Note: This uses a nanosecond timestamp, making output non-deterministic
+/// (breaks snapshot/golden testing). In concurrent scenarios, nanosecond
+/// timestamps can collide. Consider using a UUID (the workspace already
+/// depends on `uuid`) or accepting an ID generator as a parameter.
 fn generate_id() -> String {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -194,6 +206,26 @@ impl StreamProxy {
             write_sse_event(writer, &event)?;
             self.content_started = false;
             self.reasoning_started = false;
+        }
+        Ok(())
+    }
+
+    /// Close the currently open reasoning block and advance the content index.
+    /// Used when transitioning from reasoning to text.
+    fn close_reasoning_block(&mut self, writer: &mut impl fmt::Write) -> Result<(), String> {
+        if self.reasoning_started {
+            self.close_current_block(writer)?;
+            self.content_index += 1;
+        }
+        Ok(())
+    }
+
+    /// Close the currently open text block and advance the content index.
+    /// Used when transitioning from text to reasoning.
+    fn close_text_block(&mut self, writer: &mut impl fmt::Write) -> Result<(), String> {
+        if self.content_started {
+            self.close_current_block(writer)?;
+            self.content_index += 1;
         }
         Ok(())
     }
@@ -420,20 +452,7 @@ impl StreamProxy {
             if let Some(content) = fast_extract_delta_content(data) {
                 if !content.is_empty() {
                     // Close reasoning block if one is open.
-                    if self.reasoning_started {
-                        let event = MessageEvent {
-                            r#type: "content_block_stop".to_owned(),
-                            message: None,
-                            index: Some(self.content_index),
-                            content_block: None,
-                            delta: None,
-                            usage: None,
-                            error: None,
-                        };
-                        write_sse_event(writer, &event)?;
-                        self.content_index += 1;
-                        self.reasoning_started = false;
-                    }
+                    self.close_reasoning_block(writer)?;
 
                     if !self.content_started {
                         self.start_text_block(writer)?;
@@ -448,7 +467,10 @@ impl StreamProxy {
         // Full JSON parse path.
         let chunk: ChatCompletionChunk = match serde_json::from_str(data) {
             Ok(c) => c,
-            Err(_) => return Ok(()), // skip malformed chunks
+            // Malformed SSE chunks are silently skipped for resilience.
+            // This means upstream data corruption is invisible. This is
+            // documented as intentional Phase 0 characterization behavior.
+            Err(_) => return Ok(()),
         };
 
         // Usage-only chunk (no choices).
@@ -505,20 +527,7 @@ impl StreamProxy {
         {
             if !reasoning.is_empty() {
                 // Close text block if open.
-                if self.content_started {
-                    let event = MessageEvent {
-                        r#type: "content_block_stop".to_owned(),
-                        message: None,
-                        index: Some(self.content_index),
-                        content_block: None,
-                        delta: None,
-                        usage: None,
-                        error: None,
-                    };
-                    write_sse_event(writer, &event)?;
-                    self.content_index += 1;
-                    self.content_started = false;
-                }
+                self.close_text_block(writer)?;
 
                 if !self.reasoning_started {
                     self.start_thinking_block(writer)?;
@@ -532,20 +541,7 @@ impl StreamProxy {
         if let Some(ref delta) = choice.delta {
             if !delta.content.is_empty() {
                 // Close reasoning block if open.
-                if self.reasoning_started {
-                    let event = MessageEvent {
-                        r#type: "content_block_stop".to_owned(),
-                        message: None,
-                        index: Some(self.content_index),
-                        content_block: None,
-                        delta: None,
-                        usage: None,
-                        error: None,
-                    };
-                    write_sse_event(writer, &event)?;
-                    self.content_index += 1;
-                    self.reasoning_started = false;
-                }
+                self.close_reasoning_block(writer)?;
 
                 if !self.content_started {
                     self.start_text_block(writer)?;
@@ -1250,22 +1246,22 @@ mod tests {
         assert!(out.contains("event: message_delta"));
     }
 
-    /// Characterization: unknown fields in OpenAI chunk JSON are now rejected
-    /// by `deny_unknown_fields` on `ChatCompletionChunk`. The chunk is silently
-    /// skipped (no error propagated, no content emitted).
+    /// Characterization: unknown fields in OpenAI chunk JSON are now tolerated
+    /// (silently ignored) since `deny_unknown_fields` was removed from streaming
+    /// chunk types. The chunk is processed normally -- unknown fields like
+    /// `custom_field` are simply ignored during deserialization.
     #[test]
-    fn openai_unknown_fields_rejected_chunk_skipped() {
+    fn openai_unknown_fields_in_chunk_are_ignored() {
         let mut proxy = StreamProxy::new("model");
         let mut out = String::new();
 
-        // Chunk with unknown fields is rejected by deny_unknown_fields.
+        // Chunk with unknown fields -- now tolerated, not rejected.
         let chunk_with_unknown = r#"data: {"id":"c","object":"chat.completion.chunk","created":0,"model":"m","choices":[{"index":0,"delta":{"content":"hello"},"finish_reason":null}],"custom_field":"ignored"}"#;
 
         proxy.process_openai_chunk(chunk_with_unknown, &mut out).unwrap();
 
-        // The chunk should be silently skipped -- no content, no error.
-        assert!(!out.contains("hello"));
-        assert!(!out.contains("custom_field"));
+        // The chunk should be processed normally -- content is emitted.
+        assert!(out.contains("hello"));
     }
 
     /// Characterization: a chunk without unknown fields is processed normally.
@@ -1427,9 +1423,12 @@ mod tests {
     }
 
     /// Characterization: unknown fields in OpenAI response JSON are now
-    /// rejected by serde (`deny_unknown_fields` on `ChatCompletionResponse`).
+    /// tolerated (silently ignored) since `deny_unknown_fields` was removed
+    /// from `ChatCompletionResponse`. Unknown fields like `system_fingerprint`
+    /// are simply ignored during deserialization, preventing silent data loss
+    /// when providers add new fields.
     #[test]
-    fn response_transform_rejects_unknown_openai_fields() {
+    fn response_transform_tolerates_unknown_openai_fields() {
         use crate::openai::ChatCompletionResponse;
 
         let raw = serde_json::json!({
@@ -1455,7 +1454,10 @@ mod tests {
         });
 
         let result = serde_json::from_value::<ChatCompletionResponse>(raw);
-        assert!(result.is_err(), "unknown fields should be rejected by deny_unknown_fields");
+        assert!(result.is_ok(), "unknown fields should be tolerated, not rejected");
+        let resp = result.unwrap();
+        assert_eq!(resp.id, "chatcmpl-test");
+        assert_eq!(resp.model, "gpt-4o");
     }
 
     // =========================================================================
@@ -1556,4 +1558,61 @@ mod tests {
         assert!(out.contains(" Done."));
         assert!(out.contains("event: message_stop"));
     }
+
+    // -- Responses API: function_call delta events are ignored -----------------
+
+    /// Characterization: `response.function_call_arguments.delta` events are
+    /// silently ignored by the Responses API stream processor. The stream does
+    /// not crash or produce garbage output when function call events arrive.
+    /// This is a known gap -- Phase 2/5/12 should add proper adapter fixtures.
+    #[test]
+    fn responses_function_call_delta_events_are_ignored() {
+        let mut proxy = StreamProxy::new("resp-model");
+        let mut out = String::new();
+
+        let chunks = [
+            r#"data: {"type":"response.output_text.delta","delta":"text before"}"#,
+            // Function call delta event -- should be silently ignored.
+            r#"data: {"type":"response.function_call_arguments.delta","delta":"{\"city\":"}"#,
+            r#"data: {"type":"response.function_call_arguments.delta","delta":"\"SF\"}"}"#,
+            r#"data: {"type":"response.output_text.delta","delta":" text after"}"#,
+            r#"data: {"type":"response.completed"}"#,
+        ];
+
+        for chunk in &chunks {
+            proxy.process_responses_chunk(chunk, &mut out).unwrap();
+        }
+
+        // Text deltas should be present; function call deltas should not.
+        assert!(out.contains("text before"));
+        assert!(out.contains(" text after"));
+        assert!(!out.contains("city"));
+        assert!(!out.contains("SF"));
+        assert!(out.contains("event: message_delta"));
+    }
+
+    // =========================================================================
+    // Phase 0: Test inventory -- recorded fixture gaps
+    // =========================================================================
+    //
+    // The following gaps are recorded per the plan's test inventory section.
+    // Phase 2, Phase 5, and Phase 12 should add the right adapter fixtures:
+    //
+    // 1. Upstream stream errors:
+    //    No test simulates an HTTP 500 mid-stream from the upstream provider.
+    //    The current code handles this by breaking out of the stream loop in
+    //    spawn_proxy_task (Err(_) => break), but this path is untested.
+    //
+    // 2. Client disconnect mid-stream:
+    //    No test simulates an actual client disconnect (dropping the response
+    //    body while SSE events are being written). ErrClientDisconnected
+    //    exists but is only tested for its Display/Debug formatting.
+    //
+    // 3. Unrecognized finish reasons in Gemini:
+    //    If Gemini returns a finish reason other than "MAX_TOKENS" or "STOP",
+    //    it falls through to the default "end_turn". No tracing is emitted
+    //    for unrecognized finish reasons in any of the three stream processors.
+    //
+    // Do not fill all fixture gaps in Phase 0. Record the gaps so later
+    // phases add the right adapter fixtures.
 }

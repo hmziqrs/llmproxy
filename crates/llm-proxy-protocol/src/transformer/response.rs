@@ -17,9 +17,54 @@ use super::{non_negative, map_finish_reason};
 
 /// Build an empty-text content block (fallback when no other blocks exist).
 fn empty_text_block() -> ContentBlock {
+    ContentBlock::new_text(String::new())
+}
+
+/// Build a tool_use content block from response data (used in response transformers).
+fn new_tool_use_response_block(
+    id: Option<String>,
+    name: Option<String>,
+    input: serde_json::Value,
+) -> ContentBlock {
+    ContentBlock {
+        r#type: "tool_use".to_owned(),
+        text: None,
+        id,
+        tool_use_id: None,
+        name,
+        input: Some(input),
+        output: None,
+        content: None,
+        is_error: None,
+        thinking: None,
+        signature: None,
+        source: None,
+    }
+}
+
+/// Build a thinking content block from response data.
+fn new_thinking_response_block(thinking: String) -> ContentBlock {
+    ContentBlock {
+        r#type: "thinking".to_owned(),
+        thinking: Some(thinking),
+        text: None,
+        id: None,
+        tool_use_id: None,
+        name: None,
+        input: None,
+        output: None,
+        content: None,
+        is_error: None,
+        signature: None,
+        source: None,
+    }
+}
+
+/// Build a text content block from response data.
+fn new_text_response_block(text: String) -> ContentBlock {
     ContentBlock {
         r#type: "text".to_owned(),
-        text: Some(String::new()),
+        text: Some(text),
         id: None,
         tool_use_id: None,
         name: None,
@@ -79,20 +124,7 @@ pub fn transform_response(
     // Reasoning content -> thinking block.
     if let Some(ref reasoning) = msg.reasoning_content {
         if !reasoning.is_empty() {
-            blocks.push(ContentBlock {
-                r#type: "thinking".to_owned(),
-                thinking: Some(reasoning.clone()),
-                text: None,
-                id: None,
-                tool_use_id: None,
-                name: None,
-                input: None,
-                output: None,
-                content: None,
-                is_error: None,
-                signature: None,
-                source: None,
-            });
+            blocks.push(new_thinking_response_block(reasoning.clone()));
         }
     }
 
@@ -101,6 +133,8 @@ pub fn transform_response(
         // Legacy behavior: malformed tool_call arguments silently fall back to
         // an empty JSON object. The core protocol migration should propagate
         // the parse error or log a warning instead.
+        // TODO: Add tracing::warn! when the protocol crate gains a tracing
+        // dependency, or propagate the error via a typed TransformError enum.
         let input_json = tc
             .function
             .as_ref()
@@ -108,38 +142,16 @@ pub fn transform_response(
             .and_then(|args| serde_json::from_str::<serde_json::Value>(args).ok())
             .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
 
-        blocks.push(ContentBlock {
-            r#type: "tool_use".to_owned(),
-            id: tc.id.clone(),
-            name: tc.function.as_ref().and_then(|f| f.name.clone()),
-            input: Some(input_json),
-            text: None,
-            tool_use_id: None,
-            output: None,
-            content: None,
-            is_error: None,
-            thinking: None,
-            signature: None,
-            source: None,
-        });
+        blocks.push(new_tool_use_response_block(
+            tc.id.clone(),
+            tc.function.as_ref().and_then(|f| f.name.clone()),
+            input_json,
+        ));
     }
 
     // Plain text content.
     if !msg.content.is_empty() {
-        blocks.push(ContentBlock {
-            r#type: "text".to_owned(),
-            text: Some(msg.content.clone()),
-            id: None,
-            tool_use_id: None,
-            name: None,
-            input: None,
-            output: None,
-            content: None,
-            is_error: None,
-            thinking: None,
-            signature: None,
-            source: None,
-        });
+        blocks.push(new_text_response_block(msg.content.clone()));
     }
 
     // Guarantee at least one content block.
@@ -197,20 +209,9 @@ pub fn transform_responses_response(
                 if let Some(ref content_items) = output.content {
                     for c in content_items {
                         if c.r#type == "output_text" {
-                            blocks.push(ContentBlock {
-                                r#type: "text".to_owned(),
-                                text: c.text.clone(),
-                                id: None,
-                                tool_use_id: None,
-                                name: None,
-                                input: None,
-                                output: None,
-                                content: None,
-                                is_error: None,
-                                thinking: None,
-                                signature: None,
-                                source: None,
-                            });
+                            blocks.push(new_text_response_block(
+                                c.text.clone().unwrap_or_default(),
+                            ));
                         }
                     }
                 }
@@ -218,27 +219,24 @@ pub fn transform_responses_response(
             "function_call" => {
                 // Legacy behavior: malformed function_call arguments silently
                 // fall back to an empty JSON object.
+                // TODO: Add tracing::warn! when the protocol crate gains a
+                // tracing dependency, or propagate the error via a typed
+                // TransformError enum.
                 let input_json = output
                     .arguments
                     .as_deref()
                     .and_then(|args| serde_json::from_str::<serde_json::Value>(args).ok())
                     .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
 
-                blocks.push(ContentBlock {
-                    r#type: "tool_use".to_owned(),
-                    id: output.call_id.clone(),
-                    name: output.name.clone(),
-                    input: Some(input_json),
-                    text: None,
-                    tool_use_id: None,
-                    output: None,
-                    content: None,
-                    is_error: None,
-                    thinking: None,
-                    signature: None,
-                    source: None,
-                });
+                blocks.push(new_tool_use_response_block(
+                    output.call_id.clone(),
+                    output.name.clone(),
+                    input_json,
+                ));
             }
+            // TODO: Unrecognized Responses API output item types are silently
+            // dropped. See the `_ => {}` arm in `transform_user_message` in
+            // request.rs for the same known gap.
             _ => {}
         }
     }
@@ -292,20 +290,7 @@ pub fn transform_gemini_response(
     for part in &candidate.content.parts {
         if let Some(ref text) = part.text {
             if !text.is_empty() {
-                blocks.push(ContentBlock {
-                    r#type: "text".to_owned(),
-                    text: Some(text.clone()),
-                    id: None,
-                    tool_use_id: None,
-                    name: None,
-                    input: None,
-                    output: None,
-                    content: None,
-                    is_error: None,
-                    thinking: None,
-                    signature: None,
-                    source: None,
-                });
+                blocks.push(new_text_response_block(text.clone()));
             }
         }
     }
@@ -341,6 +326,11 @@ pub fn transform_gemini_response(
         });
 
     // Synthesise an ID since Gemini does not provide one.
+    // Note: This uses a nanosecond timestamp, making the response non-deterministic.
+    // This breaks snapshot/golden testing. In concurrent scenarios, nanosecond
+    // timestamps can collide. Consider using a UUID or accepting an ID generator
+    // as a parameter for deterministic testing (the workspace already depends on
+    // the `uuid` crate).
     let id = format!(
         "gemini_{}",
         SystemTime::now()
@@ -380,6 +370,10 @@ fn build_usage_from_openai(info: &UsageInfo) -> Usage {
         // the upstream reports prompt-cache fields we subtract them out so
         // that Claude Code's local context counter does not see an inflated
         // input_tokens on every turn.
+        // TODO: The `as i32` cast silently truncates if the value exceeds
+        // i32::MAX (~2.1 billion tokens). Use i32::try_from().unwrap_or(i32::MAX)
+        // for a saturating conversion. Token counts are expected to fit in i32
+        // in practice, but this should be documented or guarded.
         input_tokens: non_negative(prompt - cache_hit - cache_miss) as i32,
         output_tokens: info.completion_tokens,
         cache_creation_input_tokens: info.prompt_cache_miss_tokens,
@@ -785,12 +779,10 @@ mod tests {
             prompt_tokens: prompt,
             completion_tokens: completion,
             total_tokens: prompt + completion,
-            prompt_cache_hit_tokens: if cache_hit > 0 { Some(cache_hit) } else { None },
-            prompt_cache_miss_tokens: if cache_miss > 0 {
-                Some(cache_miss)
-            } else {
-                None
-            },
+            // Always set cache fields to match production codepaths where
+            // `build_usage_from_openai` always sets these from UsageInfo fields.
+            prompt_cache_hit_tokens: Some(cache_hit),
+            prompt_cache_miss_tokens: Some(cache_miss),
         }
     }
 

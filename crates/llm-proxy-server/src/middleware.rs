@@ -195,6 +195,15 @@ impl Default for RequestIdGenerator {
 ///
 /// Checks `X-Forwarded-For` first (leftmost IP), then falls back to
 /// connection info.
+///
+/// # Trust assumption
+///
+/// This function trusts `X-Forwarded-For` and `X-Real-IP` headers without
+/// validation. If the proxy is deployed behind a reverse proxy, these headers
+/// can be spoofed by clients to bypass rate limiting. The proxy should only
+/// be deployed behind a trusted reverse proxy that overwrites these headers.
+/// Consider adding a config option to control whether `X-Forwarded-For` is
+/// trusted.
 pub fn get_client_ip(
     headers: &axum::http::HeaderMap,
     connect_info: Option<&axum::extract::ConnectInfo<std::net::SocketAddr>>,

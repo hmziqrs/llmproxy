@@ -103,6 +103,10 @@ pub struct FunctionCall {
 /// For assistant messages that carry tool calls, `content` may be empty
 /// while `tool_calls` is populated. For tool-result messages, `tool_call_id`
 /// identifies the call being answered.
+///
+/// Note: `deny_unknown_fields` is intentionally omitted because this struct is
+/// used in streaming deltas where fields may vary between providers. Unknown
+/// fields are silently ignored rather than causing parse failures.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     /// `"system"`, `"user"`, `"assistant"`, or `"tool"`.
@@ -181,6 +185,11 @@ pub struct ChatCompletionRequest {
 // ---------------------------------------------------------------------------
 
 /// Token usage statistics returned by the API.
+///
+/// Note: `deny_unknown_fields` is intentionally omitted because providers may
+/// return additional usage fields (e.g. `prompt_tokens_details`) that the
+/// proxy does not model. Unknown fields are silently ignored rather than
+/// causing parse failures.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UsageInfo {
     /// Tokens consumed by the prompt.
@@ -222,8 +231,14 @@ pub struct Choice {
 // ---------------------------------------------------------------------------
 
 /// Response body for a non-streaming Chat Completions call.
+///
+/// Note: `deny_unknown_fields` is intentionally omitted on upstream response
+/// types. Providers may add fields (e.g. `service_tier`, `system_fingerprint`)
+/// that the proxy does not model. Without `deny_unknown_fields`, these fields
+/// are silently ignored during deserialization rather than causing a parse
+/// failure that would surface as a 502 to the client. Request types retain
+/// `deny_unknown_fields` for strict inbound validation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ChatCompletionResponse {
     /// Unique completion identifier.
     pub id: String,
@@ -244,8 +259,14 @@ pub struct ChatCompletionResponse {
 // ---------------------------------------------------------------------------
 
 /// A single Server-Sent Events chunk for a streaming completion.
+///
+/// Note: `deny_unknown_fields` is intentionally omitted here because upstream
+/// providers may add new fields to streaming chunks at any time. With
+/// `deny_unknown_fields`, serde would reject unknown fields, causing the chunk
+/// to be silently dropped. Without it, unknown fields are simply ignored,
+/// avoiding silent data loss. Request types (e.g. `ChatCompletionRequest`)
+/// retain `deny_unknown_fields` because the proxy controls their construction.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ChatCompletionChunk {
     /// Unique completion identifier (stable across all chunks).
     pub id: String,
