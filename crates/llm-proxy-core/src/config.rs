@@ -543,7 +543,9 @@ mod tests {
     /// clean environment.  The returned `EnvScope` holds a mutex lock
     /// that serialises all env-touching tests.
     fn save_oc_env() -> EnvScope {
-        let lock = ENV_LOCK.lock().unwrap();
+        // Recover from a poisoned mutex caused by a previous test panic,
+        // so that one failure does not cascade to every other env-touching test.
+        let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let guards = vec![
             EnvVarGuard::remove("OC_GO_CC_API_KEY"),
             EnvVarGuard::remove("OC_GO_CC_HOST"),
