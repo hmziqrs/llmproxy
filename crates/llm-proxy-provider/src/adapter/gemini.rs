@@ -41,6 +41,21 @@ pub struct GeminiAdapter;
 // ---------------------------------------------------------------------------
 
 /// Stateful stream decoder for Gemini SSE frames.
+///
+/// ## CoreEvent variants emitted
+///
+/// - `MessageStart` -- on the first chunk received
+/// - `ContentStart` -- on the first text delta
+/// - `TextDelta` -- on text parts
+/// - `ToolCallStart` -- on function_call parts
+/// - `ToolCallDelta` -- on function_call arguments
+/// - `ToolCallStop` -- immediately after each function_call part
+/// - `UsageDelta` -- on usage-only chunks or final chunks with usage
+/// - `MessageStop` -- on finish_reason or stream end
+///
+/// Intentionally never emitted: `Ping` (Gemini has no heartbeat), `ThinkingDelta`
+/// (Gemini thinking is not streamed as deltas in the current API), `Error`
+/// (Gemini errors are handled at the transport level, not in stream decoding).
 #[derive(Debug)]
 pub struct GeminiStreamDecoder {
     model_ref: ModelRef,
@@ -172,6 +187,13 @@ impl ProviderStreamDecoder for GeminiStreamDecoder {
 
         self.close_content_if_open(&mut events);
 
+        // Emit ToolCallStop for any unclosed tool blocks.
+        let mut tool_indices: Vec<_> = self.tool_blocks.to_vec();
+        tool_indices.sort();
+        for idx in tool_indices {
+            events.push(CoreEvent::ToolCallStop { index: idx });
+        }
+
         if !self.stop_sent {
             self.stop_sent = true;
             events.push(CoreEvent::MessageStop {
@@ -217,8 +239,13 @@ impl GeminiAdapter {
             let role = match msg.role {
                 CoreRole::User => "user",
                 CoreRole::Assistant => "model",
-                CoreRole::System => "user", // Gemini uses "user" for system prompts.
-                CoreRole::Tool => "user",   // Tool results go as user.
+                // Gemini has no system role; user is the standard mapping per
+                // Gemini's documentation for injecting system instructions.
+                CoreRole::System => "user",
+                // Gemini's API requires tool results to be in "user" role
+                // messages with functionResponse parts.  This is the canonical
+                // mapping per Gemini's documentation.
+                CoreRole::Tool => "user",
                 _ => "user",
             };
 
@@ -273,11 +300,17 @@ impl GeminiAdapter {
 
                         // The name field must match the function name from the
                         // original call.  Gemini uses it to correlate the
-                        // response with the function declaration.  The tool_use_id
-                        // is a synthetic "gemini_call_N" so strip the prefix.
-                        let fn_name = tool_use_id
-                            .trim_start_matches("gemini_call_")
-                            .to_owned();
+                        // response with the function declaration.  We look up
+                        // the function name by searching for the ToolUse content
+                        // block that has a matching tool_use_id in prior messages.
+                        let fn_name = lookup_tool_name(core, tool_use_id)
+                            .unwrap_or_else(|| {
+                                // Fallback: strip the 'gemini_call_' prefix from
+                                // tool_use_id (the Gemini decoder uses this format).
+                                tool_use_id
+                                    .trim_start_matches("gemini_call_")
+                                    .to_owned()
+                            });
                         parts.push(
                             serde_json::from_value(serde_json::json!({
                                 "function_response": {
@@ -357,17 +390,21 @@ impl GeminiAdapter {
             temperature: core.sampling.temperature,
             top_p: core.sampling.top_p,
             max_output_tokens: core.sampling.max_tokens,
+            stop_sequences: core.sampling.stop.as_ref().and_then(|s| {
+                if s.is_empty() { None } else { Some(s.clone()) }
+            }),
         };
 
         // Forward tool_choice if present.
         // Note: Gemini supports `tool_config.function_calling_config` for
         // controlling tool choice, but the wire types don't model it yet.
-        // For now, emit a debug log when tool_choice is specified so it isn't
-        // silently ignored.
+        // Per the plan's lossy translation rules, emit a warning since the
+        // omission is safe but potentially impactful.
         if core.tool_choice.is_some() {
-            tracing::debug!(
+            tracing::warn!(
                 ?core.tool_choice,
-                "Gemini: tool_choice specified but not yet forwarded to upstream"
+                "Gemini: tool_choice specified but not yet forwarded to upstream; \
+                 the model will use its default tool calling behavior"
             );
         }
 
@@ -379,7 +416,7 @@ impl GeminiAdapter {
         };
 
         let body = serde_json::to_vec(&req)?;
-        let url = expand_url_template(&target.endpoint, target);
+        let url = expand_url_template(&target.endpoint, target)?;
 
         Ok(build_proxy_request(body, target, core.stream, url))
     }
@@ -478,6 +515,23 @@ impl GeminiAdapter {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Look up the original function name for a tool_use_id by searching ToolUse
+/// content blocks in the conversation messages.  This is needed because Gemini
+/// requires the `function_response.name` to match the original function
+/// declaration, but the core `ToolResult` type only carries `tool_use_id`.
+fn lookup_tool_name(core: &CoreRequest, tool_use_id: &str) -> Option<String> {
+    for msg in &core.messages {
+        for content in &msg.content {
+            if let CoreContent::ToolUse { id, name, .. } = content {
+                if id == tool_use_id {
+                    return Some(name.clone());
+                }
+            }
+        }
+    }
+    None
+}
 
 /// Build usage from Gemini usage metadata.
 fn build_gemini_usage(usage: &GeminiUsage) -> Usage {
@@ -981,6 +1035,198 @@ mod tests {
         assert!(start_idx < content_start_idx, "MessageStart must precede ContentStart");
         assert!(content_start_idx < text_delta_idx, "ContentStart must precede TextDelta");
         assert!(text_delta_idx < stop_idx, "TextDelta must precede MessageStop");
+    }
+
+    // -- Additional missing tests ----------------------------------------------
+
+    #[test]
+    fn encode_stop_sequences_forwarded() {
+        let mut core = make_core_request(vec![CoreMessage {
+            role: CoreRole::User,
+            content: vec![CoreContent::Text {
+                text: "hi".into(),
+                cache: None,
+            }],
+        }]);
+        core.sampling.stop = Some(vec!["END".into(), "STOP".into()]);
+        let adapter = GeminiAdapter;
+        let target = make_target();
+        let proxy_req = adapter.encode_request(&core, &target).unwrap();
+
+        let body: GeminiRequest = serde_json::from_slice(&proxy_req.body).unwrap();
+        let config = body.generation_config.unwrap();
+        assert_eq!(config.stop_sequences, Some(vec!["END".into(), "STOP".into()]));
+    }
+
+    #[test]
+    fn encode_tool_result_lookup_function_name() {
+        let core = make_core_request(vec![
+            CoreMessage {
+                role: CoreRole::Assistant,
+                content: vec![CoreContent::ToolUse {
+                    id: "gemini_call_0".into(),
+                    name: "get_weather".into(),
+                    input: serde_json::json!({"city": "SF"}),
+                }],
+            },
+            CoreMessage {
+                role: CoreRole::Tool,
+                content: vec![CoreContent::ToolResult {
+                    tool_use_id: "gemini_call_0".into(),
+                    content: vec![CoreContent::Text {
+                        text: "72F".into(),
+                        cache: None,
+                    }],
+                    is_error: false,
+                }],
+            },
+        ]);
+        let adapter = GeminiAdapter;
+        let target = make_target();
+        let proxy_req = adapter.encode_request(&core, &target).unwrap();
+
+        let body: GeminiRequest = serde_json::from_slice(&proxy_req.body).unwrap();
+        // The ToolResult should be encoded as a function_response with the
+        // correct function name (looked up from the ToolUse block).
+        let fr = body.contents.iter()
+            .find_map(|c| c.parts.iter().find_map(|p| p.function_response.clone()));
+        assert!(fr.is_some(), "expected function_response part");
+        assert_eq!(fr.unwrap().name, "get_weather");
+    }
+
+    #[test]
+    fn stream_unknown_event_skipped() {
+        let target = make_target();
+        let adapter = GeminiAdapter;
+        let mut decoder = adapter.new_stream_decoder(&target);
+
+        let frame = make_frame(r#"{"candidates":[],"usageMetadata":null}"#);
+        let events = decoder.decode_frame(&frame).unwrap();
+        // Only MessageStart should be emitted (first chunk), no content events.
+        assert!(events.iter().any(|e| matches!(e, CoreEvent::MessageStart { .. })));
+        assert!(!events.iter().any(|e| matches!(e, CoreEvent::TextDelta { .. })));
+    }
+
+    #[test]
+    fn decode_stop_reason_max_tokens() {
+        let target = make_target();
+        let resp_json = serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "role": "model",
+                    "parts": [{"text": "truncated"}]
+                },
+                "finishReason": "MAX_TOKENS"
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 10,
+                "candidatesTokenCount": 5,
+                "totalTokenCount": 15
+            }
+        });
+        let bytes = serde_json::to_vec(&resp_json).unwrap();
+        let adapter = GeminiAdapter;
+        let core_resp = adapter.decode_response(&bytes, &target).unwrap();
+
+        assert_eq!(core_resp.stop_reason, StopReason::MaxTokens);
+    }
+
+    #[test]
+    fn decode_empty_content_gets_default_text() {
+        let target = make_target();
+        let resp_json = serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "role": "model",
+                    "parts": []
+                },
+                "finishReason": "STOP"
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 10,
+                "candidatesTokenCount": 5,
+                "totalTokenCount": 15
+            }
+        });
+        let bytes = serde_json::to_vec(&resp_json).unwrap();
+        let adapter = GeminiAdapter;
+        let core_resp = adapter.decode_response(&bytes, &target).unwrap();
+
+        assert_eq!(core_resp.content.len(), 1);
+        assert_eq!(core_resp.content[0], CoreContent::Text { text: String::new(), cache: None });
+    }
+
+    #[test]
+    fn stream_finish_emits_tool_use_for_unclosed_blocks() {
+        let target = make_target();
+        let adapter = GeminiAdapter;
+        let mut decoder = adapter.new_stream_decoder(&target);
+
+        // Simulate receiving a function call chunk but no explicit finish.
+        let frame = make_frame(r#"{"candidates":[{"content":{"role":"model","parts":[{"function_call":{"name":"get_weather","args":{"city":"SF"}}}]},"finishReason":null}],"usageMetadata":null}"#);
+        decoder.decode_frame(&frame).unwrap();
+
+        let events = decoder.finish().unwrap();
+        // finish() should emit ToolCallStop for the unclosed block and infer ToolUse.
+        let msg_stop = events.iter().find(|e| matches!(e, CoreEvent::MessageStop { .. }));
+        assert!(msg_stop.is_some());
+        match msg_stop.unwrap() {
+            CoreEvent::MessageStop { stop_reason, .. } => {
+                assert_eq!(*stop_reason, StopReason::ToolUse);
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn encode_reasoning_effort_omitted() {
+        // Gemini does not forward reasoning_effort; verify no panic.
+        let mut core = make_core_request(vec![CoreMessage {
+            role: CoreRole::User,
+            content: vec![CoreContent::Text {
+                text: "hi".into(),
+                cache: None,
+            }],
+        }]);
+        core.sampling.reasoning_effort = Some("high".into());
+        let adapter = GeminiAdapter;
+        let target = make_target();
+        let proxy_req = adapter.encode_request(&core, &target).unwrap();
+
+        let body: GeminiRequest = serde_json::from_slice(&proxy_req.body).unwrap();
+        // Gemini generation_config should not have reasoning_effort.
+        let config = body.generation_config.unwrap();
+        assert_eq!(config.temperature, None);
+    }
+
+    #[test]
+    fn decode_function_call_tool_use_id_format() {
+        let target = make_target();
+        let resp_json = serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "role": "model",
+                    "parts": [{"function_call": {"name": "search", "args": {"q": "test"}}}]
+                },
+                "finishReason": "STOP"
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 10,
+                "candidatesTokenCount": 5,
+                "totalTokenCount": 15
+            }
+        });
+        let bytes = serde_json::to_vec(&resp_json).unwrap();
+        let adapter = GeminiAdapter;
+        let core_resp = adapter.decode_response(&bytes, &target).unwrap();
+
+        match &core_resp.content[0] {
+            CoreContent::ToolUse { id, name, .. } => {
+                assert!(id.starts_with("gemini_call_"), "Gemini tool use IDs should start with gemini_call_");
+                assert_eq!(name, "search");
+            }
+            _ => panic!("expected ToolUse"),
+        }
     }
 
     // -- Source guard ---------------------------------------------------------

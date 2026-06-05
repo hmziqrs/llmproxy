@@ -237,6 +237,9 @@ pub struct GeminiGenerationConfig {
     pub top_p: Option<f64>,
     /// Maximum number of tokens in the completion.
     pub max_output_tokens: Option<i32>,
+    /// Stop sequences that cause generation to stop.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_sequences: Option<Vec<String>>,
 }
 
 /// A tool declaration in the Gemini API.

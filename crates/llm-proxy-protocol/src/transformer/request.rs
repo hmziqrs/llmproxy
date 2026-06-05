@@ -881,6 +881,7 @@ pub fn transform_to_gemini(
         temperature: None,
         top_p: None,
         max_output_tokens: None,
+        stop_sequences: None,
     };
 
     if anthropic_req.max_tokens > 0 {

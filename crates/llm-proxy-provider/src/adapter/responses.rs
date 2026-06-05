@@ -58,6 +58,8 @@ pub struct ResponsesStreamDecoder {
     content_started: bool,
     /// Whether a ToolCallStart has been emitted for the current function call.
     tool_call_started: bool,
+    /// Whether any tool call was seen during this stream.
+    saw_tool_call: bool,
     stop_sent: bool,
 }
 
@@ -105,6 +107,7 @@ impl ProviderStreamDecoder for ResponsesStreamDecoder {
                             }
                         } else if output.r#type == "function_call" {
                             // Emit ToolCallStart for new function calls.
+                            self.saw_tool_call = true;
                             if !self.tool_call_started {
                                 self.close_content_if_open(&mut events);
                                 self.tool_call_started = true;
@@ -220,8 +223,27 @@ impl ProviderStreamDecoder for ResponsesStreamDecoder {
 
                 if !self.stop_sent {
                     self.stop_sent = true;
+                    // Check for function_call outputs in the chunk, same as
+                    // response.completed.
+                    let stop_reason = if let Some(ref outputs) = chunk.output {
+                        outputs
+                            .iter()
+                            .find(|o| o.r#type == "function_call")
+                            .map(|_| StopReason::ToolUse)
+                            .unwrap_or_else(|| {
+                                if self.saw_tool_call {
+                                    StopReason::ToolUse
+                                } else {
+                                    StopReason::EndTurn
+                                }
+                            })
+                    } else if self.saw_tool_call {
+                        StopReason::ToolUse
+                    } else {
+                        StopReason::EndTurn
+                    };
                     events.push(CoreEvent::MessageStop {
-                        stop_reason: StopReason::EndTurn,
+                        stop_reason,
                         stop_sequence: None,
                     });
                 }
@@ -263,8 +285,13 @@ impl ProviderStreamDecoder for ResponsesStreamDecoder {
 
         if !self.stop_sent {
             self.stop_sent = true;
+            let stop_reason = if self.saw_tool_call {
+                StopReason::ToolUse
+            } else {
+                StopReason::EndTurn
+            };
             events.push(CoreEvent::MessageStop {
-                stop_reason: StopReason::EndTurn,
+                stop_reason,
                 stop_sequence: None,
             });
         }
@@ -324,34 +351,76 @@ impl ResponsesAdapter {
                 _ => "user",
             };
 
-            let text: String = msg
-                .content
-                .iter()
-                .filter_map(|c| match c {
-                    CoreContent::Text { text, .. } => Some(text.as_str()),
-                    _ => None,
-                })
-                .collect();
+            // Build content from all supported types, not just text.
+            let mut text_parts = Vec::new();
+            let mut has_function_call_output = false;
 
-            // Warn about dropped non-text content types.
             for c in &msg.content {
-                if !matches!(c, CoreContent::Text { .. }) {
-                    tracing::warn!(
-                        role,
-                        ?c,
-                        "dropping unsupported content block during Responses encode"
-                    );
+                match c {
+                    CoreContent::Text { text, .. } => {
+                        if !text.is_empty() {
+                            text_parts.push(text.as_str());
+                        }
+                    }
+                    CoreContent::ToolUse { id, name, input: tool_input } => {
+                        // Encode ToolUse as a function_call output item for the
+                        // Responses API format (used when replaying prior turns).
+                        // The Responses API represents prior tool calls as input
+                        // items with type "function_call".
+                        let call_id = id.clone();
+                        let fn_name = name.clone();
+                        let arguments = serde_json::to_string(tool_input)
+                            .unwrap_or_else(|_| "{}".to_owned());
+                        input.push(ResponsesInput {
+                            role: role.to_owned(),
+                            content: Some(serde_json::json!({
+                                "type": "function_call",
+                                "call_id": call_id,
+                                "name": fn_name,
+                                "arguments": arguments,
+                            })),
+                        });
+                        has_function_call_output = true;
+                    }
+                    CoreContent::ToolResult { tool_use_id, content: result_content, .. } => {
+                        // Encode ToolResult as a function_call_output item.
+                        let result_text: String = result_content
+                            .iter()
+                            .filter_map(|rc| match rc {
+                                CoreContent::Text { text, .. } => Some(text.as_str()),
+                                _ => None,
+                            })
+                            .collect();
+                        input.push(ResponsesInput {
+                            role: role.to_owned(),
+                            content: Some(serde_json::json!({
+                                "type": "function_call_output",
+                                "call_id": tool_use_id,
+                                "output": result_text,
+                            })),
+                        });
+                        has_function_call_output = true;
+                    }
+                    _ => {
+                        tracing::warn!(
+                            role,
+                            ?c,
+                            "dropping unsupported content block during Responses encode"
+                        );
+                    }
                 }
             }
 
-            input.push(ResponsesInput {
-                role: role.to_owned(),
-                content: if text.is_empty() {
-                    None
-                } else {
-                    Some(serde_json::Value::String(text))
-                },
-            });
+            // Add a text message input if there was text content and no
+            // function_call/function_call_output was emitted (to avoid
+            // duplicating role entries that already carry tool data).
+            if !text_parts.is_empty() && !has_function_call_output {
+                let text: String = text_parts.join("");
+                input.push(ResponsesInput {
+                    role: role.to_owned(),
+                    content: Some(serde_json::Value::String(text)),
+                });
+            }
         }
 
         // Tools.
@@ -388,23 +457,27 @@ impl ResponsesAdapter {
             tool_choice: None,
         };
 
-        // Forward tool_choice if present.
+        // Forward tool_choice if present.  Omit unknown variants instead of
+        // sending null (per the plan's lossy translation rules).
         if let Some(ref tc) = core.tool_choice {
-            req.tool_choice = Some(match tc {
-                CoreToolChoice::Auto => serde_json::json!({"type": "auto"}),
-                CoreToolChoice::Any => serde_json::json!({"type": "required"}),
-                CoreToolChoice::None => serde_json::json!({"type": "none"}),
-                CoreToolChoice::Tool { name } => serde_json::json!({
+            req.tool_choice = match tc {
+                CoreToolChoice::Auto => Some(serde_json::json!({"type": "auto"})),
+                CoreToolChoice::Any => Some(serde_json::json!({"type": "required"})),
+                CoreToolChoice::None => Some(serde_json::json!({"type": "none"})),
+                CoreToolChoice::Tool { name } => Some(serde_json::json!({
                     "type": "function",
                     "name": name
-                }),
-                CoreToolChoice::Raw(v) => v.clone(),
-                _ => serde_json::json!(null),
-            });
+                })),
+                CoreToolChoice::Raw(v) => Some(v.clone()),
+                _ => {
+                    tracing::warn!(?tc, "Responses: unknown tool_choice variant, omitting");
+                    None
+                }
+            };
         }
 
         let body = serde_json::to_vec(&req)?;
-        let url = expand_url_template(&target.endpoint, target);
+        let url = expand_url_template(&target.endpoint, target)?;
 
         Ok(build_proxy_request(body, target, core.stream, url))
     }
@@ -501,6 +574,7 @@ impl ResponsesAdapter {
             content_index: 0,
             content_started: false,
             tool_call_started: false,
+            saw_tool_call: false,
             stop_sent: false,
         })
     }
@@ -902,6 +976,192 @@ mod tests {
         assert!(body.tool_choice.is_some(), "tool_choice must be forwarded");
         let tc = body.tool_choice.unwrap();
         assert_eq!(tc["type"], "auto");
+    }
+
+    // -- Additional missing tests ----------------------------------------------
+
+    #[test]
+    fn encode_tool_use_as_function_call() {
+        let core = make_core_request(vec![CoreMessage {
+            role: CoreRole::Assistant,
+            content: vec![CoreContent::ToolUse {
+                id: "call_1".into(),
+                name: "get_weather".into(),
+                input: serde_json::json!({"city": "SF"}),
+            }],
+        }]);
+        let adapter = ResponsesAdapter;
+        let target = make_target();
+        let proxy_req = adapter.encode_request(&core, &target).unwrap();
+
+        let body: ResponsesRequest = serde_json::from_slice(&proxy_req.body).unwrap();
+        assert_eq!(body.input.len(), 1);
+        let content = body.input[0].content.as_ref().unwrap();
+        assert_eq!(content["type"], "function_call");
+        assert_eq!(content["name"], "get_weather");
+    }
+
+    #[test]
+    fn encode_tool_result_as_function_call_output() {
+        let core = make_core_request(vec![CoreMessage {
+            role: CoreRole::Tool,
+            content: vec![CoreContent::ToolResult {
+                tool_use_id: "call_1".into(),
+                content: vec![CoreContent::Text {
+                    text: "72F sunny".into(),
+                    cache: None,
+                }],
+                is_error: false,
+            }],
+        }]);
+        let adapter = ResponsesAdapter;
+        let target = make_target();
+        let proxy_req = adapter.encode_request(&core, &target).unwrap();
+
+        let body: ResponsesRequest = serde_json::from_slice(&proxy_req.body).unwrap();
+        assert_eq!(body.input.len(), 1);
+        let content = body.input[0].content.as_ref().unwrap();
+        assert_eq!(content["type"], "function_call_output");
+        assert_eq!(content["call_id"], "call_1");
+        assert_eq!(content["output"], "72F sunny");
+    }
+
+    #[test]
+    fn encode_input_schema_null_coerced() {
+        let mut core = make_core_request(vec![CoreMessage {
+            role: CoreRole::User,
+            content: vec![CoreContent::Text {
+                text: "hi".into(),
+                cache: None,
+            }],
+        }]);
+        core.tools = vec![CoreTool {
+            name: "my_tool".into(),
+            description: None,
+            input_schema: serde_json::Value::Null,
+        }];
+        let adapter = ResponsesAdapter;
+        let target = make_target();
+        let proxy_req = adapter.encode_request(&core, &target).unwrap();
+
+        let body: ResponsesRequest = serde_json::from_slice(&proxy_req.body).unwrap();
+        let params = body.tools[0].parameters.as_ref().unwrap();
+        assert_eq!(params["type"], "object");
+    }
+
+    #[test]
+    fn stream_stop_reason_mapping_tool_use() {
+        let target = make_target();
+        let adapter = ResponsesAdapter;
+        let mut decoder = adapter.new_stream_decoder(&target);
+
+        let frames = vec![
+            make_frame(r#"{"type":"response.created","id":"resp_1"}"#),
+            make_frame(r#"{"type":"response.output_item.added","output":[{"type":"function_call","call_id":"call_1","name":"test"}]}"#),
+            make_frame(r#"{"type":"response.function_call_arguments.done"}"#),
+            make_frame(r#"{"type":"response.done","usage":{"input_tokens":10,"output_tokens":5}}"#),
+        ];
+
+        let mut all_events = Vec::new();
+        for frame in &frames {
+            all_events.extend(decoder.decode_frame(frame).unwrap());
+        }
+
+        // Stop reason should be ToolUse since we saw a function_call.
+        let msg_stop = all_events.iter().find(|e| matches!(e, CoreEvent::MessageStop { .. }));
+        assert!(msg_stop.is_some());
+        match msg_stop.unwrap() {
+            CoreEvent::MessageStop { stop_reason, .. } => {
+                assert_eq!(*stop_reason, StopReason::ToolUse);
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn stream_unknown_event_skipped() {
+        let target = make_target();
+        let adapter = ResponsesAdapter;
+        let mut decoder = adapter.new_stream_decoder(&target);
+
+        let frame = make_frame(r#"{"type":"some_new_event","data":"whatever"}"#);
+        let events = decoder.decode_frame(&frame).unwrap();
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn stream_finish_emits_tool_use_if_saw_tool_call() {
+        let target = make_target();
+        let adapter = ResponsesAdapter;
+        let mut decoder = adapter.new_stream_decoder(&target);
+
+        // Simulate receiving a tool call event but no explicit done/completed.
+        let frames = vec![
+            make_frame(r#"{"type":"response.created","id":"resp_1"}"#),
+            make_frame(r#"{"type":"response.output_item.added","output":[{"type":"function_call","call_id":"c1","name":"fn"}]}"#),
+            make_frame(r#"{"type":"response.function_call_arguments.done"}"#),
+        ];
+
+        let mut all_events = Vec::new();
+        for frame in &frames {
+            all_events.extend(decoder.decode_frame(frame).unwrap());
+        }
+        all_events.extend(decoder.finish().unwrap());
+
+        let msg_stop = all_events.iter().find(|e| matches!(e, CoreEvent::MessageStop { .. }));
+        assert!(msg_stop.is_some());
+        match msg_stop.unwrap() {
+            CoreEvent::MessageStop { stop_reason, .. } => {
+                assert_eq!(*stop_reason, StopReason::ToolUse,
+                    "finish() should infer ToolUse when saw_tool_call is true");
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn decode_empty_content_gets_default_text() {
+        let target = make_target();
+        let resp = ResponsesResponse {
+            id: "test".into(),
+            object: "response".into(),
+            created: 0,
+            model: "gpt-4o".into(),
+            output: vec![],
+            usage: ResponsesUsage {
+                input_tokens: 10,
+                output_tokens: 5,
+            },
+        };
+        let bytes = serde_json::to_vec(&resp).unwrap();
+        let adapter = ResponsesAdapter;
+        let core_resp = adapter.decode_response(&bytes, &target).unwrap();
+
+        assert_eq!(core_resp.content.len(), 1);
+        assert_eq!(core_resp.content[0], CoreContent::Text { text: String::new(), cache: None });
+    }
+
+    #[test]
+    fn encode_tool_choice_any_and_none() {
+        for (tc, expected_type) in [
+            (CoreToolChoice::Any, "required"),
+            (CoreToolChoice::None, "none"),
+        ] {
+            let mut core = make_core_request(vec![CoreMessage {
+                role: CoreRole::User,
+                content: vec![CoreContent::Text {
+                    text: "hi".into(),
+                    cache: None,
+                }],
+            }]);
+            core.tool_choice = Some(tc);
+            let adapter = ResponsesAdapter;
+            let target = make_target();
+            let proxy_req = adapter.encode_request(&core, &target).unwrap();
+
+            let body: ResponsesRequest = serde_json::from_slice(&proxy_req.body).unwrap();
+            assert_eq!(body.tool_choice.unwrap()["type"], expected_type);
+        }
     }
 
     // -- Source guard ---------------------------------------------------------

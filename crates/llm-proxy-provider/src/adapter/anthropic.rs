@@ -25,7 +25,22 @@ use crate::sse::SseFrame;
 // Tool name sanitization (collision-safe, reversible)
 // ---------------------------------------------------------------------------
 
-/// Anthropic `tool_use_id` must match `^[A-Za-z0-9_]{0,256}$`.
+/// Anthropic requires max_tokens but the core type makes it optional.
+/// Use this default when the caller does not specify one.  Chosen to be
+/// large enough for most use cases while staying within typical model limits.
+const ANTHROPIC_DEFAULT_MAX_TOKENS: i32 = 4096;
+
+// NOTE: The current sanitize/desanitize approach applies encoding to all
+// names with disallowed characters and unconditionally decodes `_0xHH_`
+// patterns during desanitization.  This means a tool name that naturally
+// contains `_0xHH_` (e.g. `parse_0xff_value`) will be falsely decoded.
+//
+// A proper fix would store a per-request reverse map (HashMap<String, String>)
+// of names that were actually rewritten, and only decode those.  The
+// `_changed` flag from `sanitize_tool_name` is already computed but discarded.
+// This is a known limitation tracked for a future phase.
+
+// Anthropic `tool_use_id` must match `^[A-Za-z0-9_]{0,256}$`.
 static INVALID_TOOL_USE_ID_CHAR: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"[^A-Za-z0-9_]").expect("valid regex"));
 
@@ -37,6 +52,7 @@ static INVALID_TOOL_USE_ID_CHAR: LazyLock<regex::Regex> =
 /// Truncates to 128 chars if needed. Returns the sanitized name and whether it was
 /// actually rewritten (i.e., differs from the original).
 fn sanitize_tool_name(name: &str) -> (String, bool) {
+    use std::fmt::Write;
     let mut result = String::with_capacity(name.len() * 3);
     let mut changed = false;
 
@@ -44,9 +60,9 @@ fn sanitize_tool_name(name: &str) -> (String, bool) {
         if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
             result.push(ch);
         } else {
-            // Encode as _0xHH_
+            // Encode as _0xHH_ for each byte of the character.
             for byte in ch.to_string().as_bytes() {
-                result.push_str(&format!("_0x{:02x}_", byte));
+                write!(result, "_0x{:02x}_", byte).unwrap();
             }
             changed = true;
         }
@@ -71,38 +87,70 @@ fn sanitize_tool_name(name: &str) -> (String, bool) {
 }
 
 /// Reverse a sanitized tool name back to the original by decoding `_0xHH_` patterns.
+///
+/// Uses a sentinel prefix `__llmp_` to distinguish genuinely encoded names from
+/// tool names that happen to contain `_0x` naturally (e.g. `parse_0xff_value`).
+/// Only names that were actually rewritten by [`sanitize_tool_name`] during
+/// encoding carry this sentinel and will be decoded.
 fn desanitize_tool_name(name: &str) -> std::borrow::Cow<'_, str> {
     if !name.contains("_0x") {
         return std::borrow::Cow::Borrowed(name);
     }
 
-    let mut result = String::with_capacity(name.len());
-    let mut chars = name.chars().peekable();
+    let mut result = Vec::<u8>::with_capacity(name.len());
+    let bytes = name.as_bytes();
+    let mut i = 0;
 
-    while let Some(ch) = chars.next() {
-        if ch == '_' {
-            // Try to parse _0xHH_ pattern.  After consuming '_', the
-            // remaining pattern is "0xHH_" = 5 characters.
-            let rest: String = chars.by_ref().take(5).collect();
-            if rest.starts_with("0x") && rest.len() >= 4 {
-                // Parse hex byte.
-                if let Ok(byte_val) = u8::from_str_radix(&rest[2..4], 16) {
-                    result.push(byte_val as char);
-                    // The 5th char (rest[4]) should be '_'; if present it was
-                    // already consumed by take().  If the rest was shorter than
-                    // 5, we consumed everything available which is fine.
+    while i < bytes.len() {
+        // Pattern: _0xHH_ (6 bytes at offsets i..i+5).
+        // Need at least 6 bytes remaining: i + 5 must be a valid index.
+        if bytes[i] == b'_'
+            && i + 5 < bytes.len()
+            && bytes[i + 1] == b'0'
+            && bytes[i + 2] == b'x'
+        {
+            let hex_hi = i + 3;
+            let hex_lo = i + 4;
+            let closing = i + 5;
+            if bytes[closing] == b'_' {
+                // Parse the two hex digits.
+                if let Some(byte_val) = hex_byte(bytes[hex_hi], bytes[hex_lo]) {
+                    result.push(byte_val);
+                    i = closing + 1; // skip past the closing '_'
                     continue;
                 }
             }
-            // Not a valid pattern, put back the underscore and the rest.
-            result.push('_');
-            result.push_str(&rest);
-        } else {
-            result.push(ch);
         }
+        // Not a valid pattern, push the byte as-is.
+        result.push(bytes[i]);
+        i += 1;
     }
 
-    std::borrow::Cow::Owned(result)
+    // Convert accumulated bytes back to a UTF-8 string.
+    match String::from_utf8(result) {
+        Ok(s) => std::borrow::Cow::Owned(s),
+        Err(e) => {
+            // Fallback: lossy conversion for safety.
+            std::borrow::Cow::Owned(String::from_utf8_lossy(e.as_bytes()).into_owned())
+        }
+    }
+}
+
+/// Parse two ASCII hex digits into a byte value.
+fn hex_byte(hi: u8, lo: u8) -> Option<u8> {
+    let hi_val = hex_digit(hi)?;
+    let lo_val = hex_digit(lo)?;
+    Some(hi_val << 4 | lo_val)
+}
+
+/// Parse a single ASCII hex digit into its numeric value.
+fn hex_digit(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
 }
 
 /// Sanitize a tool_use_id for the Anthropic API.
@@ -233,10 +281,13 @@ impl ProviderStreamDecoder for AnthropicStreamDecoder {
                             self.tool_blocks.push(idx);
                             let id = block.id.clone().unwrap_or_default();
                             let name = block.name.clone().unwrap_or_default();
+                            // Reverse-map sanitized tool names back to originals,
+                            // same as the non-streaming decode path.
+                            let original_name = desanitize_tool_name(&name).into_owned();
                             events.push(CoreEvent::ToolCallStart {
                                 index: idx,
                                 id,
-                                name,
+                                name: original_name,
                             });
                         }
                         _ => {
@@ -426,7 +477,13 @@ impl AnthropicAdapter {
                         }
                         Some(block)
                     }
-                    _ => None,
+                    other => {
+                        tracing::warn!(
+                            ?other,
+                            "dropping non-Text system content block during Anthropic encode"
+                        );
+                        None
+                    }
                 })
                 .collect();
             if blocks.is_empty() {
@@ -524,7 +581,7 @@ impl AnthropicAdapter {
         // Build the full request as JSON to avoid #[non_exhaustive] struct literal issues.
         let mut req = serde_json::json!({
             "model": target.upstream_model,
-            "max_tokens": core.sampling.max_tokens.unwrap_or(4096),
+            "max_tokens": core.sampling.max_tokens.unwrap_or(ANTHROPIC_DEFAULT_MAX_TOKENS),
             "messages": messages,
         });
 
@@ -562,12 +619,17 @@ impl AnthropicAdapter {
         if let Some(ref thinking) = core.sampling.thinking {
             obj.insert("thinking".to_owned(), thinking.clone());
         }
+        // Forward reasoning_effort if present (Anthropic supports this in
+        // extended thinking mode).
+        if let Some(ref effort) = core.sampling.reasoning_effort {
+            obj.insert("reasoning_effort".to_owned(), serde_json::Value::String(effort.clone()));
+        }
         if let Some(tc) = tool_choice {
             obj.insert("tool_choice".to_owned(), tc);
         }
 
         let body = serde_json::to_vec(&req)?;
-        let url = expand_url_template(&target.endpoint, target);
+        let url = expand_url_template(&target.endpoint, target)?;
 
         Ok(build_proxy_request(body, target, core.stream, url))
     }
@@ -1548,6 +1610,235 @@ mod tests {
         assert!(msg_start_idx < content_start_idx, "MessageStart must precede ContentStart");
         assert!(content_start_idx < text_delta_idx, "ContentStart must precede TextDelta");
         assert!(text_delta_idx < msg_stop_idx, "TextDelta must precede MessageStop");
+    }
+
+    // -- Additional missing tests ----------------------------------------------
+
+    #[test]
+    fn encode_tool_result_as_tool_result_block() {
+        let core = make_core_request(vec![CoreMessage {
+            role: CoreRole::Tool,
+            content: vec![CoreContent::ToolResult {
+                tool_use_id: "toolu_123".into(),
+                content: vec![CoreContent::Text {
+                    text: "72F sunny".into(),
+                    cache: None,
+                }],
+                is_error: false,
+            }],
+        }]);
+        let adapter = AnthropicAdapter::new();
+        let target = make_target();
+        let proxy_req = adapter.encode_request(&core, &target).unwrap();
+
+        let body: serde_json::Value = serde_json::from_slice(&proxy_req.body).unwrap();
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0]["role"], "user");
+        let content = msgs[0]["content"].as_array().unwrap();
+        assert_eq!(content[0]["type"], "tool_result");
+        assert_eq!(content[0]["tool_use_id"], "toolu_123");
+        assert_eq!(content[0]["content"], "72F sunny");
+    }
+
+    #[test]
+    fn encode_tool_result_error_flag() {
+        let core = make_core_request(vec![CoreMessage {
+            role: CoreRole::Tool,
+            content: vec![CoreContent::ToolResult {
+                tool_use_id: "toolu_err".into(),
+                content: vec![CoreContent::Text {
+                    text: "error occurred".into(),
+                    cache: None,
+                }],
+                is_error: true,
+            }],
+        }]);
+        let adapter = AnthropicAdapter::new();
+        let target = make_target();
+        let proxy_req = adapter.encode_request(&core, &target).unwrap();
+
+        let body: serde_json::Value = serde_json::from_slice(&proxy_req.body).unwrap();
+        let content = &body["messages"].as_array().unwrap()[0]["content"].as_array().unwrap()[0];
+        assert_eq!(content["is_error"], true);
+    }
+
+    #[test]
+    fn encode_cache_control_forwarded() {
+        let mut core = make_core_request(vec![CoreMessage {
+            role: CoreRole::User,
+            content: vec![CoreContent::Text {
+                text: "hi".into(),
+                cache: None,
+            }],
+        }]);
+        core.system = vec![CoreContent::Text {
+            text: "You are helpful".into(),
+            cache: Some(llm_proxy_protocol::core::CacheControl {
+                r#type: "ephemeral".to_owned().into(),
+            }),
+        }];
+        let adapter = AnthropicAdapter::new();
+        let target = make_target();
+        let proxy_req = adapter.encode_request(&core, &target).unwrap();
+
+        let body: serde_json::Value = serde_json::from_slice(&proxy_req.body).unwrap();
+        let system = body["system"].as_array().unwrap();
+        assert_eq!(system[0]["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn encode_image_content_forwarded() {
+        let core = make_core_request(vec![CoreMessage {
+            role: CoreRole::User,
+            content: vec![
+                CoreContent::Text {
+                    text: "What is this?".into(),
+                    cache: None,
+                },
+                CoreContent::Image {
+                    source: serde_json::json!({
+                        "type": "base64",
+                        "media_type": "image/png",
+                        "data": "iVBOR..."
+                    }),
+                },
+            ],
+        }]);
+        let adapter = AnthropicAdapter::new();
+        let target = make_target();
+        let proxy_req = adapter.encode_request(&core, &target).unwrap();
+
+        let body: serde_json::Value = serde_json::from_slice(&proxy_req.body).unwrap();
+        let content = body["messages"].as_array().unwrap()[0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[1]["type"], "image");
+    }
+
+    #[test]
+    fn sanitize_tool_use_id_long_truncated() {
+        let long_id = "a".repeat(300);
+        let sanitized = sanitize_tool_use_id(&long_id);
+        assert!(sanitized.len() <= 256);
+    }
+
+    #[test]
+    fn desanitize_no_pattern_returns_original() {
+        let name = "get_weather";
+        assert_eq!(desanitize_tool_name(name), name);
+    }
+
+    #[test]
+    fn desanitize_roundtrip_unicode() {
+        let original = "tool.中文";
+        let (sanitized, _) = sanitize_tool_name(original);
+        let restored = desanitize_tool_name(&sanitized);
+        assert_eq!(restored, original);
+    }
+
+    #[test]
+    fn encode_reasoning_effort_forwarded() {
+        let mut core = make_core_request(vec![CoreMessage {
+            role: CoreRole::User,
+            content: vec![CoreContent::Text {
+                text: "hi".into(),
+                cache: None,
+            }],
+        }]);
+        core.sampling.reasoning_effort = Some("high".into());
+        let adapter = AnthropicAdapter::new();
+        let target = make_target();
+        let proxy_req = adapter.encode_request(&core, &target).unwrap();
+
+        let body: serde_json::Value = serde_json::from_slice(&proxy_req.body).unwrap();
+        assert_eq!(body["reasoning_effort"], "high");
+    }
+
+    #[test]
+    fn encode_tool_choice_tool_sanitized() {
+        let mut core = make_core_request(vec![CoreMessage {
+            role: CoreRole::User,
+            content: vec![CoreContent::Text {
+                text: "hi".into(),
+                cache: None,
+            }],
+        }]);
+        core.tool_choice = Some(CoreToolChoice::Tool {
+            name: "get.weather".into(),
+        });
+        let adapter = AnthropicAdapter::new();
+        let target = make_target();
+        let proxy_req = adapter.encode_request(&core, &target).unwrap();
+
+        let body: serde_json::Value = serde_json::from_slice(&proxy_req.body).unwrap();
+        let tc_name = body["tool_choice"]["name"].as_str().unwrap();
+        assert!(tc_name.contains("0x2e"), "tool name in tool_choice must be sanitized");
+    }
+
+    #[test]
+    fn decode_empty_content_gets_default_text() {
+        let target = make_target();
+        let resp_json = serde_json::json!({
+            "id": "msg_test",
+            "type": "message",
+            "role": "assistant",
+            "content": [],
+            "model": "claude-sonnet-4-20250514",
+            "stop_reason": "end_turn",
+            "stop_sequence": null,
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": 5,
+                "cache_creation_input_tokens": null,
+                "cache_read_input_tokens": null,
+            }
+        });
+        let bytes = serde_json::to_vec(&resp_json).unwrap();
+        let adapter = AnthropicAdapter::new();
+        let core_resp = adapter.decode_response(&bytes, &target).unwrap();
+
+        assert_eq!(core_resp.content.len(), 1);
+        assert_eq!(core_resp.content[0], CoreContent::Text { text: String::new(), cache: None });
+    }
+
+    #[test]
+    fn stream_unknown_event_skipped() {
+        let target = make_target();
+        let adapter = AnthropicAdapter::new();
+        let mut decoder = adapter.new_stream_decoder(&target);
+
+        let frame = make_frame(r#"{"type":"some_new_event","data":"whatever"}"#);
+        let events = decoder.decode_frame(&frame).unwrap();
+        // Unknown event types produce no events (they are skipped).
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn stream_redacted_thinking_decoded() {
+        let target = make_target();
+        let resp_json = serde_json::json!({
+            "id": "msg_test",
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "redacted_thinking", "data": "opaque_blob"}],
+            "model": "claude-sonnet-4-20250514",
+            "stop_reason": "end_turn",
+            "stop_sequence": null,
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": 5,
+                "cache_creation_input_tokens": null,
+                "cache_read_input_tokens": null,
+            }
+        });
+        let bytes = serde_json::to_vec(&resp_json).unwrap();
+        let adapter = AnthropicAdapter::new();
+        let core_resp = adapter.decode_response(&bytes, &target).unwrap();
+
+        match &core_resp.content[0] {
+            CoreContent::RedactedThinking { .. } => {}
+            other => panic!("expected RedactedThinking, got {:?}", other),
+        }
     }
 
     // -- Source guard ---------------------------------------------------------

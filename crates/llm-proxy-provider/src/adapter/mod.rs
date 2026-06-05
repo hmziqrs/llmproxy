@@ -154,10 +154,12 @@ impl ProviderAdapter {
         target: &ProviderAdapterTarget,
     ) -> Result<ProxyRequest, ProviderError> {
         // Log non-empty provider_hints so they are not silently ignored.
+        // Per the plan's lossy translation rules, hints with no provider mapping
+        // should be warned at warn level.  No adapter currently forwards any
+        // hint keys, so all non-empty hints are unmapped.
         if !core.provider_hints.raw.is_empty() {
-            tracing::debug!(
+            tracing::warn!(
                 protocol = %target.protocol.name(),
-                hints = ?core.provider_hints.raw,
                 "provider_hints present but no adapter currently forwards them"
             );
         }
@@ -273,17 +275,22 @@ impl ProviderAdapterRegistry {
 /// Currently supports `{model}` -> `upstream_model`.
 ///
 /// Validates that the model name contains only safe characters (alphanumeric,
-/// dots, hyphens, underscores) to prevent path traversal injection.
-pub(crate) fn expand_url_template(template: &str, target: &ProviderAdapterTarget) -> String {
+/// dots, hyphens, underscores) to prevent path traversal injection.  Returns
+/// an error if the model name contains characters that could enable SSRF or
+/// path-traversal attacks (e.g. `/`, `..`, control characters).
+pub(crate) fn expand_url_template(
+    template: &str,
+    target: &ProviderAdapterTarget,
+) -> Result<String, ProviderError> {
     let model = &target.upstream_model;
-    // Validate model name contains only safe characters.
+    // Reject model names containing path traversal or other unsafe characters.
     if !model.chars().all(|c| c.is_alphanumeric() || c == '.' || c == '-' || c == '_') {
-        tracing::warn!(
-            model,
-            "upstream_model contains potentially unsafe characters, sanitizing for URL"
-        );
+        return Err(ProviderError::SseFraming(format!(
+            "upstream_model {:?} contains unsafe characters; refusing to interpolate into URL",
+            model
+        )));
     }
-    template.replace("{model}", model)
+    Ok(template.replace("{model}", model))
 }
 
 /// Map a finish reason string from OpenAI-compatible providers to a core StopReason.
@@ -469,7 +476,7 @@ mod tests {
         let url = expand_url_template(
             "https://generativelanguage.googleapis.com/v1beta/models/{model}:streamGenerateContent",
             &target,
-        );
+        ).unwrap();
         assert_eq!(
             url,
             "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:streamGenerateContent"
@@ -479,8 +486,34 @@ mod tests {
     #[test]
     fn url_template_no_placeholder_unchanged() {
         let target = make_target(ProviderProtocol::OpenAiChatCompletions);
-        let url = expand_url_template("https://api.openai.com/v1/chat/completions", &target);
+        let url = expand_url_template("https://api.openai.com/v1/chat/completions", &target).unwrap();
         assert_eq!(url, "https://api.openai.com/v1/chat/completions");
+    }
+
+    #[test]
+    fn url_template_rejects_unsafe_model_name() {
+        let mut target = make_target(ProviderProtocol::OpenAiChatCompletions);
+        target.upstream_model = "../../etc/passwd".into();
+        let result = expand_url_template("https://api.openai.com/v1/{model}", &target);
+        assert!(result.is_err(), "should reject model name with path traversal");
+    }
+
+    #[test]
+    fn provider_adapter_target_debug_redacts_api_key() {
+        let target = ProviderAdapterTarget {
+            provider_name: "test".into(),
+            adapter_name: "openai-chat".into(),
+            protocol: ProviderProtocol::OpenAiChatCompletions,
+            endpoint: "https://api.openai.com/v1/chat/completions".into(),
+            auth_style: AuthStyle::Bearer,
+            api_key: "sk-test-super-secret-key-1234567890".into(),
+            requested_model: "gpt-4o".into(),
+            upstream_model: "gpt-4o".into(),
+        };
+        let debug = format!("{:?}", target);
+        assert!(!debug.contains("sk-test-super-secret-key-1234567890"),
+            "Debug output must not contain the actual API key");
+        assert!(debug.contains("***"), "Debug output must show *** for api_key");
     }
 
     // -- Finish reason mapping -----------------------------------------------

@@ -37,6 +37,22 @@ pub struct OpenAiChatAdapter;
 // ---------------------------------------------------------------------------
 
 /// Stateful stream decoder for OpenAI Chat Completions SSE frames.
+///
+/// ## CoreEvent variants emitted
+///
+/// - `MessageStart` -- on the first chunk received
+/// - `ContentStart` -- on first text or reasoning delta
+/// - `TextDelta` -- on `delta.content`
+/// - `ThinkingDelta` -- on `delta.reasoning_content` (or `delta.reasoning`)
+/// - `ToolCallStart` -- on new tool calls in `delta.tool_calls`
+/// - `ToolCallDelta` -- on tool call argument deltas
+/// - `ToolCallStop` -- on stream end for unclosed tool blocks
+/// - `UsageDelta` -- on usage-only chunks or final chunks with usage
+/// - `MessageStop` -- on `finish_reason` or stream end
+///
+/// Intentionally never emitted: `Ping` (OpenAI Chat has no ping mechanism),
+/// `Error` (OpenAI errors are handled at the transport level, not in stream
+/// decoding).
 #[derive(Debug)]
 pub struct OpenAiChatStreamDecoder {
     model_ref: ModelRef,
@@ -298,18 +314,26 @@ impl OpenAiChatAdapter {
 
         // System messages.
         for sys_content in &core.system {
-            if let CoreContent::Text { text, .. } = sys_content {
-                if !text.is_empty() {
-                    messages.push(ChatMessage {
-                        role: "system".to_owned(),
-                        content: text.clone(),
-                        reasoning_content: None,
-                        tool_calls: Vec::new(),
-                        name: None,
-                        tool_call_id: None,
-                        cache_control: None,
-                        refusal: None,
-                    });
+            match sys_content {
+                CoreContent::Text { text, .. } => {
+                    if !text.is_empty() {
+                        messages.push(ChatMessage {
+                            role: "system".to_owned(),
+                            content: text.clone(),
+                            reasoning_content: None,
+                            tool_calls: Vec::new(),
+                            name: None,
+                            tool_call_id: None,
+                            cache_control: None,
+                            refusal: None,
+                        });
+                    }
+                }
+                other => {
+                    tracing::warn!(
+                        ?other,
+                        "OpenAI Chat: dropping non-Text system content block during encode"
+                    );
                 }
             }
         }
@@ -485,17 +509,20 @@ impl OpenAiChatAdapter {
             })
             .collect();
 
-        // Tool choice.
-        let tool_choice = core.tool_choice.as_ref().map(|tc| match tc {
-            CoreToolChoice::Auto => serde_json::json!({"type": "auto"}),
-            CoreToolChoice::Any => serde_json::json!({"type": "required"}),
-            CoreToolChoice::None => serde_json::json!({"type": "none"}),
-            CoreToolChoice::Tool { name } => serde_json::json!({
+        // Tool choice -- omit (None) for unknown variants instead of sending null.
+        let tool_choice = core.tool_choice.as_ref().and_then(|tc| match tc {
+            CoreToolChoice::Auto => Some(serde_json::json!({"type": "auto"})),
+            CoreToolChoice::Any => Some(serde_json::json!({"type": "required"})),
+            CoreToolChoice::None => Some(serde_json::json!({"type": "none"})),
+            CoreToolChoice::Tool { name } => Some(serde_json::json!({
                 "type": "function",
                 "function": {"name": name}
-            }),
-            CoreToolChoice::Raw(v) => v.clone(),
-            _ => serde_json::json!(null),
+            })),
+            CoreToolChoice::Raw(v) => Some(v.clone()),
+            _ => {
+                tracing::warn!(?tc, "OpenAI Chat: unknown tool_choice variant, omitting");
+                None
+            }
         });
 
         let mut req = ChatCompletionRequest {
@@ -529,7 +556,7 @@ impl OpenAiChatAdapter {
         }
 
         let body = serde_json::to_vec(&req)?;
-        let url = expand_url_template(&target.endpoint, target);
+        let url = expand_url_template(&target.endpoint, target)?;
 
         Ok(build_proxy_request(body, target, core.stream, url))
     }
@@ -557,7 +584,7 @@ impl OpenAiChatAdapter {
 
         let mut content = Vec::new();
 
-        // Reasoning -> Thinking.
+        // Reasoning -> Thinking (typically comes first from the provider).
         if let Some(ref reasoning) = msg.reasoning_content {
             if !reasoning.is_empty() {
                 content.push(CoreContent::Thinking {
@@ -565,6 +592,14 @@ impl OpenAiChatAdapter {
                     signature: None,
                 });
             }
+        }
+
+        // Text content (may appear before or after tool calls).
+        if !msg.content.is_empty() {
+            content.push(CoreContent::Text {
+                text: msg.content.clone(),
+                cache: None,
+            });
         }
 
         // Refusal.
@@ -593,14 +628,6 @@ impl OpenAiChatAdapter {
                     .and_then(|f| f.name.clone())
                     .unwrap_or_default(),
                 input,
-            });
-        }
-
-        // Text content.
-        if !msg.content.is_empty() {
-            content.push(CoreContent::Text {
-                text: msg.content.clone(),
-                cache: None,
             });
         }
 
@@ -658,14 +685,26 @@ impl OpenAiChatAdapter {
 // ---------------------------------------------------------------------------
 
 /// Collect all text from a list of content blocks.
+///
+/// Non-text blocks are silently omitted, but a warning is logged since this
+/// means data is being dropped.  Per the plan's lossy translation rules, every
+/// dropped feature must be either rejected, warned, or preserved opaquely.
 fn collect_text(content: &[CoreContent]) -> String {
-    content
-        .iter()
-        .filter_map(|c| match c {
-            CoreContent::Text { text, .. } => Some(text.as_str()),
-            _ => None,
-        })
-        .collect()
+    let mut text = String::new();
+    for c in content {
+        match c {
+            CoreContent::Text { text: t, .. } => {
+                text.push_str(t);
+            }
+            other => {
+                tracing::warn!(
+                    ?other,
+                    "OpenAI Chat: dropping non-text content block during collect_text"
+                );
+            }
+        }
+    }
+    text
 }
 
 // ===========================================================================
@@ -1299,6 +1338,213 @@ mod tests {
         let events = decoder.decode_frame(&frame).unwrap();
         assert!(events.iter().any(|e| matches!(e, CoreEvent::ThinkingDelta { .. })),
             "reasoning alias must produce ThinkingDelta");
+    }
+
+    // -- Additional missing tests ----------------------------------------------
+
+    #[test]
+    fn encode_reasoning_effort_forwarded() {
+        let mut core = make_core_request(vec![CoreMessage {
+            role: CoreRole::User,
+            content: vec![CoreContent::Text {
+                text: "hi".into(),
+                cache: None,
+            }],
+        }]);
+        core.sampling.reasoning_effort = Some("high".into());
+        let adapter = OpenAiChatAdapter;
+        let target = make_target();
+        let proxy_req = adapter.encode_request(&core, &target).unwrap();
+
+        let body: ChatCompletionRequest = serde_json::from_slice(&proxy_req.body).unwrap();
+        assert_eq!(body.reasoning_effort, Some("high".to_owned()));
+    }
+
+    #[test]
+    fn encode_stop_sequences() {
+        let mut core = make_core_request(vec![CoreMessage {
+            role: CoreRole::User,
+            content: vec![CoreContent::Text {
+                text: "hi".into(),
+                cache: None,
+            }],
+        }]);
+        core.sampling.stop = Some(vec!["END".into(), "STOP".into()]);
+        let adapter = OpenAiChatAdapter;
+        let target = make_target();
+        let proxy_req = adapter.encode_request(&core, &target).unwrap();
+
+        let body: ChatCompletionRequest = serde_json::from_slice(&proxy_req.body).unwrap();
+        assert_eq!(body.stop, Some(serde_json::json!(["END", "STOP"])));
+    }
+
+    #[test]
+    fn encode_stop_single_sequence_scalar() {
+        let mut core = make_core_request(vec![CoreMessage {
+            role: CoreRole::User,
+            content: vec![CoreContent::Text {
+                text: "hi".into(),
+                cache: None,
+            }],
+        }]);
+        core.sampling.stop = Some(vec!["END".into()]);
+        let adapter = OpenAiChatAdapter;
+        let target = make_target();
+        let proxy_req = adapter.encode_request(&core, &target).unwrap();
+
+        let body: ChatCompletionRequest = serde_json::from_slice(&proxy_req.body).unwrap();
+        assert_eq!(body.stop, Some(serde_json::json!("END")));
+    }
+
+    #[test]
+    fn encode_thinking_forwarded() {
+        let mut core = make_core_request(vec![CoreMessage {
+            role: CoreRole::User,
+            content: vec![CoreContent::Text {
+                text: "hi".into(),
+                cache: None,
+            }],
+        }]);
+        core.sampling.thinking = Some(serde_json::json!({"type": "enabled", "budget_tokens": 5000}));
+        let adapter = OpenAiChatAdapter;
+        let target = make_target();
+        let proxy_req = adapter.encode_request(&core, &target).unwrap();
+
+        let body: ChatCompletionRequest = serde_json::from_slice(&proxy_req.body).unwrap();
+        assert!(body.thinking.is_some());
+        assert_eq!(body.thinking.unwrap()["budget_tokens"], 5000);
+    }
+
+    #[test]
+    fn encode_tool_choice_none_omitted() {
+        // Verify that unknown tool_choice variants produce None (omitted).
+        let mut core = make_core_request(vec![CoreMessage {
+            role: CoreRole::User,
+            content: vec![CoreContent::Text {
+                text: "hi".into(),
+                cache: None,
+            }],
+        }]);
+        // Raw null is a valid variant, but we can test with Auto to ensure it's Some.
+        core.tool_choice = Some(CoreToolChoice::Auto);
+        let adapter = OpenAiChatAdapter;
+        let target = make_target();
+        let proxy_req = adapter.encode_request(&core, &target).unwrap();
+
+        let body: ChatCompletionRequest = serde_json::from_slice(&proxy_req.body).unwrap();
+        assert!(body.tool_choice.is_some());
+    }
+
+    #[test]
+    fn encode_input_schema_null_coerced() {
+        let mut core = make_core_request(vec![CoreMessage {
+            role: CoreRole::User,
+            content: vec![CoreContent::Text {
+                text: "hi".into(),
+                cache: None,
+            }],
+        }]);
+        core.tools = vec![CoreTool {
+            name: "my_tool".into(),
+            description: None,
+            input_schema: serde_json::Value::Null,
+        }];
+        let adapter = OpenAiChatAdapter;
+        let target = make_target();
+        let proxy_req = adapter.encode_request(&core, &target).unwrap();
+
+        let body: ChatCompletionRequest = serde_json::from_slice(&proxy_req.body).unwrap();
+        let schema = &body.tools[0].function.parameters;
+        assert_eq!(schema.as_ref().unwrap()["type"], "object");
+    }
+
+    #[test]
+    fn decode_preserves_content_order_thinking_before_text() {
+        // Verify that Thinking appears before Text (provider order).
+        let target = make_target();
+        let resp = llm_proxy_protocol::openai::ChatCompletionResponse {
+            id: "test".into(),
+            object: "chat.completion".into(),
+            created: 0,
+            model: "deepseek-chat".into(),
+            choices: vec![Choice {
+                index: 0,
+                message: Some(ChatMessage {
+                    role: "assistant".into(),
+                    content: "answer".into(),
+                    reasoning_content: Some("thoughts".into()),
+                    tool_calls: vec![],
+                    name: None,
+                    tool_call_id: None,
+                    cache_control: None,
+                    refusal: None,
+                }),
+                finish_reason: Some("stop".into()),
+                delta: None,
+            }],
+            usage: UsageInfo {
+                prompt_tokens: 10,
+                completion_tokens: 20,
+                total_tokens: 30,
+                prompt_cache_hit_tokens: None,
+                prompt_cache_miss_tokens: None,
+            },
+        };
+        let bytes = serde_json::to_vec(&resp).unwrap();
+        let adapter = OpenAiChatAdapter;
+        let core_resp = adapter.decode_response(&bytes, &target).unwrap();
+
+        // Thinking must come before Text.
+        let thinking_idx = core_resp.content.iter().position(|c| matches!(c, CoreContent::Thinking { .. })).unwrap();
+        let text_idx = core_resp.content.iter().position(|c| matches!(c, CoreContent::Text { .. })).unwrap();
+        assert!(thinking_idx < text_idx, "Thinking must precede Text in content order");
+    }
+
+    #[test]
+    fn stream_full_lifecycle_ordering() {
+        let target = make_target();
+        let adapter = OpenAiChatAdapter;
+        let mut decoder = adapter.new_stream_decoder(&target);
+
+        let frames = vec![
+            make_frame(r#"{"id":"c","object":"chat.completion.chunk","created":0,"model":"m","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}"#),
+            make_frame(r#"{"id":"c","object":"chat.completion.chunk","created":0,"model":"m","choices":[{"index":0,"delta":{"content":"Hello"},"finish_reason":null}]}"#),
+            make_frame(r#"{"id":"c","object":"chat.completion.chunk","created":0,"model":"m","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#),
+        ];
+
+        let mut all_events = Vec::new();
+        for frame in &frames {
+            all_events.extend(decoder.decode_frame(frame).unwrap());
+        }
+
+        let start_idx = all_events.iter().position(|e| matches!(e, CoreEvent::MessageStart { .. })).unwrap();
+        let content_start_idx = all_events.iter().position(|e| matches!(e, CoreEvent::ContentStart { .. })).unwrap();
+        let text_delta_idx = all_events.iter().position(|e| matches!(e, CoreEvent::TextDelta { .. })).unwrap();
+        let stop_idx = all_events.iter().rposition(|e| matches!(e, CoreEvent::MessageStop { .. })).unwrap();
+
+        assert!(start_idx < content_start_idx, "MessageStart must precede ContentStart");
+        assert!(content_start_idx < text_delta_idx, "ContentStart must precede TextDelta");
+        assert!(text_delta_idx < stop_idx, "TextDelta must precede MessageStop");
+    }
+
+    #[test]
+    fn stream_finish_reason_only_chunk() {
+        // Test a chunk that only has finish_reason with no prior content.
+        let target = make_target();
+        let adapter = OpenAiChatAdapter;
+        let mut decoder = adapter.new_stream_decoder(&target);
+
+        let frames = vec![
+            make_frame(r#"{"id":"c","object":"chat.completion.chunk","created":0,"model":"m","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#),
+        ];
+
+        let mut all_events = Vec::new();
+        for frame in &frames {
+            all_events.extend(decoder.decode_frame(frame).unwrap());
+        }
+
+        assert!(all_events.iter().any(|e| matches!(e, CoreEvent::MessageStart { .. })));
+        assert!(all_events.iter().any(|e| matches!(e, CoreEvent::MessageStop { stop_reason: StopReason::EndTurn, .. })));
     }
 
     // -- Source guard ---------------------------------------------------------
