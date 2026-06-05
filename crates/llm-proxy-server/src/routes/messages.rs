@@ -585,16 +585,43 @@ const MAX_UPSTREAM_ERROR_LEN: usize = 512;
 /// may contain sensitive information (API key prefixes, full URLs with query
 /// parameters). The full unsanitized message should be logged server-side
 /// before calling this function.
+///
+/// Uses regex-based matching (same patterns as `sanitize_api_error_body` in
+/// the provider crate) to avoid false-positive redaction of short substrings
+/// like `sk-` that appear in ordinary words (e.g. "desk-area", "task-name").
 fn sanitize_upstream_error(msg: String) -> String {
-    // Strip common API key prefixes that may appear in upstream error bodies.
-    // Order matters: longer (more specific) patterns must be replaced first,
-    // otherwise the shorter "sk-" pattern would partially consume "sk_live_"
-    // and "sk_test_", preventing those replacements from matching.
-    let sanitized = msg
-        .replace("sk_live_", "***")
-        .replace("sk_test_", "***")
-        .replace("sk-", "***")
-        .replace("key-", "***");
+    use std::sync::OnceLock;
+    static PATTERNS: OnceLock<Vec<regex::Regex>> = OnceLock::new();
+    let patterns = PATTERNS.get_or_init(|| {
+        [
+            // Anthropic keys: sk-ant-api03-XXXXX
+            r"sk-ant-api03-[A-Za-z0-9_-]{10,}",
+            // Anthropic keys: sk-ant-XXXXX
+            r"sk-ant-[A-Za-z0-9_-]{10,}",
+            // OpenAI keys: sk-live-XXXXX (hyphen form)
+            r"sk-live-[A-Za-z0-9_-]{10,}",
+            // OpenAI keys: sk-test-XXXXX (hyphen form)
+            r"sk-test-[A-Za-z0-9_-]{10,}",
+            // OpenAI keys: sk_live_XXXXX (underscore form)
+            r"sk_live_[A-Za-z0-9_-]{10,}",
+            // OpenAI keys: sk_test_XXXXX (underscore form)
+            r"sk_test_[A-Za-z0-9_-]{10,}",
+            // Generic sk- prefix with enough trailing chars to look like a key
+            r"sk-[A-Za-z0-9_-]{20,}",
+            // Google API keys: AIza followed by 30+ alphanumeric chars
+            r"AIza[A-Za-z0-9_-]{30,}",
+            // Generic key- prefix with enough trailing chars
+            r"key-[A-Za-z0-9_-]{20,}",
+        ]
+        .iter()
+        .map(|pat| regex::Regex::new(pat).expect("invalid redaction regex"))
+        .collect()
+    });
+
+    let mut sanitized = msg;
+    for re in patterns {
+        sanitized = re.replace_all(&sanitized, "***").into_owned();
+    }
 
     // Truncate to prevent leaking large upstream responses.
     if sanitized.len() > MAX_UPSTREAM_ERROR_LEN {

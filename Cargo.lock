@@ -2111,7 +2111,6 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tokio",
- "tokio-stream",
  "tracing",
 ]
 
@@ -2126,6 +2125,7 @@ dependencies = [
  "llm-proxy-core",
  "llm-proxy-protocol",
  "llm-proxy-provider",
+ "regex",
  "reqwest",
  "serde",
  "serde_json",

@@ -19,7 +19,7 @@ use futures::Stream;
 use futures::TryStreamExt;
 use llm_proxy_core::AuthStyle;
 
-use crate::error::{ProviderError, sanitize_api_error_body};
+use crate::error::ProviderError;
 
 // ---------------------------------------------------------------------------
 // AuthHeaders
@@ -64,7 +64,12 @@ pub struct ProxyRequest {
     pub auth: AuthHeaders,
     /// Raw request body bytes.
     pub body: Vec<u8>,
-    /// Whether this is a streaming request (sets `Accept: text/event-stream`).
+    /// Whether this is a streaming request (informational for logging/metrics).
+    ///
+    /// The caller must pick the correct method: [`ProxyClient::send`] for
+    /// non-streaming requests and [`ProxyClient::send_stream`] for streaming
+    /// requests. This field does **not** control transport behaviour; it exists
+    /// for structured logging and future metrics.
     pub stream: bool,
 }
 
@@ -105,10 +110,12 @@ impl ProxyClient {
     /// (no custom TLS backend, no proxy env validation at build time), so the
     /// `expect` is safe. If future configuration changes make this fallible,
     /// switch to `try_new()` returning `Result<Self, ProviderError>`.
+    #[allow(clippy::expect_used)]
     pub fn new() -> Self {
         let http = reqwest::Client::builder()
             .pool_max_idle_per_host(20)
             .pool_idle_timeout(Duration::from_secs(90))
+            .connect_timeout(Duration::from_secs(10))
             .build()
             .expect("failed to build reqwest client");
 
@@ -165,10 +172,7 @@ impl ProxyClient {
                 .text()
                 .await
                 .unwrap_or_else(|e| format!("<failed to read error body: {}>", e));
-            return Err(ProviderError::Api {
-                status,
-                body: sanitize_api_error_body(body_text),
-            });
+            return Err(ProviderError::api(status, body_text));
         }
 
         // `bytes_stream()` consumes the Response and returns an owned stream;
@@ -207,10 +211,7 @@ async fn check_status(resp: reqwest::Response) -> Result<Vec<u8>, ProviderError>
             .text()
             .await
             .unwrap_or_else(|e| format!("<failed to read error body: {}>", e));
-        return Err(ProviderError::Api {
-            status,
-            body: sanitize_api_error_body(body_text),
-        });
+        return Err(ProviderError::api(status, body_text));
     }
     let body = resp.bytes().await?;
     Ok(body.to_vec())
@@ -676,6 +677,163 @@ mod tests {
     // Source guard checks
     // -----------------------------------------------------------------------
 
+    /// Handler that sends partial data then drops the connection (upstream disconnect).
+    async fn partial_disconnect_handler() -> axum::response::Response {
+        let stream = futures::stream::unfold(0u32, |i| async move {
+            if i >= 2 {
+                // Stop sending -- simulates upstream dropping the connection.
+                None
+            } else {
+                let chunk = format!("data: chunk {}\n\n", i);
+                Some((Ok::<_, std::convert::Infallible>(bytes::Bytes::from(chunk)), i + 1))
+            }
+        });
+        (
+            StatusCode::OK,
+            [("Content-Type", "text/event-stream")],
+            Body::from_stream(stream),
+        )
+            .into_response()
+    }
+
+    #[tokio::test]
+    async fn upstream_disconnect_ends_stream_gracefully() {
+        let app = Router::new().route("/test", post(partial_disconnect_handler));
+        let base = start_test_server(app).await;
+
+        let client = ProxyClient::new();
+        let req = ProxyRequest {
+            url: format!("{}/test", base),
+            auth: AuthHeaders {
+                style: AuthStyle::Bearer,
+                api_key: "key".to_owned(),
+            },
+            body: vec![],
+            stream: true,
+        };
+
+        let mut stream = client.send_stream(req).await.unwrap();
+        let mut chunks = Vec::new();
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(bytes) => chunks.push(bytes),
+                Err(e) => {
+                    // Mid-stream errors are also acceptable.
+                    panic!("unexpected mid-stream error: {:?}", e);
+                }
+            }
+        }
+        // Stream should have ended with the two chunks the server sent.
+        assert!(
+            !chunks.is_empty(),
+            "Expected at least one chunk before upstream disconnect"
+        );
+        let combined = chunks.concat();
+        let all_text = String::from_utf8_lossy(&combined);
+        assert!(all_text.contains("chunk 0"), "Should have received chunk 0");
+        assert!(all_text.contains("chunk 1"), "Should have received chunk 1");
+    }
+
+    /// Handler that sends some data then returns an error body mid-stream.
+    async fn mid_stream_error_handler() -> axum::response::Response {
+        // We simulate a mid-stream error by sending two successful chunks
+        // then ending the stream. The consumer should see the data.
+        // (A true mid-stream TCP error is hard to simulate with axum;
+        // this test verifies the stream terminates correctly.)
+        let stream = futures::stream::iter(vec![
+            Ok::<_, std::convert::Infallible>(bytes::Bytes::from("data: first\n\n")),
+            Ok::<_, std::convert::Infallible>(bytes::Bytes::from("data: second\n\n")),
+        ]);
+        (
+            StatusCode::OK,
+            [("Content-Type", "text/event-stream")],
+            Body::from_stream(stream),
+        )
+            .into_response()
+    }
+
+    #[tokio::test]
+    async fn stream_collects_all_chunks_then_ends() {
+        let app = Router::new().route("/test", post(mid_stream_error_handler));
+        let base = start_test_server(app).await;
+
+        let client = ProxyClient::new();
+        let req = ProxyRequest {
+            url: format!("{}/test", base),
+            auth: AuthHeaders {
+                style: AuthStyle::Bearer,
+                api_key: "key".to_owned(),
+            },
+            body: vec![],
+            stream: true,
+        };
+
+        let mut stream = client.send_stream(req).await.unwrap();
+        let mut all_data = Vec::new();
+        while let Some(item) = stream.next().await {
+            let bytes = item.expect("chunk should be Ok");
+            all_data.push(bytes);
+        }
+        assert_eq!(all_data.len(), 2, "Expected exactly 2 chunks");
+        assert!(String::from_utf8_lossy(&all_data[0]).contains("first"));
+        assert!(String::from_utf8_lossy(&all_data[1]).contains("second"));
+    }
+
+    #[tokio::test]
+    async fn empty_url_returns_http_error() {
+        let client = ProxyClient::new();
+        let req = ProxyRequest {
+            url: String::new(),
+            auth: AuthHeaders {
+                style: AuthStyle::Bearer,
+                api_key: "key".to_owned(),
+            },
+            body: vec![],
+            stream: false,
+        };
+
+        let err = client.send(req).await.unwrap_err();
+        match err {
+            ProviderError::Http(_) => {} // expected
+            other => panic!("expected ProviderError::Http for empty URL, got: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn large_body_sent_successfully() {
+        // Use a body size that exceeds axum's default 2 MB limit would reject,
+        // but is still reasonable. We configure the test server with a larger
+        // body limit to verify the transport does not buffer or truncate.
+        let app = axum::Router::new()
+            .route("/test", post(echo_handler))
+            .layer(axum::extract::DefaultBodyLimit::max(10 * 1024 * 1024));
+        let base = start_test_server(app).await;
+
+        let client = ProxyClient::new();
+        // 5 MB body
+        let large_body = "x".repeat(5 * 1024 * 1024);
+        let req = ProxyRequest {
+            url: format!("{}/test", base),
+            auth: AuthHeaders {
+                style: AuthStyle::Bearer,
+                api_key: "key".to_owned(),
+            },
+            body: large_body.clone().into_bytes(),
+            stream: false,
+        };
+
+        let resp = client.send(req).await.unwrap();
+        let text = String::from_utf8(resp).unwrap();
+        assert!(
+            text.contains(&large_body),
+            "Response must echo the full large body back"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Source guard checks (original)
+    // -----------------------------------------------------------------------
+
     /// Return only the production (non-test) portion of the source file.
     /// The guard tests check for forbidden identifiers in production code,
     /// not in the test assertions that mention those identifiers by name.
@@ -767,6 +925,8 @@ mod tests {
 
     #[tokio::test]
     async fn unreachable_url_returns_http_error() {
+        // With connect_timeout(10s) on ProxyClient, this should fail within
+        // ~10 seconds rather than waiting for the OS TCP timeout (120+ s).
         let client = ProxyClient::new();
         let req = ProxyRequest {
             // Non-routable address guarantees a connection failure.
@@ -779,7 +939,13 @@ mod tests {
             stream: false,
         };
 
-        let err = client.send(req).await.unwrap_err();
+        // Bound the test to 15 seconds as a safety net.
+        let result = tokio::time::timeout(Duration::from_secs(15), client.send(req)).await;
+        let err = match result {
+            Ok(Err(e)) => e,
+            Ok(Ok(_)) => panic!("expected error for unreachable URL, got success"),
+            Err(_) => panic!("test timed out waiting for connection failure"),
+        };
         match err {
             ProviderError::Http(_) => {} // expected
             other => panic!("expected ProviderError::Http for unreachable URL, got: {:?}", other),

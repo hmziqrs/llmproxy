@@ -71,10 +71,11 @@ impl SseFramer {
         // If there is anything left in the buffer, treat it as a line.
         if !self.buffer.is_empty() {
             let line = std::mem::take(&mut self.buffer);
-            self.process_line(&line);
+            let line = line.trim_end_matches('\r');
+            self.process_line(line);
         }
         let frame = self.take_current_frame();
-        Ok(frame.into_iter().collect())
+        Ok(frame.map(|f| vec![f]).unwrap_or_default())
     }
 
     // -----------------------------------------------------------------------
@@ -419,6 +420,43 @@ mod tests {
             frames.is_empty(),
             "Finish after fully drained stream should produce no frames"
         );
+    }
+
+    #[test]
+    fn sse_framer_ignores_unknown_fields() {
+        let mut framer = SseFramer::new();
+
+        let frames = framer
+            .push_chunk(b"retry: 5000\ndata: hello\n\n")
+            .unwrap();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].data, "hello");
+        // The retry field is silently ignored per SSE spec.
+    }
+
+    #[test]
+    fn sse_framer_preserves_url_with_multiple_colons() {
+        let mut framer = SseFramer::new();
+
+        let frames = framer
+            .push_chunk(b"data: http://example.com:8080/api\n\n")
+            .unwrap();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].data, "http://example.com:8080/api");
+    }
+
+    #[test]
+    fn sse_framer_finish_trims_trailing_cr() {
+        let mut framer = SseFramer::new();
+
+        // Simulate a stream ending with 'data: hello\r' (no trailing \n).
+        let frames = framer.push_chunk(b"data: hello\r").unwrap();
+        assert!(frames.is_empty());
+
+        let frames = framer.finish().unwrap();
+        assert_eq!(frames.len(), 1);
+        // The trailing \r must be trimmed, not preserved in the data.
+        assert_eq!(frames[0].data, "hello");
     }
 
     // -----------------------------------------------------------------------

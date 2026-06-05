@@ -36,6 +36,10 @@ pub enum ProviderError {
     /// Invalid UTF-8 encountered in streamed bytes.
     #[error("invalid UTF-8 in stream: {0}")]
     Utf8(#[from] std::str::Utf8Error),
+
+    /// SSE framing error (malformed frame structure, unexpected stream termination).
+    #[error("SSE framing error: {0}")]
+    SseFraming(String),
 }
 
 /// Maximum length for upstream API error bodies stored in [`ProviderError::Api`].
@@ -46,9 +50,9 @@ pub(crate) const MAX_API_ERROR_BODY_LEN: usize = 512;
 
 /// Length of the `...[truncated]` suffix appended when a body exceeds the limit.
 const TRUNCATED_SUFFIX: &str = "...[truncated]";
-const TRUNCATED_SUFFIX_LEN: usize = 15; // "...[truncated]".len()
+const TRUNCATED_SUFFIX_LEN: usize = TRUNCATED_SUFFIX.len();
 
-/// Redaction patterns compiled once via `lazy_static` / `OnceLock`.
+/// Redaction patterns compiled once via `OnceLock`.
 ///
 /// Each pattern matches a known API-key prefix followed by enough alphanumeric
 /// characters to be a real key (20+). This avoids false positives on short
@@ -114,6 +118,23 @@ pub(crate) fn sanitize_api_error_body(mut body: String) -> String {
         body.push_str(TRUNCATED_SUFFIX);
     }
     body
+}
+
+// ---------------------------------------------------------------------------
+// ProviderError convenience constructors
+// ---------------------------------------------------------------------------
+
+impl ProviderError {
+    /// Construct an [`ProviderError::Api`] with automatic body sanitization.
+    ///
+    /// Encapsulates the sanitization call so callers never need to remember
+    /// to call [`sanitize_api_error_body`] manually.
+    pub fn api(status: u16, body_text: String) -> Self {
+        Self::Api {
+            status,
+            body: sanitize_api_error_body(body_text),
+        }
+    }
 }
 
 // ===========================================================================
