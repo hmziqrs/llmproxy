@@ -107,7 +107,7 @@ enum AutostartAction {
 
 /// Migration error printed when legacy JSON config is detected.
 const MIGRATION_ERROR: &str = "\
-JSON oc-go-cc config is no longer supported by serve.\
+JSON oc-go-cc config is no longer supported by serve.\n\
 Run `llm-proxy init` to create TOML config, then copy model/API settings.";
 
 // ---------------------------------------------------------------------------
