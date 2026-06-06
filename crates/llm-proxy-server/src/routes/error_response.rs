@@ -127,7 +127,10 @@ struct OpenAiErrorBody {
 struct OpenAiErrorDetail {
     message: String,
     r#type: String,
-    code: Option<()>,
+    // Always serializes as `null` to match the OpenAI wire format:
+    // `{"error":{"message":"...","type":"...","code":null}}`.
+    // Using `serde_json::Value::Null` is more idiomatic than `Option<()>`.
+    code: serde_json::Value,
 }
 
 // ---------------------------------------------------------------------------
@@ -160,7 +163,90 @@ pub(crate) const PROVIDER_DECODE_CLIENT_MESSAGE: &str = "provider response decod
 /// disclosure. The actual messages are available through `RouteError::Display`
 /// for server-side logging before this function is called.
 fn anthropic_error_response(error: RouteError) -> Response<Body> {
-    let (status, error_type, message) = match error {
+    let (status, error_type, message) = extract_error_fields(error);
+
+    let body = AnthropicErrorBody {
+        r#type: "error",
+        error: AnthropicErrorDetail {
+            r#type: error_type.to_owned(),
+            message,
+        },
+    };
+
+    // axum::Json already sets Content-Type: application/json in its
+    // IntoResponse implementation. The explicit insert below is
+    // defense-in-depth to ensure the header is always present.
+    let mut response = (status, axum::Json(body)).into_response();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    response
+}
+
+/// Build an OpenAI Chat-shaped error response.
+///
+/// The error envelope follows the OpenAI error shape:
+/// `{"error":{"message":"...","type":"invalid_request_error","code":null}}`.
+///
+/// Internal error messages are sanitized: `Internal` and `ProviderDecode`
+/// variants use generic messages in the response body to prevent information
+/// disclosure.
+fn openai_error_response(error: RouteError) -> Response<Body> {
+    let (status, error_type, message) = extract_error_fields(error);
+    // OpenAI uses "server_error" for internal errors instead of "api_error".
+    let error_type = match status {
+        StatusCode::INTERNAL_SERVER_ERROR => "server_error",
+        StatusCode::NOT_FOUND => "invalid_request_error",
+        _ => error_type,
+    };
+
+    let body = OpenAiErrorBody {
+        error: OpenAiErrorDetail {
+            message,
+            r#type: error_type.to_owned(),
+            code: serde_json::Value::Null,
+        },
+    };
+
+    // axum::Json already sets Content-Type: application/json. The explicit
+    // insert below is defense-in-depth.
+    let mut response = (status, axum::Json(body)).into_response();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    response
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Build an OpenAI-shaped SSE error JSON string for in-band stream errors.
+///
+/// Reuses the same typed structs (`OpenAiErrorBody`, `OpenAiErrorDetail`) as
+/// the HTTP error path so both paths go through the same compile-time-validated
+/// serialization. This avoids raw `serde_json::json!()` which could silently
+/// produce a malformed envelope if field names change.
+pub fn openai_stream_error_json(message: &str) -> Option<String> {
+    let body = OpenAiErrorBody {
+        error: OpenAiErrorDetail {
+            message: truncate_error_body(message),
+            r#type: "api_error".to_owned(),
+            code: serde_json::Value::Null,
+        },
+    };
+    serde_json::to_string(&body).ok()
+}
+
+/// Extract the (status, error_type, message) tuple from a RouteError.
+///
+/// Shared between `anthropic_error_response` and `openai_error_response` to
+/// avoid duplicating the match arms. Each caller wraps the tuple in its own
+/// JSON envelope.
+fn extract_error_fields(error: RouteError) -> (StatusCode, &'static str, String) {
+    match error {
         RouteError::InvalidRequest(msg) => {
             (StatusCode::BAD_REQUEST, "invalid_request_error", msg)
         }
@@ -199,84 +285,8 @@ fn anthropic_error_response(error: RouteError) -> Response<Body> {
             "not_found_error",
             "not found".to_owned(),
         ),
-    };
-
-    let body = AnthropicErrorBody {
-        r#type: "error",
-        error: AnthropicErrorDetail {
-            r#type: error_type.to_owned(),
-            message,
-        },
-    };
-
-    // axum::Json already sets Content-Type: application/json in its
-    // IntoResponse implementation. The explicit insert below is
-    // defense-in-depth to ensure the header is always present.
-    let mut response = (status, axum::Json(body)).into_response();
-    response.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("application/json"),
-    );
-    response
+    }
 }
-
-/// Build an OpenAI Chat-shaped error response.
-///
-/// The error envelope follows the OpenAI error shape:
-/// `{"error":{"message":"...","type":"invalid_request_error","code":null}}`.
-///
-/// Internal error messages are sanitized: `Internal` and `ProviderDecode`
-/// variants use generic messages in the response body to prevent information
-/// disclosure.
-fn openai_error_response(error: RouteError) -> Response<Body> {
-    let (status, error_type, message) = match error {
-        RouteError::InvalidRequest(msg) => {
-            (StatusCode::BAD_REQUEST, "invalid_request_error", msg)
-        }
-        RouteError::UnknownModel(model) => {
-            (StatusCode::BAD_REQUEST, "invalid_request_error", format!("unknown model: {model}"))
-        }
-        RouteError::Upstream { status, body } => {
-            (map_upstream_status(status), "api_error", truncate_error_body(&body))
-        }
-        RouteError::ProviderDecode(_msg) => {
-            (StatusCode::BAD_GATEWAY, "api_error", PROVIDER_DECODE_CLIENT_MESSAGE.to_owned())
-        }
-        RouteError::Internal(_msg) => {
-            (StatusCode::INTERNAL_SERVER_ERROR, "server_error", INTERNAL_ERROR_CLIENT_MESSAGE.to_owned())
-        }
-        RouteError::RateLimited => {
-            (StatusCode::TOO_MANY_REQUESTS, "rate_limit_error", "rate limit exceeded".to_owned())
-        }
-        RouteError::Conflict => {
-            (StatusCode::CONFLICT, "invalid_request_error", "duplicate request, please retry".to_owned())
-        }
-        RouteError::NotFound => {
-            (StatusCode::NOT_FOUND, "invalid_request_error", "not found".to_owned())
-        }
-    };
-
-    let body = OpenAiErrorBody {
-        error: OpenAiErrorDetail {
-            message,
-            r#type: error_type.to_owned(),
-            code: None,
-        },
-    };
-
-    // axum::Json already sets Content-Type: application/json. The explicit
-    // insert below is defense-in-depth.
-    let mut response = (status, axum::Json(body)).into_response();
-    response.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("application/json"),
-    );
-    response
-}
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
 
 /// Map an upstream HTTP status to the status we return to the client.
 ///

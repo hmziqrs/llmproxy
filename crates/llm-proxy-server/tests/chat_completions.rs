@@ -458,13 +458,18 @@ async fn route_preserves_fields_through_core() {
     let body = json!({
         "model": "gpt-4o",
         "messages": [
-            { "role": "system", "content": "You are helpful" },
+            {
+                "role": "system",
+                "content": "You are helpful",
+                "cache_control": { "type": "ephemeral" }
+            },
             { "role": "user", "content": "hello" }
         ],
         "max_tokens": 256,
         "temperature": 0.7,
         "top_p": 0.9,
         "stream": false,
+        "stream_options": { "include_usage": true },
         "tools": [{
             "type": "function",
             "function": {
@@ -475,6 +480,7 @@ async fn route_preserves_fields_through_core() {
         }],
         "tool_choice": "auto",
         "reasoning_effort": "high",
+        "thinking": { "type": "enabled", "budget_tokens": 10000 },
         "user": "test-user-123"
     });
     let resp = app.oneshot(chat_request(&body.to_string())).await.unwrap();
@@ -499,6 +505,16 @@ async fn route_preserves_fields_through_core() {
     assert_eq!(upstream_json["reasoning_effort"], "high");
     // user (metadata) should be preserved.
     assert_eq!(upstream_json["user"], "test-user-123");
+    // thinking should be preserved.
+    assert_eq!(upstream_json["thinking"]["type"], "enabled");
+    assert_eq!(upstream_json["thinking"]["budget_tokens"], 10000);
+    // Note: stream_options is only forwarded to upstream when stream=true,
+    // because the provider adapter only reads provider_hints for streaming
+    // requests. This is expected behavior -- stream_options is a streaming-
+    // specific hint. The cache_control on the system message is decoded into
+    // the core system array but the OpenAI provider adapter does not re-emit
+    // it in the outbound request, which is correct for OpenAI-to-OpenAI
+    // passthrough (OpenAI does not have a native cache_control field).
 }
 
 // ===========================================================================
@@ -1381,5 +1397,95 @@ async fn system_only_messages_does_not_panic() {
         resp.status(),
         StatusCode::INTERNAL_SERVER_ERROR,
         "system-only messages should not cause an internal server error"
+    );
+}
+
+// ===========================================================================
+// Missing tests from audit round 3
+// ===========================================================================
+
+/// Missing provider registry/config returns 500 Internal Server Error with
+/// OpenAI-shaped error envelope. This exercises the scenario where the server
+/// state has no TOML config (legacy mode), so the core pipeline cannot resolve
+/// a provider adapter.
+#[tokio::test]
+async fn missing_provider_config_returns_openai_shaped_500() {
+    use llm_proxy_core::{Config, FallbackHandler};
+    use llm_proxy_provider::OpenCodeClient;
+    use std::sync::Arc;
+
+    // Build legacy state (no TOML config, no providers).
+    let state = AppState::from_legacy(
+        Config::default(),
+        BuildInfo {
+            name: "test",
+            version: "0.0.0",
+            target: "test",
+            git_sha: "test",
+        },
+        OpenCodeClient::new(Arc::new(Config::default())),
+        FallbackHandler::new(3, Duration::from_secs(30)),
+        ProviderAdapterRegistry::builtin(),
+        ProxyClient::new(),
+    );
+    let app = build_router(state);
+
+    let body = json!({
+        "model": "gpt-4o",
+        "messages": [{ "role": "user", "content": "hello" }]
+    });
+    let resp = app.oneshot(chat_request(&body.to_string())).await.unwrap();
+
+    // Legacy state has no TOML config -> 500 Internal Server Error.
+    assert_eq!(
+        resp.status(),
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "legacy state should return 500 for missing TOML config"
+    );
+
+    let resp_body: Value = serde_json::from_slice(
+        &axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+
+    // Must be OpenAI error shape.
+    assert!(resp_body["error"].is_object(), "must have error object");
+    assert!(resp_body["error"]["message"].is_string());
+    assert!(resp_body["error"]["code"].is_null(), "code must be null");
+
+    // Must NOT be Anthropic-shaped (no top-level "type" field).
+    assert!(
+        resp_body.get("type").is_none() || resp_body["type"].is_null(),
+        "must not have Anthropic 'type' field"
+    );
+}
+
+/// Large messages array (1000 messages) is handled without errors.
+#[tokio::test]
+async fn large_messages_array_is_handled() {
+    let mock_url = spawn_mock_openai_chat_non_stream().await;
+    let state = state_with_openai_chat_provider(&mock_url);
+    let app = build_router(state);
+
+    // Build a request with 1000 messages.
+    let mut messages = Vec::new();
+    for i in 0..1000 {
+        messages.push(json!({
+            "role": if i % 2 == 0 { "user" } else { "assistant" },
+            "content": format!("message {i}")
+        }));
+    }
+    let body = json!({
+        "model": "gpt-4o",
+        "messages": messages
+    });
+    let resp = app.oneshot(chat_request(&body.to_string())).await.unwrap();
+    // Should not panic or return an internal server error.
+    assert_ne!(
+        resp.status(),
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "large messages array should not cause an internal server error"
     );
 }

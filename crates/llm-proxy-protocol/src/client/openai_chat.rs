@@ -31,6 +31,26 @@ use crate::openai::{
 use crate::openai::{CacheControl as OpenAICacheControl, StreamOptions};
 
 // ---------------------------------------------------------------------------
+// Shared helpers
+// ---------------------------------------------------------------------------
+
+/// Return the current Unix timestamp in seconds.
+///
+/// The `u64 -> i64` cast is safe because `u64::MAX` corresponds to a date
+/// ~584 billion years in the future, which is unreachable in any real timeline.
+/// `unwrap_or_default()` produces 0 if the system clock is before the Unix epoch,
+/// which maps cleanly to `i64`.
+fn unix_timestamp_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_else(|e| {
+            tracing::warn!("system clock appears to be before UNIX epoch: {e}");
+            std::time::Duration::ZERO
+        })
+        .as_secs() as i64
+}
+
+// ---------------------------------------------------------------------------
 // decode_request
 // ---------------------------------------------------------------------------
 
@@ -153,6 +173,9 @@ pub fn decode_request(req: ChatCompletionRequest) -> Result<CoreRequest, Protoco
                 // does not capture unknown fields (it lacks #[serde(flatten)]).
                 // Adding a flattened extra Map to ChatMessage would enable this.
                 let is_error = false;
+                let tool_use_id = msg.tool_call_id.ok_or_else(|| {
+                    ProtocolError::InvalidRequest("tool_call_id is required on tool messages".into())
+                })?;
                 let inner_content = if msg.content.is_empty() {
                     vec![]
                 } else {
@@ -164,7 +187,7 @@ pub fn decode_request(req: ChatCompletionRequest) -> Result<CoreRequest, Protoco
                 messages.push(CoreMessage {
                     role: CoreRole::Tool,
                     content: vec![CoreContent::ToolResult {
-                        tool_use_id: msg.tool_call_id.unwrap_or_default(),
+                        tool_use_id,
                         content: inner_content,
                         is_error,
                     }],
@@ -331,8 +354,12 @@ pub fn encode_response(
             }
             CoreContent::Thinking { text, .. } => {
                 // Only the last Thinking block is preserved. If multiple
-                // thinking blocks are present, earlier ones are silently
-                // dropped. Consider concatenating if this becomes common.
+                // thinking blocks are present, earlier ones are overwritten.
+                if reasoning.is_some() {
+                    tracing::warn!(
+                        "multiple Thinking blocks in response; earlier blocks overwritten"
+                    );
+                }
                 reasoning = Some(text);
             }
             CoreContent::ToolUse { id, name, input } => {
@@ -412,13 +439,7 @@ pub fn encode_response(
     // NOTE: The timestamp is non-deterministic, which prevents snapshot testing
     // of the full output. If deterministic output is needed, accept `created` as
     // a parameter or read it from CoreResponse.provider_meta.
-    let created = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_else(|e| {
-            tracing::warn!("system clock appears to be before UNIX epoch: {e}");
-            std::time::Duration::ZERO
-        })
-        .as_secs() as i64;
+    let created = unix_timestamp_secs();
 
     Ok(ChatCompletionResponse {
         id,
@@ -618,7 +639,7 @@ impl StreamEncoder {
                         content: String::new(),
                         reasoning_content: None,
                         tool_calls: vec![ToolCall {
-                            index: Some((index).min(i32::MAX as usize) as i32),
+                            index: Some(index.min(i32::MAX as usize) as i32),
                             id: Some(id),
                             r#type: Some("function".to_owned()),
                             function: Some(FunctionCall {
@@ -644,7 +665,7 @@ impl StreamEncoder {
                         content: String::new(),
                         reasoning_content: None,
                         tool_calls: vec![ToolCall {
-                            index: Some((index).min(i32::MAX as usize) as i32),
+                            index: Some(index.min(i32::MAX as usize) as i32),
                             id: None,
                             r#type: None,
                             function: Some(FunctionCall {
@@ -1976,5 +1997,174 @@ mod tests {
         assert_eq!(remaining[0].choices[0].finish_reason.as_deref(), Some("stop"));
         assert!(remaining[1].usage.is_some());
         assert_eq!(remaining[1].usage.as_ref().unwrap().prompt_tokens, 50);
+    }
+
+    // -- tool_call validation tests -------------------------------------------
+
+    #[test]
+    fn tool_call_missing_id_returns_error() {
+        let mut req = make_openai_request();
+        req.messages.push(ChatMessage {
+            role: "assistant".into(),
+            content: String::new(),
+            reasoning_content: None,
+            tool_calls: vec![ToolCall {
+                index: Some(0),
+                id: None, // missing id
+                r#type: Some("function".into()),
+                function: Some(FunctionCall {
+                    name: Some("get_weather".into()),
+                    arguments: Some("{}".into()),
+                }),
+            }],
+            name: None,
+            tool_call_id: None,
+            cache_control: None,
+            refusal: None,
+        });
+        let err = decode_request(req).unwrap_err();
+        match &err {
+            ProtocolError::InvalidRequest(msg) => {
+                assert!(msg.contains("tool_call.id"), "expected tool_call.id error, got: {msg}");
+            }
+            _ => panic!("expected InvalidRequest, got: {:?}", err),
+        }
+    }
+
+    #[test]
+    fn tool_call_missing_function_returns_error() {
+        let mut req = make_openai_request();
+        req.messages.push(ChatMessage {
+            role: "assistant".into(),
+            content: String::new(),
+            reasoning_content: None,
+            tool_calls: vec![ToolCall {
+                index: Some(0),
+                id: Some("call_1".into()),
+                r#type: Some("function".into()),
+                function: None, // missing function
+            }],
+            name: None,
+            tool_call_id: None,
+            cache_control: None,
+            refusal: None,
+        });
+        let err = decode_request(req).unwrap_err();
+        match &err {
+            ProtocolError::InvalidRequest(msg) => {
+                assert!(msg.contains("tool_call.function"), "expected tool_call.function error, got: {msg}");
+            }
+            _ => panic!("expected InvalidRequest, got: {:?}", err),
+        }
+    }
+
+    #[test]
+    fn tool_call_missing_function_name_returns_error() {
+        let mut req = make_openai_request();
+        req.messages.push(ChatMessage {
+            role: "assistant".into(),
+            content: String::new(),
+            reasoning_content: None,
+            tool_calls: vec![ToolCall {
+                index: Some(0),
+                id: Some("call_1".into()),
+                r#type: Some("function".into()),
+                function: Some(FunctionCall {
+                    name: None, // missing name
+                    arguments: Some("{}".into()),
+                }),
+            }],
+            name: None,
+            tool_call_id: None,
+            cache_control: None,
+            refusal: None,
+        });
+        let err = decode_request(req).unwrap_err();
+        match &err {
+            ProtocolError::InvalidRequest(msg) => {
+                assert!(msg.contains("tool_call.function.name"), "expected tool_call.function.name error, got: {msg}");
+            }
+            _ => panic!("expected InvalidRequest, got: {:?}", err),
+        }
+    }
+
+    #[test]
+    fn tool_message_missing_tool_call_id_returns_error() {
+        let mut req = make_openai_request();
+        req.messages.push(ChatMessage {
+            role: "tool".into(),
+            content: "result".into(),
+            reasoning_content: None,
+            tool_calls: vec![],
+            name: None,
+            tool_call_id: None, // missing tool_call_id
+            cache_control: None,
+            refusal: None,
+        });
+        let err = decode_request(req).unwrap_err();
+        match &err {
+            ProtocolError::InvalidRequest(msg) => {
+                assert!(msg.contains("tool_call_id"), "expected tool_call_id error, got: {msg}");
+            }
+            _ => panic!("expected InvalidRequest, got: {:?}", err),
+        }
+    }
+
+    #[test]
+    fn malformed_tool_call_arguments_replaced_with_empty_object() {
+        let mut req = make_openai_request();
+        req.messages.push(ChatMessage {
+            role: "assistant".into(),
+            content: String::new(),
+            reasoning_content: None,
+            tool_calls: vec![ToolCall {
+                index: Some(0),
+                id: Some("call_1".into()),
+                r#type: Some("function".into()),
+                function: Some(FunctionCall {
+                    name: Some("get_weather".into()),
+                    arguments: Some("not valid json{}".into()),
+                }),
+            }],
+            name: None,
+            tool_call_id: None,
+            cache_control: None,
+            refusal: None,
+        });
+        let core = decode_request(req).unwrap();
+        match &core.messages[1].content[0] {
+            CoreContent::ToolUse { input, .. } => {
+                // Malformed arguments should be replaced with an empty object.
+                assert_eq!(input, &serde_json::json!({}), "malformed args should become empty object");
+            }
+            _ => panic!("expected ToolUse"),
+        }
+    }
+
+    // -- stop field parsing tests ---------------------------------------------
+
+    #[test]
+    fn stop_as_string_decodes_to_single_element_vec() {
+        let mut req = make_openai_request();
+        req.stop = Some(serde_json::json!("END"));
+        let core = decode_request(req).unwrap();
+        assert_eq!(core.sampling.stop, Some(vec!["END".to_owned()]));
+    }
+
+    #[test]
+    fn stop_as_non_string_non_array_is_dropped() {
+        let mut req = make_openai_request();
+        req.stop = Some(serde_json::json!(42));
+        let core = decode_request(req).unwrap();
+        assert_eq!(core.sampling.stop, None);
+    }
+
+    #[test]
+    fn stop_array_with_non_string_items_filters_them() {
+        let mut req = make_openai_request();
+        req.stop = Some(serde_json::json!(["STOP", 123, "END"]));
+        let core = decode_request(req).unwrap();
+        // Non-string items should be filtered out with a warning.
+        assert_eq!(core.sampling.stop, Some(vec!["STOP".to_owned(), "END".to_owned()]));
     }
 }

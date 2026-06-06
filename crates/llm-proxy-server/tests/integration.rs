@@ -1,4 +1,5 @@
-//! Integration tests for ops endpoints and the `/v1/messages` proxy route.
+//! Integration tests for ops endpoints, the `/v1/messages` proxy route, and
+//! TOML-mode integration scenarios.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -272,40 +273,10 @@ async fn messages_valid_json_missing_fields_returns_validation_error() {
     );
 }
 
-/// Phase 9 guardrail: POST /v1/chat/completions with OpenAI-shaped JSON
-/// is now mounted (no longer 404). With an empty routing table (legacy state),
-/// the model is unknown so we expect 400 with an OpenAI-shaped error.
-#[tokio::test]
-async fn chat_completions_post_with_openai_json_is_mounted() {
-    let app = build_router(state());
-    let body = json!({
-        "model": "gpt-4o",
-        "messages": [{ "role": "user", "content": "hello" }]
-    });
-    let req = Request::builder()
-        .method("POST")
-        .uri("/v1/chat/completions")
-        .header("content-type", "application/json")
-        .body(Body::from(body.to_string()))
-        .unwrap();
-    let resp = app.oneshot(req).await.unwrap();
-    // Route is now mounted. With legacy state (empty routing table),
-    // the model is unknown -> 400 Bad Request with OpenAI error shape.
-    assert_ne!(resp.status(), StatusCode::NOT_FOUND, "route must be mounted");
-    // With legacy state, TOML config is missing -> 500.
-    // Or with the model unknown -> 400. Either way, not 404.
-    let resp_body: Value = serde_json::from_slice(
-        &axum::body::to_bytes(resp.into_body(), 64 * 1024)
-            .await
-            .unwrap(),
-    )
-    .unwrap();
-    // Error shape depends on the state: legacy state returns Anthropic errors
-    // (since there's no TOML config for the core pipeline). This is acceptable
-    // because the legacy state path is deprecated. The important thing is that
-    // the route is no longer 404.
-    let _ = resp_body;
-}
+/// Phase 9 guardrail: POST /v1/chat/completions route is mounted and tested
+/// comprehensively in tests/chat_completions.rs. The legacy chat_echo test that
+/// was here has been removed since its single assertion (not-404) is a subset
+/// of the `route_is_mounted_no_longer_404` test in that file.
 
 #[tokio::test]
 async fn count_tokens_returns_estimate() {

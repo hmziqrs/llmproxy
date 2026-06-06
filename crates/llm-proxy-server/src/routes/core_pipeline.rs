@@ -23,12 +23,12 @@ use llm_proxy_protocol::core::{CoreEvent, CoreRequest};
 use llm_proxy_provider::adapter::{ProviderAdapter, ProviderAdapterTarget, ProviderProtocol, ProviderStreamDecoder};
 use llm_proxy_provider::sse::SseFramer;
 use llm_proxy_provider::transport::ProxyRequest;
-use tracing::{info, warn};
+use tracing::warn;
 
 use crate::middleware::get_client_ip;
 use crate::state::AppState;
 
-use super::error_response::{ClientProtocol, RouteError, PROVIDER_DECODE_CLIENT_MESSAGE, truncate_with_suffix};
+use super::error_response::{ClientProtocol, RouteError, PROVIDER_DECODE_CLIENT_MESSAGE, truncate_with_suffix, openai_stream_error_json};
 
 // ---------------------------------------------------------------------------
 // ClientStreamEncoder — protocol-agnostic stream encoder wrapper
@@ -73,8 +73,8 @@ impl ClientStreamEncoder {
                     .and_then(|v| v.get("include_usage"))
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
-                // 0 = epoch fallback; system clock before epoch is effectively
-                // impossible in production.
+                // The u64 -> i64 cast is safe: u64::MAX corresponds to a date
+                // ~584 billion years in the future, unreachable in any real timeline.
                 let created = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
@@ -89,34 +89,11 @@ impl ClientStreamEncoder {
         match self {
             Self::Anthropic(enc) => {
                 let msg_events = enc.encode_event(event)?;
-                Ok(msg_events
-                    .into_iter()
-                    .filter_map(|me| {
-                        let event_type = me.r#type.clone();
-                        match serde_json::to_string(&me) {
-                            Ok(json) => Some(ClientEncodedEvent::Anthropic { event_type, json }),
-                            Err(e) => {
-                                warn!(error = %e, "failed to serialize Anthropic SSE event; dropping");
-                                None
-                            }
-                        }
-                    })
-                    .collect())
+                Ok(wrap_anthropic_events(msg_events, "encode"))
             }
             Self::OpenAi(enc) => {
                 let chunks = enc.encode_event(event)?;
-                Ok(chunks
-                    .into_iter()
-                    .filter_map(|chunk| {
-                        match serde_json::to_string(&chunk) {
-                            Ok(json) => Some(ClientEncodedEvent::OpenAi { json }),
-                            Err(e) => {
-                                warn!(error = %e, "failed to serialize OpenAI SSE chunk; dropping");
-                                None
-                            }
-                        }
-                    })
-                    .collect())
+                Ok(wrap_openai_events(chunks, "encode"))
             }
         }
     }
@@ -126,34 +103,11 @@ impl ClientStreamEncoder {
         match self {
             Self::Anthropic(enc) => {
                 let msg_events = enc.finish()?;
-                Ok(msg_events
-                    .into_iter()
-                    .filter_map(|me| {
-                        let event_type = me.r#type.clone();
-                        match serde_json::to_string(&me) {
-                            Ok(json) => Some(ClientEncodedEvent::Anthropic { event_type, json }),
-                            Err(e) => {
-                                warn!(error = %e, "failed to serialize Anthropic SSE event in finish; dropping");
-                                None
-                            }
-                        }
-                    })
-                    .collect())
+                Ok(wrap_anthropic_events(msg_events, "finish"))
             }
             Self::OpenAi(enc) => {
                 let chunks = enc.finish()?;
-                Ok(chunks
-                    .into_iter()
-                    .filter_map(|chunk| {
-                        match serde_json::to_string(&chunk) {
-                            Ok(json) => Some(ClientEncodedEvent::OpenAi { json }),
-                            Err(e) => {
-                                warn!(error = %e, "failed to serialize OpenAI SSE chunk in finish; dropping");
-                                None
-                            }
-                        }
-                    })
-                    .collect())
+                Ok(wrap_openai_events(chunks, "finish"))
             }
         }
     }
@@ -165,6 +119,49 @@ impl ClientStreamEncoder {
             Self::OpenAi(enc) => enc.mark_finished(),
         }
     }
+}
+
+/// Serialize Anthropic SSE events, dropping any that fail to serialize.
+///
+/// `phase` is used in log messages (e.g. "encode" vs "finish") for context.
+fn wrap_anthropic_events(
+    events: Vec<llm_proxy_protocol::anthropic::MessageEvent>,
+    phase: &str,
+) -> Vec<ClientEncodedEvent> {
+    events
+        .into_iter()
+        .filter_map(|me| {
+            let event_type = me.r#type.clone();
+            match serde_json::to_string(&me) {
+                Ok(json) => Some(ClientEncodedEvent::Anthropic { event_type, json }),
+                Err(e) => {
+                    warn!(error = %e, phase, "failed to serialize Anthropic SSE event; dropping");
+                    None
+                }
+            }
+        })
+        .collect()
+}
+
+/// Serialize OpenAI SSE chunks, dropping any that fail to serialize.
+///
+/// `phase` is used in log messages (e.g. "encode" vs "finish") for context.
+fn wrap_openai_events<T: serde::Serialize>(
+    chunks: Vec<T>,
+    phase: &str,
+) -> Vec<ClientEncodedEvent> {
+    chunks
+        .into_iter()
+        .filter_map(|chunk| {
+            match serde_json::to_string(&chunk) {
+                Ok(json) => Some(ClientEncodedEvent::OpenAi { json }),
+                Err(e) => {
+                    warn!(error = %e, phase, "failed to serialize OpenAI SSE chunk; dropping");
+                    None
+                }
+            }
+        })
+        .collect()
 }
 
 /// Convert a [`ClientEncodedEvent`] into an axum SSE [`Event`].
@@ -309,7 +306,7 @@ pub(crate) async fn handle_core_once(
 ) -> Result<Response<Body>, RouteError> {
     state.metrics.record_request(false);
 
-    info!(
+    tracing::debug!(
         request_id = %ctx.request_id,
         model = %core.model.requested,
         streaming = false,
@@ -320,7 +317,7 @@ pub(crate) async fn handle_core_once(
         state.metrics.record_failure();
     })?;
 
-    info!(
+    tracing::debug!(
         request_id = %ctx.request_id,
         provider = %target.provider_name,
         model = %target.upstream_model,
@@ -377,7 +374,7 @@ pub(crate) async fn handle_core_once(
         }
     };
 
-    info!(
+    tracing::debug!(
         request_id = %ctx.request_id,
         model = %target.upstream_model,
         latency_ms = latency.as_millis(),
@@ -419,11 +416,13 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(3);
 /// first-byte probe phase. This enables the handler to return a proper
 /// HTTP error status if the stream fails before emitting any data.
 enum FirstByteResult {
-    /// At least one SSE event was produced. The stream is live and all
-    /// subsequent events/errors must be delivered as in-band SSE events.
+    /// At least one SSE event was produced by the stream. The stream is now
+    /// live and all subsequent events/errors must be delivered as in-band
+    /// SSE events (the HTTP status is already committed as 200 OK).
     FirstEvent(Event),
     /// The stream failed before producing any event. The handler should
-    /// return an HTTP error response instead of committing 200 OK.
+    /// return an HTTP error response (e.g. 502 Bad Gateway) instead of
+    /// committing a 200 OK SSE response.
     PreStreamError(RouteError),
 }
 
@@ -450,7 +449,7 @@ pub(crate) async fn handle_core_stream(
 ) -> Result<Response<Body>, RouteError> {
     state.metrics.record_request(true);
 
-    info!(
+    tracing::debug!(
         request_id = %ctx.request_id,
         model = %core.model.requested,
         streaming = true,
@@ -461,7 +460,7 @@ pub(crate) async fn handle_core_stream(
         state.metrics.record_failure();
     })?;
 
-    info!(
+    tracing::debug!(
         request_id = %ctx.request_id,
         provider = %target.provider_name,
         model = %target.upstream_model,
@@ -579,7 +578,7 @@ pub(crate) async fn handle_core_stream(
                     .unwrap_or_else(|_| axum::http::HeaderValue::from_static("unknown")),
             );
 
-            info!(
+            tracing::debug!(
                 request_id = %request_id,
                 model = %target.upstream_model,
                 "streaming started"
@@ -597,8 +596,11 @@ pub(crate) async fn handle_core_stream(
 /// Context for tracking metrics during a streaming response.
 #[derive(Debug)]
 struct StreamMetrics {
+    /// Shared metrics recorder for success/failure/latency tracking.
     metrics: Arc<Metrics>,
+    /// Upstream model name used as the metrics label.
     upstream_model: String,
+    /// Instant when the handler was entered (for latency measurement).
     start: Instant,
 }
 
@@ -1041,16 +1043,10 @@ async fn emit_stream_error(
     let events = encode_core_event(client_encoder, error_event);
     if events.is_empty() && matches!(client_protocol, ClientProtocol::OpenAiChat) {
         // The OpenAI StreamEncoder returns Err for CoreEvent::Error, which
-        // causes encode_core_event to produce an empty Vec. Construct a raw
-        // SSE error event directly so the OpenAI client sees the error.
-        let error_json = serde_json::json!({
-            "error": {
-                "message": message,
-                "type": "api_error",
-                "code": null
-            }
-        });
-        if let Ok(json_str) = serde_json::to_string(&error_json) {
+        // causes encode_core_event to produce an empty Vec. Construct an SSE
+        // error event using the same typed structs as the HTTP error path so
+        // both paths stay consistent at compile time.
+        if let Some(json_str) = openai_stream_error_json(message) {
             let _ = tx.send(Event::default().data(json_str)).await;
         }
     } else {

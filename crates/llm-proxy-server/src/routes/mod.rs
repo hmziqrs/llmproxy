@@ -85,11 +85,15 @@ pub fn router(state: AppState) -> Router {
 }
 
 async fn not_found(req: Request) -> impl IntoResponse {
-    // Protocol-aware 404: return OpenAI-shaped errors for /v1/chat/completions
-    // and related paths, Anthropic-shaped errors for everything else.
-    // Uses the typed error structs from error_response.rs for consistency.
+    // Protocol-aware 404: return OpenAI-shaped errors for the /v1/chat/completions
+    // route and any path under /v1/chat/ (future OpenAI chat sub-routes), and
+    // Anthropic-shaped errors for everything else.
+    //
+    // Boundary note: the starts_with("/v1/chat/") check covers future routes
+    // like /v1/chat/edits. If a non-OpenAI protocol is ever mounted under
+    // /v1/chat/, this heuristic must be updated.
     let path = req.uri().path();
-    let _ = req; // consumed for URI extraction
+    let _ = req; // Request must be consumed (moved) for IntoResponse; body intentionally ignored
 
     if path == "/v1/chat/completions" || path.starts_with("/v1/chat/") {
         error_response::route_error_response(

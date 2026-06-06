@@ -46,9 +46,8 @@ async fn handle_chat_completions_inner(
 ) -> Result<Response<Body>, RouteError> {
     // Pre-flight: rate limit, dedup, request ID.
     // Note: prepare_request takes a &[u8] reference (non-consuming) so the
-    // body bytes remain available for the second parse below. The double
-    // deserialization is intentional: prepare_request needs raw bytes for
-    // dedup hashing before we know the request type.
+    // body bytes remain available for the second parse below. The body bytes
+    // are hashed for dedup, then deserialized as ChatCompletionRequest.
     let ctx = core_pipeline::prepare_request(&state, &headers, &body)?;
 
     // Parse the OpenAI ChatCompletionRequest.
