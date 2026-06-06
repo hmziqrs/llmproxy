@@ -430,7 +430,12 @@ impl OpenAiChatAdapter {
                                     }),
                                 });
                             }
-                            _ => {}
+                            other => {
+                                tracing::warn!(
+                                    ?other,
+                                    "OpenAI Chat: dropping unsupported content block in assistant message encoding"
+                                );
+                            }
                         }
                     }
 
@@ -472,6 +477,11 @@ impl OpenAiChatAdapter {
                             _ => None,
                         })
                         .unwrap_or_default();
+                    if tool_use_id.is_empty() {
+                        tracing::warn!(
+                            "OpenAI Chat: Tool message has empty tool_use_id; downstream protocols may reject this"
+                        );
+                    }
                     messages.push(ChatMessage {
                         role: "tool".to_owned(),
                         content: text,
@@ -554,7 +564,11 @@ impl OpenAiChatAdapter {
                 if v.len() == 1 {
                     serde_json::Value::String(v[0].clone())
                 } else {
-                    serde_json::to_value(v).unwrap_or(serde_json::Value::Null)
+                    // Serializing Vec<String> to JSON is infallible; use
+                    // expect to enforce this invariant rather than silently
+                    // producing null.
+                    serde_json::to_value(v)
+                        .expect("serializing Vec<String> to JSON cannot fail")
                 }
             }),
             stream_options: None,

@@ -178,6 +178,11 @@ fn decode_content_block(block: ContentBlock) -> Result<CoreContent, ProtocolErro
             })
         }
         "image" => {
+            if block.cache_control.is_some() {
+                tracing::warn!(
+                    "Anthropic client: cache_control on image block is not supported; dropping"
+                );
+            }
             let source = block
                 .source
                 .map(|s| serde_json::to_value(&s).unwrap_or(serde_json::Value::Null))

@@ -10,4 +10,5 @@ pub mod anthropic;
 pub mod client;
 pub mod core;
 pub mod openai;
+pub mod util;
 pub mod zen;

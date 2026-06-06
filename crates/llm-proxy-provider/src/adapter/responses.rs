@@ -166,6 +166,10 @@ impl ProviderStreamDecoder for ResponsesStreamDecoder {
                         if !self.tool_call_started {
                             self.close_content_if_open();
                             self.tool_call_started = true;
+                            tracing::warn!(
+                                "Responses: emitting ToolCallStart with empty id/name \
+                                 (no prior response.output_item.added event)"
+                            );
                             events.push(CoreEvent::ToolCallStart {
                                 index: self.content_index,
                                 id: String::new(),
@@ -448,7 +452,14 @@ impl ResponsesAdapter {
                             .iter()
                             .filter_map(|rc| match rc {
                                 CoreContent::Text { text, .. } => Some(text.as_str()),
-                                _ => None,
+                                other => {
+                                    tracing::warn!(
+                                        ?other,
+                                        tool_use_id,
+                                        "Responses: dropping non-text content block in ToolResult encoding"
+                                    );
+                                    None
+                                }
                             })
                             .collect();
                         input.push(ResponsesInput {

@@ -320,6 +320,10 @@ impl GeminiAdapter {
                             tool_name_map.get(tool_use_id).cloned().unwrap_or_else(|| {
                                 // Fallback: strip the 'gemini_call_' prefix from
                                 // tool_use_id (the Gemini decoder uses this format).
+                                tracing::warn!(
+                                    tool_use_id,
+                                    "Gemini: tool name lookup fell back to ID-stripping heuristic"
+                                );
                                 tool_use_id.trim_start_matches("gemini_call_").to_owned()
                             });
                         parts.push(GeminiPart::function_response(fn_name, response_val));

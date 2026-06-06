@@ -298,6 +298,11 @@ fn decode_tool_choice(value: serde_json::Value) -> CoreToolChoice {
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_owned();
+                if name.is_empty() {
+                    tracing::warn!(
+                        "OpenAI Chat: tool_choice function has empty or missing name field"
+                    );
+                }
                 CoreToolChoice::Tool { name }
             }
             _ => CoreToolChoice::Raw(value),
@@ -471,6 +476,8 @@ pub fn encode_response(resp: CoreResponse) -> Result<ChatCompletionResponse, Pro
 /// - `Unknown` -> `"stop"` (safe default, "other normal stop")
 fn encode_finish_reason(reason: StopReason) -> String {
     match reason {
+        StopReason::EndTurn => "stop".to_owned(),
+        StopReason::StopSequence => "stop".to_owned(),
         StopReason::ToolUse => "tool_calls".to_owned(),
         StopReason::MaxTokens => "length".to_owned(),
         StopReason::Refusal => "content_filter".to_owned(),
@@ -478,7 +485,10 @@ fn encode_finish_reason(reason: StopReason) -> String {
             tracing::warn!("StopReason::Error mapped to 'stop' in OpenAI finish_reason");
             "stop".to_owned()
         }
-        _ => "stop".to_owned(),
+        StopReason::Unknown => {
+            tracing::warn!("StopReason::Unknown mapped to 'stop' in OpenAI finish_reason");
+            "stop".to_owned()
+        }
     }
 }
 

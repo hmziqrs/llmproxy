@@ -128,7 +128,54 @@ fn build_core_response_from_output(adapter: &str, output_json: &serde_json::Valu
                                         .and_then(|v| v.as_str())
                                         .map(String::from),
                                 }),
-                                _ => None,
+                                "redacted_thinking" => Some(CoreContent::RedactedThinking {
+                                    data: block.get("data").cloned().unwrap_or(
+                                        serde_json::Value::Object(serde_json::Map::new()),
+                                    ),
+                                }),
+                                "image" => Some(CoreContent::Image {
+                                    source: block.get("source").cloned().unwrap_or(
+                                        serde_json::Value::Object(serde_json::Map::new()),
+                                    ),
+                                }),
+                                "document" => Some(CoreContent::Document {
+                                    source: block.get("source").cloned().unwrap_or(
+                                        serde_json::Value::Object(serde_json::Map::new()),
+                                    ),
+                                }),
+                                "audio" => Some(CoreContent::Audio {
+                                    source: block.get("source").cloned().unwrap_or(
+                                        serde_json::Value::Object(serde_json::Map::new()),
+                                    ),
+                                }),
+                                "video" => Some(CoreContent::Video {
+                                    source: block.get("source").cloned().unwrap_or(
+                                        serde_json::Value::Object(serde_json::Map::new()),
+                                    ),
+                                }),
+                                "refusal" => Some(CoreContent::Refusal {
+                                    text: block
+                                        .get("text")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("")
+                                        .into(),
+                                }),
+                                "tool_result" => Some(CoreContent::ToolResult {
+                                    tool_use_id: block
+                                        .get("tool_use_id")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("")
+                                        .into(),
+                                    content: Vec::new(),
+                                    is_error: block
+                                        .get("is_error")
+                                        .and_then(|v| v.as_bool())
+                                        .unwrap_or(false),
+                                }),
+                                _ => panic!(
+                                    "build_core_response_from_output (anthropic): \
+                                     unknown content type in output.json. Add a branch."
+                                ),
                             }
                         })
                         .collect::<Vec<_>>()
@@ -224,6 +271,14 @@ fn build_core_response_from_output(adapter: &str, output_json: &serde_json::Valu
                                 .unwrap_or("")
                                 .into(),
                             input: args,
+                        });
+                    }
+                }
+                // Handle refusal content in OpenAI responses.
+                if let Some(refusal) = msg.get("refusal").and_then(|v| v.as_str()) {
+                    if !refusal.is_empty() {
+                        content.push(CoreContent::Refusal {
+                            text: refusal.into(),
                         });
                     }
                 }
@@ -332,6 +387,69 @@ fn assert_encode_matches_output(
                 exp_choices.and_then(|c| c.get("finish_reason")),
                 "finish_reason mismatch"
             );
+            // Compare message content
+            let out_msg = out_choices.and_then(|c| c.get("message"));
+            let exp_msg = exp_choices.and_then(|c| c.get("message"));
+            if let (Some(out_m), Some(exp_m)) = (out_msg, exp_msg) {
+                assert_eq!(
+                    out_m.get("content"),
+                    exp_m.get("content"),
+                    "message content mismatch"
+                );
+                // Compare tool_calls if present
+                if exp_m.get("tool_calls").is_some() {
+                    let out_tcs = out_m.get("tool_calls").and_then(|v| v.as_array());
+                    let exp_tcs = exp_m.get("tool_calls").and_then(|v| v.as_array());
+                    assert_eq!(
+                        out_tcs.map(|a| a.len()),
+                        exp_tcs.map(|a| a.len()),
+                        "tool_calls count mismatch"
+                    );
+                    if let (Some(out_tc_arr), Some(exp_tc_arr)) = (out_tcs, exp_tcs) {
+                        for (i, (otc, etc)) in out_tc_arr.iter().zip(exp_tc_arr.iter()).enumerate() {
+                            if etc.get("id").is_some() {
+                                assert_eq!(
+                                    otc.get("id"), etc.get("id"),
+                                    "tool_calls[{i}].id mismatch"
+                                );
+                            }
+                            assert_eq!(
+                                otc.get("function").and_then(|f| f.get("name")),
+                                etc.get("function").and_then(|f| f.get("name")),
+                                "tool_calls[{i}].function.name mismatch"
+                            );
+                        }
+                    }
+                }
+            }
+            // Compare model if present in expected output
+            if output_json.get("model").is_some() {
+                assert_eq!(
+                    serialized.get("model"),
+                    output_json.get("model"),
+                    "model mismatch"
+                );
+            }
+            // Compare usage if present in expected output
+            if let Some(exp_usage) = output_json.get("usage") {
+                let out_usage = serialized.get("usage");
+                assert!(
+                    out_usage.is_some(),
+                    "expected usage in encoded output but got none"
+                );
+                if let Some(ou) = out_usage {
+                    assert_eq!(
+                        ou.get("prompt_tokens"),
+                        exp_usage.get("prompt_tokens"),
+                        "usage.prompt_tokens mismatch"
+                    );
+                    assert_eq!(
+                        ou.get("completion_tokens"),
+                        exp_usage.get("completion_tokens"),
+                        "usage.completion_tokens mismatch"
+                    );
+                }
+            }
         }
         _ => panic!("unknown adapter: {adapter}"),
     };
@@ -351,7 +469,17 @@ fn run_non_stream_fixture(adapter: &str, case: &str) {
 
     assert_decode_matches_core(adapter, &input, &core);
 
-    // Only run encode check if output.json exists
+    // Encode direction: construct a CoreResponse from the adapter-specific
+    // output.json via build_core_response_from_output, encode it back through
+    // the adapter, and compare key fields with output.json.
+    //
+    // NOTE: This is not a fully independent round-trip -- the CoreResponse is
+    // built from the same output.json it is compared against.  The decode
+    // direction (above) is the true cross-format test.  The encode direction
+    // primarily verifies that encode_response produces structurally correct
+    // output for a given CoreResponse.  If core-response.json fixtures are
+    // added in a future audit, the encode test should construct CoreResponse
+    // from those instead.
     if dir.join("output.json").exists() {
         let output = read_fixture(&dir, "output.json");
         let response = build_core_response_from_output(adapter, &output);
@@ -569,13 +697,92 @@ fn all_streaming_fixtures_have_required_files() {
 }
 
 // ---------------------------------------------------------------------------
+// Unified coverage-matrix test
+// ---------------------------------------------------------------------------
+
+/// Non-stream fixture cases required for every client adapter.
+/// Each entry is (case_name, required_files).
+///
+/// Universal cases apply to all client adapters.  Additional cases from the
+/// plan (multiple-messages, refusal, redacted-thinking, multimedia content,
+/// sampling-intent, model-mapping, stop-sequence) are listed as TODO items
+/// for the next audit round.
+fn required_client_non_stream_cases() -> Vec<(&'static str, Vec<&'static str>)> {
+    vec![
+        ("plain-text-request", vec!["input.json", "core.json", "output.json"]),
+        ("system-prompt", vec!["input.json", "core.json", "output.json"]),
+        ("tool-call", vec!["input.json", "core.json", "output.json"]),
+        ("tool-result", vec!["input.json", "core.json", "output.json"]),
+        ("thinking", vec!["input.json", "core.json", "output.json"]),
+        ("cache-control", vec!["input.json", "core.json", "output.json"]),
+        ("tool-choice", vec!["input.json", "core.json", "output.json"]),
+        ("stop-reason", vec!["input.json", "core.json", "output.json"]),
+        ("usage", vec!["input.json", "core.json", "output.json"]),
+        ("malformed", vec!["input.json", "core.json"]),
+        // TODO: Additional cases for the next audit round:
+        //   multiple-messages, refusal, redacted-thinking, image/document/audio/video
+        //   content, sampling-intent, model-mapping, stop-sequence.
+    ]
+}
+
+/// Streaming fixture cases required for every client adapter.
+fn required_client_streaming_cases() -> Vec<(&'static str, Vec<&'static str>)> {
+    vec![
+        ("streaming-text", vec!["input.sse", "core-events.json", "output.sse"]),
+        ("streaming-tool", vec!["input.sse", "core-events.json", "output.sse"]),
+        ("streaming-usage", vec!["input.sse", "core-events.json", "output.sse"]),
+        ("streaming-error", vec!["input.sse", "core-events.json", "output.sse"]),
+        ("streaming-ping", vec!["input.sse", "core-events.json", "output.sse"]),
+    ]
+}
+
+/// Unified coverage-matrix test that enforces required fixture cases for
+/// all client adapters.  Mirrors the provider-side coverage-matrix pattern.
+/// `cargo test` must fail when a required fixture is missing.
+#[test]
+fn coverage_matrix_all_required_client_fixtures_exist() {
+    let adapters = ["anthropic", "openai_chat"];
+    let mut missing: Vec<String> = Vec::new();
+
+    for adapter in &adapters {
+        // Non-stream cases
+        for (case, files) in required_client_non_stream_cases() {
+            let dir = Path::new(FIXTURE_ROOT).join(adapter).join(case);
+            for file in &files {
+                if !dir.join(file).exists() {
+                    missing.push(format!("{adapter}/{case}/{file}"));
+                }
+            }
+        }
+
+        // Streaming cases
+        for (case, files) in required_client_streaming_cases() {
+            let dir = Path::new(FIXTURE_ROOT).join(adapter).join(case);
+            for file in &files {
+                if !dir.join(file).exists() {
+                    missing.push(format!("{adapter}/{case}/{file}"));
+                }
+            }
+        }
+    }
+
+    assert!(
+        missing.is_empty(),
+        "missing required client fixture files:\n  {}",
+        missing.join("\n  ")
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Streaming fixture validation tests
 // ---------------------------------------------------------------------------
 
 /// Verify that the core-events.json fixture can be deserialized into CoreEvent
 /// values. This is a basic validation that streaming fixtures are well-formed.
-/// Full encode/decode round-trip tests (parsing input.sse, feeding through
-/// StreamEncoder, comparing with output.sse) are deferred to a later audit cycle.
+/// Full encode/decode round-trip tests (parsing input.sse through a
+/// StreamDecoder, encoding CoreEvents through a StreamEncoder, comparing with
+/// output.sse) are deferred to a later audit cycle.  The current tests
+/// validate fixture structure only, not adapter behavior.
 #[test]
 fn streaming_core_events_json_is_valid() {
     let streaming_cases = [

@@ -407,7 +407,14 @@ impl ProviderStreamDecoder for AnthropicStreamDecoder {
                 if self.current_block_kind == ContentKind::ToolUse {
                     events.push(CoreEvent::ToolCallStop { index: idx });
                     // Mark this tool block as closed so finish() won't re-emit.
-                    let tool_idx = self.tool_blocks.iter().position(|&i| i == idx).unwrap_or(0);
+                    let tool_idx = self.tool_blocks.iter().position(|&i| i == idx).unwrap_or_else(|| {
+                        tracing::warn!(
+                            idx,
+                            "Anthropic: tool block index not found in content_block_stop; \
+                             marking first tool block as closed"
+                        );
+                        0
+                    });
                     if tool_idx < self.tool_blocks_closed.len() {
                         self.tool_blocks_closed[tool_idx] = true;
                     }
@@ -897,7 +904,14 @@ fn encode_content_blocks(content: &[CoreContent]) -> serde_json::Value {
                     .iter()
                     .filter_map(|c| match c {
                         CoreContent::Text { text, .. } => Some(text.as_str()),
-                        _ => None,
+                        other => {
+                            tracing::warn!(
+                                ?other,
+                                tool_use_id,
+                                "Anthropic: dropping non-text content block in ToolResult encoding"
+                            );
+                            None
+                        }
                     })
                     .collect::<String>();
                 let sanitized_id = sanitize_tool_use_id(tool_use_id);

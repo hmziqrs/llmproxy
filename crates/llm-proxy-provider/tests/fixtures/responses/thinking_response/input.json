@@ -1,6 +1,7 @@
 {
   "id": "resp_think",
   "object": "response",
+  "created": 12345,
   "model": "gpt-4o",
   "output": [
     {

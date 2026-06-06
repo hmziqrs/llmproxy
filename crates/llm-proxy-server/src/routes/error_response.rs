@@ -357,20 +357,9 @@ const TRUNCATED_SUFFIX: &str = "...[truncated]";
 
 /// Truncate an error body to a safe length for client responses.
 ///
-/// The final string is at most `max_len` bytes (the suffix is included within
-/// this budget). Respects UTF-8 char boundaries to prevent panics on multi-byte
-/// characters.
+/// Delegates to the shared implementation in `llm_proxy_protocol::util`.
 pub(crate) fn truncate_with_suffix(s: &str, max_len: usize, suffix: &str) -> String {
-    if s.len() <= max_len {
-        s.to_owned()
-    } else {
-        let max_content = max_len - suffix.len();
-        let mut end = max_content;
-        while !s.is_char_boundary(end) && end > 0 {
-            end -= 1;
-        }
-        format!("{}{}", &s[..end], suffix)
-    }
+    llm_proxy_protocol::util::truncate_with_suffix(s, max_len, suffix)
 }
 
 /// Truncate an error body to a safe length for client responses.
