@@ -1,6 +1,22 @@
-# Address the HTTP server binds to.
-bind = "0.0.0.0:8080"
-# Maximum request duration before timeout (humantime string).
-request_timeout = "60s"
-# Public server name reported by /version.
+# LLM Proxy configuration file.
+#
+# Copy to ~/.config/llm-proxy/config.toml and adjust settings.
+# Generate a default config by running: llm-proxy init
+
+[server]
+bind = "127.0.0.1:3456"
+request_timeout = "300s"
+log_level = "info"
+hot_reload = false
 server_name = "llm-proxy"
+
+[models]
+# Map client model names to provider names.
+# Optional: specify upstream_model to alias a client model to a different
+# upstream model name.
+#
+# "client-model-name" = { provider = "provider-name" }
+# "alias" = { provider = "provider-name", upstream_model = "real-model-name" }
+#
+# Uncomment and adjust after creating provider configs via `llm-proxy init`:
+# "my-model" = { provider = "opencode-go" }

@@ -1,0 +1,33 @@
+# Provider config for opencode-zen.
+#
+# Copy to ~/.config/llm-proxy/providers/opencode-zen.toml and set your API key.
+# Generate a default config by running: llm-proxy init
+
+[provider]
+name = "opencode-zen"
+api_key = "${LLM_PROXY_OPENCODE_ZEN_KEY}"
+auth_style = "bearer"
+
+[provider.adapters.chat]
+protocol = "openai_chat_completions"
+endpoint = "https://opencode.ai/zen/v1/chat/completions"
+
+[provider.adapters.anthropic]
+protocol = "anthropic_messages"
+endpoint = "https://opencode.ai/zen/v1/messages"
+
+[provider.adapters.responses]
+protocol = "openai_responses"
+endpoint = "https://opencode.ai/zen/v1/responses"
+
+[provider.adapters.gemini]
+protocol = "gemini_generate_content"
+endpoint = "https://opencode.ai/zen/v1/models/{model}:generateContent"
+
+[provider.models]
+# Map model names to adapter names.
+# "model-name" = { adapter = "adapter-name" }
+#
+# Uncomment and adjust after running `llm-proxy init`:
+# "gpt-5.4" = { adapter = "chat" }
+# "gemini-3.5-flash" = { adapter = "gemini" }

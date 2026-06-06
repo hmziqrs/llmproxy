@@ -567,6 +567,11 @@ pub(crate) async fn handle_core_stream(
                 header::CONTENT_TYPE,
                 axum::http::HeaderValue::from_static("text/event-stream"),
             );
+            // Prevent proxy/CDN caching of streaming responses.
+            parts.headers.insert(
+                header::CACHE_CONTROL,
+                axum::http::HeaderValue::from_static("no-cache"),
+            );
             parts.headers.insert(
                 "x-accel-buffering",
                 axum::http::HeaderValue::from_static("no"),

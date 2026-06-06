@@ -1,23 +1,26 @@
 //! `llm-proxy` binary -- CLI entry point.
 //!
-//! Implements a multi-command CLI matching the Go `oc-go-cc` reference:
+//! Multi-command CLI for the LLM proxy server. Uses TOML config exclusively;
+//! legacy JSON config is rejected with a migration error directing users to
+//! `llm-proxy init`.
+//!
+//! Commands:
 //!
 //! - `serve`    Start the proxy server (foreground or daemon)
 //! - `stop`     Stop a running daemon
 //! - `status`   Check if the server is running
-//! - `init`     Create default config file
-//! - `validate` Validate a config file and print settings
-//! - `models`   List available model IDs
+//! - `init`     Create default TOML config and provider files
+//! - `validate` Validate TOML config and print route table
+//! - `models`   List configured client model IDs
 //! - `autostart` Manage auto-start on login (enable / disable / status)
 
 use std::io::Write as IoWrite;
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use llm_proxy_core::{FallbackHandler, resolve_model_route};
-use llm_proxy_provider::{OpenCodeClient, ProviderAdapterRegistry, ProxyClient};
+use llm_proxy_core::resolve_model_route;
+use llm_proxy_provider::{ProviderAdapterRegistry, ProxyClient};
 use llm_proxy_server::{AppState, BuildInfo, build_router, shutdown_signal};
 use tokio::net::TcpListener;
 use tracing::info;
@@ -31,7 +34,7 @@ use tracing::info;
 #[command(
     name = "llm-proxy",
     version,
-    about = "LLM proxy server with scenario-based routing",
+    about = "LLM proxy server with provider-based model routing",
     propagate_version = true
 )]
 struct Cli {
@@ -398,12 +401,15 @@ async fn cmd_serve(
     let (path, legacy_env) = resolve_serve_config(config_path);
 
     // Reject JSON config with migration error.
+    // This handles explicit --config old.json (CLI path, not legacy env).
     if is_json_config(&path) {
         bail!("{}", MIGRATION_ERROR);
     }
 
     // If only $OC_GO_CC_CONFIG is set (no explicit --config, no $LLM_PROXY_CONFIG),
-    // print migration warning and exit.
+    // print migration error and exit. This rejects $OC_GO_CC_CONFIG regardless of
+    // file extension: even TOML files via this env var are rejected to force users
+    // to migrate to the preferred $LLM_PROXY_CONFIG or explicit --config.
     if legacy_env {
         bail!("{}", MIGRATION_ERROR);
     }
@@ -441,7 +447,9 @@ async fn cmd_serve(
     // Ensure PID file is cleaned up on shutdown.
     let pid_path = pid_file_path();
     let cleanup = async move {
-        let _ = std::fs::remove_file(&pid_path);
+        if let Err(e) = std::fs::remove_file(&pid_path) {
+            tracing::warn!(error = %e, "failed to remove PID file during shutdown");
+        }
     };
 
     // Load TOML config and build state.
@@ -507,6 +515,12 @@ fn spawn_daemon(config_path: Option<PathBuf>, port_override: Option<u16>) -> Res
         cmd.stderr(log_file);
     }
 
+    #[cfg(not(unix))]
+    {
+        println!("warning: daemon log redirection is not supported on this platform; \
+                   output will be lost");
+    }
+
     let mut child = cmd.spawn().with_context(|| "spawning daemon process")?;
 
     let pid = child.id();
@@ -518,7 +532,9 @@ fn spawn_daemon(config_path: Option<PathBuf>, port_override: Option<u16>) -> Res
     );
 
     // Detach from child so we don't wait on it.
-    let _ = child.try_wait();
+    if let Err(e) = child.try_wait() {
+        tracing::warn!(error = %e, "failed to check daemon child status");
+    }
 
     Ok(())
 }
@@ -579,8 +595,19 @@ fn cmd_status() -> Result<()> {
         Some(pid) => {
             if is_process_running(pid) {
                 println!("server is running (PID {pid})");
-                println!("  listen: 127.0.0.1:3456");
-                println!("  config: {}", default_config_path().display());
+                // Try to load actual bind address from config.
+                let config_path = default_config_path();
+                if config_path.exists() {
+                    use llm_proxy_core::load_app_config;
+                    if let Ok(cfg) = load_app_config(&config_path) {
+                        println!("  listen: {}", cfg.server.bind);
+                    } else {
+                        println!("  listen: (could not parse config)");
+                    }
+                } else {
+                    println!("  listen: (config file not found)");
+                }
+                println!("  config: {}", config_path.display());
             } else {
                 println!("server not running (stale PID {pid})");
             }
@@ -730,11 +757,7 @@ fn cmd_validate(config_path: Option<PathBuf>) -> Result<()> {
         println!();
         println!("=== Model Route Table ===");
         let mut route_errors: Vec<String> = Vec::new();
-        for (client_model, route) in &app_config.models {
-            let _upstream_model = route
-                .upstream_model
-                .as_deref()
-                .unwrap_or(client_model);
+        for client_model in app_config.models.keys() {
 
             match resolve_model_route(&app_config.models, client_model) {
                 Ok(target) => {
@@ -783,6 +806,14 @@ fn cmd_validate(config_path: Option<PathBuf>) -> Result<()> {
 /// Respects TOML aliases and does NOT use hardcoded model lists.
 fn cmd_models(config_path: Option<PathBuf>) -> Result<()> {
     let path = resolve_config(config_path);
+
+    // Reject JSON config with migration error (consistent with validate/serve).
+    if is_json_config(&path) {
+        bail!(
+            "JSON config is no longer supported. \
+             Run `llm-proxy init` to create TOML config, then copy model/API settings."
+        );
+    }
 
     // Reject non-TOML.
     if !is_toml_config(&path) {
@@ -1046,6 +1077,8 @@ fn load_toml_state(
         load_app_config(path).with_context(|| format!("loading TOML config from {}", path.display()))?;
 
     // Apply CLI port override.
+    // In-place mutation is safe here: the config is consumed by AppState::from_toml
+    // below and is not shared with any other caller.
     if let Some(p) = port_override {
         let mut bind = app_config.server.bind;
         bind.set_port(p);
@@ -1124,7 +1157,6 @@ mod dirs {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write as IoWrite;
     use std::sync::Mutex;
 
     /// Crate-level mutex for serialising tests that mutate environment variables.
@@ -1337,7 +1369,7 @@ mod tests {
         let _g1 = EnvGuard::set("LLM_PROXY_OPENCODE_GO_KEY", "test-go-key");
         let _g2 = EnvGuard::set("LLM_PROXY_OPENCODE_ZEN_KEY", "test-zen-key");
 
-        use llm_proxy_core::{ProviderRegistry, load_app_config, load_provider_config};
+        use llm_proxy_core::{ProviderRegistry, load_app_config};
 
         let dir = tempfile::tempdir().expect("tempdir");
 
@@ -1382,7 +1414,7 @@ mod tests {
         let _g1 = EnvGuard::set("LLM_PROXY_OPENCODE_GO_KEY", "test-go-key");
         let _g2 = EnvGuard::set("LLM_PROXY_OPENCODE_ZEN_KEY", "test-zen-key");
 
-        use llm_proxy_core::{ProviderRegistry, load_app_config, load_provider_config};
+        use llm_proxy_core::{ProviderRegistry, load_app_config};
 
         let dir = tempfile::tempdir().expect("tempdir");
 
@@ -1405,7 +1437,7 @@ mod tests {
         let app_config = load_app_config(&config_path).expect("load app config");
         let registry = ProviderRegistry::load_from_dir(&providers_dir).expect("load providers");
 
-        for (client_model, _route) in &app_config.models {
+        for client_model in app_config.models.keys() {
             let target = resolve_model_route(&app_config.models, client_model)
                 .unwrap_or_else(|e| panic!("route resolution failed for {}: {}", client_model, e));
             let resolved = registry

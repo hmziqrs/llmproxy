@@ -92,7 +92,7 @@ async fn not_found(req: Request) -> impl IntoResponse {
     // Boundary note: the starts_with("/v1/chat/") check covers future routes
     // like /v1/chat/edits. If a non-OpenAI protocol is ever mounted under
     // /v1/chat/, this heuristic must be updated.
-    let path = req.uri().path();
+    let path = req.uri().path().to_owned();
     let _ = req; // Request must be consumed (moved) for IntoResponse; body intentionally ignored
 
     if path == "/v1/chat/completions" || path.starts_with("/v1/chat/") {
