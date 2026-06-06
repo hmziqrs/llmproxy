@@ -215,10 +215,9 @@ pub(crate) async fn handle_core_once(
         }
         ClientProtocol::OpenAiChat => {
             // Phase 9 will implement OpenAI Chat response encoding.
-            return Err(RouteError::Upstream {
-                status: StatusCode::NOT_IMPLEMENTED,
-                body: "OpenAI Chat response encoding not yet implemented".to_owned(),
-            });
+            return Err(RouteError::Internal(
+                "OpenAI Chat response encoding not yet implemented".to_owned(),
+            ));
         }
     };
 
@@ -229,10 +228,7 @@ pub(crate) async fn handle_core_once(
         "request completed"
     );
 
-    let mut response = Response::builder()
-        .status(StatusCode::OK)
-        .body(Body::from(response_body))
-        .expect("building a response with a valid status code cannot fail");
+    let mut response = (StatusCode::OK, Body::from(response_body)).into_response();
 
     // Insert the request ID header safely -- the ID is dynamically generated
     // so we use from_str with a fallback rather than expect/unwrap.
@@ -263,12 +259,33 @@ pub(crate) async fn handle_core_once(
 /// TODO(future): Make this configurable via AppState or TOML config.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(3);
 
+/// Message sent from the spawned stream task to the handler during the
+/// first-byte probe phase. This enables the handler to return a proper
+/// HTTP error status if the stream fails before emitting any data.
+enum FirstByteResult {
+    /// At least one SSE event was produced. The stream is live and all
+    /// subsequent events/errors must be delivered as in-band SSE events.
+    FirstEvent(Event),
+    /// The stream failed before producing any event. The handler should
+    /// return an HTTP error response instead of committing 200 OK.
+    PreStreamError(RouteError),
+}
+
 /// Streaming core pipeline.
 ///
 /// ```text
 /// CoreRequest -> encode -> send_stream -> SseFramer -> ProviderStreamDecoder
 ///            -> StreamEncoder -> SSE response
 /// ```
+///
+/// ## first_byte_sent tracking
+///
+/// The plan requires that errors before the first data byte be returned as
+/// HTTP errors (e.g. 502), not as in-band SSE error events. This is
+/// implemented by probing for the first event before committing the HTTP 200
+/// response: the spawned task sends the first event (or an error) back to
+/// the handler via a oneshot channel, and the handler decides whether to
+/// return an HTTP error or an SSE response.
 pub(crate) async fn handle_core_stream(
     state: AppState,
     ctx: RequestContext,
@@ -325,14 +342,16 @@ pub(crate) async fn handle_core_stream(
     // instead, so clients tracking message IDs for conversation continuity
     // see the real ID. See issue tracker for future improvement.
     let msg_id = format!("msg_{}", uuid::Uuid::new_v4());
-    let model_name = core.model.requested.clone();
+    let model_name = core.model.requested;
     let client_encoder = StreamEncoder::new(msg_id, model_name);
 
-    // ctx is consumed after this point, so move request_id instead of cloning.
+    // ctx is consumed after this point. request_id is cloned once for the
+    // spawned task and once for the response header (both are needed).
     let request_id = ctx.request_id;
     let upstream_model = target.upstream_model.clone();
 
-    // Build the output SSE stream.
+    // Build the output SSE stream with first-byte tracking.
+    let (first_byte_tx, first_byte_rx) = tokio::sync::oneshot::channel::<FirstByteResult>();
     let output_stream = build_sse_output_stream(
         byte_stream,
         provider_decoder,
@@ -345,34 +364,55 @@ pub(crate) async fn handle_core_stream(
             upstream_model: upstream_model.clone(),
             start: ctx.start,
         },
+        first_byte_tx,
     );
 
-    // Wrap in an axum SSE response.
-    let sse = Sse::new(output_stream.map(Ok::<_, std::convert::Infallible>))
-        .keep_alive(KeepAlive::new().interval(HEARTBEAT_INTERVAL));
+    // Wait for the first event (or a pre-stream error). This is the
+    // first_byte_sent boundary: errors before this point become HTTP
+    // errors; errors after this point become in-band SSE error events.
+    let first_event = first_byte_rx.await.map_err(|_| {
+        state.metrics.record_failure();
+        RouteError::Internal("stream task panicked before first event".to_owned())
+    })?;
 
-    let response = sse.into_response();
-    let (mut parts, body) = response.into_parts();
+    match first_event {
+        FirstByteResult::PreStreamError(route_error) => {
+            // Stream failed before emitting any data. Return as HTTP error.
+            Err(route_error)
+        }
+        FirstByteResult::FirstEvent(event) => {
+            // First event received. Commit HTTP 200 and start streaming.
+            // Prepend the first event to the output stream.
+            let stream = futures::stream::once(async move { Ok::<_, std::convert::Infallible>(event) })
+                .chain(output_stream.map(Ok::<_, std::convert::Infallible>));
 
-    // Add custom headers (use lowercase for custom header names consistently).
-    parts.headers.insert(
-        "x-accel-buffering",
-        axum::http::HeaderValue::from_static("no"),
-    );
-    parts.headers.insert(
-        "x-request-id",
-        request_id
-            .parse()
-            .unwrap_or_else(|_| axum::http::HeaderValue::from_static("unknown")),
-    );
+            let sse = Sse::new(stream)
+                .keep_alive(KeepAlive::new().interval(HEARTBEAT_INTERVAL));
 
-    info!(
-        request_id = %request_id,
-        model = %target.upstream_model,
-        "streaming started"
-    );
+            let response = sse.into_response();
+            let (mut parts, body) = response.into_parts();
 
-    Ok(Response::from_parts(parts, body))
+            // Add custom headers.
+            parts.headers.insert(
+                "x-accel-buffering",
+                axum::http::HeaderValue::from_static("no"),
+            );
+            parts.headers.insert(
+                "x-request-id",
+                request_id
+                    .parse()
+                    .unwrap_or_else(|_| axum::http::HeaderValue::from_static("unknown")),
+            );
+
+            info!(
+                request_id = %request_id,
+                model = %target.upstream_model,
+                "streaming started"
+            );
+
+            Ok(Response::from_parts(parts, body))
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -388,6 +428,12 @@ struct StreamMetrics {
 }
 
 /// Build a stream that converts provider byte chunks into client SSE events.
+///
+/// The `first_byte_tx` channel is used to signal the first-byte boundary:
+/// the spawned task sends either `FirstByteResult::FirstEvent` (once the
+/// first SSE event is produced) or `FirstByteResult::PreStreamError` (if
+/// the stream fails before any event). After the first event is sent, the
+/// channel is dropped and all subsequent errors become in-band SSE events.
 #[allow(clippy::too_many_arguments)]
 fn build_sse_output_stream(
     byte_stream: std::pin::Pin<Box<dyn futures::Stream<Item = Result<Bytes, llm_proxy_provider::error::ProviderError>> + Send + 'static>>,
@@ -397,6 +443,7 @@ fn build_sse_output_stream(
     client_protocol: ClientProtocol,
     request_id: String,
     stream_metrics: StreamMetrics,
+    first_byte_tx: tokio::sync::oneshot::Sender<FirstByteResult>,
 ) -> BoxStream<'static, Event> {
     let (tx, rx) = tokio::sync::mpsc::channel::<Event>(256);
     let cancel = tokio_util::sync::CancellationToken::new();
@@ -408,12 +455,56 @@ fn build_sse_output_stream(
         // Track whether the stream terminated due to an error so we can
         // skip the finalization path that follows the main loop.
         let mut stream_errored = false;
+        // Track whether we have sent the first SSE event to the client.
+        // Before first_byte_sent, errors are sent back to the handler via
+        // first_byte_tx so they become HTTP errors. After first_byte_sent,
+        // errors become in-band SSE error events.
+        let mut first_byte_sent = false;
+        // Sender for the first-byte probe. Consumed once (either by sending
+        // FirstEvent or by sending PreStreamError on error).
+        let mut first_byte_tx = Some(first_byte_tx);
+
+        /// Helper: send an event through the first-byte channel (if not yet
+        /// consumed) and mark first_byte_sent. Returns true if the event was
+        /// successfully delivered as the first byte.
+        async fn send_first_event(
+            first_byte_tx: &mut Option<tokio::sync::oneshot::Sender<FirstByteResult>>,
+            event: Event,
+        ) -> bool {
+            if let Some(tx) = first_byte_tx.take() {
+                if tx.send(FirstByteResult::FirstEvent(event)).is_ok() {
+                    return true;
+                }
+                // Receiver dropped -- handler is gone, task should exit.
+            }
+            false
+        }
+
+        /// Helper: send a pre-stream error through the first-byte channel.
+        /// Returns true if the error was delivered (handler will return HTTP error).
+        fn send_pre_stream_error(
+            first_byte_tx: &mut Option<tokio::sync::oneshot::Sender<FirstByteResult>>,
+            error: RouteError,
+        ) -> bool {
+            if let Some(tx) = first_byte_tx.take() {
+                tx.send(FirstByteResult::PreStreamError(error)).is_ok()
+            } else {
+                false
+            }
+        }
 
         'outer: loop {
             tokio::select! {
                 _ = cancel_clone.cancelled() => {
                     // Client disconnected; abort upstream stream.
                     stream_metrics.metrics.record_failure();
+                    // If first byte hasn't been sent yet, signal pre-stream error.
+                    if !first_byte_sent {
+                        send_pre_stream_error(
+                            &mut first_byte_tx,
+                            RouteError::Internal("client disconnected before first byte".to_owned()),
+                        );
+                    }
                     return;
                 }
                 chunk = stream.next() => {
@@ -428,18 +519,25 @@ fn build_sse_output_stream(
                                         error = %e,
                                         "SSE framing error in stream"
                                     );
-                                    // Always emit an in-band error event so the
-                                    // client gets an explanation, even when no
-                                    // data event has been sent yet.  The HTTP
-                                    // status is already committed (200) so the
-                                    // best we can do is an in-band error.
-                                    emit_stream_error(
-                                        &mut client_encoder,
-                                        &tx,
-                                        &client_protocol,
-                                        &format!("stream framing error: {e}"),
-                                    ).await;
-                                    stream_metrics.metrics.record_failure();
+                                    if !first_byte_sent {
+                                        // Error before first byte: send as HTTP error.
+                                        stream_metrics.metrics.record_failure();
+                                        send_pre_stream_error(
+                                            &mut first_byte_tx,
+                                            RouteError::ProviderDecode(
+                                                format!("stream framing error: {e}"),
+                                            ),
+                                        );
+                                    } else {
+                                        // Error after first byte: in-band SSE error event.
+                                        emit_stream_error(
+                                            &mut client_encoder,
+                                            &tx,
+                                            &client_protocol,
+                                            &format!("stream framing error: {e}"),
+                                        ).await;
+                                        stream_metrics.metrics.record_failure();
+                                    }
                                     stream_errored = true;
                                     break 'outer;
                                 }
@@ -454,13 +552,25 @@ fn build_sse_output_stream(
                                             error = %e,
                                             "provider decode error in stream"
                                         );
-                                        emit_stream_error(
-                                            &mut client_encoder,
-                                            &tx,
-                                            &client_protocol,
-                                            &format!("provider decode error: {e}"),
-                                        ).await;
-                                        stream_metrics.metrics.record_failure();
+                                        if !first_byte_sent {
+                                            // Error before first byte: send as HTTP error.
+                                            stream_metrics.metrics.record_failure();
+                                            send_pre_stream_error(
+                                                &mut first_byte_tx,
+                                                RouteError::ProviderDecode(
+                                                    format!("provider decode error: {e}"),
+                                                ),
+                                            );
+                                        } else {
+                                            // Error after first byte: in-band SSE error event.
+                                            emit_stream_error(
+                                                &mut client_encoder,
+                                                &tx,
+                                                &client_protocol,
+                                                &format!("provider decode error: {e}"),
+                                            ).await;
+                                            stream_metrics.metrics.record_failure();
+                                        }
                                         stream_errored = true;
                                         break 'outer;
                                     }
@@ -473,7 +583,20 @@ fn build_sse_output_stream(
                                         core_event,
                                     );
                                     for event in client_events {
-                                        if tx.send(event).await.is_err() {
+                                        if !first_byte_sent {
+                                            // First event: send via first-byte channel
+                                            // so the handler commits HTTP 200.
+                                            if send_first_event(
+                                                &mut first_byte_tx,
+                                                event,
+                                            ).await {
+                                                first_byte_sent = true;
+                                            } else {
+                                                // Handler dropped; abort.
+                                                stream_metrics.metrics.record_failure();
+                                                return;
+                                            }
+                                        } else if tx.send(event).await.is_err() {
                                             stream_metrics.metrics.record_failure();
                                             return;
                                         }
@@ -487,19 +610,33 @@ fn build_sse_output_stream(
                                 error = %e,
                                 "upstream stream error"
                             );
-                            // Always emit an in-band error event regardless of
-                            // first_event_emitted state.
-                            emit_stream_error(
-                                &mut client_encoder,
-                                &tx,
-                                &client_protocol,
-                                &format!("upstream error: {e}"),
-                            ).await;
-                            stream_metrics.metrics.record_failure();
+                            if !first_byte_sent {
+                                // Error before first byte: send as HTTP error.
+                                stream_metrics.metrics.record_failure();
+                                send_pre_stream_error(
+                                    &mut first_byte_tx,
+                                    map_provider_error(e),
+                                );
+                            } else {
+                                // Error after first byte: in-band SSE error event.
+                                emit_stream_error(
+                                    &mut client_encoder,
+                                    &tx,
+                                    &client_protocol,
+                                    &format!("upstream error: {e}"),
+                                ).await;
+                                stream_metrics.metrics.record_failure();
+                            }
                             stream_errored = true;
                             break 'outer;
                         }
-                        None => break 'outer,
+                        None => {
+                            // Stream ended with no events at all.
+                            // If first byte was never sent, this is a normal
+                            // completion of an empty stream -- the handler will
+                            // see the channel close and respond accordingly.
+                            break 'outer;
+                        }
                     }
                 }
             }
@@ -507,7 +644,7 @@ fn build_sse_output_stream(
 
         // Only run finalization when the stream completed normally (not errored).
         // When stream_errored is true, emit_stream_error already handled the
-        // terminal events.
+        // terminal events (or the error was sent back as an HTTP error).
         if !stream_errored {
             // Finalize: call sse_framer.finish() first to flush any trailing partial
             // SSE frame that arrived without a terminating blank line.
@@ -532,7 +669,17 @@ fn build_sse_output_stream(
                                 core_event,
                             );
                             for event in client_events {
-                                if tx.send(event).await.is_err() {
+                                if !first_byte_sent {
+                                    if send_first_event(
+                                        &mut first_byte_tx,
+                                        event,
+                                    ).await {
+                                        first_byte_sent = true;
+                                    } else {
+                                        stream_metrics.metrics.record_failure();
+                                        return;
+                                    }
+                                } else if tx.send(event).await.is_err() {
                                     stream_metrics.metrics.record_failure();
                                     return;
                                 }
@@ -559,7 +706,17 @@ fn build_sse_output_stream(
                             core_event,
                         );
                         for event in client_events {
-                            if tx.send(event).await.is_err() {
+                            if !first_byte_sent {
+                                if send_first_event(
+                                    &mut first_byte_tx,
+                                    event,
+                                ).await {
+                                    first_byte_sent = true;
+                                } else {
+                                    stream_metrics.metrics.record_failure();
+                                    return;
+                                }
+                            } else if tx.send(event).await.is_err() {
                                 stream_metrics.metrics.record_failure();
                                 return;
                             }
@@ -583,7 +740,17 @@ fn build_sse_output_stream(
                             let event = Event::default()
                                 .event(&me.r#type)
                                 .data(json);
-                            if tx.send(event).await.is_err() {
+                            if !first_byte_sent {
+                                if send_first_event(
+                                    &mut first_byte_tx,
+                                    event,
+                                ).await {
+                                    first_byte_sent = true;
+                                } else {
+                                    stream_metrics.metrics.record_failure();
+                                    return;
+                                }
+                            } else if tx.send(event).await.is_err() {
                                 stream_metrics.metrics.record_failure();
                                 return;
                             }
@@ -609,6 +776,13 @@ fn build_sse_output_stream(
                 stream_metrics.start.elapsed(),
             );
         }
+
+        // If the stream ended without ever sending a first byte (empty stream
+        // with no errors), close the first_byte channel gracefully. The handler
+        // will see a RecvError and treat it as an internal error. We don't send
+        // a PreStreamError here because the stream didn't fail -- it was just
+        // empty. Dropping the sender signals the handler.
+        drop(first_byte_tx);
     });
 
     // Wrap the receiver so that dropping it cancels the spawned task.
@@ -633,11 +807,21 @@ fn encode_core_event(
     client_protocol: &ClientProtocol,
     event: CoreEvent,
 ) -> Vec<Event> {
-    // Guard: only Anthropic protocol is supported until Phase 9.
+    // Runtime guard: only Anthropic protocol is supported until Phase 9.
+    // In debug builds, debug_assert catches programming errors. In release
+    // builds, the match below returns an empty vec for unsupported protocols.
     debug_assert!(
         matches!(client_protocol, ClientProtocol::Anthropic),
         "encode_core_event only supports ClientProtocol::Anthropic until Phase 9"
     );
+
+    if !matches!(client_protocol, ClientProtocol::Anthropic) {
+        warn!(
+            protocol = ?client_protocol,
+            "encode_core_event called with unsupported protocol, returning empty events"
+        );
+        return Vec::new();
+    }
 
     match client_encoder.encode_event(event) {
         Ok(msg_events) => msg_events
@@ -651,7 +835,14 @@ fn encode_core_event(
                         Some(Event::default().event(&me.r#type).data(json))
                     }
                     Err(e) => {
-                        warn!("MsgEvent serialization failed, dropping event: {e}");
+                        // Terminal events (message_delta, message_stop) must not be
+                        // silently dropped, as clients may hang waiting for them.
+                        // Emit a warning with the event type for diagnostics.
+                        warn!(
+                            event_type = %me.r#type,
+                            error = %e,
+                            "MsgEvent serialization failed, dropping event"
+                        );
                         None
                     }
                 }
@@ -664,7 +855,12 @@ fn encode_core_event(
     }
 }
 
-/// Emit an error event into the stream, then let the encoder finish.
+/// Emit an error event into the stream.
+///
+/// After the error event, the encoder's `finished` flag is set to `true` so
+/// that any subsequent `finish()` call returns an empty vec. The error event
+/// itself is the terminal event -- no synthetic message_delta/message_stop
+/// pair should follow an error.
 ///
 /// TODO(Phase 9): Dispatch on `client_protocol` to choose the correct encoder.
 /// Currently always delegates to the Anthropic `StreamEncoder`.
@@ -674,11 +870,20 @@ async fn emit_stream_error(
     client_protocol: &ClientProtocol,
     message: &str,
 ) {
-    // Guard: only Anthropic protocol is supported until Phase 9.
+    // Runtime guard: only Anthropic protocol is supported until Phase 9.
     debug_assert!(
         matches!(client_protocol, ClientProtocol::Anthropic),
         "emit_stream_error only supports ClientProtocol::Anthropic until Phase 9"
     );
+
+    if !matches!(client_protocol, ClientProtocol::Anthropic) {
+        warn!(
+            protocol = ?client_protocol,
+            "emit_stream_error called with unsupported protocol, skipping error event"
+        );
+        return;
+    }
+
     use llm_proxy_protocol::core::{CoreStreamError, CoreStreamErrorKind};
 
     let error_event = CoreEvent::Error {
@@ -692,24 +897,10 @@ async fn emit_stream_error(
         }
     }
 
-    // Emit terminal events if the encoder hasn't finished yet.
-    match client_encoder.finish() {
-        Ok(final_msg_events) => {
-            for me in final_msg_events {
-                if let Ok(json) = serde_json::to_string(&me) {
-                    let event = Event::default()
-                        .event(&me.r#type)
-                        .data(json);
-                    if tx.send(event).await.is_err() {
-                        return;
-                    }
-                }
-            }
-        }
-        Err(e) => {
-            warn!("client encoder finish after error: {e}");
-        }
-    }
+    // Mark the encoder as finished so that subsequent finish() calls return
+    // empty events. The error event itself is the terminal event -- we do NOT
+    // emit synthetic message_delta/message_stop after an error.
+    client_encoder.mark_finished();
 }
 
 // ---------------------------------------------------------------------------
@@ -719,27 +910,80 @@ async fn emit_stream_error(
 /// Map a [`ProviderError`](llm_proxy_provider::error::ProviderError) to a
 /// [`RouteError`].
 ///
-/// Note: For non-Api variants (Http, Serialize, etc.), `e.to_string()` is used
-/// as the error body. This may include upstream hostnames or URL paths from
-/// reqwest error messages. If this becomes a concern, sanitize the body here.
+/// Upstream error bodies are sanitized before being forwarded to clients:
+/// - `Api` variants: already sanitized at construction time.
+/// - Non-`Api` variants (Http, Serialize, etc.): sanitized here to strip
+///   upstream hostnames, URL paths, and potential secrets from reqwest error
+///   messages before they reach the client.
 pub(crate) fn map_provider_error(e: llm_proxy_provider::error::ProviderError) -> RouteError {
     match &e {
-        llm_proxy_provider::error::ProviderError::Api { status, body } => RouteError::Upstream {
-            status: StatusCode::from_u16(*status).unwrap_or(StatusCode::BAD_GATEWAY),
-            body: body.clone(),
-        },
-        _ => RouteError::Upstream {
-            status: StatusCode::BAD_GATEWAY,
-            body: e.to_string(),
-        },
+        llm_proxy_provider::error::ProviderError::Api { status, body } => {
+            let status_code = StatusCode::from_u16(*status).unwrap_or_else(|_| {
+                warn!(
+                    status = *status,
+                    "invalid HTTP status from provider; mapping to 502"
+                );
+                StatusCode::BAD_GATEWAY
+            });
+            RouteError::Upstream {
+                status: status_code,
+                body: body.clone(),
+            }
+        }
+        _ => {
+            // Sanitize non-Api error messages to prevent leaking upstream
+            // hostnames, URL paths, or connection details in the response body.
+            let sanitized = sanitize_upstream_error_body(&e.to_string());
+            RouteError::Upstream {
+                status: StatusCode::BAD_GATEWAY,
+                body: sanitized,
+            }
+        }
     }
+}
+
+/// Sanitize non-Api upstream error bodies to prevent information leakage.
+///
+/// Non-Api errors (Http, Serialize, Utf8, etc.) are converted via
+/// `e.to_string()`, which for reqwest errors can contain full URLs including
+/// hostnames and paths. This function replaces such details with generic
+/// messages while preserving enough context for debugging.
+fn sanitize_upstream_error_body(msg: &str) -> String {
+    // Truncate to 512 chars as a safety net. The actual error body in
+    // RouteError::Upstream is further truncated by truncate_error_body()
+    // in the error response encoder.
+    let truncated = if msg.len() > 512 {
+        let mut end = 512;
+        while !msg.is_char_boundary(end) && end > 0 {
+            end -= 1;
+        }
+        format!("{}...[truncated]", &msg[..end])
+    } else {
+        msg.to_owned()
+    };
+
+    // Redact URL-like patterns that may contain hostnames/paths.
+    // Matches http:// or https:// followed by any non-whitespace chars.
+    let re = regex::Regex::new(r"https?://\S+").expect("valid regex");
+    re.replace_all(&truncated, "[url-redacted]").into_owned()
 }
 
 /// Map a [`ProtocolError`](llm_proxy_protocol::client::ProtocolError) to a
 /// [`RouteError`].
+///
+/// Per the `ProtocolError` doc comments:
+/// - `InvalidRequest` -> 400 Bad Request (bad client input)
+/// - `Decode` -> 400 Bad Request (malformed client input)
+/// - `Encode` -> 500 Internal Server Error
+/// - `EncodeSkippable` -> mapped as non-fatal (skipped), so 500 if it
+///   reaches this path.
 pub(crate) fn protocol_error_to_route(e: llm_proxy_protocol::client::ProtocolError) -> RouteError {
     match e {
         llm_proxy_protocol::client::ProtocolError::InvalidRequest(msg) => {
+            RouteError::InvalidRequest(msg)
+        }
+        llm_proxy_protocol::client::ProtocolError::Decode(msg) => {
+            // Per ProtocolError doc: Decode -> 400 Bad Request (malformed client input).
             RouteError::InvalidRequest(msg)
         }
         other => RouteError::Internal(other.to_string()),
@@ -764,8 +1008,18 @@ mod tests {
     }
 
     #[test]
-    fn protocol_error_decode_maps_to_route_internal() {
+    fn protocol_error_decode_maps_to_route_invalid_request() {
         let err = llm_proxy_protocol::client::ProtocolError::Decode("bad".into());
+        let route_err = protocol_error_to_route(err);
+        match route_err {
+            RouteError::InvalidRequest(msg) => assert!(msg.contains("bad")),
+            other => panic!("expected InvalidRequest, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn protocol_error_encode_maps_to_route_internal() {
+        let err = llm_proxy_protocol::client::ProtocolError::Encode("bad".into());
         let route_err = protocol_error_to_route(err);
         assert!(matches!(route_err, RouteError::Internal(_)));
     }
@@ -916,5 +1170,29 @@ mod tests {
         // Ping may or may not produce output depending on the encoder impl.
         // The important thing is it doesn't panic.
         let _ = events;
+    }
+
+    // -- sanitize_upstream_error_body tests ------------------------------------
+
+    #[test]
+    fn sanitize_removes_urls() {
+        let msg = "request failed: connection refused to https://api.openai.com/v1/chat/completions";
+        let sanitized = sanitize_upstream_error_body(msg);
+        assert!(!sanitized.contains("api.openai.com"), "URL should be redacted");
+        assert!(sanitized.contains("[url-redacted]"), "should contain redacted placeholder");
+    }
+
+    #[test]
+    fn sanitize_truncates_long_messages() {
+        let msg = "x".repeat(600);
+        let sanitized = sanitize_upstream_error_body(&msg);
+        assert!(sanitized.ends_with("...[truncated]"));
+    }
+
+    #[test]
+    fn sanitize_preserves_short_messages_without_urls() {
+        let msg = "connection reset by peer";
+        let sanitized = sanitize_upstream_error_body(msg);
+        assert_eq!(sanitized, msg);
     }
 }

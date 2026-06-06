@@ -767,6 +767,15 @@ impl StreamEncoder {
         Ok(events)
     }
 
+    /// Mark the encoder as finished without emitting synthetic terminal events.
+    ///
+    /// This is used after an in-band error event has been emitted: the error
+    /// event itself is the terminal event, so subsequent `finish()` calls
+    /// return an empty vec rather than a synthetic message_delta/message_stop pair.
+    pub fn mark_finished(&mut self) {
+        self.finished = true;
+    }
+
     /// Flush any remaining buffered events (e.g. if the stream was terminated
     /// without a `MessageStop`).
     ///

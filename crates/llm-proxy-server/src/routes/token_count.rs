@@ -26,7 +26,10 @@ pub(crate) struct TokenCountResponse {
     /// Non-standard extension: `token_count` duplicates `input_tokens`.
     /// The Anthropic Messages API `count_tokens` endpoint returns only
     /// `input_tokens`. This extra field is retained for backward
-    /// compatibility with existing clients.
+    /// compatibility with existing clients that depend on this field name.
+    ///
+    /// TODO(future): Remove this field once all known clients are migrated
+    /// to use `input_tokens` only.
     token_count: usize,
 }
 
@@ -77,6 +80,7 @@ async fn count_tokens_inner(
     //
     // TODO(future): Extend counting to include tool definitions, tool_use blocks,
     // and tool_result blocks for a more accurate estimate.
+    // Collect system text without intermediate Vec allocation.
     let system_text: String = core
         .system
         .iter()
@@ -86,8 +90,10 @@ async fn count_tokens_inner(
                 _ => None,
             }
         })
-        .collect::<Vec<_>>()
-        .join("");
+        .fold(String::new(), |mut acc, s| {
+            acc.push_str(s);
+            acc
+        });
 
     let messages: Vec<MessageContent> = core
         .messages
@@ -109,8 +115,21 @@ async fn count_tokens_inner(
                 llm_proxy_protocol::core::CoreRole::User => "user",
                 llm_proxy_protocol::core::CoreRole::Assistant => "assistant",
                 llm_proxy_protocol::core::CoreRole::System => "system",
-                llm_proxy_protocol::core::CoreRole::Tool => "tool",
-                // Handle future unknown variants gracefully.
+                // The Anthropic Messages API does not have a 'tool' role.
+                // Tool results are carried in 'user' role messages with
+                // tool_result content blocks. If a CoreRole::Tool reaches
+                // here, treat it as 'user' since tool_result content is
+                // typically nested under the user role in Anthropic.
+                llm_proxy_protocol::core::CoreRole::Tool => {
+                    tracing::debug!(
+                        "CoreRole::Tool mapped to 'user' for token counting; \
+                         tool_result content is counted under user role"
+                    );
+                    "user"
+                }
+                // All known variants are handled above. This catch-all exists
+                // for forward compatibility. Unknown roles are treated as
+                // 'user' since that is the least-lossy mapping.
                 _ => {
                     tracing::warn!(
                         role = ?msg.role,

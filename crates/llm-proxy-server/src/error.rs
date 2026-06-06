@@ -8,6 +8,11 @@ use thiserror::Error;
 
 /// API-layer error type. Implements `IntoResponse` so handlers can
 /// return `Result<T, ApiError>`.
+///
+/// TODO(Phase 9): Remove once chat.rs is migrated to core pipeline.
+/// The new `RouteError` in `error_response.rs` replaces this type.
+/// `ApiError` and its `AnthropicErrorBody`/`AnthropicErrorDetail` are
+/// duplicated in `error_response.rs` -- both have the same JSON structure.
 #[derive(Debug, Error)]
 pub enum ApiError {
     /// Bad client input.

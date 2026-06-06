@@ -92,6 +92,8 @@ async fn not_found() -> impl IntoResponse {
             "message": "not found"
         }
     });
+    // axum::Json already sets Content-Type: application/json. The explicit
+    // insert below is defense-in-depth.
     let mut response = (StatusCode::NOT_FOUND, axum::Json(body)).into_response();
     response.headers_mut().insert(
         header::CONTENT_TYPE,

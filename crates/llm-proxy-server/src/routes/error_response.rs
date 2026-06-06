@@ -4,6 +4,17 @@
 //! pipeline, and [`route_error_response`] to encode it into a client-specific
 //! HTTP response. Each route passes its [`ClientProtocol`] so the error shape
 //! matches what the client expects (Anthropic JSON envelope, OpenAI error, etc.).
+//!
+//! # Security: error message sanitization
+//!
+//! Internal error messages (config details, adapter names, protocol names, etc.)
+//! are NEVER sent to clients. Instead, generic messages are used in the HTTP
+//! response body, while the actual messages are logged server-side only. This
+//! prevents information disclosure about the proxy's internal architecture.
+//!
+//! Upstream error bodies are sanitized by the provider error layer and further
+//! truncated here. Provider decode errors are similarly replaced with generic
+//! messages to avoid leaking upstream response fragments.
 
 use axum::body::Body;
 use axum::http::{HeaderValue, StatusCode, header};
@@ -18,7 +29,12 @@ use serde::Serialize;
 ///
 /// Each route knows which protocol its callers speak. The error response module
 /// uses this to produce the correct JSON envelope.
+///
+/// Note: RateLimited and Conflict variants extend the plan's original 5-variant
+/// RouteError definition (InvalidRequest, UnknownModel, Upstream, ProviderDecode,
+/// Internal). These are used by prepare_request for rate limiting and deduplication.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ClientProtocol {
     /// Anthropic Messages API (`/v1/messages`).
     Anthropic,
@@ -35,6 +51,11 @@ pub enum ClientProtocol {
 ///
 /// Route handlers return `Result<T, RouteError>`. The [`route_error_response`]
 /// function encodes this into a protocol-specific HTTP response.
+///
+/// # Security note
+///
+/// Some variants carry internal details (Internal, ProviderDecode, Upstream).
+/// The error response encoder sanitizes these before sending them to clients.
 #[derive(Debug, thiserror::Error)]
 pub enum RouteError {
     /// Bad client input (malformed JSON, missing fields).
@@ -99,9 +120,22 @@ pub fn route_error_response(protocol: ClientProtocol, error: RouteError) -> Resp
     }
 }
 
+/// Generic message used for 500 Internal Server Error responses.
+/// The actual internal error details are logged server-side only.
+const INTERNAL_ERROR_CLIENT_MESSAGE: &str = "internal server error";
+
+/// Generic message used for provider decode error responses.
+/// The actual decode error details are logged server-side only.
+const PROVIDER_DECODE_CLIENT_MESSAGE: &str = "provider response decode error";
+
 /// Build an Anthropic-shaped error response.
+///
+/// Internal error messages are sanitized: `Internal` and `ProviderDecode`
+/// variants use generic messages in the response body to prevent information
+/// disclosure. The actual messages are available through `RouteError::Display`
+/// for server-side logging before this function is called.
 fn anthropic_error_response(error: RouteError) -> Response<Body> {
-    let (status, error_type, message): (StatusCode, &str, String) = match error {
+    let (status, error_type, message) = match error {
         RouteError::InvalidRequest(msg) => {
             (StatusCode::BAD_REQUEST, "invalid_request_error", msg)
         }
@@ -115,15 +149,15 @@ fn anthropic_error_response(error: RouteError) -> Response<Body> {
             "api_error",
             truncate_error_body(&body),
         ),
-        RouteError::ProviderDecode(msg) => (
+        RouteError::ProviderDecode(_msg) => (
             StatusCode::BAD_GATEWAY,
             "api_error",
-            msg,
+            PROVIDER_DECODE_CLIENT_MESSAGE.to_owned(),
         ),
-        RouteError::Internal(msg) => (
+        RouteError::Internal(_msg) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             "api_error",
-            msg,
+            INTERNAL_ERROR_CLIENT_MESSAGE.to_owned(),
         ),
         RouteError::RateLimited => (
             StatusCode::TOO_MANY_REQUESTS,
@@ -145,6 +179,9 @@ fn anthropic_error_response(error: RouteError) -> Response<Body> {
         },
     };
 
+    // axum::Json already sets Content-Type: application/json in its
+    // IntoResponse implementation. The explicit insert below is
+    // defense-in-depth to ensure the header is always present.
     let mut response = (status, axum::Json(body)).into_response();
     response.headers_mut().insert(
         header::CONTENT_TYPE,
@@ -168,8 +205,12 @@ fn openai_error_response(error: RouteError) -> Response<Body> {
         RouteError::Upstream { status, body } => {
             (map_upstream_status(status), truncate_error_body(&body))
         }
-        RouteError::ProviderDecode(msg) => (StatusCode::BAD_GATEWAY, msg),
-        RouteError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
+        RouteError::ProviderDecode(_msg) => {
+            (StatusCode::BAD_GATEWAY, PROVIDER_DECODE_CLIENT_MESSAGE.to_owned())
+        }
+        RouteError::Internal(_msg) => {
+            (StatusCode::INTERNAL_SERVER_ERROR, INTERNAL_ERROR_CLIENT_MESSAGE.to_owned())
+        }
         RouteError::RateLimited => (
             StatusCode::TOO_MANY_REQUESTS,
             "rate limit exceeded".to_owned(),
@@ -188,6 +229,8 @@ fn openai_error_response(error: RouteError) -> Response<Body> {
         }
     });
 
+    // axum::Json already sets Content-Type: application/json. The explicit
+    // insert below is defense-in-depth.
     let mut response = (status, axum::Json(body)).into_response();
     response.headers_mut().insert(
         header::CONTENT_TYPE,
@@ -275,7 +318,7 @@ mod tests {
 
     #[test]
     fn anthropic_provider_decode_returns_502() {
-        let err = RouteError::ProviderDecode("bad frame".into());
+        let err = RouteError::ProviderDecode("bad frame with sensitive data".into());
         let response = route_error_response(ClientProtocol::Anthropic, err);
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     }
@@ -299,6 +342,42 @@ mod tests {
         let err = RouteError::Conflict;
         let response = route_error_response(ClientProtocol::Anthropic, err);
         assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+
+    // -- Internal error message sanitization -----------------------------------
+
+    #[tokio::test]
+    async fn internal_error_message_is_sanitized_in_response_body() {
+        let err = RouteError::Internal("secret config detail: /etc/proxy.toml".into());
+        let response = route_error_response(ClientProtocol::Anthropic, err);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .expect("body");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("valid JSON");
+        let message = json["error"]["message"].as_str().unwrap();
+        assert_eq!(message, INTERNAL_ERROR_CLIENT_MESSAGE);
+        assert!(
+            !message.contains("secret"),
+            "internal error message must not contain internal details"
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_decode_error_message_is_sanitized_in_response_body() {
+        let err = RouteError::ProviderDecode(
+            "decode response: upstream returned malformed JSON with api_key=sk-ant-abc123".into(),
+        );
+        let response = route_error_response(ClientProtocol::Anthropic, err);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .expect("body");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("valid JSON");
+        let message = json["error"]["message"].as_str().unwrap();
+        assert_eq!(message, PROVIDER_DECODE_CLIENT_MESSAGE);
+        assert!(
+            !message.contains("upstream"),
+            "provider decode error must not contain upstream details"
+        );
     }
 
     // -- OpenAI error encoding -------------------------------------------------
@@ -418,7 +497,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn anthropic_internal_body_has_correct_structure() {
+    async fn anthropic_internal_body_uses_generic_message() {
         let err = RouteError::Internal("config missing".into());
         let response = route_error_response(ClientProtocol::Anthropic, err);
         let body = axum::body::to_bytes(response.into_body(), 4096)
@@ -427,7 +506,7 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).expect("valid JSON");
         assert_eq!(json["type"], "error");
         assert_eq!(json["error"]["type"], "api_error");
-        assert_eq!(json["error"]["message"], "config missing");
+        assert_eq!(json["error"]["message"], INTERNAL_ERROR_CLIENT_MESSAGE);
     }
 
     #[tokio::test]

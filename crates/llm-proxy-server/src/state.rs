@@ -6,7 +6,7 @@ use llm_proxy_core::{
     AppConfig, Config, Counter, FallbackHandler, Metrics, ProviderRegistry,
 };
 use llm_proxy_provider::{OpenCodeClient, ProviderAdapterRegistry, ProxyClient};
-#[allow(unused_imports)]
+#[cfg(not(debug_assertions))]
 use tracing::warn;
 
 use crate::middleware::{RateLimiter, RequestDeduplicator, RequestIdGenerator};
