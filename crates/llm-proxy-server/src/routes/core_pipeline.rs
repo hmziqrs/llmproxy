@@ -652,11 +652,17 @@ impl StreamContext {
                     self.first_byte_sent = true;
                     return true;
                 }
-                // Receiver dropped -- handler is gone.
+                // Receiver dropped -- handler is gone (client disconnected or
+                // handler timed out). The failure is unactionable because the
+                // handler has already returned, so we just record the metric
+                // and stop the stream task.
                 self.stream_metrics.metrics.record_failure();
                 return false;
             }
         } else if tx.send(event).await.is_err() {
+            // Channel receiver dropped -- the SSE handler task has exited
+            // (client disconnect or timeout). No further events can be
+            // delivered, so stop the stream task.
             self.stream_metrics.metrics.record_failure();
             return false;
         }

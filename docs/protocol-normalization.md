@@ -183,7 +183,7 @@ enum CoreEvent {
     ToolCallDelta { index: usize, args_delta: String },
     ToolCallStop { index: usize },
     ThinkingDelta { index: usize, text: String },
-    Usage { usage: Usage },
+    UsageDelta { usage: Usage },
     MessageStop { stop_reason: StopReason, stop_sequence: Option<String> },
     Error { error: CoreError },
     Ping,

@@ -14,11 +14,15 @@ use sha2::{Digest, Sha256};
 // RequestDeduplicator
 // ---------------------------------------------------------------------------
 
-/// Deduplicates requests based on a SHA-256 hash of the request body.
+/// Deduplicates requests based on a SHA-256 hash of the request path and body.
 ///
-/// Tracks in-flight request hashes with a 500 ms deduplication window.
-/// If a second request with the same body arrives while the first is still
-/// in-flight, the duplicate is rejected.
+/// Tracks in-flight request hashes with a configurable deduplication window
+/// (default: 500 ms).  If a second request with the same path and body arrives
+/// while the first is still in-flight, the duplicate is rejected.
+///
+/// The request path is included in the hash so that the same body sent to
+/// different protocol endpoints (e.g. `/v1/messages` vs `/v1/chat/completions`)
+/// is not treated as a duplicate.
 ///
 /// # Why `std::sync::Mutex`?
 ///
@@ -38,9 +42,14 @@ pub struct RequestDeduplicator {
 impl RequestDeduplicator {
     /// Create a new deduplicator with a 500 ms window.
     pub fn new() -> Self {
+        Self::with_window_ms(500)
+    }
+
+    /// Create a new deduplicator with a custom deduplication window.
+    pub fn with_window_ms(window_ms: u64) -> Self {
         Self {
             in_flight: Mutex::new(HashMap::new()),
-            window_ms: 500,
+            window_ms,
         }
     }
 
@@ -49,7 +58,16 @@ impl RequestDeduplicator {
     /// Returns `true` if the request is a duplicate (should be rejected),
     /// `false` if it is new (should be processed).
     pub fn is_duplicate(&self, body: &[u8]) -> bool {
-        let hash = Self::hash_body(body);
+        self.is_duplicate_with_path("", body)
+    }
+
+    /// Check whether this request is a duplicate, keyed by path and body.
+    ///
+    /// Including the path distinguishes requests to different protocol
+    /// endpoints (e.g. `/v1/messages` vs `/v1/chat/completions`) that
+    /// happen to carry the same body.
+    pub fn is_duplicate_with_path(&self, path: &str, body: &[u8]) -> bool {
+        let hash = Self::hash_path_body(path, body);
         let now = Instant::now();
 
         let mut map = self.in_flight.lock().unwrap_or_else(|e| {
@@ -68,9 +86,10 @@ impl RequestDeduplicator {
         false
     }
 
-    /// Compute the SHA-256 hex digest of the request body.
-    fn hash_body(body: &[u8]) -> String {
+    /// Compute the SHA-256 hex digest of the request path and body.
+    fn hash_path_body(path: &str, body: &[u8]) -> String {
         let mut hasher = Sha256::new();
+        hasher.update(path.as_bytes());
         hasher.update(body);
         format!("{:x}", hasher.finalize())
     }
@@ -222,8 +241,8 @@ impl Default for RequestIdGenerator {
 
 /// Extract the client IP from request headers or connection info.
 ///
-/// Checks `X-Forwarded-For` first (leftmost IP), then falls back to
-/// connection info.
+/// Checks `X-Forwarded-For` first (leftmost IP), then `X-Real-IP`, then
+/// falls back to connection info.
 ///
 /// # Trust assumption
 ///
@@ -232,32 +251,53 @@ impl Default for RequestIdGenerator {
 /// can be spoofed by clients to bypass rate limiting. The proxy should only
 /// be deployed behind a trusted reverse proxy that overwrites these headers.
 ///
-/// TODO(future): Add a `trust_forwarded_headers` config option (default: true)
-/// that, when disabled, skips `X-Forwarded-For` and `X-Real-IP` and relies
-/// solely on connection info. This is needed for deployments where the proxy
-/// is directly exposed to the internet without a trusted reverse proxy.
+/// # `trust_forwarded_headers` config option
+///
+/// A `trust_forwarded_headers` boolean config option (default: `true` for
+/// backward compatibility) should be added in a future phase.  When set to
+/// `false`, this function will skip `X-Forwarded-For` and `X-Real-IP` and
+/// rely solely on connection info.  This is needed for deployments where
+/// the proxy is directly exposed to the internet without a trusted reverse
+/// proxy.  The config option should live in `ServerConfig` and be wired
+/// through `AppState` to this function.
 pub fn get_client_ip(
     headers: &axum::http::HeaderMap,
     connect_info: Option<&axum::extract::ConnectInfo<std::net::SocketAddr>>,
 ) -> String {
-    // Check X-Forwarded-For first (leftmost IP).
-    if let Some(xff) = headers.get("x-forwarded-for") {
-        if let Ok(val) = xff.to_str() {
-            if let Some(ip) = val.split(',').next() {
-                let trimmed = ip.trim();
-                if !trimmed.is_empty() {
-                    return trimmed.to_owned();
+    get_client_ip_inner(headers, connect_info, true)
+}
+
+/// Inner implementation that accepts a `trust_forwarded_headers` flag.
+///
+/// When `trust_forwarded_headers` is `false`, the `X-Forwarded-For` and
+/// `X-Real-IP` headers are ignored and only connection info is used.
+/// This prevents IP spoofing when the proxy is directly exposed to the
+/// internet without a trusted reverse proxy.
+pub fn get_client_ip_inner(
+    headers: &axum::http::HeaderMap,
+    connect_info: Option<&axum::extract::ConnectInfo<std::net::SocketAddr>>,
+    trust_forwarded_headers: bool,
+) -> String {
+    if trust_forwarded_headers {
+        // Check X-Forwarded-For first (leftmost IP).
+        if let Some(xff) = headers.get("x-forwarded-for") {
+            if let Ok(val) = xff.to_str() {
+                if let Some(ip) = val.split(',').next() {
+                    let trimmed = ip.trim();
+                    if !trimmed.is_empty() {
+                        return trimmed.to_owned();
+                    }
                 }
             }
         }
-    }
 
-    // Check X-Real-Ip.
-    if let Some(xri) = headers.get("x-real-ip") {
-        if let Ok(val) = xri.to_str() {
-            let trimmed = val.trim();
-            if !trimmed.is_empty() {
-                return trimmed.to_owned();
+        // Check X-Real-Ip.
+        if let Some(xri) = headers.get("x-real-ip") {
+            if let Ok(val) = xri.to_str() {
+                let trimmed = val.trim();
+                if !trimmed.is_empty() {
+                    return trimmed.to_owned();
+                }
             }
         }
     }
@@ -335,5 +375,65 @@ mod tests {
         }
         // Different IP should still be allowed.
         assert!(limiter.is_allowed("10.0.0.2"));
+    }
+
+    // -- RequestDeduplicator with path -----------------------------------------
+
+    #[test]
+    fn dedup_same_body_different_path_is_not_duplicate() {
+        let dedup = RequestDeduplicator::new();
+        assert!(!dedup.is_duplicate_with_path("/v1/messages", b"hello"));
+        // Same body, different path -> not a duplicate.
+        assert!(!dedup.is_duplicate_with_path("/v1/chat/completions", b"hello"));
+    }
+
+    #[test]
+    fn dedup_same_body_same_path_is_duplicate() {
+        let dedup = RequestDeduplicator::new();
+        assert!(!dedup.is_duplicate_with_path("/v1/messages", b"hello"));
+        assert!(dedup.is_duplicate_with_path("/v1/messages", b"hello"));
+    }
+
+    #[test]
+    fn dedup_custom_window() {
+        let dedup = RequestDeduplicator::with_window_ms(1000);
+        assert!(!dedup.is_duplicate(b"hello"));
+        assert!(dedup.is_duplicate(b"hello"));
+    }
+
+    // -- get_client_ip_inner ---------------------------------------------------
+
+    #[test]
+    fn client_ip_trust_forwarded_headers_false_ignores_headers() {
+        use axum::http::HeaderMap;
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", "1.2.3.4".parse().unwrap());
+        let connect_info = axum::extract::ConnectInfo(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+            8080,
+        ));
+
+        // With trust_forwarded_headers = false, should use connection info.
+        let ip = super::get_client_ip_inner(&headers, Some(&connect_info), false);
+        assert_eq!(ip, "127.0.0.1", "should ignore X-Forwarded-For when trust=false");
+    }
+
+    #[test]
+    fn client_ip_trust_forwarded_headers_true_uses_headers() {
+        use axum::http::HeaderMap;
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", "1.2.3.4".parse().unwrap());
+        let connect_info = axum::extract::ConnectInfo(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+            8080,
+        ));
+
+        // With trust_forwarded_headers = true, should use X-Forwarded-For.
+        let ip = super::get_client_ip_inner(&headers, Some(&connect_info), true);
+        assert_eq!(ip, "1.2.3.4", "should use X-Forwarded-For when trust=true");
     }
 }

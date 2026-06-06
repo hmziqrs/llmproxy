@@ -13,6 +13,7 @@
   "tool_choice": null,
   "sampling": {
     "temperature": null,
+    "top_p": null,
     "max_tokens": null,
     "stop": null
   },

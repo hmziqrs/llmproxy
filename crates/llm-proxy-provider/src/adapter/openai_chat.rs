@@ -8,6 +8,8 @@
 //! ChatCompletionChunk stream -> CoreEvent stream
 //! ```
 
+use std::collections::HashMap;
+
 use llm_proxy_protocol::core::{
     ContentKind, CoreContent, CoreEvent, CoreRequest, CoreResponse, CoreRole, CoreToolChoice,
     ModelRef, StopReason,
@@ -61,7 +63,7 @@ pub struct OpenAiChatStreamDecoder {
     content_started: bool,
     reasoning_started: bool,
     /// Maps OpenAI tool-call index to our content block index.
-    tool_blocks: std::collections::HashMap<usize, usize>,
+    tool_blocks: HashMap<usize, usize>,
     stop_sent: bool,
 }
 
@@ -564,11 +566,11 @@ impl OpenAiChatAdapter {
                 if v.len() == 1 {
                     serde_json::Value::String(v[0].clone())
                 } else {
-                    // Serializing Vec<String> to JSON is infallible; use
-                    // expect to enforce this invariant rather than silently
-                    // producing null.
-                    serde_json::to_value(v)
-                        .expect("serializing Vec<String> to JSON cannot fail")
+                    // Manual serialization avoids an infallible expect.
+                    // Vec<String> always serializes to a JSON array of strings.
+                    serde_json::Value::Array(
+                        v.iter().map(|s| serde_json::Value::String(s.clone())).collect(),
+                    )
                 }
             }),
             stream_options: None,
@@ -649,12 +651,18 @@ impl OpenAiChatAdapter {
 
         // Tool calls -> ToolUse.
         for tc in &msg.tool_calls {
-            let input = tc
+            let raw_args = tc
                 .function
                 .as_ref()
-                .and_then(|f| f.arguments.as_ref())
+                .and_then(|f| f.arguments.as_ref());
+            let input = raw_args
                 .and_then(|args| serde_json::from_str::<serde_json::Value>(args).ok())
-                .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+                .unwrap_or_else(|| {
+                    if raw_args.is_some() {
+                        tracing::debug!("OpenAI: tool_call.arguments was not valid JSON, using empty object");
+                    }
+                    serde_json::Value::Object(serde_json::Map::new())
+                });
 
             content.push(CoreContent::ToolUse {
                 id: tc.id.clone().unwrap_or_else(|| {
@@ -716,7 +724,7 @@ impl OpenAiChatAdapter {
             content_index: 0,
             content_started: false,
             reasoning_started: false,
-            tool_blocks: std::collections::HashMap::new(),
+            tool_blocks: HashMap::new(),
             stop_sent: false,
         })
     }

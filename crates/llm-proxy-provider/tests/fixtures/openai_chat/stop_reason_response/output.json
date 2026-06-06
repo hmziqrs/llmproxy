@@ -18,7 +18,7 @@
     "reasoning_tokens": null,
     "cache_creation_input_tokens": null,
     "cache_read_input_tokens": null,
-    "provenance": "provider_reported"
+    "provenance": "ProviderReported"
   },
   "provider_meta": {}
 }

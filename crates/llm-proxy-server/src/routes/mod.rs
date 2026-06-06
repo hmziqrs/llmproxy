@@ -116,9 +116,12 @@ async fn not_found(req: Request) -> impl IntoResponse {
     let path = req.uri().path().to_owned();
 
     // Drain the body to ensure the connection is cleaned up promptly.
-    // Use a small limit since 404 responses never process the body content;
-    // we only need to consume it so the connection can be reused.
-    let _body = axum::body::to_bytes(req.into_body(), NOT_FOUND_BODY_DRAIN_LIMIT).await;
+    // We attempt to read up to NOT_FOUND_BODY_DRAIN_LIMIT bytes. If the body
+    // is larger, the remaining bytes are discarded when the request body is
+    // dropped. This is acceptable because: (a) the 404 response will cause
+    // the client to close the connection, and (b) HTTP/2 multiplexing does
+    // not have the same head-of-line blocking concern as HTTP/1.1 keep-alive.
+    drop(axum::body::to_bytes(req.into_body(), NOT_FOUND_BODY_DRAIN_LIMIT).await);
 
     if path == "/v1/chat/completions" || path.starts_with("/v1/chat/") {
         error_response::route_error_response(

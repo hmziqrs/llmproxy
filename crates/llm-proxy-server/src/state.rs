@@ -9,6 +9,9 @@ use crate::middleware::{RateLimiter, RequestDeduplicator, RequestIdGenerator};
 /// Default rate limit (requests per minute) when no config override is provided.
 ///
 /// TODO: Make this configurable via TOML config in a future phase.
+/// TODO: Add a maximum capacity to the rate limiter HashMap (e.g. 100K entries
+/// with LRU eviction) to prevent unbounded memory growth under DDoS with many
+/// unique IPs.
 const DEFAULT_RATE_LIMIT_RPM: u32 = 100;
 
 /// Static information about this binary.

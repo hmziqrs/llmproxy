@@ -393,4 +393,13 @@ mod tests {
         let result = sanitize_api_error_body(body.clone());
         assert_eq!(result, body);
     }
+
+    #[test]
+    fn redaction_patterns_all_compile_successfully() {
+        // Verify every regex in REDACTION_PATTERNS compiles without panicking.
+        // This is a regression guard: if a pattern is edited to be invalid,
+        // the LazyLock would panic at first use in production. This test
+        // exercises the initialization path explicitly.
+        let _ = &*REDACTION_PATTERNS;
+    }
 }

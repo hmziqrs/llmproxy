@@ -90,12 +90,15 @@ pub(crate) struct VersionBody {
 /// Build metadata for ops/debugging. `name` comes from config so
 /// operators can distinguish deployments; the rest is compile-time
 /// build info.
-pub async fn version(State(state): State<AppState>) -> Json<VersionBody> {
+pub async fn version(State(state): State<AppState>) -> (StatusCode, Json<VersionBody>) {
     let build = state.build_info();
-    Json(VersionBody {
-        name: state.server_name().to_owned(),
-        version: build.version,
-        target: build.target,
-        git_sha: build.git_sha,
-    })
+    (
+        StatusCode::OK,
+        Json(VersionBody {
+            name: state.server_name().to_owned(),
+            version: build.version,
+            target: build.target,
+            git_sha: build.git_sha,
+        }),
+    )
 }

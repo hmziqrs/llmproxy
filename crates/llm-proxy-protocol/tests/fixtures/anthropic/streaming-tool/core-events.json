@@ -1,8 +1,9 @@
 [
-  { "ContentStart": { "index": 1, "kind": "ToolUse" } },
-  { "ToolCallDelta": { "index": 1, "args_delta": "{\"city\":" } },
-  { "ToolCallDelta": { "index": 1, "args_delta": "\"SF\"}" } },
-  { "ToolCallStop": { "index": 1 } },
+  { "MessageStart": { "id": "msg_tool_1", "model": { "requested": "claude-sonnet-4-20250514", "upstream": null } } },
+  { "ContentStart": { "index": 0, "kind": "ToolUse" } },
+  { "ToolCallDelta": { "index": 0, "args_delta": "{\"city\":" } },
+  { "ToolCallDelta": { "index": 0, "args_delta": "\"SF\"}" } },
+  { "ToolCallStop": { "index": 0 } },
   { "UsageDelta": { "usage": { "input_tokens": 0, "output_tokens": 50, "reasoning_tokens": null, "cache_creation_input_tokens": null, "cache_read_input_tokens": null, "provenance": "ProviderReported" } } },
   { "MessageStop": { "stop_reason": "ToolUse", "stop_sequence": null } }
 ]

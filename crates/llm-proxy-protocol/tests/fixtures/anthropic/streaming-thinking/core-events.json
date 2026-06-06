@@ -1,0 +1,10 @@
+[
+  { "MessageStart": { "id": "msg_think_1", "model": { "requested": "claude-sonnet-4-20250514", "upstream": null } } },
+  { "ContentStart": { "index": 0, "kind": "Thinking" } },
+  { "ThinkingDelta": { "index": 0, "text": "Let me reason..." } },
+  { "ContentStart": { "index": 1, "kind": "Text" } },
+  { "TextDelta": { "index": 1, "text": "Hello" } },
+  { "TextDelta": { "index": 1, "text": " world" } },
+  { "UsageDelta": { "usage": { "input_tokens": 30, "output_tokens": 20, "reasoning_tokens": null, "cache_creation_input_tokens": null, "cache_read_input_tokens": null, "provenance": "ProviderReported" } } },
+  { "MessageStop": { "stop_reason": "EndTurn", "stop_sequence": null } }
+]

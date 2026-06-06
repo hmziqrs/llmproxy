@@ -1,4 +1,5 @@
 [
+  { "MessageStart": { "id": "chatcmpl-tool-1", "model": { "requested": "gpt-4o", "upstream": null } } },
   { "ToolCallStart": { "index": 0, "id": "call_1", "name": "get_weather" } },
   { "ToolCallDelta": { "index": 0, "args_delta": "{\"city\":" } },
   { "ToolCallDelta": { "index": 0, "args_delta": "\"SF\"}" } },

@@ -11,8 +11,8 @@ use llm_proxy_provider::{
     ProviderProtocol, ResponsesAdapter, SseFrame,
 };
 use llm_proxy_protocol::core::{
-    CoreContent, CoreEvent, CoreMessage, CoreRequest, CoreRole, CoreTool,
-    CoreToolChoice, ModelRef, SamplingOptions,
+    CacheControl, CacheControlType, CoreContent, CoreEvent, CoreMessage, CoreRequest, CoreRole,
+    CoreTool, CoreToolChoice, ModelRef, SamplingOptions,
 };
 
 use std::fs;
@@ -208,14 +208,26 @@ fn parse_core_content(v: &serde_json::Value) -> CoreContent {
         .and_then(|t| t.as_str())
         .unwrap_or("")
     {
-        "text" => CoreContent::Text {
-            text: obj
-                .get("text")
-                .and_then(|t| t.as_str())
-                .unwrap_or("")
-                .to_owned(),
-            cache: None,
-        },
+        "text" => {
+            let cache = obj.get("cache").and_then(|v| {
+                let ctrl = v.as_object()?;
+                let typ = ctrl.get("type")?.as_str()?;
+                Some(CacheControl {
+                    r#type: match typ {
+                        "ephemeral" => CacheControlType::Ephemeral,
+                        _ => CacheControlType::Ephemeral,
+                    },
+                })
+            });
+            CoreContent::Text {
+                text: obj
+                    .get("text")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("")
+                    .to_owned(),
+                cache,
+            }
+        }
         "tool_use" => CoreContent::ToolUse {
             id: obj
                 .get("id")
@@ -982,7 +994,55 @@ fn run_stream_decode_fixture(adapter_name: &str, case: &str) {
                     );
                 }
             }
-            // MessageStart, ContentStart, ToolCallStop, Ping -- variant-only comparison is sufficient.
+            CoreEvent::MessageStart { id, model } => {
+                if let Some(exp_id) = expected.get("id") {
+                    assert_eq!(
+                        id.as_deref(),
+                        exp_id.as_str(),
+                        "{adapter_name}/{case}: event[{i}] MessageStart.id mismatch"
+                    );
+                }
+                if let Some(exp_model) = expected.get("model") {
+                    if let Some(exp_req) = exp_model.get("requested").and_then(|v| v.as_str()) {
+                        assert_eq!(
+                            model.requested, exp_req,
+                            "{adapter_name}/{case}: event[{i}] MessageStart.model.requested mismatch"
+                        );
+                    }
+                }
+            }
+            CoreEvent::ContentStart { index, kind } => {
+                if let Some(exp_index) = expected.get("index") {
+                    assert_eq!(
+                        *index,
+                        exp_index.as_u64().unwrap_or(0) as usize,
+                        "{adapter_name}/{case}: event[{i}] ContentStart.index mismatch"
+                    );
+                }
+                if let Some(exp_kind) = expected.get("kind").and_then(|v| v.as_str()) {
+                    // Normalize both to lowercase for comparison since Debug
+                    // formatting produces PascalCase (e.g. "Text") while the
+                    // fixture uses lowercase (e.g. "text").
+                    let actual_kind = format!("{kind:?}").to_lowercase();
+                    assert_eq!(
+                        actual_kind, exp_kind,
+                        "{adapter_name}/{case}: event[{i}] ContentStart.kind mismatch"
+                    );
+                }
+            }
+            CoreEvent::ToolCallStop { index } => {
+                if let Some(exp_index) = expected.get("index") {
+                    assert_eq!(
+                        *index,
+                        exp_index.as_u64().unwrap_or(0) as usize,
+                        "{adapter_name}/{case}: event[{i}] ToolCallStop.index mismatch"
+                    );
+                }
+            }
+            // Ping -- variant-only comparison is sufficient.
+            CoreEvent::Ping => {}
+            // #[non_exhaustive] requires a wildcard arm.  New variants should
+            // get explicit match arms above for field-level validation.
             _ => {}
         }
     }
@@ -1478,9 +1538,11 @@ fn coverage_matrix_all_required_fixtures_exist() {
                         }
                     }
                 }
-                // NOTE: OpenAI Chat does not currently have dedicated stream_error
-                // or stream_ping fixtures.  These may be added in a future audit
-                // round if the adapter supports those event types.
+                // OpenAI Chat intentionally does NOT emit Ping or Error events:
+                // - Ping: OpenAI Chat has no ping mechanism in the SSE protocol.
+                // - Error: OpenAI errors are handled at the transport level (HTTP
+                //   status codes), not in stream decoding. See the doc comment on
+                //   OpenAiChatStreamDecoder for the explicit exclusion list.
             }
             RESPONSES => {
                 // Responses supports error SSE events.

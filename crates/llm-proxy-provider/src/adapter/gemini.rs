@@ -147,8 +147,8 @@ impl ProviderStreamDecoder for GeminiStreamDecoder {
                 if let Some(ref args) = function_call.args {
                     let args_str =
                         serde_json::to_string(args).unwrap_or_else(|e| {
-                            tracing::warn!(error = %e, "Gemini: failed to serialize function_call args");
-                            String::new()
+                            tracing::warn!(error = %e, "Gemini: failed to serialize function_call args, falling back to empty object");
+                            "{}".to_owned()
                         });
                     if !args_str.is_empty() && args_str != "null" {
                         events.push(CoreEvent::ToolCallDelta {

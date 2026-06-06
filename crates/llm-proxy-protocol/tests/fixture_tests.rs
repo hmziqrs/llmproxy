@@ -2,6 +2,21 @@
 //!
 //! Loads each fixture's input.json, decodes it to core, compares with core.json,
 //! then encodes a response from core and compares with output.json.
+//!
+//! # Fixture format: client vs provider
+//!
+//! **Client-side fixtures** (this file) use serde's externally-tagged enum format
+//! in `core-events.json` (e.g. `{"TextDelta": {"index": 0, "text": "Hello"}}`).
+//! This matches how `CoreEvent` serializes with default serde derive.
+//!
+//! **Provider-side fixtures** (in `llm-proxy-provider/tests/fixture_tests.rs`) use
+//! a human-readable format with a `"type"` field per event (e.g.
+//! `{"type": "text_delta", "text": "Hello"}`). This format is compared against the
+//! actual adapter output via `event_variant_name()`.
+//!
+//! The two formats serve different purposes: client fixtures test serde round-trips,
+//! while provider fixtures test adapter decode output against human-readable expected
+//! values. This is a deliberate design choice.
 
 use llm_proxy_protocol::anthropic::MessageRequest as AnthropicMessageRequest;
 use llm_proxy_protocol::client::{anthropic as anthropic_adapter, openai_chat as openai_adapter};
@@ -673,11 +688,13 @@ fn all_streaming_fixtures_have_required_files() {
         ("anthropic", "streaming-usage"),
         ("anthropic", "streaming-error"),
         ("anthropic", "streaming-ping"),
+        ("anthropic", "streaming-thinking"),
         ("openai_chat", "streaming-text"),
         ("openai_chat", "streaming-tool"),
         ("openai_chat", "streaming-usage"),
         ("openai_chat", "streaming-error"),
         ("openai_chat", "streaming-ping"),
+        ("openai_chat", "streaming-thinking"),
     ];
     for (adapter, case) in &streaming_cases {
         let dir = Path::new(FIXTURE_ROOT).join(adapter).join(case);
@@ -733,6 +750,7 @@ fn required_client_streaming_cases() -> Vec<(&'static str, Vec<&'static str>)> {
         ("streaming-usage", vec!["input.sse", "core-events.json", "output.sse"]),
         ("streaming-error", vec!["input.sse", "core-events.json", "output.sse"]),
         ("streaming-ping", vec!["input.sse", "core-events.json", "output.sse"]),
+        ("streaming-thinking", vec!["input.sse", "core-events.json", "output.sse"]),
     ]
 }
 
@@ -791,11 +809,13 @@ fn streaming_core_events_json_is_valid() {
         ("anthropic", "streaming-usage"),
         ("anthropic", "streaming-error"),
         ("anthropic", "streaming-ping"),
+        ("anthropic", "streaming-thinking"),
         ("openai_chat", "streaming-text"),
         ("openai_chat", "streaming-tool"),
         ("openai_chat", "streaming-usage"),
         ("openai_chat", "streaming-error"),
         ("openai_chat", "streaming-ping"),
+        ("openai_chat", "streaming-thinking"),
     ];
     for (adapter, case) in &streaming_cases {
         let dir = Path::new(FIXTURE_ROOT).join(adapter).join(case);
@@ -820,11 +840,13 @@ fn streaming_sse_fixtures_are_well_formed() {
         ("anthropic", "streaming-usage"),
         ("anthropic", "streaming-error"),
         ("anthropic", "streaming-ping"),
+        ("anthropic", "streaming-thinking"),
         ("openai_chat", "streaming-text"),
         ("openai_chat", "streaming-tool"),
         ("openai_chat", "streaming-usage"),
         ("openai_chat", "streaming-error"),
         ("openai_chat", "streaming-ping"),
+        ("openai_chat", "streaming-thinking"),
     ];
     for (adapter, case) in &streaming_cases {
         let dir = Path::new(FIXTURE_ROOT).join(adapter).join(case);
@@ -855,6 +877,152 @@ fn streaming_sse_fixtures_are_well_formed() {
                 output_has_sse,
                 "{adapter}/{case}/output.sse should contain SSE-formatted lines (or be empty/whitespace-only)"
             );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Streaming encode round-trip tests
+// ---------------------------------------------------------------------------
+
+/// Streaming round-trip test: parse core-events.json into CoreEvent values,
+/// encode them through the client adapter's StreamEncoder, format the output
+/// as SSE, and verify that encoding succeeds and produces valid SSE output.
+///
+/// This test validates that the encode path produces structurally valid SSE
+/// output for the given CoreEvent sequence. It does NOT compare exact byte
+/// output with output.sse because the encoder may emit additional framing
+/// events (e.g. content_block_start/stop) that are not explicit in the
+/// minimal core-events.json representation.
+#[test]
+fn streaming_encode_round_trip() {
+    // Cases where output.sse is non-empty.
+    let cases = [
+        ("anthropic", "streaming-text"),
+        ("anthropic", "streaming-tool"),
+        ("anthropic", "streaming-usage"),
+        ("anthropic", "streaming-thinking"),
+        ("openai_chat", "streaming-text"),
+        ("openai_chat", "streaming-tool"),
+        ("openai_chat", "streaming-usage"),
+        ("openai_chat", "streaming-thinking"),
+    ];
+
+    for (adapter, case) in &cases {
+        let dir = Path::new(FIXTURE_ROOT).join(adapter).join(case);
+
+        let core_events_raw = read_fixture_raw(&dir, "core-events.json");
+        let events: Vec<CoreEvent> = serde_json::from_str(&core_events_raw)
+            .unwrap_or_else(|e| panic!("failed to parse {adapter}/{case}/core-events.json: {e}"));
+
+        match *adapter {
+            "anthropic" => {
+                let msg_id = events.iter().find_map(|e| match e {
+                    CoreEvent::MessageStart { id, .. } => id.clone(),
+                    _ => None,
+                }).unwrap_or_else(|| "msg_default".to_owned());
+                let model = events.iter().find_map(|e| match e {
+                    CoreEvent::MessageStart { model, .. } => Some(model.requested.clone()),
+                    _ => None,
+                }).unwrap_or_else(|| "unknown".to_owned());
+
+                let mut encoder = anthropic_adapter::StreamEncoder::new(msg_id, model);
+                let mut total_data_lines = 0;
+
+                for event in &events {
+                    let message_events = encoder.encode_event(event.clone())
+                        .unwrap_or_else(|e| panic!("encode_event failed for {adapter}/{case}: {e}"));
+                    for me in &message_events {
+                        // Verify each MessageEvent serializes to valid JSON
+                        let json = serde_json::to_string(me)
+                            .unwrap_or_else(|e| panic!("failed to serialize MessageEvent for {adapter}/{case}: {e}"));
+                        // Verify event type is a known Anthropic event type
+                        let known_types = [
+                            "message_start", "content_block_start", "content_block_delta",
+                            "content_block_stop", "message_delta", "message_stop", "ping", "error",
+                        ];
+                        assert!(
+                            known_types.contains(&me.r#type.as_str()),
+                            "{adapter}/{case}: unknown event type '{}'",
+                            me.r#type
+                        );
+                        // Verify the JSON starts with {" and ends with "}
+                        assert!(
+                            json.starts_with('{') && json.ends_with('}'),
+                            "{adapter}/{case}: MessageEvent JSON should be an object, got: {json}"
+                        );
+                        total_data_lines += 1;
+                    }
+                }
+
+                // Also call finish() to emit any remaining events
+                let final_events = encoder.finish()
+                    .unwrap_or_else(|e| panic!("finish failed for {adapter}/{case}: {e}"));
+                for me in &final_events {
+                    let json = serde_json::to_string(me)
+                        .unwrap_or_else(|e| panic!("failed to serialize final MessageEvent for {adapter}/{case}: {e}"));
+                    assert!(
+                        json.starts_with('{') && json.ends_with('}'),
+                        "{adapter}/{case}: final MessageEvent JSON should be an object, got: {json}"
+                    );
+                    total_data_lines += 1;
+                }
+
+                // Verify at least some events were produced
+                assert!(
+                    total_data_lines > 0,
+                    "{adapter}/{case}: encoder should produce at least one SSE event"
+                );
+            }
+            "openai_chat" => {
+                let msg_id = events.iter().find_map(|e| match e {
+                    CoreEvent::MessageStart { id, .. } => id.clone(),
+                    _ => None,
+                }).unwrap_or_else(|| "chatcmpl-default".to_owned());
+                let model = events.iter().find_map(|e| match e {
+                    CoreEvent::MessageStart { model, .. } => Some(model.requested.clone()),
+                    _ => None,
+                }).unwrap_or_else(|| "unknown".to_owned());
+
+                let mut encoder = openai_adapter::StreamEncoder::new(
+                    msg_id, model, 1000, false,
+                );
+                let mut total_data_lines = 0;
+
+                for event in &events {
+                    let chunks = encoder.encode_event(event.clone())
+                        .unwrap_or_else(|e| panic!("encode_event failed for {adapter}/{case}: {e}"));
+                    for chunk in &chunks {
+                        let json = serde_json::to_string(chunk)
+                            .unwrap_or_else(|e| panic!("failed to serialize ChatCompletionChunk for {adapter}/{case}: {e}"));
+                        assert!(
+                            json.starts_with('{') && json.ends_with('}'),
+                            "{adapter}/{case}: ChatCompletionChunk JSON should be an object, got: {json}"
+                        );
+                        total_data_lines += 1;
+                    }
+                }
+
+                // Call finish() to emit the [DONE] sentinel
+                let final_chunks = encoder.finish()
+                    .unwrap_or_else(|e| panic!("finish failed for {adapter}/{case}: {e}"));
+                for chunk in &final_chunks {
+                    let json = serde_json::to_string(chunk)
+                        .unwrap_or_else(|e| panic!("failed to serialize final ChatCompletionChunk for {adapter}/{case}: {e}"));
+                    assert!(
+                        json.starts_with('{') && json.ends_with('}'),
+                        "{adapter}/{case}: final ChatCompletionChunk JSON should be an object, got: {json}"
+                    );
+                    total_data_lines += 1;
+                }
+
+                // Verify at least some chunks were produced
+                assert!(
+                    total_data_lines > 0,
+                    "{adapter}/{case}: encoder should produce at least one SSE chunk"
+                );
+            }
+            _ => panic!("unknown adapter: {adapter}"),
         }
     }
 }

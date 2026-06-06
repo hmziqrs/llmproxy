@@ -131,7 +131,7 @@ enum CoreChatEvent {
     ToolCallStop {
         index: usize,
     },
-    Usage {
+    UsageDelta {
         usage: Usage,
     },
     MessageStop {

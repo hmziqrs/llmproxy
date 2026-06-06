@@ -114,20 +114,29 @@ impl Default for ProxyClient {
 impl ProxyClient {
     /// Creates a new transport client with sensible connection pool defaults.
     ///
-    /// `reqwest::Client::build()` cannot fail with the configuration used here
-    /// (no custom TLS backend, no proxy env validation at build time), so the
-    /// `expect` is safe. If future configuration changes make this fallible,
-    /// switch to `try_new()` returning `Result<Self, ProviderError>`.
+    /// This is a convenience wrapper around [`Self::try_new`] that unwraps the
+    /// result. The current configuration (no custom TLS backend, no proxy env
+    /// validation at build time) makes `reqwest::Client::build()` infallible
+    /// in practice. If a future configuration change makes this fallible,
+    /// callers should switch to [`Self::try_new`].
     #[allow(clippy::expect_used)]
     pub fn new() -> Self {
+        Self::try_new().expect("failed to build reqwest client with default configuration")
+    }
+
+    /// Creates a new transport client, returning an error if the HTTP client
+    /// cannot be built.
+    ///
+    /// Use this when configuration may make client construction fallible
+    /// (e.g. custom TLS backends, proxy environment validation).
+    pub fn try_new() -> Result<Self, ProviderError> {
         let http = reqwest::Client::builder()
             .pool_max_idle_per_host(20)
             .pool_idle_timeout(Duration::from_secs(90))
             .connect_timeout(Duration::from_secs(10))
-            .build()
-            .expect("failed to build reqwest client");
+            .build()?;
 
-        Self { http }
+        Ok(Self { http })
     }
 
     /// Sends a non-streaming request and returns the response body bytes.

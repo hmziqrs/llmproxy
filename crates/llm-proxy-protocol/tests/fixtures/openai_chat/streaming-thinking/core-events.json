@@ -1,0 +1,9 @@
+[
+  { "MessageStart": { "id": "chatcmpl-think-1", "model": { "requested": "gpt-4o", "upstream": null } } },
+  { "ContentStart": { "index": 0, "kind": "Thinking" } },
+  { "ThinkingDelta": { "index": 0, "text": "Let me reason..." } },
+  { "ContentStart": { "index": 1, "kind": "Text" } },
+  { "TextDelta": { "index": 1, "text": "Hello" } },
+  { "TextDelta": { "index": 1, "text": " world" } },
+  { "MessageStop": { "stop_reason": "EndTurn", "stop_sequence": null } }
+]
