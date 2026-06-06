@@ -942,6 +942,21 @@ pub(crate) fn map_provider_error(e: llm_proxy_provider::error::ProviderError) ->
     }
 }
 
+/// Maximum length for sanitized upstream error bodies before passing to
+/// `truncate_error_body()` in the error response encoder.
+const MAX_SANITIZE_LEN: usize = 512;
+const SANITIZE_SUFFIX: &str = "...[truncated]";
+const SANITIZE_SUFFIX_LEN: usize = SANITIZE_SUFFIX.len();
+
+/// Compiled regex for URL redaction, initialized once via `OnceLock`.
+static URL_REDACT_REGEX: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+
+fn url_redact_regex() -> &'static regex::Regex {
+    URL_REDACT_REGEX.get_or_init(|| {
+        regex::Regex::new(r"https?://\S+").expect("valid URL redaction regex")
+    })
+}
+
 /// Sanitize non-Api upstream error bodies to prevent information leakage.
 ///
 /// Non-Api errors (Http, Serialize, Utf8, etc.) are converted via
@@ -949,23 +964,25 @@ pub(crate) fn map_provider_error(e: llm_proxy_provider::error::ProviderError) ->
 /// hostnames and paths. This function replaces such details with generic
 /// messages while preserving enough context for debugging.
 fn sanitize_upstream_error_body(msg: &str) -> String {
-    // Truncate to 512 chars as a safety net. The actual error body in
-    // RouteError::Upstream is further truncated by truncate_error_body()
-    // in the error response encoder.
-    let truncated = if msg.len() > 512 {
-        let mut end = 512;
+    // Truncate to MAX_SANITIZE_LEN as a safety net. The suffix is included
+    // within this budget. The actual error body in RouteError::Upstream is
+    // further truncated by truncate_error_body() in the error response encoder.
+    let truncated = if msg.len() > MAX_SANITIZE_LEN {
+        let max_content = MAX_SANITIZE_LEN - SANITIZE_SUFFIX_LEN;
+        let mut end = max_content;
         while !msg.is_char_boundary(end) && end > 0 {
             end -= 1;
         }
-        format!("{}...[truncated]", &msg[..end])
+        format!("{}{}", &msg[..end], SANITIZE_SUFFIX)
     } else {
         msg.to_owned()
     };
 
     // Redact URL-like patterns that may contain hostnames/paths.
     // Matches http:// or https:// followed by any non-whitespace chars.
-    let re = regex::Regex::new(r"https?://\S+").expect("valid regex");
-    re.replace_all(&truncated, "[url-redacted]").into_owned()
+    url_redact_regex()
+        .replace_all(&truncated, "[url-redacted]")
+        .into_owned()
 }
 
 /// Map a [`ProtocolError`](llm_proxy_protocol::client::ProtocolError) to a

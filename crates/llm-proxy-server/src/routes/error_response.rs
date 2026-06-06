@@ -259,16 +259,24 @@ fn map_upstream_status(upstream: StatusCode) -> StatusCode {
 /// Maximum length for error messages returned to clients.
 const MAX_ERROR_MESSAGE_LEN: usize = 512;
 
+/// Suffix appended when an error body is truncated.
+const TRUNCATED_SUFFIX: &str = "...[truncated]";
+const TRUNCATED_SUFFIX_LEN: usize = TRUNCATED_SUFFIX.len();
+
 /// Truncate an error body to a safe length for client responses.
+///
+/// The final string is at most `MAX_ERROR_MESSAGE_LEN` bytes (the suffix is
+/// included within this budget).
 fn truncate_error_body(body: &str) -> String {
     if body.len() <= MAX_ERROR_MESSAGE_LEN {
         body.to_owned()
     } else {
-        let mut end = MAX_ERROR_MESSAGE_LEN;
+        let max_content = MAX_ERROR_MESSAGE_LEN - TRUNCATED_SUFFIX_LEN;
+        let mut end = max_content;
         while !body.is_char_boundary(end) && end > 0 {
             end -= 1;
         }
-        format!("{}...[truncated]", &body[..end])
+        format!("{}{}", &body[..end], TRUNCATED_SUFFIX)
     }
 }
 
@@ -436,7 +444,34 @@ mod tests {
         let body = "x".repeat(600);
         let truncated = truncate_error_body(&body);
         assert!(truncated.ends_with("...[truncated]"));
-        assert!(truncated.len() <= MAX_ERROR_MESSAGE_LEN + "...[truncated]".len());
+        // The suffix is included within the MAX_ERROR_MESSAGE_LEN budget.
+        assert!(
+            truncated.len() <= MAX_ERROR_MESSAGE_LEN,
+            "truncated body must not exceed MAX_ERROR_MESSAGE_LEN, got {}",
+            truncated.len()
+        );
+    }
+
+    #[test]
+    fn truncate_exact_length_is_unchanged() {
+        // Exactly at the limit should NOT be truncated.
+        let body = "a".repeat(MAX_ERROR_MESSAGE_LEN);
+        assert_eq!(truncate_error_body(&body), body);
+
+        // One over the limit should be truncated.
+        let body = "a".repeat(MAX_ERROR_MESSAGE_LEN + 1);
+        let truncated = truncate_error_body(&body);
+        assert!(truncated.ends_with("...[truncated]"));
+        assert!(truncated.len() <= MAX_ERROR_MESSAGE_LEN);
+    }
+
+    #[test]
+    fn truncate_multibyte_at_boundary_does_not_panic() {
+        // Japanese characters are 3 bytes each in UTF-8.
+        let body = "あ".repeat(200); // 600 bytes, exceeds 512
+        let truncated = truncate_error_body(&body);
+        assert!(truncated.len() <= MAX_ERROR_MESSAGE_LEN);
+        assert!(truncated.ends_with("...[truncated]"));
     }
 
     // -- Response body content-type --------------------------------------------
