@@ -147,12 +147,19 @@ impl ProviderRegistry {
         for entry in sorted_entries {
             let file_path = entry.path();
 
+            // Skip symlinks to prevent a malicious actor with write access to
+            // the providers directory from tricking the proxy into reading
+            // arbitrary files. This check uses symlink_metadata which does not
+            // follow symlinks, unlike entry.file_type() which does.
+            if file_path.is_symlink() {
+                tracing::warn!(
+                    path = %file_path.display(),
+                    "skipping symlink in provider directory (security: only regular files are loaded)"
+                );
+                continue;
+            }
+
             // Skip non-regular files (directories, pipes, sockets, etc.).
-            // Security note: symlinks pointing to regular files ARE followed
-            // (DirEntry::file_type().is_file() returns true for them). This
-            // means write access to the config directory implies trust: a
-            // malicious symlink could point to arbitrary files. The config
-            // directory trust boundary is documented in provider_config.rs.
             if let Ok(ft) = entry.file_type() {
                 if !ft.is_file() {
                     tracing::debug!(

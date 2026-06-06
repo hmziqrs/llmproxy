@@ -280,6 +280,16 @@ pub enum ConfigValidationError {
         /// Protocol name.
         protocol: String,
     },
+    /// An adapter endpoint has a non-HTTP(S) URL scheme.
+    #[error("provider \"{provider}\": adapter \"{adapter}\" has invalid endpoint scheme (expected http:// or https://): \"{endpoint}\"")]
+    InvalidEndpointScheme {
+        /// Provider name.
+        provider: String,
+        /// Adapter name.
+        adapter: String,
+        /// The endpoint URL that has an invalid scheme.
+        endpoint: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -351,6 +361,19 @@ pub fn validate_provider_config(
             return Err(ConfigValidationError::EmptyEndpoint {
                 provider: name.clone(),
                 adapter: adapter_name.clone(),
+            });
+        }
+        // Reject non-HTTP(S) URL schemes to prevent SSRF via crafted endpoints.
+        // Valid schemes are "http://" and "https://". This prevents endpoints like
+        // "file:///etc/passwd" or other arbitrary schemes.
+        let endpoint_trimmed = adapter_cfg.endpoint.trim();
+        let has_valid_scheme = endpoint_trimmed.starts_with("http://")
+            || endpoint_trimmed.starts_with("https://");
+        if !has_valid_scheme {
+            return Err(ConfigValidationError::InvalidEndpointScheme {
+                provider: name.clone(),
+                adapter: adapter_name.clone(),
+                endpoint: adapter_cfg.endpoint.clone(),
             });
         }
         if let Some(known) = known_protocols {
@@ -534,9 +557,8 @@ pub fn load_provider_config(
                 return Err(CoreError::ConfigValidation {
                     message: ConfigValidationError::EmptyEnvVar {
                         // Provider name is not yet known (no parse has occurred),
-                        // so we use a generic placeholder. The var name is the
-                        // key diagnostic for the user.
-                        provider: String::new(),
+                        // so we include the file path as context instead.
+                        provider: format!("(file: {})", path.display()),
                         var: var_name,
                     }
                     .to_string(),
@@ -2203,7 +2225,7 @@ auth_style = "bearer"
 
 [provider.adapters.chat]
 protocol = "openai_chat_completions"
-endpoint = "${{_LLM_PROXY_DUP_VAR}}/v1/chat/completions"
+endpoint = "https://${{_LLM_PROXY_DUP_VAR}}/v1/chat/completions"
 
 [provider.models]
 "test-model" = {{ adapter = "chat" }}
@@ -2213,7 +2235,7 @@ endpoint = "${{_LLM_PROXY_DUP_VAR}}/v1/chat/completions"
 
         let cfg = load_provider_config(&path, None).expect("load");
         assert_eq!(cfg.api_key, "shared-value");
-        assert_eq!(cfg.adapters["chat"].endpoint, "shared-value/v1/chat/completions");
+        assert_eq!(cfg.adapters["chat"].endpoint, "https://shared-value/v1/chat/completions");
     }
 
     // -- Env var interpolation in provider name ------------------------------------

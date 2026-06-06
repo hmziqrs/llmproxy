@@ -294,10 +294,25 @@ fn extract_error_fields(error: RouteError) -> (StatusCode, &'static str, String)
 /// between the proxy and the upstream provider, not a client error. The one
 /// exception is 429 (rate limit) which we propagate as-is so clients can
 /// implement their own back-off strategies.
+///
+/// Specific upstream errors (401, 403) are logged at warn level with the original
+/// status so operators can distinguish "upstream auth failure" from "upstream server
+/// crash" in logs, even though all are mapped to 502 for the client.
 fn map_upstream_status(upstream: StatusCode) -> StatusCode {
     match upstream.as_u16() {
         429 => StatusCode::TOO_MANY_REQUESTS,
-        _ => StatusCode::BAD_GATEWAY,
+        code => {
+            // Log specific upstream statuses that may indicate configuration issues
+            // rather than transient upstream failures, so operators can diagnose them.
+            if matches!(code, 401 | 403 | 404) {
+                tracing::warn!(
+                    upstream_status = code,
+                    "upstream returned a status that may indicate a configuration issue \
+                     (auth failure, forbidden, or not found); mapping to 502 for client"
+                );
+            }
+            StatusCode::BAD_GATEWAY
+        }
     }
 }
 

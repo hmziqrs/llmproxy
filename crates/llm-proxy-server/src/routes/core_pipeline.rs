@@ -572,6 +572,13 @@ pub(crate) async fn handle_core_stream(
                 header::CACHE_CONTROL,
                 axum::http::HeaderValue::from_static("no-cache"),
             );
+            // Defense-in-depth: explicitly request persistent connection for
+            // reverse-proxy scenarios. axum adds this automatically for HTTP/1.1
+            // but some reverse proxies strip it unless explicitly set.
+            parts.headers.insert(
+                header::CONNECTION,
+                axum::http::HeaderValue::from_static("keep-alive"),
+            );
             parts.headers.insert(
                 "x-accel-buffering",
                 axum::http::HeaderValue::from_static("no"),

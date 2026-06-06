@@ -15,7 +15,6 @@ workspace = true
 [dependencies]
 llm-proxy-server = { workspace = true }
 llm-proxy-core = { workspace = true }
-llm-proxy-protocol = { path = "../../crates/llm-proxy-protocol" }
 llm-proxy-provider = { path = "../../crates/llm-proxy-provider" }
 
 anyhow = { workspace = true }

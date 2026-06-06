@@ -9,11 +9,17 @@ use thiserror::Error;
 /// API-layer error type. Implements `IntoResponse` so handlers can
 /// return `Result<T, ApiError>`.
 ///
-/// TODO(Phase 9): Remove once chat.rs is migrated to core pipeline.
-/// The new `RouteError` in `error_response.rs` replaces this type.
-/// `ApiError` and its `AnthropicErrorBody`/`AnthropicErrorDetail` are
-/// duplicated in `error_response.rs` -- both have the same JSON structure.
+/// **Deprecated:** Use [`RouteError`](crate::routes::error_response::RouteError) in
+/// `error_response.rs` instead. `ApiError` is retained only for backward compatibility
+/// during the Phase 7-11 transition. Phase 11 owns the final removal of this type.
+///
+/// `ApiError` and its `AnthropicErrorBody`/`AnthropicErrorDetail` are duplicated in
+/// `error_response.rs` -- both have the same JSON structure.
 #[derive(Debug, Error)]
+#[deprecated(
+    since = "0.2.0",
+    note = "use RouteError in error_response.rs instead; this type will be removed in Phase 11"
+)]
 pub enum ApiError {
     /// Bad client input.
     #[error("bad request: {0}")]
@@ -40,6 +46,7 @@ pub enum ApiError {
 
 /// Wraps an [`ApiError`] with a request ID for inclusion in error responses.
 #[derive(Debug)]
+#[allow(deprecated)]
 pub struct ApiErrorWithRequestId {
     /// The underlying error.
     pub error: ApiError,
@@ -89,6 +96,7 @@ struct AnthropicErrorDetail {
     message: String,
 }
 
+#[allow(deprecated)]
 impl ApiError {
     /// Convert to an Anthropic-format error JSON and HTTP status code.
     fn to_anthropic_response(&self) -> (StatusCode, Json<AnthropicErrorBody>) {
@@ -176,6 +184,7 @@ impl ApiError {
     }
 }
 
+#[allow(deprecated)]
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let (status, body) = self.to_anthropic_response();
@@ -194,6 +203,7 @@ impl IntoResponse for ApiError {
 // ===========================================================================
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
 

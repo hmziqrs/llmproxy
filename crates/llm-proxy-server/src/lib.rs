@@ -16,6 +16,7 @@ pub mod shutdown;
 /// Shared application state and build metadata.
 pub mod state;
 
+#[allow(deprecated)]
 pub use error::ApiError;
 pub use middleware::{RateLimiter, RequestDeduplicator, RequestIdGenerator};
 pub use shutdown::shutdown_signal;

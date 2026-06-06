@@ -201,6 +201,15 @@ impl ProxyClient {
 // ---------------------------------------------------------------------------
 
 /// Apply authentication headers to a request builder based on [`AuthStyle`].
+///
+/// # Security note on `AuthStyle::Both`
+///
+/// When `AuthStyle::Both` is used, the API key is sent in **both** the
+/// `Authorization: Bearer` and `x-api-key` headers simultaneously. This
+/// doubles the exposure surface of the secret in the wire data. This mode
+/// exists for compatibility with providers that accept either header (e.g.,
+/// Anthropic). Where possible, prefer `AuthStyle::Bearer` or
+/// `AuthStyle::XApiKey` to send the key in only one header.
 fn apply_auth(
     mut builder: reqwest::RequestBuilder,
     auth: &AuthHeaders,

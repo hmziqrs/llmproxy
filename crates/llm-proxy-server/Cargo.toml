@@ -14,7 +14,6 @@ llm-proxy-protocol = { path = "../llm-proxy-protocol" }
 llm-proxy-provider = { path = "../llm-proxy-provider" }
 
 axum = { workspace = true, features = ["macros", "json"] }
-axum-serde = { workspace = true, features = ["sonic"] }
 tokio = { workspace = true }
 tokio-stream = "0.1"
 tokio-util = { workspace = true }
