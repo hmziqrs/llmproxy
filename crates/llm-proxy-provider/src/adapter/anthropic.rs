@@ -407,14 +407,18 @@ impl ProviderStreamDecoder for AnthropicStreamDecoder {
                 if self.current_block_kind == ContentKind::ToolUse {
                     events.push(CoreEvent::ToolCallStop { index: idx });
                     // Mark this tool block as closed so finish() won't re-emit.
-                    let tool_idx = self.tool_blocks.iter().position(|&i| i == idx).unwrap_or_else(|| {
-                        tracing::warn!(
-                            idx,
-                            "Anthropic: tool block index not found in content_block_stop; \
+                    let tool_idx = self
+                        .tool_blocks
+                        .iter()
+                        .position(|&i| i == idx)
+                        .unwrap_or_else(|| {
+                            tracing::warn!(
+                                idx,
+                                "Anthropic: tool block index not found in content_block_stop; \
                              marking first tool block as closed"
-                        );
-                        0
-                    });
+                            );
+                            0
+                        });
                     if tool_idx < self.tool_blocks_closed.len() {
                         self.tool_blocks_closed[tool_idx] = true;
                     }

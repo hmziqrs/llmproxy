@@ -308,7 +308,9 @@ fn build_core_response_from_output(adapter: &str, output_json: &serde_json::Valu
             let finish_reason = choice
                 .and_then(|c| c.get("finish_reason"))
                 .and_then(|v| v.as_str())
-                .unwrap_or_else(|| panic!("openai_chat output.json must contain 'finish_reason' in choices[0]"));
+                .unwrap_or_else(|| {
+                    panic!("openai_chat output.json must contain 'finish_reason' in choices[0]")
+                });
             let stop_reason = match finish_reason {
                 "stop" => StopReason::EndTurn,
                 "length" => StopReason::MaxTokens,
@@ -428,10 +430,12 @@ fn assert_encode_matches_output(
                         "tool_calls count mismatch"
                     );
                     if let (Some(out_tc_arr), Some(exp_tc_arr)) = (out_tcs, exp_tcs) {
-                        for (i, (otc, etc)) in out_tc_arr.iter().zip(exp_tc_arr.iter()).enumerate() {
+                        for (i, (otc, etc)) in out_tc_arr.iter().zip(exp_tc_arr.iter()).enumerate()
+                        {
                             if etc.get("id").is_some() {
                                 assert_eq!(
-                                    otc.get("id"), etc.get("id"),
+                                    otc.get("id"),
+                                    etc.get("id"),
                                     "tool_calls[{i}].id mismatch"
                                 );
                             }
@@ -742,14 +746,32 @@ fn all_streaming_fixtures_have_required_files() {
 /// for the next audit round.
 fn required_client_non_stream_cases() -> Vec<(&'static str, Vec<&'static str>)> {
     vec![
-        ("plain-text-request", vec!["input.json", "core.json", "output.json"]),
-        ("system-prompt", vec!["input.json", "core.json", "output.json"]),
+        (
+            "plain-text-request",
+            vec!["input.json", "core.json", "output.json"],
+        ),
+        (
+            "system-prompt",
+            vec!["input.json", "core.json", "output.json"],
+        ),
         ("tool-call", vec!["input.json", "core.json", "output.json"]),
-        ("tool-result", vec!["input.json", "core.json", "output.json"]),
+        (
+            "tool-result",
+            vec!["input.json", "core.json", "output.json"],
+        ),
         ("thinking", vec!["input.json", "core.json", "output.json"]),
-        ("cache-control", vec!["input.json", "core.json", "output.json"]),
-        ("tool-choice", vec!["input.json", "core.json", "output.json"]),
-        ("stop-reason", vec!["input.json", "core.json", "output.json"]),
+        (
+            "cache-control",
+            vec!["input.json", "core.json", "output.json"],
+        ),
+        (
+            "tool-choice",
+            vec!["input.json", "core.json", "output.json"],
+        ),
+        (
+            "stop-reason",
+            vec!["input.json", "core.json", "output.json"],
+        ),
         ("usage", vec!["input.json", "core.json", "output.json"]),
         ("malformed", vec!["input.json"]),
         // TODO: Additional cases for the next audit round:
@@ -761,12 +783,30 @@ fn required_client_non_stream_cases() -> Vec<(&'static str, Vec<&'static str>)> 
 /// Streaming fixture cases required for every client adapter.
 fn required_client_streaming_cases() -> Vec<(&'static str, Vec<&'static str>)> {
     vec![
-        ("streaming-text", vec!["input.sse", "core-events.json", "output.sse"]),
-        ("streaming-tool", vec!["input.sse", "core-events.json", "output.sse"]),
-        ("streaming-usage", vec!["input.sse", "core-events.json", "output.sse"]),
-        ("streaming-error", vec!["input.sse", "core-events.json", "output.sse"]),
-        ("streaming-ping", vec!["input.sse", "core-events.json", "output.sse"]),
-        ("streaming-thinking", vec!["input.sse", "core-events.json", "output.sse"]),
+        (
+            "streaming-text",
+            vec!["input.sse", "core-events.json", "output.sse"],
+        ),
+        (
+            "streaming-tool",
+            vec!["input.sse", "core-events.json", "output.sse"],
+        ),
+        (
+            "streaming-usage",
+            vec!["input.sse", "core-events.json", "output.sse"],
+        ),
+        (
+            "streaming-error",
+            vec!["input.sse", "core-events.json", "output.sse"],
+        ),
+        (
+            "streaming-ping",
+            vec!["input.sse", "core-events.json", "output.sse"],
+        ),
+        (
+            "streaming-thinking",
+            vec!["input.sse", "core-events.json", "output.sse"],
+        ),
     ]
 }
 
@@ -944,14 +984,20 @@ fn streaming_encode_round_trip() {
         } else {
             "chatcmpl-default".to_owned()
         };
-        let msg_id = events.iter().find_map(|e| match e {
-            CoreEvent::MessageStart { id, .. } => id.clone(),
-            _ => None,
-        }).unwrap_or(default_id);
-        let model = events.iter().find_map(|e| match e {
-            CoreEvent::MessageStart { model, .. } => Some(model.requested.clone()),
-            _ => None,
-        }).unwrap_or_else(|| "unknown".to_owned());
+        let msg_id = events
+            .iter()
+            .find_map(|e| match e {
+                CoreEvent::MessageStart { id, .. } => id.clone(),
+                _ => None,
+            })
+            .unwrap_or(default_id);
+        let model = events
+            .iter()
+            .find_map(|e| match e {
+                CoreEvent::MessageStart { model, .. } => Some(model.requested.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| "unknown".to_owned());
 
         match *adapter {
             "anthropic" => {
@@ -959,15 +1005,17 @@ fn streaming_encode_round_trip() {
                 let mut total_data_lines = 0;
 
                 for event in &events {
-                    let message_events = encoder.encode_event(event.clone())
-                        .unwrap_or_else(|e| panic!("encode_event failed for {adapter}/{case}: {e}"));
+                    let message_events = encoder.encode_event(event.clone()).unwrap_or_else(|e| {
+                        panic!("encode_event failed for {adapter}/{case}: {e}")
+                    });
                     for me in &message_events {
                         verify_anthropic_event_json(adapter, case, me);
                         total_data_lines += 1;
                     }
                 }
 
-                let final_events = encoder.finish()
+                let final_events = encoder
+                    .finish()
                     .unwrap_or_else(|e| panic!("finish failed for {adapter}/{case}: {e}"));
                 for me in &final_events {
                     verify_anthropic_event_json(adapter, case, me);
@@ -980,9 +1028,7 @@ fn streaming_encode_round_trip() {
                 );
             }
             "openai_chat" => {
-                let mut encoder = openai_adapter::StreamEncoder::new(
-                    msg_id, model, 1000, false,
-                );
+                let mut encoder = openai_adapter::StreamEncoder::new(msg_id, model, 1000, false);
                 let mut total_data_lines = 0;
 
                 for event in &events {
@@ -1008,7 +1054,8 @@ fn streaming_encode_round_trip() {
                     }
                 }
 
-                let final_chunks = encoder.finish()
+                let final_chunks = encoder
+                    .finish()
                     .unwrap_or_else(|e| panic!("finish failed for {adapter}/{case}: {e}"));
                 for chunk in &final_chunks {
                     verify_openai_chunk_json(adapter, case, chunk);
@@ -1017,7 +1064,9 @@ fn streaming_encode_round_trip() {
 
                 // Verify at least some chunks were produced, unless the fixture
                 // is an error-only case where OpenAI intentionally returns Err.
-                let is_error_only = events.iter().all(|e| matches!(e, CoreEvent::Error { .. } | CoreEvent::Ping));
+                let is_error_only = events
+                    .iter()
+                    .all(|e| matches!(e, CoreEvent::Error { .. } | CoreEvent::Ping));
                 if !is_error_only {
                     assert!(
                         total_data_lines > 0,
@@ -1035,8 +1084,14 @@ fn verify_anthropic_event_json(adapter: &str, case: &str, me: &MessageEvent) {
     let json = serde_json::to_string(me)
         .unwrap_or_else(|e| panic!("failed to serialize MessageEvent for {adapter}/{case}: {e}"));
     let known_types = [
-        "message_start", "content_block_start", "content_block_delta",
-        "content_block_stop", "message_delta", "message_stop", "ping", "error",
+        "message_start",
+        "content_block_start",
+        "content_block_delta",
+        "content_block_stop",
+        "message_delta",
+        "message_stop",
+        "ping",
+        "error",
     ];
     assert!(
         known_types.contains(&me.r#type.as_str()),
@@ -1051,8 +1106,9 @@ fn verify_anthropic_event_json(adapter: &str, case: &str, me: &MessageEvent) {
 
 /// Verify an OpenAI ChatCompletionChunk is valid JSON.
 fn verify_openai_chunk_json(adapter: &str, case: &str, chunk: &ChatCompletionChunk) {
-    let json = serde_json::to_string(chunk)
-        .unwrap_or_else(|e| panic!("failed to serialize ChatCompletionChunk for {adapter}/{case}: {e}"));
+    let json = serde_json::to_string(chunk).unwrap_or_else(|e| {
+        panic!("failed to serialize ChatCompletionChunk for {adapter}/{case}: {e}")
+    });
     assert!(
         json.starts_with('{') && json.ends_with('}'),
         "{adapter}/{case}: ChatCompletionChunk JSON should be an object, got: {json}"

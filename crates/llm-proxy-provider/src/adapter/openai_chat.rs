@@ -574,7 +574,9 @@ impl OpenAiChatAdapter {
                     // Manual serialization avoids an infallible expect.
                     // Vec<String> always serializes to a JSON array of strings.
                     serde_json::Value::Array(
-                        v.iter().map(|s| serde_json::Value::String(s.clone())).collect(),
+                        v.iter()
+                            .map(|s| serde_json::Value::String(s.clone()))
+                            .collect(),
                     )
                 }
             }),
@@ -656,15 +658,14 @@ impl OpenAiChatAdapter {
 
         // Tool calls -> ToolUse.
         for tc in &msg.tool_calls {
-            let raw_args = tc
-                .function
-                .as_ref()
-                .and_then(|f| f.arguments.as_ref());
+            let raw_args = tc.function.as_ref().and_then(|f| f.arguments.as_ref());
             let input = raw_args
                 .and_then(|args| serde_json::from_str::<serde_json::Value>(args).ok())
                 .unwrap_or_else(|| {
                     if raw_args.is_some() {
-                        tracing::debug!("OpenAI: tool_call.arguments was not valid JSON, using empty object");
+                        tracing::debug!(
+                            "OpenAI: tool_call.arguments was not valid JSON, using empty object"
+                        );
                     }
                     serde_json::Value::Object(serde_json::Map::new())
                 });

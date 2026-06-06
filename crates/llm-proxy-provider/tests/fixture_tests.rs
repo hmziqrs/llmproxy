@@ -6,13 +6,13 @@
 //! core-events.json.
 
 use llm_proxy_core::AuthStyle;
-use llm_proxy_provider::{
-    AnthropicAdapter, GeminiAdapter, OpenAiChatAdapter, ProviderAdapter, ProviderAdapterTarget,
-    ProviderProtocol, ResponsesAdapter, SseFrame,
-};
 use llm_proxy_protocol::core::{
     CacheControl, CacheControlType, CoreContent, CoreEvent, CoreMessage, CoreRequest, CoreRole,
     CoreTool, CoreToolChoice, ModelRef, SamplingOptions,
+};
+use llm_proxy_provider::{
+    AnthropicAdapter, GeminiAdapter, OpenAiChatAdapter, ProviderAdapter, ProviderAdapterTarget,
+    ProviderProtocol, ResponsesAdapter, SseFrame,
 };
 
 use std::fs;
@@ -133,8 +133,9 @@ fn build_core_request(core_json: &serde_json::Value) -> CoreRequest {
             requested: v.as_str().unwrap().to_owned(),
             upstream: None,
         },
-        Some(v) if v.is_object() => serde_json::from_value(v.clone())
-            .expect("model as object must be valid ModelRef"),
+        Some(v) if v.is_object() => {
+            serde_json::from_value(v.clone()).expect("model as object must be valid ModelRef")
+        }
         _ => panic!("core.json missing 'model' field"),
     };
 
@@ -149,11 +150,7 @@ fn build_core_request(core_json: &serde_json::Value) -> CoreRequest {
     let messages: Vec<CoreMessage> = obj
         .get("messages")
         .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .map(parse_core_message)
-                .collect()
-        })
+        .map(|arr| arr.iter().map(parse_core_message).collect())
         .unwrap_or_default();
 
     // Tools
@@ -174,16 +171,10 @@ fn build_core_request(core_json: &serde_json::Value) -> CoreRequest {
     });
 
     // Sampling
-    let sampling: SamplingOptions = obj
-        .get("sampling")
-        .map(parse_sampling)
-        .unwrap_or_default();
+    let sampling: SamplingOptions = obj.get("sampling").map(parse_sampling).unwrap_or_default();
 
     // Stream
-    let stream = obj
-        .get("stream")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+    let stream = obj.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
 
     CoreRequest {
         model,
@@ -200,14 +191,8 @@ fn build_core_request(core_json: &serde_json::Value) -> CoreRequest {
 
 /// Parse a CoreContent from JSON.
 fn parse_core_content(v: &serde_json::Value) -> CoreContent {
-    let obj = v
-        .as_object()
-        .expect("content must be a JSON object");
-    match obj
-        .get("type")
-        .and_then(|t| t.as_str())
-        .unwrap_or("")
-    {
+    let obj = v.as_object().expect("content must be a JSON object");
+    match obj.get("type").and_then(|t| t.as_str()).unwrap_or("") {
         "text" => {
             let cache = obj.get("cache").and_then(|v| {
                 let ctrl = v.as_object()?;
@@ -242,10 +227,7 @@ fn parse_core_content(v: &serde_json::Value) -> CoreContent {
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_owned(),
-            input: obj
-                .get("input")
-                .cloned()
-                .unwrap_or(serde_json::json!({})),
+            input: obj.get("input").cloned().unwrap_or(serde_json::json!({})),
         },
         "tool_result" => CoreContent::ToolResult {
             tool_use_id: obj
@@ -253,7 +235,10 @@ fn parse_core_content(v: &serde_json::Value) -> CoreContent {
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_owned(),
-            is_error: obj.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false),
+            is_error: obj
+                .get("is_error")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
             content: obj
                 .get("content")
                 .and_then(|v| v.as_array())
@@ -272,34 +257,19 @@ fn parse_core_content(v: &serde_json::Value) -> CoreContent {
                 .map(String::from),
         },
         "redacted_thinking" => CoreContent::RedactedThinking {
-            data: obj
-                .get("data")
-                .cloned()
-                .unwrap_or(serde_json::json!({})),
+            data: obj.get("data").cloned().unwrap_or(serde_json::json!({})),
         },
         "image" => CoreContent::Image {
-            source: obj
-                .get("source")
-                .cloned()
-                .unwrap_or(serde_json::json!({})),
+            source: obj.get("source").cloned().unwrap_or(serde_json::json!({})),
         },
         "document" => CoreContent::Document {
-            source: obj
-                .get("source")
-                .cloned()
-                .unwrap_or(serde_json::json!({})),
+            source: obj.get("source").cloned().unwrap_or(serde_json::json!({})),
         },
         "audio" => CoreContent::Audio {
-            source: obj
-                .get("source")
-                .cloned()
-                .unwrap_or(serde_json::json!({})),
+            source: obj.get("source").cloned().unwrap_or(serde_json::json!({})),
         },
         "video" => CoreContent::Video {
-            source: obj
-                .get("source")
-                .cloned()
-                .unwrap_or(serde_json::json!({})),
+            source: obj.get("source").cloned().unwrap_or(serde_json::json!({})),
         },
         "refusal" => CoreContent::Refusal {
             text: obj
@@ -317,14 +287,8 @@ fn parse_core_content(v: &serde_json::Value) -> CoreContent {
 
 /// Parse a CoreMessage from JSON.
 fn parse_core_message(v: &serde_json::Value) -> CoreMessage {
-    let obj = v
-        .as_object()
-        .expect("message must be a JSON object");
-    let role = match obj
-        .get("role")
-        .and_then(|r| r.as_str())
-        .unwrap_or("user")
-    {
+    let obj = v.as_object().expect("message must be a JSON object");
+    let role = match obj.get("role").and_then(|r| r.as_str()).unwrap_or("user") {
         "user" => CoreRole::User,
         "assistant" => CoreRole::Assistant,
         "system" => CoreRole::System,
@@ -344,9 +308,7 @@ fn parse_core_message(v: &serde_json::Value) -> CoreMessage {
 
 /// Parse a CoreTool from JSON.
 fn parse_core_tool(v: &serde_json::Value) -> CoreTool {
-    let obj = v
-        .as_object()
-        .expect("tool must be a JSON object");
+    let obj = v.as_object().expect("tool must be a JSON object");
     CoreTool {
         name: obj
             .get("name")
@@ -376,22 +338,18 @@ fn parse_tool_choice_string(s: &str) -> CoreToolChoice {
 
 /// Parse SamplingOptions from JSON.
 fn parse_sampling(v: &serde_json::Value) -> SamplingOptions {
-    let obj = v.as_object().unwrap_or_else(|| panic!("sampling must be a JSON object"));
+    let obj = v
+        .as_object()
+        .unwrap_or_else(|| panic!("sampling must be a JSON object"));
     SamplingOptions {
-        temperature: obj.get("temperature").and_then(|v| {
-            if v.is_null() {
-                None
-            } else {
-                v.as_f64()
-            }
-        }),
-        top_p: obj.get("top_p").and_then(|v| {
-            if v.is_null() {
-                None
-            } else {
-                v.as_f64()
-            }
-        }),
+        temperature: obj.get("temperature").and_then(
+            |v| {
+                if v.is_null() { None } else { v.as_f64() }
+            },
+        ),
+        top_p: obj
+            .get("top_p")
+            .and_then(|v| if v.is_null() { None } else { v.as_f64() }),
         max_tokens: obj.get("max_tokens").and_then(|v| {
             if v.is_null() {
                 None
@@ -485,7 +443,20 @@ fn extract_content_variant(v: &serde_json::Value) -> String {
     v.as_object()
         .and_then(|obj| {
             obj.keys()
-                .find(|k| matches!(k.as_str(), "Text" | "ToolUse" | "ToolResult" | "Thinking" | "Image" | "Document" | "Audio" | "Video" | "Refusal"))
+                .find(|k| {
+                    matches!(
+                        k.as_str(),
+                        "Text"
+                            | "ToolUse"
+                            | "ToolResult"
+                            | "Thinking"
+                            | "Image"
+                            | "Document"
+                            | "Audio"
+                            | "Video"
+                            | "Refusal"
+                    )
+                })
                 .cloned()
         })
         .unwrap_or_else(|| "Unknown".to_owned())
@@ -514,8 +485,9 @@ fn run_encode_request_fixture(adapter_name: &str, case: &str) {
         .encode_request(&core, &target)
         .unwrap_or_else(|e| panic!("encode_request failed for {adapter_name}/{case}: {e}"));
 
-    let actual: serde_json::Value = serde_json::from_slice(&proxy_req.body)
-        .unwrap_or_else(|e| panic!("encoded body is not valid JSON for {adapter_name}/{case}: {e}"));
+    let actual: serde_json::Value = serde_json::from_slice(&proxy_req.body).unwrap_or_else(|e| {
+        panic!("encoded body is not valid JSON for {adapter_name}/{case}: {e}")
+    });
 
     // The adapter must produce a JSON object.
     assert!(
@@ -538,9 +510,7 @@ fn run_encode_request_fixture(adapter_name: &str, case: &str) {
     // Messages/system/tools/sampling fields are compared when present in output.json.
     if let Some(expected_msgs) = output_json.get("messages").and_then(|v| v.as_array()) {
         let actual_msgs = actual.get("messages").and_then(|v| v.as_array());
-        let actual_msgs = actual_msgs
-            .map(|a| a.as_slice())
-            .unwrap_or(&[]);
+        let actual_msgs = actual_msgs.map(|a| a.as_slice()).unwrap_or(&[]);
         assert_eq!(
             actual_msgs.len(),
             expected_msgs.len(),
@@ -568,7 +538,8 @@ fn run_encode_request_fixture(adapter_name: &str, case: &str) {
                         let act_text = if act_content.is_string() {
                             act_content.as_str().unwrap_or("").to_owned()
                         } else if act_content.is_array() {
-                            act_content.as_array()
+                            act_content
+                                .as_array()
                                 .unwrap()
                                 .iter()
                                 .filter_map(|b| {
@@ -596,14 +567,14 @@ fn run_encode_request_fixture(adapter_name: &str, case: &str) {
                         );
                     }
                 } else {
-                    panic!(
-                        "{adapter_name}/{case}: messages[{i}] missing content field"
-                    );
+                    panic!("{adapter_name}/{case}: messages[{i}] missing content field");
                 }
             }
             // Compare tool_calls if present
             if let Some(exp_tcs) = exp_msg.get("tool_calls").and_then(|v| v.as_array()) {
-                let act_tcs = act_msg.get("tool_calls").and_then(|v| v.as_array())
+                let act_tcs = act_msg
+                    .get("tool_calls")
+                    .and_then(|v| v.as_array())
                     .map(|a| a.as_slice())
                     .unwrap_or(&[]);
                 assert_eq!(
@@ -615,14 +586,16 @@ fn run_encode_request_fixture(adapter_name: &str, case: &str) {
                     let act_tc = &act_tcs[j];
                     if exp_tc.get("id").is_some() {
                         assert_eq!(
-                            act_tc.get("id"), exp_tc.get("id"),
+                            act_tc.get("id"),
+                            exp_tc.get("id"),
                             "{adapter_name}/{case}: messages[{i}].tool_calls[{j}].id mismatch"
                         );
                     }
                     if let Some(exp_fn) = exp_tc.get("function") {
                         if let Some(act_fn) = act_tc.get("function") {
                             assert_eq!(
-                                act_fn.get("name"), exp_fn.get("name"),
+                                act_fn.get("name"),
+                                exp_fn.get("name"),
                                 "{adapter_name}/{case}: messages[{i}].tool_calls[{j}].function.name mismatch"
                             );
                         }
@@ -679,9 +652,11 @@ fn run_encode_request_fixture(adapter_name: &str, case: &str) {
             }
             // Compare tool input_schema if present in expected
             if exp_tool.get("input_schema").is_some() || exp_tool.get("parameters").is_some() {
-                let act_schema = act_tool.get("input_schema")
+                let act_schema = act_tool
+                    .get("input_schema")
                     .or_else(|| act_tool.get("parameters"));
-                let exp_schema = exp_tool.get("input_schema")
+                let exp_schema = exp_tool
+                    .get("input_schema")
                     .or_else(|| exp_tool.get("parameters"));
                 assert_eq!(
                     act_schema, exp_schema,
@@ -704,10 +679,7 @@ fn run_encode_request_fixture(adapter_name: &str, case: &str) {
                     "{adapter_name}/{case}: {field} should be null or absent, got {actual_val:?}"
                 );
             } else if let Some(av) = actual_val {
-                assert_eq!(
-                    av, expected_val,
-                    "{adapter_name}/{case}: {field} mismatch"
-                );
+                assert_eq!(av, expected_val, "{adapter_name}/{case}: {field} mismatch");
             } else {
                 // expected is non-null but actual is absent
                 panic!(
@@ -739,13 +711,20 @@ fn run_decode_response_fixture(adapter_name: &str, case: &str) {
         .decode_response(&bytes, &target)
         .unwrap_or_else(|e| panic!("decode_response failed for {adapter_name}/{case}: {e}"));
 
-    let actual = serde_json::to_value(&core_resp)
-        .unwrap_or_else(|e| panic!("failed to serialize CoreResponse for {adapter_name}/{case}: {e}"));
+    let actual = serde_json::to_value(&core_resp).unwrap_or_else(|e| {
+        panic!("failed to serialize CoreResponse for {adapter_name}/{case}: {e}")
+    });
 
     // Compare stop_reason (normalize to PascalCase for comparison since
     // CoreResponse serializes with default serde).
-    let actual_stop = actual.get("stop_reason").cloned().unwrap_or(serde_json::Value::Null);
-    let expected_stop = output_json.get("stop_reason").cloned().unwrap_or(serde_json::Value::Null);
+    let actual_stop = actual
+        .get("stop_reason")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let expected_stop = output_json
+        .get("stop_reason")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
     // Normalize both to PascalCase for comparison
     let actual_stop_str = normalize_stop_reason(actual_stop.as_str().unwrap_or(""));
     let expected_stop_str = normalize_stop_reason(expected_stop.as_str().unwrap_or(""));
@@ -823,7 +802,11 @@ fn run_decode_response_fixture(adapter_name: &str, case: &str) {
         actual_content.len(),
         expected_content.len()
     );
-    for (i, (ac, ec)) in actual_content.iter().zip(expected_content.iter()).enumerate() {
+    for (i, (ac, ec)) in actual_content
+        .iter()
+        .zip(expected_content.iter())
+        .enumerate()
+    {
         // Actual: externally-tagged serde, extract the key (e.g. "Text", "ToolUse")
         let actual_key = extract_content_variant(ac);
         // Expected: human-readable "type" field (e.g. "text", "tool_use")
@@ -847,24 +830,30 @@ fn run_decode_response_fixture(adapter_name: &str, case: &str) {
             "{adapter_name}/{case}: content[{i}] type mismatch"
         );
         // Get the inner object from the actual serde format
-        let inner = ac.get(&actual_key).cloned().unwrap_or(serde_json::Value::Object(Default::default()));
+        let inner = ac
+            .get(&actual_key)
+            .cloned()
+            .unwrap_or(serde_json::Value::Object(Default::default()));
         // For text blocks, compare text
         if expected_type == "text" {
             assert_eq!(
-                inner.get("text"), ec.get("text"),
+                inner.get("text"),
+                ec.get("text"),
                 "{adapter_name}/{case}: content[{i}] text mismatch"
             );
         }
         // For thinking blocks, compare text and optionally signature
         if expected_type == "thinking" {
             assert_eq!(
-                inner.get("text"), ec.get("text"),
+                inner.get("text"),
+                ec.get("text"),
                 "{adapter_name}/{case}: content[{i}] thinking text mismatch"
             );
             // Compare signature if present in expected output
             if ec.get("signature").is_some() {
                 assert_eq!(
-                    inner.get("signature"), ec.get("signature"),
+                    inner.get("signature"),
+                    ec.get("signature"),
                     "{adapter_name}/{case}: content[{i}] thinking signature mismatch"
                 );
             }
@@ -872,17 +861,20 @@ fn run_decode_response_fixture(adapter_name: &str, case: &str) {
         // For tool_use blocks, compare id, name, and input
         if expected_type == "tool_use" {
             assert_eq!(
-                inner.get("name"), ec.get("name"),
+                inner.get("name"),
+                ec.get("name"),
                 "{adapter_name}/{case}: content[{i}] tool_use name mismatch"
             );
             assert_eq!(
-                inner.get("input"), ec.get("input"),
+                inner.get("input"),
+                ec.get("input"),
                 "{adapter_name}/{case}: content[{i}] tool_use input mismatch"
             );
             // Compare id if present in expected output
             if ec.get("id").is_some() {
                 assert_eq!(
-                    inner.get("id"), ec.get("id"),
+                    inner.get("id"),
+                    ec.get("id"),
                     "{adapter_name}/{case}: content[{i}] tool_use id mismatch"
                 );
             }
@@ -890,22 +882,30 @@ fn run_decode_response_fixture(adapter_name: &str, case: &str) {
         // For refusal blocks, compare text
         if expected_type == "refusal" {
             assert_eq!(
-                inner.get("text"), ec.get("text"),
+                inner.get("text"),
+                ec.get("text"),
                 "{adapter_name}/{case}: content[{i}] refusal text mismatch"
             );
         }
         // For redacted_thinking blocks, compare data if present
         if expected_type == "redacted_thinking" && ec.get("data").is_some() {
             assert_eq!(
-                inner.get("data"), ec.get("data"),
+                inner.get("data"),
+                ec.get("data"),
                 "{adapter_name}/{case}: content[{i}] redacted_thinking data mismatch"
             );
         }
     }
 
     // Compare usage token counts
-    let actual_usage = actual.get("usage").cloned().unwrap_or(serde_json::json!({}));
-    let expected_usage = output_json.get("usage").cloned().unwrap_or(serde_json::json!({}));
+    let actual_usage = actual
+        .get("usage")
+        .cloned()
+        .unwrap_or(serde_json::json!({}));
+    let expected_usage = output_json
+        .get("usage")
+        .cloned()
+        .unwrap_or(serde_json::json!({}));
     assert_eq!(
         actual_usage.get("input_tokens"),
         expected_usage.get("input_tokens"),
@@ -979,7 +979,9 @@ fn run_stream_decode_fixture(adapter_name: &str, case: &str) {
 
     // Parse expected event types from the fixture file.
     let expected_raw: Vec<serde_json::Value> = serde_json::from_str(&core_events_raw)
-        .unwrap_or_else(|e| panic!("failed to parse core-events.json for {adapter_name}/{case}: {e}"));
+        .unwrap_or_else(|e| {
+            panic!("failed to parse core-events.json for {adapter_name}/{case}: {e}")
+        });
 
     // Compare event counts.
     assert_eq!(
@@ -1007,7 +1009,8 @@ fn run_stream_decode_fixture(adapter_name: &str, case: &str) {
             CoreEvent::TextDelta { index, text } => {
                 if let Some(exp_text) = expected.get("text") {
                     assert_eq!(
-                        text, exp_text.as_str().unwrap_or(""),
+                        text,
+                        exp_text.as_str().unwrap_or(""),
                         "{adapter_name}/{case}: event[{i}] TextDelta.text mismatch"
                     );
                 }
@@ -1022,13 +1025,15 @@ fn run_stream_decode_fixture(adapter_name: &str, case: &str) {
             CoreEvent::ToolCallStart { index, id, name } => {
                 if let Some(exp_id) = expected.get("id") {
                     assert_eq!(
-                        id, exp_id.as_str().unwrap_or(""),
+                        id,
+                        exp_id.as_str().unwrap_or(""),
                         "{adapter_name}/{case}: event[{i}] ToolCallStart.id mismatch"
                     );
                 }
                 if let Some(exp_name) = expected.get("name") {
                     assert_eq!(
-                        name, exp_name.as_str().unwrap_or(""),
+                        name,
+                        exp_name.as_str().unwrap_or(""),
                         "{adapter_name}/{case}: event[{i}] ToolCallStart.name mismatch"
                     );
                 }
@@ -1043,7 +1048,8 @@ fn run_stream_decode_fixture(adapter_name: &str, case: &str) {
             CoreEvent::ToolCallDelta { index, args_delta } => {
                 if let Some(exp_args) = expected.get("args_delta") {
                     assert_eq!(
-                        args_delta, exp_args.as_str().unwrap_or(""),
+                        args_delta,
+                        exp_args.as_str().unwrap_or(""),
                         "{adapter_name}/{case}: event[{i}] ToolCallDelta.args_delta mismatch"
                     );
                 }
@@ -1059,17 +1065,26 @@ fn run_stream_decode_fixture(adapter_name: &str, case: &str) {
                 if let Some(exp_usage) = expected.get("usage") {
                     assert_eq!(
                         usage.input_tokens,
-                        exp_usage.get("input_tokens").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
+                        exp_usage
+                            .get("input_tokens")
+                            .and_then(|v| v.as_i64())
+                            .unwrap_or(0) as i32,
                         "{adapter_name}/{case}: event[{i}] UsageDelta.usage.input_tokens mismatch"
                     );
                     assert_eq!(
                         usage.output_tokens,
-                        exp_usage.get("output_tokens").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
+                        exp_usage
+                            .get("output_tokens")
+                            .and_then(|v| v.as_i64())
+                            .unwrap_or(0) as i32,
                         "{adapter_name}/{case}: event[{i}] UsageDelta.usage.output_tokens mismatch"
                     );
                 }
             }
-            CoreEvent::MessageStop { stop_reason, stop_sequence } => {
+            CoreEvent::MessageStop {
+                stop_reason,
+                stop_sequence,
+            } => {
                 if let Some(exp_sr) = expected.get("stop_reason") {
                     let actual_sr = format!("{stop_reason:?}");
                     // Normalize: serde serializes PascalCase, fixture may use either
@@ -1092,7 +1107,8 @@ fn run_stream_decode_fixture(adapter_name: &str, case: &str) {
             CoreEvent::ThinkingDelta { index, text } => {
                 if let Some(exp_text) = expected.get("text") {
                     assert_eq!(
-                        text, exp_text.as_str().unwrap_or(""),
+                        text,
+                        exp_text.as_str().unwrap_or(""),
                         "{adapter_name}/{case}: event[{i}] ThinkingDelta.text mismatch"
                     );
                 }
@@ -1276,13 +1292,18 @@ fn openai_chat_stream_malformed() {
 
 #[test]
 fn openai_chat_decode_malformed_response() {
-    let dir = Path::new(FIXTURE_ROOT).join(OPENAI_CHAT).join("malformed_response");
+    let dir = Path::new(FIXTURE_ROOT)
+        .join(OPENAI_CHAT)
+        .join("malformed_response");
     let input_raw = read_fixture_raw(&dir, "input.json");
     let protocol = get_protocol(OPENAI_CHAT);
     let target = make_target(protocol);
     let adapter = get_adapter(OPENAI_CHAT);
     let result = adapter.decode_response(input_raw.as_bytes(), &target);
-    assert!(result.is_err(), "malformed response should produce an error");
+    assert!(
+        result.is_err(),
+        "malformed response should produce an error"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1371,13 +1392,18 @@ fn anthropic_stream_malformed() {
 
 #[test]
 fn anthropic_decode_malformed_response() {
-    let dir = Path::new(FIXTURE_ROOT).join(ANTHROPIC).join("malformed_response");
+    let dir = Path::new(FIXTURE_ROOT)
+        .join(ANTHROPIC)
+        .join("malformed_response");
     let input_raw = read_fixture_raw(&dir, "input.json");
     let protocol = get_protocol(ANTHROPIC);
     let target = make_target(protocol);
     let adapter = get_adapter(ANTHROPIC);
     let result = adapter.decode_response(input_raw.as_bytes(), &target);
-    assert!(result.is_err(), "malformed response should produce an error");
+    assert!(
+        result.is_err(),
+        "malformed response should produce an error"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1456,13 +1482,18 @@ fn responses_stream_malformed() {
 
 #[test]
 fn responses_decode_malformed_response() {
-    let dir = Path::new(FIXTURE_ROOT).join(RESPONSES).join("malformed_response");
+    let dir = Path::new(FIXTURE_ROOT)
+        .join(RESPONSES)
+        .join("malformed_response");
     let input_raw = read_fixture_raw(&dir, "input.json");
     let protocol = get_protocol(RESPONSES);
     let target = make_target(protocol);
     let adapter = get_adapter(RESPONSES);
     let result = adapter.decode_response(input_raw.as_bytes(), &target);
-    assert!(result.is_err(), "malformed response should produce an error");
+    assert!(
+        result.is_err(),
+        "malformed response should produce an error"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1536,13 +1567,18 @@ fn gemini_stream_malformed() {
 
 #[test]
 fn gemini_decode_malformed_response() {
-    let dir = Path::new(FIXTURE_ROOT).join(GEMINI).join("malformed_response");
+    let dir = Path::new(FIXTURE_ROOT)
+        .join(GEMINI)
+        .join("malformed_response");
     let input_raw = read_fixture_raw(&dir, "input.json");
     let protocol = get_protocol(GEMINI);
     let target = make_target(protocol);
     let adapter = get_adapter(GEMINI);
     let result = adapter.decode_response(input_raw.as_bytes(), &target);
-    assert!(result.is_err(), "malformed response should produce an error");
+    assert!(
+        result.is_err(),
+        "malformed response should produce an error"
+    );
 }
 
 // ===========================================================================

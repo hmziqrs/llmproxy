@@ -417,7 +417,10 @@ mod tests {
 
         // With trust_forwarded_headers = false, should use connection info.
         let ip = super::get_client_ip_inner(&headers, Some(&connect_info), false);
-        assert_eq!(ip, "127.0.0.1", "should ignore X-Forwarded-For when trust=false");
+        assert_eq!(
+            ip, "127.0.0.1",
+            "should ignore X-Forwarded-For when trust=false"
+        );
     }
 
     #[test]
