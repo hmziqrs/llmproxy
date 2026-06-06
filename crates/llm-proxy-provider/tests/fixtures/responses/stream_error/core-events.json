@@ -1,0 +1,5 @@
+[
+  { "type": "message_start" },
+  { "type": "error" },
+  { "type": "message_stop" }
+]

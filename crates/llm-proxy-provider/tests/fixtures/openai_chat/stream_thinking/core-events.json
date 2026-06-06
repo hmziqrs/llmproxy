@@ -1,0 +1,8 @@
+[
+  { "type": "message_start", "id": "chatcmpl-think", "model": { "requested": "gpt-4o", "upstream": null } },
+  { "type": "content_start", "index": 0, "kind": "thinking" },
+  { "type": "thinking_delta", "index": 0, "text": "Let me think..." },
+  { "type": "content_start", "index": 1, "kind": "text" },
+  { "type": "text_delta", "index": 1, "text": "The answer is 42." },
+  { "type": "message_stop", "stop_reason": "end_turn", "stop_sequence": null }
+]

@@ -1,0 +1,9 @@
+[
+  { "type": "message_start", "id": "resp_stool" },
+  { "type": "tool_call_start", "index": 0, "id": "call_stool", "name": "get_weather" },
+  { "type": "tool_call_delta", "index": 0 },
+  { "type": "tool_call_delta", "index": 0 },
+  { "type": "tool_call_stop", "index": 0 },
+  { "type": "usage_delta" },
+  { "type": "message_stop", "stop_reason": "tool_use" }
+]

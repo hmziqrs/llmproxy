@@ -1,0 +1,24 @@
+{
+  "id": "chatcmpl-stop",
+  "model": {
+    "requested": "gpt-4o",
+    "upstream": null
+  },
+  "content": [
+    {
+      "type": "text",
+      "text": "The text was cut off..."
+    }
+  ],
+  "stop_reason": "max_tokens",
+  "stop_sequence": null,
+  "usage": {
+    "input_tokens": 20,
+    "output_tokens": 100,
+    "reasoning_tokens": null,
+    "cache_creation_input_tokens": null,
+    "cache_read_input_tokens": null,
+    "provenance": "provider_reported"
+  },
+  "provider_meta": {}
+}

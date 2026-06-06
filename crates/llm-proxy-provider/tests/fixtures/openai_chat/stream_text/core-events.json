@@ -1,0 +1,7 @@
+[
+  { "type": "message_start", "id": "chatcmpl-abc" },
+  { "type": "content_start", "index": 0, "kind": "text" },
+  { "type": "text_delta", "index": 0, "text": "Hello" },
+  { "type": "text_delta", "index": 0, "text": " world" },
+  { "type": "message_stop", "stop_reason": "end_turn" }
+]

@@ -1,0 +1,23 @@
+{
+  "contents": [
+    {
+      "role": "user",
+      "parts": [{ "text": "You are a helpful assistant." }]
+    },
+    {
+      "role": "model",
+      "parts": [{ "text": "Understood." }]
+    },
+    {
+      "role": "user",
+      "parts": [{ "text": "Hello" }]
+    }
+  ],
+  "generationConfig": {
+    "temperature": null,
+    "topP": null,
+    "maxOutputTokens": null,
+    "stopSequences": null
+  },
+  "stream": false
+}

@@ -1,0 +1,29 @@
+{
+  "model": "gpt-4o",
+  "messages": [
+    {
+      "role": "system",
+      "content": "You are a helpful assistant.",
+      "tool_calls": [],
+      "name": null,
+      "tool_call_id": null,
+      "cache_control": null,
+      "refusal": null
+    },
+    {
+      "role": "user",
+      "content": "Hello",
+      "tool_calls": [],
+      "name": null,
+      "tool_call_id": null,
+      "cache_control": null,
+      "refusal": null
+    }
+  ],
+  "stream": null,
+  "temperature": null,
+  "top_p": null,
+  "max_tokens": null,
+  "tools": [],
+  "tool_choice": null
+}

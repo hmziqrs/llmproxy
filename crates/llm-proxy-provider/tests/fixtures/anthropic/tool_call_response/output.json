@@ -1,0 +1,21 @@
+{
+  "id": "msg_tool",
+  "model": {
+    "requested": "claude-sonnet-4-20250514",
+    "upstream": null
+  },
+  "content": [
+    { "type": "tool_use", "id": "toolu_1", "name": "get_weather", "input": { "city": "SF" } }
+  ],
+  "stop_reason": "tool_use",
+  "stop_sequence": null,
+  "usage": {
+    "input_tokens": 50,
+    "output_tokens": 20,
+    "reasoning_tokens": null,
+    "cache_creation_input_tokens": null,
+    "cache_read_input_tokens": null,
+    "provenance": "provider_reported"
+  },
+  "provider_meta": {}
+}

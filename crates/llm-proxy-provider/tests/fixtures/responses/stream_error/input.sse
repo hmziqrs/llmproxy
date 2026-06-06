@@ -1,0 +1,6 @@
+event: response.created
+data: {"type":"response.created","id":"resp_serr","output":[]}
+
+event: response.failed
+data: {"type":"response.failed","error":{"code":"rate_limit_exceeded","message":"Too many requests"}}
+

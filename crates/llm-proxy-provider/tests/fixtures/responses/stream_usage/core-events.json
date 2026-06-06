@@ -1,0 +1,7 @@
+[
+  { "type": "message_start", "id": "resp_susage" },
+  { "type": "content_start", "index": 0, "kind": "text" },
+  { "type": "text_delta", "index": 0, "text": "Hi" },
+  { "type": "usage_delta" },
+  { "type": "message_stop", "stop_reason": "end_turn" }
+]

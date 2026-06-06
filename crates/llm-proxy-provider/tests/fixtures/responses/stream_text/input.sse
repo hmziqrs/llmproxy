@@ -1,0 +1,15 @@
+event: response.created
+data: {"type":"response.created","id":"resp_st","output":[]}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","delta":"Hello"}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","delta":" world"}
+
+event: response.output_text.done
+data: {"type":"response.output_text.done"}
+
+event: response.completed
+data: {"type":"response.completed","usage":{"input_tokens":10,"output_tokens":8}}
+

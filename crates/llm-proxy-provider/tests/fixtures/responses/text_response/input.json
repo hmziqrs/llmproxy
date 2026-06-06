@@ -1,6 +1,7 @@
 {
   "id": "resp_abc123",
   "object": "response",
+  "created": 1234567890,
   "model": "gpt-4o",
   "output": [
     {

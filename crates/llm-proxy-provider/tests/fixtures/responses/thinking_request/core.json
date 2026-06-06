@@ -1,0 +1,21 @@
+{
+  "model": "gpt-4o",
+  "system": [],
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        { "type": "text", "text": "Think step by step." }
+      ]
+    }
+  ],
+  "tools": [],
+  "tool_choice": null,
+  "sampling": {
+    "temperature": null,
+    "max_tokens": null,
+    "stop": null,
+    "reasoning_effort": "high"
+  },
+  "stream": false
+}

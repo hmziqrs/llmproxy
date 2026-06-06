@@ -1,0 +1,15 @@
+{
+  "contents": [
+    {
+      "role": "user",
+      "parts": [{ "text": "Think step by step." }]
+    }
+  ],
+  "generationConfig": {
+    "temperature": null,
+    "topP": null,
+    "maxOutputTokens": null,
+    "stopSequences": null
+  },
+  "stream": false
+}

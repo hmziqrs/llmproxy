@@ -1,0 +1,50 @@
+{
+  "model": "gpt-4o",
+  "messages": [
+    {
+      "role": "user",
+      "content": "What is the weather?",
+      "tool_calls": [],
+      "name": null,
+      "tool_call_id": null,
+      "cache_control": null,
+      "refusal": null
+    },
+    {
+      "role": "assistant",
+      "content": "",
+      "reasoning_content": null,
+      "tool_calls": [
+        {
+          "index": null,
+          "id": "call_1",
+          "type": "function",
+          "function": {
+            "name": "get_weather",
+            "arguments": "{\"city\":\"SF\"}"
+          }
+        }
+      ],
+      "name": null,
+      "tool_call_id": null,
+      "cache_control": null,
+      "refusal": null
+    },
+    {
+      "role": "tool",
+      "content": "72F sunny",
+      "reasoning_content": null,
+      "tool_calls": [],
+      "name": null,
+      "tool_call_id": "call_1",
+      "cache_control": null,
+      "refusal": null
+    }
+  ],
+  "stream": null,
+  "temperature": null,
+  "top_p": null,
+  "max_tokens": null,
+  "tools": [],
+  "tool_choice": null
+}

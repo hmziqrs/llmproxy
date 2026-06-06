@@ -1,0 +1,11 @@
+[
+  { "type": "message_start" },
+  { "type": "content_start" },
+  { "type": "text_delta" },
+  { "type": "tool_call_start" },
+  { "type": "tool_call_delta" },
+  { "type": "tool_call_delta" },
+  { "type": "tool_call_stop" },
+  { "type": "message_stop" },
+  { "type": "tool_call_stop" }
+]

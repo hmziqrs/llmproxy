@@ -1,0 +1,20 @@
+{
+  "id": "resp_tool",
+  "object": "response",
+  "created": 1234567890,
+  "model": "gpt-4o",
+  "output": [
+    {
+      "type": "function_call",
+      "call_id": "call_1",
+      "name": "get_weather",
+      "arguments": "{\"city\":\"SF\"}"
+    }
+  ],
+  "status": "completed",
+  "usage": {
+    "input_tokens": 50,
+    "output_tokens": 20,
+    "total_tokens": 70
+  }
+}

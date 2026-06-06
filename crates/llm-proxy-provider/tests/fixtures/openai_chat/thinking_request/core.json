@@ -1,0 +1,28 @@
+{
+  "model": {
+    "requested": "gpt-4o",
+    "upstream": null
+  },
+  "system": [],
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        { "type": "text", "text": "Solve this problem" }
+      ]
+    }
+  ],
+  "tools": [],
+  "tool_choice": null,
+  "sampling": {
+    "temperature": null,
+    "top_p": null,
+    "max_tokens": null,
+    "stop": null,
+    "reasoning_effort": null,
+    "thinking": null
+  },
+  "stream": false,
+  "metadata": {},
+  "provider_hints": { "raw": {} }
+}

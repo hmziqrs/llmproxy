@@ -1,0 +1,34 @@
+{
+  "contents": [
+    {
+      "role": "user",
+      "parts": [{ "text": "What is the weather in SF?" }]
+    },
+    {
+      "role": "model",
+      "parts": [{ "functionCall": { "name": "get_weather", "args": { "city": "SF" } } }]
+    },
+    {
+      "role": "user",
+      "parts": [{ "functionResponse": { "name": "get_weather", "response": { "result": "Sunny, 72F" } } }]
+    }
+  ],
+  "tools": [
+    {
+      "functionDeclarations": [
+        {
+          "name": "get_weather",
+          "description": "Get current weather",
+          "parameters": { "type": "object", "properties": { "city": { "type": "string" } } }
+        }
+      ]
+    }
+  ],
+  "generationConfig": {
+    "temperature": null,
+    "topP": null,
+    "maxOutputTokens": null,
+    "stopSequences": null
+  },
+  "stream": false
+}

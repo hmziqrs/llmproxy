@@ -1,0 +1,6 @@
+[
+  { "type": "message_start", "id": "chatcmpl-err", "model": { "requested": "gpt-4o", "upstream": null } },
+  { "type": "content_start", "index": 0, "kind": "text" },
+  { "type": "text_delta", "index": 0, "text": "Hi" },
+  { "type": "message_stop", "stop_reason": "end_turn", "stop_sequence": null }
+]

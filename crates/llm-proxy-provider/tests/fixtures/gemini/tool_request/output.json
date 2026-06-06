@@ -1,0 +1,26 @@
+{
+  "contents": [
+    {
+      "role": "user",
+      "parts": [{ "text": "What is the weather?" }]
+    }
+  ],
+  "tools": [
+    {
+      "functionDeclarations": [
+        {
+          "name": "get_weather",
+          "description": "Get current weather",
+          "parameters": { "type": "object", "properties": { "city": { "type": "string" } } }
+        }
+      ]
+    }
+  ],
+  "generationConfig": {
+    "temperature": null,
+    "topP": null,
+    "maxOutputTokens": null,
+    "stopSequences": null
+  },
+  "stream": false
+}

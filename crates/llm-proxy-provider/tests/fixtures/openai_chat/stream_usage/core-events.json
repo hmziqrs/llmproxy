@@ -1,0 +1,7 @@
+[
+  { "type": "message_start", "id": "chatcmpl-usage", "model": { "requested": "gpt-4o", "upstream": null } },
+  { "type": "content_start", "index": 0, "kind": "text" },
+  { "type": "text_delta", "index": 0, "text": "Hi" },
+  { "type": "usage_delta", "usage": { "input_tokens": 10, "output_tokens": 5, "reasoning_tokens": null, "cache_creation_input_tokens": null, "cache_read_input_tokens": null, "provenance": "provider_reported" } },
+  { "type": "message_stop", "stop_reason": "end_turn", "stop_sequence": null }
+]

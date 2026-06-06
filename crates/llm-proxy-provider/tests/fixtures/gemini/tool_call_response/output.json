@@ -1,0 +1,10 @@
+{
+  "content": [
+    { "type": "tool_use", "id": "gemini_call_0", "name": "get_weather", "input": { "city": "SF" } }
+  ],
+  "stop_reason": "EndTurn",
+  "usage": {
+    "input_tokens": 50,
+    "output_tokens": 20
+  }
+}

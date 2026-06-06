@@ -1,0 +1,18 @@
+{
+  "model": "gpt-4o",
+  "input": [
+    {
+      "role": "user",
+      "content": "What is the weather?"
+    }
+  ],
+  "tools": [
+    {
+      "type": "function",
+      "name": "get_weather",
+      "description": "Get current weather",
+      "parameters": { "type": "object", "properties": { "city": { "type": "string" } } }
+    }
+  ],
+  "stream": false
+}

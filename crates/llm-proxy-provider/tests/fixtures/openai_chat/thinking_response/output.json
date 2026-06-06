@@ -1,0 +1,29 @@
+{
+  "id": "chatcmpl-think",
+  "model": {
+    "requested": "gpt-4o",
+    "upstream": null
+  },
+  "content": [
+    {
+      "type": "thinking",
+      "text": "Let me think step by step...",
+      "signature": null
+    },
+    {
+      "type": "text",
+      "text": "The answer is 42."
+    }
+  ],
+  "stop_reason": "end_turn",
+  "stop_sequence": null,
+  "usage": {
+    "input_tokens": 30,
+    "output_tokens": 15,
+    "reasoning_tokens": null,
+    "cache_creation_input_tokens": null,
+    "cache_read_input_tokens": null,
+    "provenance": "provider_reported"
+  },
+  "provider_meta": {}
+}

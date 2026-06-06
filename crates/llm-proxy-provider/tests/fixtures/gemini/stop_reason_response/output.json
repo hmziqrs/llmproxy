@@ -1,0 +1,10 @@
+{
+  "content": [
+    { "type": "text", "text": "The text was cut off..." }
+  ],
+  "stop_reason": "max_tokens",
+  "usage": {
+    "input_tokens": 20,
+    "output_tokens": 100
+  }
+}

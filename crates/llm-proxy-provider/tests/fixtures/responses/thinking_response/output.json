@@ -1,0 +1,11 @@
+{
+  "id": "resp_think",
+  "content": [
+    { "type": "text", "text": "Let me think step by step... The answer is 42." }
+  ],
+  "stop_reason": "end_turn",
+  "usage": {
+    "input_tokens": 30,
+    "output_tokens": 15
+  }
+}

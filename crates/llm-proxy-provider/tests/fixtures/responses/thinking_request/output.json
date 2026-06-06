@@ -1,0 +1,11 @@
+{
+  "model": "gpt-4o",
+  "input": [
+    {
+      "role": "user",
+      "content": "Think step by step."
+    }
+  ],
+  "stream": false,
+  "reasoning": { "effort": "high" }
+}

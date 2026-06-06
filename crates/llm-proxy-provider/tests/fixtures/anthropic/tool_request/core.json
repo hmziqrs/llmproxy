@@ -1,0 +1,26 @@
+{
+  "model": "claude-sonnet-4-20250514",
+  "system": [],
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        { "type": "text", "text": "What is the weather?" }
+      ]
+    }
+  ],
+  "tools": [
+    {
+      "name": "get_weather",
+      "description": "Get current weather",
+      "input_schema": { "type": "object", "properties": { "city": { "type": "string" } } }
+    }
+  ],
+  "tool_choice": "auto",
+  "sampling": {
+    "temperature": null,
+    "max_tokens": null,
+    "stop": null
+  },
+  "stream": false
+}
