@@ -4,7 +4,7 @@
 //! mutex-guarded state is the latency ring-buffer (last 1 000 samples) and
 //! the per-model request counter map.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
@@ -30,7 +30,7 @@ pub struct Metrics {
     rate_limited: AtomicI64,
     deduplicated: AtomicI64,
     /// Ring-buffer holding the last [`LATENCY_CAP`] latency samples.
-    latencies: Mutex<Vec<Duration>>,
+    latencies: Mutex<VecDeque<Duration>>,
     /// Per-model request counts.
     model_counts: Mutex<HashMap<String, AtomicI64>>,
 }
@@ -47,7 +47,7 @@ impl Metrics {
             upstream_calls: AtomicI64::new(0),
             rate_limited: AtomicI64::new(0),
             deduplicated: AtomicI64::new(0),
-            latencies: Mutex::new(Vec::with_capacity(LATENCY_CAP)),
+            latencies: Mutex::new(VecDeque::with_capacity(LATENCY_CAP)),
             model_counts: Mutex::new(HashMap::new()),
         }
     }
@@ -74,9 +74,9 @@ impl Metrics {
         // Store latency sample (ring-buffer).
         if let Ok(mut buf) = self.latencies.lock() {
             if buf.len() >= LATENCY_CAP {
-                buf.remove(0);
+                buf.pop_front();
             }
-            buf.push(latency);
+            buf.push_back(latency);
         }
 
         // Bump per-model counter.
@@ -121,7 +121,7 @@ impl Metrics {
         let latencies = self
             .latencies
             .lock()
-            .map(|buf| buf.clone())
+            .map(|buf| buf.iter().copied().collect())
             .unwrap_or_default();
 
         let model_counts = self

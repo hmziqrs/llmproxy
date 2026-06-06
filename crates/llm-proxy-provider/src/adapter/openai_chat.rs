@@ -643,12 +643,18 @@ impl OpenAiChatAdapter {
                 .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
 
             content.push(CoreContent::ToolUse {
-                id: tc.id.clone().unwrap_or_default(),
+                id: tc.id.clone().unwrap_or_else(|| {
+                    tracing::warn!("OpenAI: tool_call missing id in response decode");
+                    "<unknown_tool_id>".to_owned()
+                }),
                 name: tc
                     .function
                     .as_ref()
                     .and_then(|f| f.name.clone())
-                    .unwrap_or_default(),
+                    .unwrap_or_else(|| {
+                        tracing::warn!("OpenAI: tool_call missing name in response decode");
+                        "<unknown_tool>".to_owned()
+                    }),
                 input,
             });
         }

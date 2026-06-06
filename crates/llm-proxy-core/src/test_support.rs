@@ -1,9 +1,9 @@
 //! Shared test utilities for `llm-proxy-core`.
 //!
 //! Provides a single crate-level mutex (`TEST_ENV_LOCK`) that serialises all
-//! environment-variable-mutating tests across both [`crate::config`] and
-//! [`crate::provider_config`], eliminating the race condition that occurred
-//! when each module used its own independent mutex.
+//! environment-variable-mutating tests in [`crate::provider_config`],
+//! eliminating the race condition that occurred when each module used its own
+//! independent mutex.
 
 use std::sync::Mutex;
 

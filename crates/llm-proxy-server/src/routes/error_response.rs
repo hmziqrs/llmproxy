@@ -56,6 +56,7 @@ pub enum ClientProtocol {
 /// Some variants carry internal details (Internal, ProviderDecode, Upstream).
 /// The error response encoder sanitizes these before sending them to clients.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum RouteError {
     /// Bad client input (malformed JSON, missing fields).
     #[error("invalid request: {0}")]
@@ -71,6 +72,9 @@ pub enum RouteError {
         /// Sanitized error body.
         body: String,
     },
+    /// Upstream provider timed out.
+    #[error("upstream timeout: {0}")]
+    UpstreamTimeout(String),
     /// Provider adapter failed to decode the upstream response.
     #[error("provider decode error: {0}")]
     ProviderDecode(String),
@@ -238,11 +242,20 @@ fn openai_error_response(error: RouteError) -> Response<Body> {
 /// the HTTP error path so both paths go through the same compile-time-validated
 /// serialization. This avoids raw `serde_json::json!()` which could silently
 /// produce a malformed envelope if field names change.
+///
+/// The `error_type` parameter controls the `"type"` field in the error envelope.
+/// For consistency with the HTTP error path, callers should pass `"server_error"`
+/// for internal errors and `"api_error"` for upstream/decode errors.
 pub fn openai_stream_error_json(message: &str) -> Option<String> {
+    openai_stream_error_json_with_type(message, "api_error")
+}
+
+/// Build an OpenAI-shaped SSE error JSON string with a custom error type.
+fn openai_stream_error_json_with_type(message: &str, error_type: &str) -> Option<String> {
     let body = OpenAiErrorBody {
         error: OpenAiErrorDetail {
             message: truncate_error_body(message),
-            r#type: "api_error".to_owned(),
+            r#type: error_type.to_owned(),
             code: serde_json::Value::Null,
         },
     };
@@ -266,6 +279,11 @@ fn extract_error_fields(error: RouteError) -> (StatusCode, &'static str, String)
             map_upstream_status(status),
             "api_error",
             truncate_error_body(&body),
+        ),
+        RouteError::UpstreamTimeout(_msg) => (
+            StatusCode::GATEWAY_TIMEOUT,
+            "api_error",
+            "upstream request timed out".to_owned(),
         ),
         RouteError::ProviderDecode(_msg) => (
             StatusCode::BAD_GATEWAY,

@@ -509,17 +509,20 @@ pub(crate) async fn handle_core_stream(
     let (first_byte_tx, first_byte_rx) = tokio::sync::oneshot::channel::<FirstByteResult>();
     let output_stream = build_sse_output_stream(
         byte_stream,
-        provider_decoder,
-        sse_framer,
-        client_encoder,
-        client_protocol,
-        request_id.clone(),
-        StreamMetrics {
-            metrics: Arc::clone(&state.metrics),
-            upstream_model: upstream_model.clone(),
-            start: ctx.start,
+        StreamContext {
+            provider_decoder,
+            sse_framer,
+            client_encoder,
+            client_protocol,
+            request_id: request_id.clone(),
+            stream_metrics: StreamMetrics {
+                metrics: Arc::clone(&state.metrics),
+                upstream_model: upstream_model.clone(),
+                start: ctx.start,
+            },
+            first_byte_tx: Some(first_byte_tx),
+            first_byte_sent: false,
         },
-        first_byte_tx,
     );
 
     // Wait for the first event (or a pre-stream error). This is the
@@ -606,6 +609,59 @@ struct StreamMetrics {
     start: Instant,
 }
 
+/// Mutable context used inside the spawned stream task.
+///
+/// Groups the state that was previously passed as individual parameters to
+/// `build_sse_output_stream`, reducing the function's parameter count from 9
+/// to a single struct plus the byte stream.
+struct StreamContext {
+    provider_decoder: Box<dyn ProviderStreamDecoder + Send>,
+    sse_framer: SseFramer,
+    client_encoder: ClientStreamEncoder,
+    client_protocol: ClientProtocol,
+    request_id: String,
+    stream_metrics: StreamMetrics,
+    first_byte_tx: Option<tokio::sync::oneshot::Sender<FirstByteResult>>,
+    first_byte_sent: bool,
+}
+
+impl StreamContext {
+    /// Emit a single SSE event, handling the first-byte boundary.
+    ///
+    /// Before the first event is sent, events go through the `first_byte_tx`
+    /// channel so the handler can return a proper HTTP status. After the first
+    /// event, events go directly to the `tx` channel.
+    ///
+    /// Returns `true` if the event was successfully delivered (or the stream
+    /// should continue), `false` if the task should exit.
+    async fn emit_event(&mut self, event: Event, tx: &tokio::sync::mpsc::Sender<Event>) -> bool {
+        if !self.first_byte_sent {
+            if let Some(fb_tx) = self.first_byte_tx.take() {
+                if fb_tx.send(FirstByteResult::FirstEvent(event)).is_ok() {
+                    self.first_byte_sent = true;
+                    return true;
+                }
+                // Receiver dropped -- handler is gone.
+                self.stream_metrics.metrics.record_failure();
+                return false;
+            }
+        } else if tx.send(event).await.is_err() {
+            self.stream_metrics.metrics.record_failure();
+            return false;
+        }
+        true
+    }
+
+    /// Emit a pre-stream error through the first-byte channel.
+    fn send_pre_stream_error(&mut self, error: RouteError) -> bool {
+        if let Some(fb_tx) = self.first_byte_tx.take() {
+            fb_tx.send(FirstByteResult::PreStreamError(error)).is_ok()
+        } else {
+            false
+        }
+    }
+}
+
 /// Build a stream that converts provider byte chunks into client SSE events.
 ///
 /// The `first_byte_tx` channel is used to signal the first-byte boundary:
@@ -613,7 +669,6 @@ struct StreamMetrics {
 /// first SSE event is produced) or `FirstByteResult::PreStreamError` (if
 /// the stream fails before any event). After the first event is sent, the
 /// channel is dropped and all subsequent errors become in-band SSE events.
-#[allow(clippy::too_many_arguments)]
 fn build_sse_output_stream(
     byte_stream: std::pin::Pin<
         Box<
@@ -622,13 +677,7 @@ fn build_sse_output_stream(
                 + 'static,
         >,
     >,
-    mut provider_decoder: Box<dyn ProviderStreamDecoder + Send>,
-    mut sse_framer: SseFramer,
-    mut client_encoder: ClientStreamEncoder,
-    client_protocol: ClientProtocol,
-    request_id: String,
-    stream_metrics: StreamMetrics,
-    first_byte_tx: tokio::sync::oneshot::Sender<FirstByteResult>,
+    ctx: StreamContext,
 ) -> BoxStream<'static, Event> {
     let (tx, rx) = tokio::sync::mpsc::channel::<Event>(256);
     let cancel = tokio_util::sync::CancellationToken::new();
@@ -636,57 +685,19 @@ fn build_sse_output_stream(
 
     tokio::spawn(async move {
         let mut stream = byte_stream;
+        let mut ctx = ctx;
         let mut stream_succeeded = false;
         // Track whether the stream terminated due to an error so we can
         // skip the finalization path that follows the main loop.
         let mut stream_errored = false;
-        // Track whether we have sent the first SSE event to the client.
-        // Before first_byte_sent, errors are sent back to the handler via
-        // first_byte_tx so they become HTTP errors. After first_byte_sent,
-        // errors become in-band SSE error events.
-        let mut first_byte_sent = false;
-        // Sender for the first-byte probe. Consumed once (either by sending
-        // FirstEvent or by sending PreStreamError on error).
-        let mut first_byte_tx = Some(first_byte_tx);
-
-        /// Helper: send an event through the first-byte channel (if not yet
-        /// consumed) and mark first_byte_sent. Returns true if the event was
-        /// successfully delivered as the first byte.
-        async fn send_first_event(
-            first_byte_tx: &mut Option<tokio::sync::oneshot::Sender<FirstByteResult>>,
-            event: Event,
-        ) -> bool {
-            if let Some(tx) = first_byte_tx.take() {
-                if tx.send(FirstByteResult::FirstEvent(event)).is_ok() {
-                    return true;
-                }
-                // Receiver dropped -- handler is gone, task should exit.
-            }
-            false
-        }
-
-        /// Helper: send a pre-stream error through the first-byte channel.
-        /// Returns true if the error was delivered (handler will return HTTP error).
-        fn send_pre_stream_error(
-            first_byte_tx: &mut Option<tokio::sync::oneshot::Sender<FirstByteResult>>,
-            error: RouteError,
-        ) -> bool {
-            if let Some(tx) = first_byte_tx.take() {
-                tx.send(FirstByteResult::PreStreamError(error)).is_ok()
-            } else {
-                false
-            }
-        }
 
         'outer: loop {
             tokio::select! {
                 _ = cancel_clone.cancelled() => {
                     // Client disconnected; abort upstream stream.
-                    stream_metrics.metrics.record_failure();
-                    // If first byte hasn't been sent yet, signal pre-stream error.
-                    if !first_byte_sent {
-                        send_pre_stream_error(
-                            &mut first_byte_tx,
+                    ctx.stream_metrics.metrics.record_failure();
+                    if !ctx.first_byte_sent {
+                        ctx.send_pre_stream_error(
                             RouteError::Internal("client disconnected before first byte".to_owned()),
                         );
                     }
@@ -696,34 +707,29 @@ fn build_sse_output_stream(
                     match chunk {
                         Some(Ok(bytes)) => {
                             // Feed bytes through the SSE framer.
-                            let frames = match sse_framer.push_chunk(&bytes) {
+                            let frames = match ctx.sse_framer.push_chunk(&bytes) {
                                 Ok(f) => f,
                                 Err(e) => {
                                     warn!(
-                                        request_id = %request_id,
+                                        request_id = %ctx.request_id,
                                         error = %e,
                                         "SSE framing error in stream"
                                     );
-                                    if !first_byte_sent {
-                                        // Error before first byte: send as HTTP error.
-                                        stream_metrics.metrics.record_failure();
-                                        send_pre_stream_error(
-                                            &mut first_byte_tx,
+                                    if !ctx.first_byte_sent {
+                                        ctx.stream_metrics.metrics.record_failure();
+                                        ctx.send_pre_stream_error(
                                             RouteError::ProviderDecode(
                                                 format!("stream framing error: {e}"),
                                             ),
                                         );
                                     } else {
-                                        // Error after first byte: in-band SSE error event.
-                                        // Sanitize the error message to prevent leaking
-                                        // internal details (adapter names, URLs, etc.).
                                         emit_stream_error(
-                                            &mut client_encoder,
+                                            &mut ctx.client_encoder,
                                             &tx,
-                                            &client_protocol,
+                                            &ctx.client_protocol,
                                             PROVIDER_DECODE_CLIENT_MESSAGE,
                                         ).await;
-                                        stream_metrics.metrics.record_failure();
+                                        ctx.stream_metrics.metrics.record_failure();
                                     }
                                     stream_errored = true;
                                     break 'outer;
@@ -731,34 +737,29 @@ fn build_sse_output_stream(
                             };
 
                             for frame in &frames {
-                                let core_events = match provider_decoder.decode_frame(frame) {
+                                let core_events = match ctx.provider_decoder.decode_frame(frame) {
                                     Ok(events) => events,
                                     Err(e) => {
                                         warn!(
-                                            request_id = %request_id,
+                                            request_id = %ctx.request_id,
                                             error = %e,
                                             "provider decode error in stream"
                                         );
-                                        if !first_byte_sent {
-                                            // Error before first byte: send as HTTP error.
-                                            stream_metrics.metrics.record_failure();
-                                            send_pre_stream_error(
-                                                &mut first_byte_tx,
+                                        if !ctx.first_byte_sent {
+                                            ctx.stream_metrics.metrics.record_failure();
+                                            ctx.send_pre_stream_error(
                                                 RouteError::ProviderDecode(
                                                     format!("provider decode error: {e}"),
                                                 ),
                                             );
                                         } else {
-                                            // Error after first byte: in-band SSE error event.
-                                            // Sanitize the error message to prevent leaking
-                                            // internal details (adapter names, URLs, etc.).
                                             emit_stream_error(
-                                                &mut client_encoder,
+                                                &mut ctx.client_encoder,
                                                 &tx,
-                                                &client_protocol,
+                                                &ctx.client_protocol,
                                                 PROVIDER_DECODE_CLIENT_MESSAGE,
                                             ).await;
-                                            stream_metrics.metrics.record_failure();
+                                            ctx.stream_metrics.metrics.record_failure();
                                         }
                                         stream_errored = true;
                                         break 'outer;
@@ -767,25 +768,11 @@ fn build_sse_output_stream(
 
                                 for core_event in core_events {
                                     let client_events = encode_core_event(
-                                        &mut client_encoder,
+                                        &mut ctx.client_encoder,
                                         core_event,
                                     );
                                     for event in client_events {
-                                        if !first_byte_sent {
-                                            // First event: send via first-byte channel
-                                            // so the handler commits HTTP 200.
-                                            if send_first_event(
-                                                &mut first_byte_tx,
-                                                event,
-                                            ).await {
-                                                first_byte_sent = true;
-                                            } else {
-                                                // Handler dropped; abort.
-                                                stream_metrics.metrics.record_failure();
-                                                return;
-                                            }
-                                        } else if tx.send(event).await.is_err() {
-                                            stream_metrics.metrics.record_failure();
+                                        if !ctx.emit_event(event, &tx).await {
                                             return;
                                         }
                                     }
@@ -794,29 +781,24 @@ fn build_sse_output_stream(
                         }
                         Some(Err(e)) => {
                             warn!(
-                                request_id = %request_id,
+                                request_id = %ctx.request_id,
                                 error = %e,
                                 "upstream stream error"
                             );
-                            if !first_byte_sent {
-                                // Error before first byte: send as HTTP error.
-                                stream_metrics.metrics.record_failure();
-                                send_pre_stream_error(
-                                    &mut first_byte_tx,
+                            if !ctx.first_byte_sent {
+                                ctx.stream_metrics.metrics.record_failure();
+                                ctx.send_pre_stream_error(
                                     map_provider_error(e),
                                 );
                             } else {
-                                // Error after first byte: in-band SSE error event.
-                                // Sanitize the error message to prevent leaking
-                                // upstream hostnames, URL paths, or connection details.
                                 let sanitized = sanitize_upstream_error_body(&e.to_string());
                                 emit_stream_error(
-                                    &mut client_encoder,
+                                    &mut ctx.client_encoder,
                                     &tx,
-                                    &client_protocol,
+                                    &ctx.client_protocol,
                                     &sanitized,
                                 ).await;
-                                stream_metrics.metrics.record_failure();
+                                ctx.stream_metrics.metrics.record_failure();
                             }
                             stream_errored = true;
                             break 'outer;
@@ -839,14 +821,14 @@ fn build_sse_output_stream(
         if !stream_errored {
             // Finalize: call sse_framer.finish() first to flush any trailing partial
             // SSE frame that arrived without a terminating blank line.
-            match sse_framer.finish() {
+            match ctx.sse_framer.finish() {
                 Ok(trailing_frames) => {
                     for frame in &trailing_frames {
-                        let core_events = match provider_decoder.decode_frame(frame) {
+                        let core_events = match ctx.provider_decoder.decode_frame(frame) {
                             Ok(events) => events,
                             Err(e) => {
                                 warn!(
-                                    request_id = %request_id,
+                                    request_id = %ctx.request_id,
                                     error = %e,
                                     "provider decode error on trailing frame"
                                 );
@@ -854,17 +836,10 @@ fn build_sse_output_stream(
                             }
                         };
                         for core_event in core_events {
-                            let client_events = encode_core_event(&mut client_encoder, core_event);
+                            let client_events =
+                                encode_core_event(&mut ctx.client_encoder, core_event);
                             for event in client_events {
-                                if !first_byte_sent {
-                                    if send_first_event(&mut first_byte_tx, event).await {
-                                        first_byte_sent = true;
-                                    } else {
-                                        stream_metrics.metrics.record_failure();
-                                        return;
-                                    }
-                                } else if tx.send(event).await.is_err() {
-                                    stream_metrics.metrics.record_failure();
+                                if !ctx.emit_event(event, &tx).await {
                                     return;
                                 }
                             }
@@ -873,7 +848,7 @@ fn build_sse_output_stream(
                 }
                 Err(e) => {
                     warn!(
-                        request_id = %request_id,
+                        request_id = %ctx.request_id,
                         error = %e,
                         "SSE framer finish error"
                     );
@@ -881,20 +856,12 @@ fn build_sse_output_stream(
             }
 
             // Then finalize: call provider decoder finish() to emit any remaining events.
-            match provider_decoder.finish() {
+            match ctx.provider_decoder.finish() {
                 Ok(final_events) => {
                     for core_event in final_events {
-                        let client_events = encode_core_event(&mut client_encoder, core_event);
+                        let client_events = encode_core_event(&mut ctx.client_encoder, core_event);
                         for event in client_events {
-                            if !first_byte_sent {
-                                if send_first_event(&mut first_byte_tx, event).await {
-                                    first_byte_sent = true;
-                                } else {
-                                    stream_metrics.metrics.record_failure();
-                                    return;
-                                }
-                            } else if tx.send(event).await.is_err() {
-                                stream_metrics.metrics.record_failure();
+                            if !ctx.emit_event(event, &tx).await {
                                 return;
                             }
                         }
@@ -902,7 +869,7 @@ fn build_sse_output_stream(
                 }
                 Err(e) => {
                     warn!(
-                        request_id = %request_id,
+                        request_id = %ctx.request_id,
                         error = %e,
                         "provider decoder finish error"
                     );
@@ -910,35 +877,19 @@ fn build_sse_output_stream(
             }
 
             // Emit any remaining client encoder events (synthetic terminal if needed).
-            match client_encoder.finish() {
+            match ctx.client_encoder.finish() {
                 Ok(final_encoded_events) => {
                     for encoded in final_encoded_events {
                         let event = client_event_to_sse(encoded);
-                        if !first_byte_sent {
-                            if send_first_event(&mut first_byte_tx, event).await {
-                                first_byte_sent = true;
-                            } else {
-                                stream_metrics.metrics.record_failure();
-                                return;
-                            }
-                        } else if tx.send(event).await.is_err() {
-                            stream_metrics.metrics.record_failure();
+                        if !ctx.emit_event(event, &tx).await {
                             return;
                         }
                     }
 
                     // For OpenAI Chat, emit the [DONE] terminator after all chunks.
-                    if matches!(client_protocol, ClientProtocol::OpenAiChat) {
+                    if matches!(ctx.client_protocol, ClientProtocol::OpenAiChat) {
                         let done_event = openai_done_event();
-                        if !first_byte_sent {
-                            if send_first_event(&mut first_byte_tx, done_event).await {
-                                first_byte_sent = true;
-                            } else {
-                                stream_metrics.metrics.record_failure();
-                                return;
-                            }
-                        } else if tx.send(done_event).await.is_err() {
-                            stream_metrics.metrics.record_failure();
+                        if !ctx.emit_event(done_event, &tx).await {
                             return;
                         }
                     }
@@ -947,20 +898,20 @@ fn build_sse_output_stream(
                 }
                 Err(e) => {
                     warn!(
-                        request_id = %request_id,
+                        request_id = %ctx.request_id,
                         error = %e,
                         "client encoder finish error"
                     );
-                    stream_metrics.metrics.record_failure();
+                    ctx.stream_metrics.metrics.record_failure();
                 }
             }
         }
 
         // Record metrics after stream completes.
         if stream_succeeded {
-            stream_metrics.metrics.record_success(
-                &stream_metrics.upstream_model,
-                stream_metrics.start.elapsed(),
+            ctx.stream_metrics.metrics.record_success(
+                &ctx.stream_metrics.upstream_model,
+                ctx.stream_metrics.start.elapsed(),
             );
         }
 
@@ -969,8 +920,8 @@ fn build_sse_output_stream(
         // The handler will return this as a 502 Bad Gateway to the client.
         // This is preferable to silently dropping the channel (which produces
         // a misleading "stream task panicked" error).
-        if !first_byte_sent {
-            if let Some(tx) = first_byte_tx.take() {
+        if !ctx.first_byte_sent {
+            if let Some(tx) = ctx.first_byte_tx.take() {
                 let _ = tx.send(FirstByteResult::PreStreamError(RouteError::ProviderDecode(
                     "upstream returned an empty stream with no events".to_owned(),
                 )));
@@ -1083,6 +1034,12 @@ pub(crate) fn map_provider_error(e: llm_proxy_provider::error::ProviderError) ->
             }
         }
         _ => {
+            // Check for reqwest timeout specifically so we can return 504
+            // instead of the generic 502 Bad Gateway.
+            if let Some(reqwest_err) = is_reqwest_timeout(&e) {
+                let sanitized = sanitize_upstream_error_body(&reqwest_err.to_string());
+                return RouteError::UpstreamTimeout(sanitized);
+            }
             // Sanitize non-Api error messages to prevent leaking upstream
             // hostnames, URL paths, or connection details in the response body.
             let sanitized = sanitize_upstream_error_body(&e.to_string());
@@ -1091,6 +1048,23 @@ pub(crate) fn map_provider_error(e: llm_proxy_provider::error::ProviderError) ->
                 body: sanitized,
             }
         }
+    }
+}
+
+/// Check whether a `ProviderError` wraps a reqwest timeout error.
+///
+/// Returns the inner `reqwest::Error` reference if the error chain contains
+/// a timeout, so the caller can extract a sanitized message.
+fn is_reqwest_timeout(e: &llm_proxy_provider::error::ProviderError) -> Option<&reqwest::Error> {
+    match e {
+        llm_proxy_provider::error::ProviderError::Http(http_err) => {
+            // reqwest::Error implements std::error::Error; check is_timeout().
+            if http_err.is_timeout() {
+                return Some(http_err);
+            }
+            None
+        }
+        _ => None,
     }
 }
 

@@ -32,12 +32,28 @@ use crate::sse::SseFrame;
 /// large enough for most use cases while staying within typical model limits.
 const ANTHROPIC_DEFAULT_MAX_TOKENS: i32 = 4096;
 
+/// Extract a mutable JSON object from a `serde_json::Value`.
+///
+/// The `serde_json::json!()` macro always produces either an object, array,
+/// or primitive value.  In all call sites below the macro literal is an object
+/// (`{ ... }`), so this unwrap is safe.  The function exists so the safety
+/// argument is documented in one place rather than repeated at each site.
+#[inline]
+#[allow(clippy::expect_used)]
+fn json_object(val: &mut serde_json::Value) -> &mut serde_json::Map<String, serde_json::Value> {
+    val.as_object_mut()
+        .expect("json! macro with {{...}} always produces a JSON object")
+}
+
 // The sanitize/desanitize approach uses a sentinel prefix `__llmp_` to mark
 // names that were actually rewritten.  Only names carrying this sentinel are
 // decoded during desanitization, which prevents false-positive decoding of
 // tool names that naturally contain `_0xHH_` patterns (e.g. `parse_0xff_value`).
 
 // Anthropic `tool_use_id` must match `^[A-Za-z0-9_]{0,256}$`.
+// SAFETY: The regex pattern is a compile-time constant that is syntactically
+// valid. This cannot fail at runtime.
+#[allow(clippy::expect_used)]
 static INVALID_TOOL_USE_ID_CHAR: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"[^A-Za-z0-9_]").expect("valid regex"));
 
@@ -65,8 +81,11 @@ fn sanitize_tool_name(name: &str) -> (String, bool) {
             result.push(ch);
         } else {
             // Encode as _0xHH_ for each byte of the character.
+            // SAFETY: write! to a String cannot fail (the fmt::Write impl for
+            // String is infallible); the unwrap is safe.
+            #[allow(clippy::expect_used)]
             for byte in ch.to_string().as_bytes() {
-                write!(result, "_0x{:02x}_", byte).unwrap();
+                write!(result, "_0x{:02x}_", byte).expect("write! to String is infallible");
             }
             changed = true;
         }
@@ -313,8 +332,18 @@ impl ProviderStreamDecoder for AnthropicStreamDecoder {
                             self.current_block_kind = ContentKind::ToolUse;
                             self.tool_blocks.push(idx);
                             self.tool_blocks_closed.push(false);
-                            let id = block.id.clone().unwrap_or_default();
-                            let name = block.name.clone().unwrap_or_default();
+                            let id = block.id.clone().unwrap_or_else(|| {
+                                tracing::warn!(
+                                    "Anthropic: tool_use block missing id, using sentinel"
+                                );
+                                "<unknown_tool_id>".to_owned()
+                            });
+                            let name = block.name.clone().unwrap_or_else(|| {
+                                tracing::warn!(
+                                    "Anthropic: tool_use block missing name, using sentinel"
+                                );
+                                "<unknown_tool>".to_owned()
+                            });
                             // Reverse-map sanitized tool names back to originals,
                             // same as the non-streaming decode path.
                             let original_name = desanitize_tool_name(&name).into_owned();
@@ -524,13 +553,10 @@ impl AnthropicAdapter {
                             "text": text,
                         });
                         if let Some(cc) = cache {
-                            block
-                                .as_object_mut()
-                                .expect("json! macro always produces an object")
-                                .insert(
-                                    "cache_control".to_owned(),
-                                    serde_json::json!({"type": cc.r#type}),
-                                );
+                            json_object(&mut block).insert(
+                                "cache_control".to_owned(),
+                                serde_json::json!({"type": cc.r#type}),
+                            );
                         }
                         Some(block)
                     }
@@ -614,12 +640,10 @@ impl AnthropicAdapter {
                     "input_schema": schema,
                 });
                 if let Some(ref desc) = t.description {
-                    tool.as_object_mut()
-                        .expect("json! macro always produces an object")
-                        .insert(
-                            "description".to_owned(),
-                            serde_json::Value::String(desc.clone()),
-                        );
+                    json_object(&mut tool).insert(
+                        "description".to_owned(),
+                        serde_json::Value::String(desc.clone()),
+                    );
                 }
                 tool
             })
@@ -649,9 +673,7 @@ impl AnthropicAdapter {
             "messages": messages,
         });
 
-        let obj = req
-            .as_object_mut()
-            .expect("json! macro always produces an object");
+        let obj = json_object(&mut req);
 
         if let Some(sys) = system {
             obj.insert("system".to_owned(), sys);
@@ -738,10 +760,17 @@ impl AnthropicAdapter {
                         .clone()
                         .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
                     // Reverse-map sanitized tool names back to originals.
-                    let name = block.name.clone().unwrap_or_default();
+                    let name = block.name.clone().unwrap_or_else(|| {
+                        tracing::warn!("Anthropic: tool_use block missing name in response decode");
+                        "<unknown_tool>".to_owned()
+                    });
                     let original_name = desanitize_tool_name(&name).into_owned();
+                    let tool_id = block.id.clone().unwrap_or_else(|| {
+                        tracing::warn!("Anthropic: tool_use block missing id in response decode");
+                        "<unknown_tool_id>".to_owned()
+                    });
                     content.push(CoreContent::ToolUse {
-                        id: block.id.clone().unwrap_or_default(),
+                        id: tool_id,
                         name: original_name,
                         input,
                     });
@@ -875,10 +904,7 @@ fn encode_content_blocks(content: &[CoreContent]) -> serde_json::Value {
                     "content": result_text,
                 });
                 if *is_error {
-                    block
-                        .as_object_mut()
-                        .expect("json! macro always produces an object")
-                        .insert("is_error".to_owned(), serde_json::json!(true));
+                    json_object(&mut block).insert("is_error".to_owned(), serde_json::json!(true));
                 }
                 Some(block)
             }
@@ -922,13 +948,10 @@ fn encode_assistant_content(content: &[CoreContent]) -> serde_json::Value {
                     "thinking": text,
                 });
                 if let Some(sig) = signature {
-                    block
-                        .as_object_mut()
-                        .expect("json! macro always produces an object")
-                        .insert(
-                            "signature".to_owned(),
-                            serde_json::Value::String(sig.clone()),
-                        );
+                    json_object(&mut block).insert(
+                        "signature".to_owned(),
+                        serde_json::Value::String(sig.clone()),
+                    );
                 }
                 Some(block)
             }

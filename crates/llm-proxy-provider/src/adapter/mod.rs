@@ -39,6 +39,7 @@ use crate::transport::{AuthHeaders, ProxyRequest};
 
 /// Identifies a provider protocol family.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum ProviderProtocol {
     /// OpenAI Chat Completions API (`/v1/chat/completions`).
     OpenAiChatCompletions,
@@ -133,6 +134,7 @@ impl fmt::Debug for ProviderAdapterTarget {
 /// Each variant wraps a concrete adapter that knows how to translate between
 /// core types and its provider-specific wire format.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum ProviderAdapter {
     /// OpenAI Chat Completions adapter.
     OpenAiChat(openai_chat::OpenAiChatAdapter),

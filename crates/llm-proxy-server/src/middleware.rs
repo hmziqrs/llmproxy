@@ -141,6 +141,15 @@ impl RateLimiter {
     pub fn is_allowed(&self, client_ip: &str) -> bool {
         let mut buckets = self.buckets.lock().unwrap_or_else(|e| e.into_inner());
 
+        // Evict stale entries periodically to prevent unbounded memory growth.
+        // Prune entries not accessed within the last 5 minutes.
+        if buckets.len() > 1000 {
+            let now = std::time::Instant::now();
+            buckets.retain(|_, bucket| {
+                now.duration_since(bucket.last_refill) < std::time::Duration::from_secs(300)
+            });
+        }
+
         // Refill rate: tokens per second.
         let refill_rate = self.max_requests_per_minute / 60.0;
 

@@ -113,10 +113,18 @@ impl ProviderStreamDecoder for ResponsesStreamDecoder {
                             // Emit ToolCallStart for new function calls.
                             self.saw_tool_call = true;
                             if !self.tool_call_started {
-                                self.close_content_if_open(&mut events);
+                                self.close_content_if_open();
                                 self.tool_call_started = true;
-                                let call_id = output.call_id.clone().unwrap_or_default();
-                                let name = output.name.clone().unwrap_or_default();
+                                let call_id = output.call_id.clone().unwrap_or_else(|| {
+                                    tracing::warn!(
+                                        "Responses: function_call output missing call_id"
+                                    );
+                                    "<unknown_tool_id>".to_owned()
+                                });
+                                let name = output.name.clone().unwrap_or_else(|| {
+                                    tracing::warn!("Responses: function_call output missing name");
+                                    "<unknown_tool>".to_owned()
+                                });
                                 events.push(CoreEvent::ToolCallStart {
                                     index: self.content_index,
                                     id: call_id,
@@ -156,7 +164,7 @@ impl ProviderStreamDecoder for ResponsesStreamDecoder {
                         // If no ToolCallStart was emitted yet (e.g. missed
                         // response.output_item.added), emit one now.
                         if !self.tool_call_started {
-                            self.close_content_if_open(&mut events);
+                            self.close_content_if_open();
                             self.tool_call_started = true;
                             events.push(CoreEvent::ToolCallStart {
                                 index: self.content_index,
@@ -174,7 +182,7 @@ impl ProviderStreamDecoder for ResponsesStreamDecoder {
             "response.function_call_arguments.done" => {
                 // If ToolCallStart was never emitted, emit one now before stop.
                 if !self.tool_call_started {
-                    self.close_content_if_open(&mut events);
+                    self.close_content_if_open();
                     events.push(CoreEvent::ToolCallStart {
                         index: self.content_index,
                         id: String::new(),
@@ -188,7 +196,7 @@ impl ProviderStreamDecoder for ResponsesStreamDecoder {
                 self.content_index += 1;
             }
             "response.completed" => {
-                self.close_content_if_open(&mut events);
+                self.close_content_if_open();
 
                 // Extract usage.
                 if let Some(ref usage) = chunk.usage {
@@ -217,7 +225,7 @@ impl ProviderStreamDecoder for ResponsesStreamDecoder {
                 }
             }
             "response.done" => {
-                self.close_content_if_open(&mut events);
+                self.close_content_if_open();
 
                 if let Some(ref usage) = chunk.usage {
                     events.push(CoreEvent::UsageDelta {
@@ -303,7 +311,7 @@ impl ProviderStreamDecoder for ResponsesStreamDecoder {
             });
         }
 
-        self.close_content_if_open(&mut events);
+        self.close_content_if_open();
 
         if !self.stop_sent {
             self.stop_sent = true;
@@ -323,7 +331,7 @@ impl ProviderStreamDecoder for ResponsesStreamDecoder {
 }
 
 impl ResponsesStreamDecoder {
-    fn close_content_if_open(&mut self, _events: &mut Vec<CoreEvent>) {
+    fn close_content_if_open(&mut self) {
         if self.content_started {
             self.content_started = false;
             self.content_index += 1;
@@ -405,7 +413,10 @@ impl ResponsesAdapter {
                         let call_id = id.clone();
                         let fn_name = name.clone();
                         let arguments =
-                            serde_json::to_string(tool_input).unwrap_or_else(|_| "{}".to_owned());
+                            serde_json::to_string(tool_input).unwrap_or_else(|e| {
+                                tracing::warn!(error = %e, "Responses: failed to serialize tool input, falling back to empty object");
+                                "{}".to_owned()
+                            });
                         input.push(ResponsesInput {
                             role: role.to_owned(),
                             content: Some(serde_json::json!({

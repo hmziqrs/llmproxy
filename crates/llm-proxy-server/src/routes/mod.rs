@@ -63,6 +63,13 @@ pub fn router(state: AppState) -> Router {
     // size check runs immediately before the timeout starts ticking. This
     // ensures a very large upload on a slow connection gets a 413 Payload Too
     // Large response rather than a 408 Request Timeout.
+    //
+    // NOTE(phase-12): The TimeoutLayer fires on long-running SSE streams,
+    // producing a 408 mid-stream. A proper fix requires either exempting
+    // streaming routes from this timeout (per-route middleware) or using a
+    // streaming-aware timeout that only covers the request-body/first-byte
+    // phase and disables itself once SSE streaming begins. See audit issue
+    // in core_pipeline.rs for details.
     let api_middleware = ServiceBuilder::new()
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .layer(TraceLayer::new_for_http())

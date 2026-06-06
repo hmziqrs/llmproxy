@@ -1,8 +1,7 @@
 //! Provider error types shared across transport, adapters, and routes.
 //!
-//! Extracted from `client.rs` so that the new transport layer (Phase 4) and
-//! future provider adapters can depend on [`ProviderError`] without coupling to
-//! the legacy `OpenCodeClient`.
+//! Extracted so that the transport layer and provider adapters can depend on
+//! [`ProviderError`] without coupling to any specific client implementation.
 
 // ---------------------------------------------------------------------------
 // Provider error

@@ -1,8 +1,7 @@
 //! Shared environment-variable interpolation for configuration files.
 //!
 //! Provides a single [`interpolate_env_vars`] function and the compiled regex
-//! used by both the old JSON config ([`crate::config`]) and the new TOML
-//! provider config ([`crate::provider_config`]).
+//! used by the TOML provider config ([`crate::provider_config`]).
 
 use regex::Regex;
 use std::sync::OnceLock;

@@ -1006,6 +1006,12 @@ impl fmt::Display for CoreStreamError {
 }
 
 impl std::error::Error for CoreStreamError {}
+// NOTE: CoreStreamError uses a manual Error impl rather than thiserror derive
+// because it also carries custom Serialize/Deserialize, a redacting Debug that
+// hides the message field, and a Display that intentionally omits the message
+// for security.  thiserror's `#[error()]` attribute would conflict with the
+// hand-rolled Display, and the derive macro does not support the serde +
+// redacting-Debug combination used here.
 
 /// Category of a stream error.
 ///

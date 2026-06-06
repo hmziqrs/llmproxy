@@ -28,8 +28,8 @@ pub(crate) struct TokenCountResponse {
     /// `input_tokens`. This extra field is retained for backward
     /// compatibility with existing clients that depend on this field name.
     ///
-    /// TODO(future): Remove this field once all known clients are migrated
-    /// to use `input_tokens` only.
+    /// TODO(phase-12): Remove this field once all known clients are migrated
+    /// to use `input_tokens` only. Track migration status before removing.
     token_count: usize,
 }
 
@@ -145,6 +145,13 @@ async fn count_tokens_inner(
     });
 
     let mut response = response.into_response();
+
+    // Defense-in-depth: explicitly set Content-Type even though
+    // axum::Json's IntoResponse already sets it internally.
+    response.headers_mut().insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("application/json"),
+    );
 
     // Insert the request ID header safely.
     response.headers_mut().insert(

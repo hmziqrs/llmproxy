@@ -1,9 +1,9 @@
 //! TOML provider configuration types, parsing, env-var interpolation, and
-//! validation for the new routing system.
+//! validation for the routing system.
 //!
-//! This module adds the TOML-based config that will eventually replace the old
-//! JSON [`Config`](crate::Config). Both systems coexist during the migration;
-//! the old config is not removed yet.
+//! This is the sole configuration system for the proxy, loaded from the main
+//! `config.toml` file. All server settings and model routing rules are defined
+//! through the types in this module.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -19,10 +19,10 @@ use crate::error::CoreError;
 // Main config: AppConfig
 // ---------------------------------------------------------------------------
 
-/// Top-level TOML application configuration (new system).
+/// Top-level TOML application configuration.
 ///
-/// Replaces the old JSON [`Config`](crate::Config). Loaded from the main
-/// `config.toml` that defines server settings and model routing rules.
+/// Loaded from the main `config.toml` that defines server settings and model
+/// routing rules.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AppConfig {

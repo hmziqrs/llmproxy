@@ -4,6 +4,7 @@ use thiserror::Error;
 
 /// Errors that can occur in `llm-proxy-core`.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum CoreError {
     /// Failed to read a config file from disk.
     #[error("failed to read config at {path}: {source}")]

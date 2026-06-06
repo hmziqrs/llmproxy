@@ -5,8 +5,6 @@
 
 #![deny(missing_docs)]
 
-/// API-layer error type.
-pub mod error;
 /// Middleware components (dedup, rate limiter, request ID, IP extraction).
 pub mod middleware;
 /// Route handlers and router composition.
@@ -16,8 +14,6 @@ pub mod shutdown;
 /// Shared application state and build metadata.
 pub mod state;
 
-#[allow(deprecated)]
-pub use error::ApiError;
 pub use middleware::{RateLimiter, RequestDeduplicator, RequestIdGenerator};
 pub use shutdown::shutdown_signal;
 pub use state::{AppState, BuildInfo};

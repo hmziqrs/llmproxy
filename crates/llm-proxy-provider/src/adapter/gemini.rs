@@ -12,6 +12,8 @@
 //! `MessageStart`, `ContentStart`, `TextDelta`, `ContentStop` (implicit),
 //! `ToolCallStart`, `ToolCallDelta`, `ToolCallStop`, `UsageDelta`, `MessageStop`.
 
+use std::collections::HashMap;
+
 use llm_proxy_protocol::core::{
     ContentKind, CoreContent, CoreEvent, CoreRequest, CoreResponse, CoreRole, ModelRef, StopReason,
     Usage, UsageProvenance,
@@ -129,7 +131,7 @@ impl ProviderStreamDecoder for GeminiStreamDecoder {
 
             // Handle function call parts.
             if let Some(ref function_call) = part.function_call {
-                self.close_content_if_open(&mut events);
+                self.close_content_if_open();
 
                 let block_idx = self.content_index;
                 self.tool_blocks.push(block_idx);
@@ -168,7 +170,7 @@ impl ProviderStreamDecoder for GeminiStreamDecoder {
         // Handle finish reason.
         if let Some(ref reason) = candidate.finish_reason {
             if !reason.is_empty() && !self.stop_sent {
-                self.close_content_if_open(&mut events);
+                self.close_content_if_open();
 
                 let stop_reason = map_gemini_finish_reason(reason);
 
@@ -200,7 +202,7 @@ impl ProviderStreamDecoder for GeminiStreamDecoder {
             });
         }
 
-        self.close_content_if_open(&mut events);
+        self.close_content_if_open();
 
         // Emit ToolCallStop for any tool blocks that were not closed during decode_frame().
         for (&idx, &closed) in self.tool_blocks.iter().zip(&self.tool_blocks_closed) {
@@ -226,7 +228,7 @@ impl ProviderStreamDecoder for GeminiStreamDecoder {
 }
 
 impl GeminiStreamDecoder {
-    fn close_content_if_open(&mut self, _events: &mut Vec<CoreEvent>) {
+    fn close_content_if_open(&mut self) {
         if self.content_started {
             self.content_started = false;
             self.content_index += 1;
@@ -246,6 +248,10 @@ impl GeminiAdapter {
         target: &ProviderAdapterTarget,
     ) -> Result<super::ProxyRequest, ProviderError> {
         let mut contents = Vec::new();
+
+        // Pre-build a tool-id-to-name map for O(1) lookups during tool result
+        // encoding, instead of scanning all messages for each tool result.
+        let tool_name_map = build_tool_name_map(core);
 
         // System instructions are handled via generation config or prepended.
         // Gemini does not have a dedicated system field in the basic request.
@@ -310,11 +316,12 @@ impl GeminiAdapter {
                         // response with the function declaration.  We look up
                         // the function name by searching for the ToolUse content
                         // block that has a matching tool_use_id in prior messages.
-                        let fn_name = lookup_tool_name(core, tool_use_id).unwrap_or_else(|| {
-                            // Fallback: strip the 'gemini_call_' prefix from
-                            // tool_use_id (the Gemini decoder uses this format).
-                            tool_use_id.trim_start_matches("gemini_call_").to_owned()
-                        });
+                        let fn_name =
+                            tool_name_map.get(tool_use_id).cloned().unwrap_or_else(|| {
+                                // Fallback: strip the 'gemini_call_' prefix from
+                                // tool_use_id (the Gemini decoder uses this format).
+                                tool_use_id.trim_start_matches("gemini_call_").to_owned()
+                            });
                         parts.push(GeminiPart::function_response(fn_name, response_val));
                     }
                     _ => {
@@ -554,17 +561,16 @@ impl GeminiAdapter {
 /// content blocks in the conversation messages.  This is needed because Gemini
 /// requires the `function_response.name` to match the original function
 /// declaration, but the core `ToolResult` type only carries `tool_use_id`.
-fn lookup_tool_name(core: &CoreRequest, tool_use_id: &str) -> Option<String> {
+fn build_tool_name_map(core: &CoreRequest) -> HashMap<String, String> {
+    let mut map = HashMap::new();
     for msg in &core.messages {
         for content in &msg.content {
             if let CoreContent::ToolUse { id, name, .. } = content {
-                if id == tool_use_id {
-                    return Some(name.clone());
-                }
+                map.entry(id.clone()).or_insert_with(|| name.clone());
             }
         }
     }
-    None
+    map
 }
 
 /// Build usage from Gemini usage metadata.

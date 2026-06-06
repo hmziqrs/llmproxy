@@ -139,7 +139,7 @@ pub struct ResponsesUsage {
 /// fields are silently ignored rather than causing chunk drops. The `delta`
 /// field carries incremental text for `response.output_text.delta` events.
 /// For `response.function_call_arguments.delta` events, the delta is also a
-/// string -- this is a known gap: the stream transformer does not currently
+/// string -- this is a known gap: the stream decoding layer does not currently
 /// handle function call streaming for the Responses API (see
 /// `responses_function_call_stream` test). Phase 2/5/12 should add the right
 /// adapter fixtures for this.

@@ -2,7 +2,7 @@
 //!
 //! Translates between OpenAI Chat Completions API wire format and the normalised
 //! core protocol types.  This adapter only knows about OpenAI Chat Completions
-//! and the core types -- it never imports provider, server, or transformer code.
+//! and the core types -- it never imports provider, server, or config code.
 //!
 //! ## Scope guardrails
 //!
@@ -12,7 +12,9 @@
 //! - core config or routing modules
 //! - endpoint classification helpers
 //! - scenario or fallback code
-//! - `transformer/*`
+//!
+//! The `transformer/` module was removed in Phase 11; the guard test at the
+//! bottom of this file remains as a regression safety net.
 
 use crate::client::ProtocolError;
 use crate::core::{

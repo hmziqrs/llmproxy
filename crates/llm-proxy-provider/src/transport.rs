@@ -30,6 +30,7 @@ use crate::error::ProviderError;
 /// The `api_key` field is redacted in [`fmt::Debug`] output so that
 /// `tracing::debug!(?auth)` or snapshot output never leaks the secret.
 #[derive(Clone)]
+#[non_exhaustive]
 pub struct AuthHeaders {
     /// Which header style to use for the API key.
     pub style: AuthStyle,
@@ -57,6 +58,7 @@ impl fmt::Debug for AuthHeaders {
 ///
 /// The `auth.api_key` field is redacted in [`fmt::Debug`] output.
 #[derive(Clone)]
+#[non_exhaustive]
 pub struct ProxyRequest {
     /// Full upstream URL.
     pub url: String,
