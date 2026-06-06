@@ -20,6 +20,7 @@ use super::error_response::{ClientProtocol, RouteError, route_error_response};
 
 /// Response body for the token count endpoint.
 #[derive(Serialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct TokenCountResponse {
     input_tokens: usize,
     /// Non-standard extension: `token_count` duplicates `input_tokens`.
@@ -39,18 +40,17 @@ pub(crate) struct TokenCountResponse {
 /// without legacy state.
 pub async fn count_tokens(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    _headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response<Body> {
-    match count_tokens_inner(state, headers, body).await {
+    match count_tokens_inner(&state, body).await {
         Ok(response) => response,
         Err(error) => route_error_response(ClientProtocol::Anthropic, error),
     }
 }
 
 async fn count_tokens_inner(
-    state: AppState,
-    _headers: HeaderMap,
+    state: &AppState,
     body: axum::body::Bytes,
 ) -> Result<Response<Body>, RouteError> {
     // Parse and validate the Anthropic MessageRequest.

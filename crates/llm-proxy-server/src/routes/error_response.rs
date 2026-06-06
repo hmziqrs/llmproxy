@@ -57,6 +57,12 @@ pub enum RouteError {
     /// Internal server error (misconfiguration, missing state).
     #[error("internal error: {0}")]
     Internal(String),
+    /// Client has exceeded its rate limit.
+    #[error("rate limit exceeded")]
+    RateLimited,
+    /// Duplicate request detected by the deduplicator.
+    #[error("duplicate request")]
+    Conflict,
 }
 
 // ---------------------------------------------------------------------------
@@ -65,12 +71,14 @@ pub enum RouteError {
 
 /// Anthropic-shaped error body.
 #[derive(Serialize)]
+#[serde(deny_unknown_fields)]
 struct AnthropicErrorBody {
     r#type: &'static str,
     error: AnthropicErrorDetail,
 }
 
 #[derive(Serialize)]
+#[serde(deny_unknown_fields)]
 struct AnthropicErrorDetail {
     r#type: String,
     message: String,
@@ -93,9 +101,9 @@ pub fn route_error_response(protocol: ClientProtocol, error: RouteError) -> Resp
 
 /// Build an Anthropic-shaped error response.
 fn anthropic_error_response(error: RouteError) -> Response<Body> {
-    let (status, error_type, message): (StatusCode, &str, String) = match &error {
+    let (status, error_type, message): (StatusCode, &str, String) = match error {
         RouteError::InvalidRequest(msg) => {
-            (StatusCode::BAD_REQUEST, "invalid_request_error", msg.clone())
+            (StatusCode::BAD_REQUEST, "invalid_request_error", msg)
         }
         RouteError::UnknownModel(model) => (
             StatusCode::BAD_REQUEST,
@@ -103,19 +111,29 @@ fn anthropic_error_response(error: RouteError) -> Response<Body> {
             format!("unknown model: {model}"),
         ),
         RouteError::Upstream { status, body } => (
-            map_upstream_status(*status),
+            map_upstream_status(status),
             "api_error",
-            truncate_error_body(body),
+            truncate_error_body(&body),
         ),
         RouteError::ProviderDecode(msg) => (
             StatusCode::BAD_GATEWAY,
             "api_error",
-            msg.clone(),
+            msg,
         ),
         RouteError::Internal(msg) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             "api_error",
-            msg.clone(),
+            msg,
+        ),
+        RouteError::RateLimited => (
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate_limit_error",
+            "rate limit exceeded".to_owned(),
+        ),
+        RouteError::Conflict => (
+            StatusCode::CONFLICT,
+            "invalid_request_error",
+            "duplicate request, please retry".to_owned(),
         ),
     };
 
@@ -141,17 +159,25 @@ fn anthropic_error_response(error: RouteError) -> Response<Body> {
 /// produces a minimal but valid JSON response so the core pipeline compiles.
 #[allow(dead_code)]
 fn openai_error_response(error: RouteError) -> Response<Body> {
-    let (status, message) = match &error {
-        RouteError::InvalidRequest(msg) => (StatusCode::BAD_REQUEST, msg.clone()),
+    let (status, message) = match error {
+        RouteError::InvalidRequest(msg) => (StatusCode::BAD_REQUEST, msg),
         RouteError::UnknownModel(model) => (
             StatusCode::BAD_REQUEST,
             format!("unknown model: {model}"),
         ),
         RouteError::Upstream { status, body } => {
-            (map_upstream_status(*status), truncate_error_body(body))
+            (map_upstream_status(status), truncate_error_body(&body))
         }
-        RouteError::ProviderDecode(msg) => (StatusCode::BAD_GATEWAY, msg.clone()),
-        RouteError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg.clone()),
+        RouteError::ProviderDecode(msg) => (StatusCode::BAD_GATEWAY, msg),
+        RouteError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
+        RouteError::RateLimited => (
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate limit exceeded".to_owned(),
+        ),
+        RouteError::Conflict => (
+            StatusCode::CONFLICT,
+            "duplicate request, please retry".to_owned(),
+        ),
     };
 
     let body = serde_json::json!({
@@ -259,6 +285,20 @@ mod tests {
         let err = RouteError::Internal("config missing".into());
         let response = route_error_response(ClientProtocol::Anthropic, err);
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn anthropic_rate_limited_returns_429() {
+        let err = RouteError::RateLimited;
+        let response = route_error_response(ClientProtocol::Anthropic, err);
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[test]
+    fn anthropic_conflict_returns_409() {
+        let err = RouteError::Conflict;
+        let response = route_error_response(ClientProtocol::Anthropic, err);
+        assert_eq!(response.status(), StatusCode::CONFLICT);
     }
 
     // -- OpenAI error encoding -------------------------------------------------
@@ -388,6 +428,32 @@ mod tests {
         assert_eq!(json["type"], "error");
         assert_eq!(json["error"]["type"], "api_error");
         assert_eq!(json["error"]["message"], "config missing");
+    }
+
+    #[tokio::test]
+    async fn anthropic_rate_limited_body_has_correct_structure() {
+        let err = RouteError::RateLimited;
+        let response = route_error_response(ClientProtocol::Anthropic, err);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .expect("body");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("valid JSON");
+        assert_eq!(json["type"], "error");
+        assert_eq!(json["error"]["type"], "rate_limit_error");
+        assert_eq!(json["error"]["message"], "rate limit exceeded");
+    }
+
+    #[tokio::test]
+    async fn anthropic_conflict_body_has_correct_structure() {
+        let err = RouteError::Conflict;
+        let response = route_error_response(ClientProtocol::Anthropic, err);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .expect("body");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("valid JSON");
+        assert_eq!(json["type"], "error");
+        assert_eq!(json["error"]["type"], "invalid_request_error");
+        assert!(json["error"]["message"].as_str().unwrap().contains("duplicate"));
     }
 
     // -- ClientProtocol equality -----------------------------------------------

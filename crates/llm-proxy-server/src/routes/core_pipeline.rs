@@ -34,6 +34,7 @@ use super::error_response::{ClientProtocol, RouteError};
 
 /// Pre-resolved per-request context shared between non-streaming and streaming
 /// paths.
+#[derive(Debug)]
 pub(crate) struct RequestContext {
     /// Unique request ID for tracing and the `x-request-id` header.
     pub(crate) request_id: String,
@@ -60,16 +61,12 @@ pub(crate) fn prepare_request(
 
     if !state.rate_limiter.is_allowed(&client_ip) {
         state.metrics.record_rate_limited();
-        return Err(RouteError::InvalidRequest(
-            "rate limit exceeded".to_owned(),
-        ));
+        return Err(RouteError::RateLimited);
     }
 
     if state.request_dedup.is_duplicate(body) {
         state.metrics.record_deduplicated();
-        return Err(RouteError::InvalidRequest(
-            "duplicate request, please retry".to_owned(),
-        ));
+        return Err(RouteError::Conflict);
     }
 
     Ok(RequestContext {
@@ -218,9 +215,10 @@ pub(crate) async fn handle_core_once(
         }
         ClientProtocol::OpenAiChat => {
             // Phase 9 will implement OpenAI Chat response encoding.
-            return Err(RouteError::Internal(
-                "OpenAI Chat response encoding not yet implemented".to_owned(),
-            ));
+            return Err(RouteError::Upstream {
+                status: StatusCode::NOT_IMPLEMENTED,
+                body: "OpenAI Chat response encoding not yet implemented".to_owned(),
+            });
         }
     };
 
@@ -233,9 +231,17 @@ pub(crate) async fn handle_core_once(
 
     let mut response = Response::builder()
         .status(StatusCode::OK)
-        .header("x-request-id", &ctx.request_id)
         .body(Body::from(response_body))
-        .expect("static header values are valid");
+        .expect("building a response with a valid status code cannot fail");
+
+    // Insert the request ID header safely -- the ID is dynamically generated
+    // so we use from_str with a fallback rather than expect/unwrap.
+    response.headers_mut().insert(
+        "x-request-id",
+        ctx.request_id
+            .parse()
+            .unwrap_or_else(|_| axum::http::HeaderValue::from_static("unknown")),
+    );
 
     // Set content-type explicitly (defense-in-depth).
     response.headers_mut().insert(
@@ -251,6 +257,10 @@ pub(crate) async fn handle_core_once(
 // ---------------------------------------------------------------------------
 
 /// Heartbeat interval for SSE streams.
+///
+/// Chosen as 3 seconds to keep Anthropic SDK clients from timing out on
+/// long-running streams while avoiding excessive bandwidth overhead.
+/// TODO(future): Make this configurable via AppState or TOML config.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(3);
 
 /// Streaming core pipeline.
@@ -310,11 +320,16 @@ pub(crate) async fn handle_core_stream(
     let sse_framer = SseFramer::new();
 
     // Create the client stream encoder.
+    // NOTE: This generates a synthetic message ID. When available, the
+    // upstream provider's message ID should be extracted from the response
+    // instead, so clients tracking message IDs for conversation continuity
+    // see the real ID. See issue tracker for future improvement.
     let msg_id = format!("msg_{}", uuid::Uuid::new_v4());
     let model_name = core.model.requested.clone();
     let client_encoder = StreamEncoder::new(msg_id, model_name);
 
-    let request_id = ctx.request_id.clone();
+    // ctx is consumed after this point, so move request_id instead of cloning.
+    let request_id = ctx.request_id;
     let upstream_model = target.upstream_model.clone();
 
     // Build the output SSE stream.
@@ -339,9 +354,9 @@ pub(crate) async fn handle_core_stream(
     let response = sse.into_response();
     let (mut parts, body) = response.into_parts();
 
-    // Add custom headers.
+    // Add custom headers (use lowercase for custom header names consistently).
     parts.headers.insert(
-        "X-Accel-Buffering",
+        "x-accel-buffering",
         axum::http::HeaderValue::from_static("no"),
     );
     parts.headers.insert(
@@ -352,7 +367,7 @@ pub(crate) async fn handle_core_stream(
     );
 
     info!(
-        request_id = %ctx.request_id,
+        request_id = %request_id,
         model = %target.upstream_model,
         "streaming started"
     );
@@ -365,6 +380,7 @@ pub(crate) async fn handle_core_stream(
 // ---------------------------------------------------------------------------
 
 /// Context for tracking metrics during a streaming response.
+#[derive(Debug)]
 struct StreamMetrics {
     metrics: Arc<Metrics>,
     upstream_model: String,
@@ -388,10 +404,12 @@ fn build_sse_output_stream(
 
     tokio::spawn(async move {
         let mut stream = byte_stream;
-        let mut first_byte_sent = false;
         let mut stream_succeeded = false;
+        // Track whether the stream terminated due to an error so we can
+        // skip the finalization path that follows the main loop.
+        let mut stream_errored = false;
 
-        loop {
+        'outer: loop {
             tokio::select! {
                 _ = cancel_clone.cancelled() => {
                     // Client disconnected; abort upstream stream.
@@ -410,16 +428,20 @@ fn build_sse_output_stream(
                                         error = %e,
                                         "SSE framing error in stream"
                                     );
-                                    if first_byte_sent {
-                                        emit_stream_error(
-                                            &mut client_encoder,
-                                            &tx,
-                                            &client_protocol,
-                                            &format!("stream framing error: {e}"),
-                                        ).await;
-                                    }
+                                    // Always emit an in-band error event so the
+                                    // client gets an explanation, even when no
+                                    // data event has been sent yet.  The HTTP
+                                    // status is already committed (200) so the
+                                    // best we can do is an in-band error.
+                                    emit_stream_error(
+                                        &mut client_encoder,
+                                        &tx,
+                                        &client_protocol,
+                                        &format!("stream framing error: {e}"),
+                                    ).await;
                                     stream_metrics.metrics.record_failure();
-                                    break;
+                                    stream_errored = true;
+                                    break 'outer;
                                 }
                             };
 
@@ -432,16 +454,15 @@ fn build_sse_output_stream(
                                             error = %e,
                                             "provider decode error in stream"
                                         );
-                                        if first_byte_sent {
-                                            emit_stream_error(
-                                                &mut client_encoder,
-                                                &tx,
-                                                &client_protocol,
-                                                &format!("provider decode error: {e}"),
-                                            ).await;
-                                        }
+                                        emit_stream_error(
+                                            &mut client_encoder,
+                                            &tx,
+                                            &client_protocol,
+                                            &format!("provider decode error: {e}"),
+                                        ).await;
                                         stream_metrics.metrics.record_failure();
-                                        break;
+                                        stream_errored = true;
+                                        break 'outer;
                                     }
                                 };
 
@@ -452,7 +473,6 @@ fn build_sse_output_stream(
                                         core_event,
                                     );
                                     for event in client_events {
-                                        first_byte_sent = true;
                                         if tx.send(event).await.is_err() {
                                             stream_metrics.metrics.record_failure();
                                             return;
@@ -467,40 +487,72 @@ fn build_sse_output_stream(
                                 error = %e,
                                 "upstream stream error"
                             );
-                            if first_byte_sent {
-                                emit_stream_error(
-                                    &mut client_encoder,
-                                    &tx,
-                                    &client_protocol,
-                                    &format!("upstream error: {e}"),
-                                ).await;
-                            }
+                            // Always emit an in-band error event regardless of
+                            // first_event_emitted state.
+                            emit_stream_error(
+                                &mut client_encoder,
+                                &tx,
+                                &client_protocol,
+                                &format!("upstream error: {e}"),
+                            ).await;
                             stream_metrics.metrics.record_failure();
-                            break;
+                            stream_errored = true;
+                            break 'outer;
                         }
-                        None => break,
+                        None => break 'outer,
                     }
                 }
             }
         }
 
-        // Finalize: call sse_framer.finish() first to flush any trailing partial
-        // SSE frame that arrived without a terminating blank line.
-        match sse_framer.finish() {
-            Ok(trailing_frames) => {
-                for frame in &trailing_frames {
-                    let core_events = match provider_decoder.decode_frame(frame) {
-                        Ok(events) => events,
-                        Err(e) => {
-                            warn!(
-                                request_id = %request_id,
-                                error = %e,
-                                "provider decode error on trailing frame"
+        // Only run finalization when the stream completed normally (not errored).
+        // When stream_errored is true, emit_stream_error already handled the
+        // terminal events.
+        if !stream_errored {
+            // Finalize: call sse_framer.finish() first to flush any trailing partial
+            // SSE frame that arrived without a terminating blank line.
+            match sse_framer.finish() {
+                Ok(trailing_frames) => {
+                    for frame in &trailing_frames {
+                        let core_events = match provider_decoder.decode_frame(frame) {
+                            Ok(events) => events,
+                            Err(e) => {
+                                warn!(
+                                    request_id = %request_id,
+                                    error = %e,
+                                    "provider decode error on trailing frame"
+                                );
+                                break;
+                            }
+                        };
+                        for core_event in core_events {
+                            let client_events = encode_core_event(
+                                &mut client_encoder,
+                                &client_protocol,
+                                core_event,
                             );
-                            break;
+                            for event in client_events {
+                                if tx.send(event).await.is_err() {
+                                    stream_metrics.metrics.record_failure();
+                                    return;
+                                }
+                            }
                         }
-                    };
-                    for core_event in core_events {
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        request_id = %request_id,
+                        error = %e,
+                        "SSE framer finish error"
+                    );
+                }
+            }
+
+            // Then finalize: call provider decoder finish() to emit any remaining events.
+            match provider_decoder.finish() {
+                Ok(final_events) => {
+                    for core_event in final_events {
                         let client_events = encode_core_event(
                             &mut client_encoder,
                             &client_protocol,
@@ -514,65 +566,39 @@ fn build_sse_output_stream(
                         }
                     }
                 }
-            }
-            Err(e) => {
-                warn!(
-                    request_id = %request_id,
-                    error = %e,
-                    "SSE framer finish error"
-                );
-            }
-        }
-
-        // Then finalize: call provider decoder finish() to emit any remaining events.
-        match provider_decoder.finish() {
-            Ok(final_events) => {
-                for core_event in final_events {
-                    let client_events = encode_core_event(
-                        &mut client_encoder,
-                        &client_protocol,
-                        core_event,
+                Err(e) => {
+                    warn!(
+                        request_id = %request_id,
+                        error = %e,
+                        "provider decoder finish error"
                     );
-                    for event in client_events {
-                        if tx.send(event).await.is_err() {
-                            stream_metrics.metrics.record_failure();
-                            return;
-                        }
-                    }
                 }
             }
-            Err(e) => {
-                warn!(
-                    request_id = %request_id,
-                    error = %e,
-                    "provider decoder finish error"
-                );
-            }
-        }
 
-        // Emit any remaining client encoder events (synthetic terminal if needed).
-        match client_encoder.finish() {
-            Ok(final_msg_events) => {
-                for me in final_msg_events {
-                    if let Ok(json) = serde_json::to_string(&me) {
-                        let event = Event::default()
-                            .event(&me.r#type)
-                            .data(json);
-                        if tx.send(event).await.is_err() {
-                            stream_metrics.metrics.record_failure();
-                            return;
+            // Emit any remaining client encoder events (synthetic terminal if needed).
+            match client_encoder.finish() {
+                Ok(final_msg_events) => {
+                    for me in final_msg_events {
+                        if let Ok(json) = serde_json::to_string(&me) {
+                            let event = Event::default()
+                                .event(&me.r#type)
+                                .data(json);
+                            if tx.send(event).await.is_err() {
+                                stream_metrics.metrics.record_failure();
+                                return;
+                            }
                         }
                     }
+                    stream_succeeded = true;
                 }
-                stream_succeeded = true;
-            }
-            Err(e) => {
-                warn!(
-                    request_id = %request_id,
-                    error = %e,
-                    "client encoder finish error"
-                );
-                stream_metrics.metrics.record_failure();
+                Err(e) => {
+                    warn!(
+                        request_id = %request_id,
+                        error = %e,
+                        "client encoder finish error"
+                    );
+                    stream_metrics.metrics.record_failure();
+                }
             }
         }
 
@@ -604,18 +630,31 @@ fn build_sse_output_stream(
 /// use the appropriate encoder for each protocol.
 fn encode_core_event(
     client_encoder: &mut StreamEncoder,
-    _client_protocol: &ClientProtocol,
+    client_protocol: &ClientProtocol,
     event: CoreEvent,
 ) -> Vec<Event> {
+    // Guard: only Anthropic protocol is supported until Phase 9.
+    debug_assert!(
+        matches!(client_protocol, ClientProtocol::Anthropic),
+        "encode_core_event only supports ClientProtocol::Anthropic until Phase 9"
+    );
+
     match client_encoder.encode_event(event) {
         Ok(msg_events) => msg_events
             .into_iter()
             .filter_map(|me| {
-                let json = serde_json::to_string(&me).ok()?;
-                // The Anthropic SSE protocol requires the `event:` field
-                // (e.g. `event: message_start`, `event: content_block_delta`).
-                // Without it, Anthropic client SDKs cannot dispatch events.
-                Some(Event::default().event(&me.r#type).data(json))
+                match serde_json::to_string(&me) {
+                    Ok(json) => {
+                        // The Anthropic SSE protocol requires the `event:` field
+                        // (e.g. `event: message_start`, `event: content_block_delta`).
+                        // Without it, Anthropic client SDKs cannot dispatch events.
+                        Some(Event::default().event(&me.r#type).data(json))
+                    }
+                    Err(e) => {
+                        warn!("MsgEvent serialization failed, dropping event: {e}");
+                        None
+                    }
+                }
             })
             .collect(),
         Err(e) => {
@@ -632,16 +671,21 @@ fn encode_core_event(
 async fn emit_stream_error(
     client_encoder: &mut StreamEncoder,
     tx: &tokio::sync::mpsc::Sender<Event>,
-    _client_protocol: &ClientProtocol,
+    client_protocol: &ClientProtocol,
     message: &str,
 ) {
+    // Guard: only Anthropic protocol is supported until Phase 9.
+    debug_assert!(
+        matches!(client_protocol, ClientProtocol::Anthropic),
+        "emit_stream_error only supports ClientProtocol::Anthropic until Phase 9"
+    );
     use llm_proxy_protocol::core::{CoreStreamError, CoreStreamErrorKind};
 
     let error_event = CoreEvent::Error {
         error: CoreStreamError::new(CoreStreamErrorKind::Upstream, message.to_owned()),
     };
 
-    let events = encode_core_event(client_encoder, _client_protocol, error_event);
+    let events = encode_core_event(client_encoder, client_protocol, error_event);
     for event in events {
         if tx.send(event).await.is_err() {
             return;
@@ -674,6 +718,10 @@ async fn emit_stream_error(
 
 /// Map a [`ProviderError`](llm_proxy_provider::error::ProviderError) to a
 /// [`RouteError`].
+///
+/// Note: For non-Api variants (Http, Serialize, etc.), `e.to_string()` is used
+/// as the error body. This may include upstream hostnames or URL paths from
+/// reqwest error messages. If this becomes a concern, sanitize the body here.
 pub(crate) fn map_provider_error(e: llm_proxy_provider::error::ProviderError) -> RouteError {
     match &e {
         llm_proxy_provider::error::ProviderError::Api { status, body } => RouteError::Upstream {

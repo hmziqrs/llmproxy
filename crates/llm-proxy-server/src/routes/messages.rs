@@ -51,6 +51,9 @@ async fn handle_messages_inner(
     let req: MessageRequest = serde_json::from_slice(&body)
         .map_err(|e| RouteError::InvalidRequest(format!("invalid JSON: {e}")))?;
 
+    // Defense-in-depth: validate() checks for empty model/messages before
+    // decode_request also validates the same fields. This catches issues
+    // early with a clearer error message.
     req.validate()
         .map_err(RouteError::InvalidRequest)?;
 
