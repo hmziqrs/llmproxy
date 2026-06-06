@@ -137,13 +137,10 @@ pub struct ResponsesUsage {
 /// types. Upstream providers may add new event fields at any time; unknown
 /// fields are silently ignored rather than causing chunk drops. The `delta`
 /// field carries incremental text for `response.output_text.delta` events.
-/// For `response.function_call_arguments.delta` events, the delta is also a
-/// string -- this is a known gap: the stream decoding layer does not currently
-/// handle function call streaming for the Responses API. Function call arguments
-/// are accumulated via the `delta` field but the Responses API provider adapter
-/// does not emit `CoreEvent::ToolCallStart`/`ToolCallDelta` events for them.
-/// This should be addressed in a future phase by adding proper event type
-/// handling in the Responses API stream decoder.
+/// For `response.function_call_arguments.delta` events, the delta carries
+/// incremental JSON arguments for tool calls. The Responses API provider
+/// adapter emits the full `CoreEvent` tool call lifecycle
+/// (`ToolCallStart`/`ToolCallDelta`/`ToolCallStop`) for these events.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResponsesChunk {
     /// Chunk type discriminator.

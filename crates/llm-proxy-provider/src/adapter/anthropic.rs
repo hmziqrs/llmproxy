@@ -416,6 +416,20 @@ impl ProviderStreamDecoder for AnthropicStreamDecoder {
                 self.current_block_kind = ContentKind::Text;
             }
             "message_delta" => {
+                // Usage from message_delta -- emitted BEFORE MessageStop so that
+                // downstream consumers see UsageDelta before the terminal event,
+                // consistent with the plan's documented event ordering.
+                if let Some(ref usage) = event.usage {
+                    events.push(CoreEvent::UsageDelta {
+                        usage: build_anthropic_usage(
+                            usage.input_tokens,
+                            usage.output_tokens,
+                            usage.cache_creation_input_tokens,
+                            usage.cache_read_input_tokens,
+                        ),
+                    });
+                }
+                // Stop reason from message_delta -- emitted AFTER UsageDelta.
                 if let Some(ref delta) = event.delta {
                     if let Some(ref reason) = delta.stop_reason {
                         if !reason.is_empty() && !self.stop_sent {
@@ -428,17 +442,6 @@ impl ProviderStreamDecoder for AnthropicStreamDecoder {
                             });
                         }
                     }
-                }
-                // Usage from message_delta.
-                if let Some(ref usage) = event.usage {
-                    events.push(CoreEvent::UsageDelta {
-                        usage: build_anthropic_usage(
-                            usage.input_tokens,
-                            usage.output_tokens,
-                            usage.cache_creation_input_tokens,
-                            usage.cache_read_input_tokens,
-                        ),
-                    });
                 }
             }
             "message_stop" => {

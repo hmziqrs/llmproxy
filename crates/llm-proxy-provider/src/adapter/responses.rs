@@ -205,13 +205,23 @@ impl ProviderStreamDecoder for ResponsesStreamDecoder {
                     });
                 }
 
-                // Extract stop reason from output if present.
+                // Extract stop reason from output if present, falling back to
+                // saw_tool_call for streams where function_call output items
+                // may not be present on the response.completed event.
                 let stop_reason = if let Some(ref outputs) = chunk.output {
                     outputs
                         .iter()
                         .find(|o| o.r#type == "function_call")
                         .map(|_| StopReason::ToolUse)
-                        .unwrap_or(StopReason::EndTurn)
+                        .unwrap_or_else(|| {
+                            if self.saw_tool_call {
+                                StopReason::ToolUse
+                            } else {
+                                StopReason::EndTurn
+                            }
+                        })
+                } else if self.saw_tool_call {
+                    StopReason::ToolUse
                 } else {
                     StopReason::EndTurn
                 };

@@ -63,7 +63,8 @@ async fn count_tokens_inner(
     let req: MessageRequest = serde_json::from_slice(&body)
         .map_err(|e| RouteError::InvalidRequest(format!("invalid JSON: {e}")))?;
 
-    req.validate().map_err(|e| RouteError::InvalidRequest(e.to_string()))?;
+    req.validate()
+        .map_err(|e| RouteError::InvalidRequest(e.to_string()))?;
 
     // Decode through the Anthropic client adapter to get a CoreRequest.
     // This validates the request shape and normalises it.

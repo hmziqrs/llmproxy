@@ -4,19 +4,21 @@
 //! used by the TOML provider config ([`crate::provider_config`]).
 
 use regex::Regex;
-use std::sync::OnceLock;
 
 /// The compiled regex for `${VAR_NAME}` patterns.
 ///
 /// Shared across all callers so the regex is compiled at most once per process.
-static ENV_VAR_RE: OnceLock<Regex> = OnceLock::new();
-
-/// Return the shared compiled regex for `${VAR_NAME}` patterns.
-pub(crate) fn env_var_regex() -> &'static Regex {
+/// Uses `LazyLock` for idiomatic one-time initialization.
+static ENV_VAR_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
     // SAFETY: this regex is a compile-time constant that is syntactically valid.
     // Failure here indicates a programming error in the regex literal, not a
     // runtime condition.
-    ENV_VAR_RE.get_or_init(|| Regex::new(r"\$\{([A-Za-z0-9_]+)\}").expect("env var regex is valid"))
+    Regex::new(r"\$\{([A-Za-z0-9_]+)\}").expect("env var regex is valid")
+});
+
+/// Return the shared compiled regex for `${VAR_NAME}` patterns.
+pub(crate) fn env_var_regex() -> &'static Regex {
+    &ENV_VAR_RE
 }
 
 /// Replace `${ENV_VAR}` patterns in `input` with the value of the

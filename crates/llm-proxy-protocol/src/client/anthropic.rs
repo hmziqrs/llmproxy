@@ -206,20 +206,17 @@ fn decode_content_block(block: ContentBlock) -> Result<CoreContent, ProtocolErro
                     serde_json::Value::Array(arr) => {
                         let mut blocks = Vec::with_capacity(arr.len());
                         for item in arr {
-                            if let Ok(cb) =
-                                serde_json::from_value::<crate::anthropic::ContentBlock>(item.clone())
-                            {
+                            if let Ok(cb) = serde_json::from_value::<crate::anthropic::ContentBlock>(
+                                item.clone(),
+                            ) {
                                 // Recursively decode each inner block. Errors from
                                 // unknown block types are logged and skipped rather
                                 // than failing the entire tool_result decode.
                                 match decode_content_block(cb) {
                                     Ok(core) => blocks.push(core),
                                     Err(ProtocolError::Decode(msg)) => {
-                                        let truncated = if msg.len() > 64 {
-                                            &msg[..64]
-                                        } else {
-                                            &msg
-                                        };
+                                        let truncated =
+                                            if msg.len() > 64 { &msg[..64] } else { &msg };
                                         tracing::warn!(
                                             block_type = truncated,
                                             "skipping unknown block inside tool_result content array"
@@ -244,10 +241,7 @@ fn decode_content_block(block: ContentBlock) -> Result<CoreContent, ProtocolErro
                         if text.is_empty() {
                             vec![]
                         } else {
-                            vec![CoreContent::Text {
-                                text,
-                                cache: None,
-                            }]
+                            vec![CoreContent::Text { text, cache: None }]
                         }
                     }
                 }
@@ -258,10 +252,7 @@ fn decode_content_block(block: ContentBlock) -> Result<CoreContent, ProtocolErro
                 if text.is_empty() {
                     vec![]
                 } else {
-                    vec![CoreContent::Text {
-                        text,
-                        cache: None,
-                    }]
+                    vec![CoreContent::Text { text, cache: None }]
                 }
             };
             Ok(CoreContent::ToolResult {
@@ -336,7 +327,7 @@ fn decode_tool_choice(value: serde_json::Value) -> CoreToolChoice {
 ///   because silently dropping a refusal would change the response semantics.
 pub fn encode_response(resp: CoreResponse) -> Result<MessageResponse, ProtocolError> {
     if !resp.provider_meta.is_empty() {
-        tracing::debug!(
+        tracing::warn!(
             meta_keys = resp.provider_meta.len(),
             "provider_meta is non-empty during Anthropic client encode; \
              this data is for provider adapters only and will not be forwarded to the client"

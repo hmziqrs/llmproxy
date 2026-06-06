@@ -87,15 +87,13 @@ fn truncate_with_suffix(s: &str, max_len: usize, suffix: &str) -> String {
     }
 }
 
-/// Redaction patterns compiled once via `OnceLock`.
+/// Redaction patterns compiled once via `LazyLock`.
 ///
 /// Each pattern matches a known API-key prefix followed by enough alphanumeric
 /// characters to be a real key (20+). This avoids false positives on short
 /// substrings like `sk-` that appear in ordinary words (e.g. "desk-area").
-static REDACTION_PATTERNS: std::sync::OnceLock<Vec<regex::Regex>> = std::sync::OnceLock::new();
-
-fn redaction_patterns() -> &'static Vec<regex::Regex> {
-    REDACTION_PATTERNS.get_or_init(|| {
+static REDACTION_PATTERNS: std::sync::LazyLock<Vec<regex::Regex>> =
+    std::sync::LazyLock::new(|| {
         // Order matters: longer/more-specific patterns first.
         [
             // Anthropic keys: sk-ant-api03-XXXXX
@@ -128,8 +126,7 @@ fn redaction_patterns() -> &'static Vec<regex::Regex> {
         // so regex::Regex::new cannot fail here.
         .map(|pat| regex::Regex::new(pat).expect("invalid redaction regex"))
         .collect()
-    })
-}
+    });
 
 /// Sanitize an upstream API error body: strip common key patterns and
 /// truncate to [`MAX_API_ERROR_BODY_LEN`].
@@ -161,7 +158,7 @@ fn redaction_patterns() -> &'static Vec<regex::Regex> {
 /// substrings like `sk-` or `key-` that appear in ordinary words.
 pub(crate) fn sanitize_api_error_body(mut body: String) -> String {
     // Redact API key patterns (regex-based, avoids false positives on short substrings).
-    for re in redaction_patterns() {
+    for re in REDACTION_PATTERNS.iter() {
         body = re.replace_all(&body, "***").into_owned();
     }
 
