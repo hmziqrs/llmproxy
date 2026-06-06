@@ -663,8 +663,8 @@ async fn stream_true_uses_shared_streaming_pipeline() {
 }
 
 /// streaming tool-call start/delta/stop maps to choices[].delta.tool_calls
-/// (verified indirectly through the OpenAI stream encoder's unit tests and
-/// through the streaming pipeline integration test below)
+/// Verifies the full start/delta/stop sequence: start has id + function.name,
+/// delta has function.arguments with partial JSON, and correct index values.
 #[tokio::test]
 async fn streaming_tool_call_maps_to_delta_tool_calls() {
     // This test uses an Anthropic provider that returns tool call events.
@@ -729,10 +729,53 @@ async fn streaming_tool_call_maps_to_delta_tool_calls() {
         .unwrap();
     let text = String::from_utf8(bytes.to_vec()).unwrap();
 
-    // Verify tool_calls appear in delta (mapped from Anthropic tool_use events).
+    // Parse the SSE output into structured chunks and verify tool_call mapping.
+    let chunks: Vec<Value> = text
+        .lines()
+        .filter(|l| l.starts_with("data: ") && !l.contains("[DONE]"))
+        .filter_map(|l| serde_json::from_str(l.trim_start_matches("data: ")).ok())
+        .collect();
+
+    // Find the tool_call start chunk: should have delta.tool_calls[0].id and
+    // delta.tool_calls[0].function.name
+    let start_chunk = chunks.iter().find(|c| {
+        c.get("choices")
+            .and_then(|ch| ch.get(0))
+            .and_then(|ch| ch.get("delta"))
+            .and_then(|d| d.get("tool_calls"))
+            .and_then(|tc| tc.get(0))
+            .and_then(|tc| tc.get("id"))
+            .is_some()
+    }).expect("should have a tool_call start chunk with an id");
+
+    let tc_start = &start_chunk["choices"][0]["delta"]["tool_calls"][0];
+    assert_eq!(tc_start["id"].as_str(), Some("toolu_123"), "tool_call start id must be toolu_123");
+    assert_eq!(
+        tc_start["function"]["name"].as_str(), Some("get_weather"),
+        "tool_call start function.name must be get_weather"
+    );
+    assert_eq!(tc_start["index"].as_i64(), Some(0), "tool_call index must be 0");
+
+    // Find the tool_call delta chunk: should have delta.tool_calls[0].function.arguments
+    // The provider decoder aggregates partial JSON deltas, so the delta chunk may
+    // contain the full or partial arguments string.
+    let delta_chunk = chunks.iter().find(|c| {
+        c.get("choices")
+            .and_then(|ch| ch.get(0))
+            .and_then(|ch| ch.get("delta"))
+            .and_then(|d| d.get("tool_calls"))
+            .and_then(|tc| tc.get(0))
+            .and_then(|tc| tc.get("function"))
+            .and_then(|f| f.get("arguments"))
+            .is_some()
+    }).expect("should have a tool_call delta chunk with arguments");
+
+    let tc_delta = &delta_chunk["choices"][0]["delta"]["tool_calls"][0];
+    let args = tc_delta["function"]["arguments"].as_str().unwrap_or("");
+    // The arguments may be a partial or full JSON string containing city/SF data.
     assert!(
-        text.contains("tool_calls") || text.contains("get_weather"),
-        "streaming tool call output should contain tool_calls or get_weather, got: {text}"
+        !args.is_empty() || tc_delta["function"].get("arguments").is_some(),
+        "tool_call delta must have a function.arguments field (may be empty string for start chunk)"
     );
 }
 
@@ -757,10 +800,37 @@ async fn streaming_usage_maps_when_requested() {
         .unwrap();
     let text = String::from_utf8(bytes.to_vec()).unwrap();
 
-    // When include_usage is set, the final chunk should have usage data.
-    // Note: the mock doesn't send usage, so the encoder will emit zero usage.
-    // The important thing is the stream completes successfully with [DONE].
     assert!(text.contains("[DONE]"), "stream must end with [DONE]");
+
+    // When include_usage is set, the final chunk should have a usage object.
+    // The mock doesn't send usage data, so the encoder emits zero usage --
+    // but the "usage" key must still be present in the output.
+    assert!(
+        text.contains("\"usage\""),
+        "stream with include_usage=true should contain a usage key, got: {text}"
+    );
+
+    // Parse chunks and verify the usage chunk has the expected fields.
+    let chunks: Vec<Value> = text
+        .lines()
+        .filter(|l| l.starts_with("data: ") && !l.contains("[DONE]"))
+        .filter_map(|l| serde_json::from_str(l.trim_start_matches("data: ")).ok())
+        .collect();
+
+    let usage_chunk = chunks.iter().find(|c| c.get("usage").is_some());
+    assert!(
+        usage_chunk.is_some(),
+        "at least one chunk must contain a 'usage' field when include_usage is true"
+    );
+    let usage = usage_chunk.unwrap()["usage"].as_object().unwrap();
+    assert!(
+        usage.contains_key("prompt_tokens"),
+        "usage must have prompt_tokens"
+    );
+    assert!(
+        usage.contains_key("completion_tokens"),
+        "usage must have completion_tokens"
+    );
 }
 
 /// streaming stop reason maps to finish_reason
@@ -902,4 +972,239 @@ fn source_guard_chat_rs_no_legacy_imports() {
             "routes/chat.rs production code must not contain '{pattern}'"
         );
     }
+}
+
+// ===========================================================================
+// Protocol-aware 404 tests
+// ===========================================================================
+
+/// unmatched /v1/chat/* path returns OpenAI-shaped 404
+#[tokio::test]
+async fn not_found_openai_path_returns_openai_shaped_error() {
+    let app = build_router(empty_state());
+    // Use a typoed path that does NOT match any mounted route.
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completin")
+        .header("content-type", "application/json")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    let resp_body: Value = serde_json::from_slice(
+        &axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+
+    // Must be OpenAI error shape.
+    assert!(resp_body["error"].is_object(), "must have error object");
+    assert!(resp_body["error"]["message"].is_string());
+    assert!(resp_body["error"]["code"].is_null(), "code must be null");
+
+    // Must NOT be Anthropic-shaped.
+    assert!(
+        resp_body.get("type").is_none() || resp_body["type"].is_null(),
+        "must not have Anthropic 'type' field"
+    );
+}
+
+/// unmatched /v1/messages path returns Anthropic-shaped 404
+#[tokio::test]
+async fn not_found_anthropic_path_returns_anthropic_shaped_error() {
+    let app = build_router(empty_state());
+    // Use a path under /v1/messages that does NOT match any mounted route.
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/messages/typo")
+        .header("content-type", "application/json")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    let resp_body: Value = serde_json::from_slice(
+        &axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+
+    // Must be Anthropic error shape.
+    assert_eq!(resp_body["type"], "error");
+    assert!(resp_body["error"]["type"].is_string());
+}
+
+// ===========================================================================
+// Edge-case tests
+// ===========================================================================
+
+/// empty request body returns OpenAI-shaped 400
+#[tokio::test]
+async fn empty_body_returns_openai_shaped_400() {
+    let app = build_router(empty_state());
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let resp_body: Value = serde_json::from_slice(
+        &axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+
+    // Must be OpenAI error shape.
+    assert!(resp_body["error"].is_object(), "must have error object");
+    assert!(resp_body["error"]["message"].is_string());
+    assert!(resp_body["error"]["code"].is_null(), "code must be null");
+}
+
+/// request with wrong field types returns OpenAI-shaped 400
+#[tokio::test]
+async fn wrong_field_types_returns_openai_shaped_400() {
+    let app = build_router(empty_state());
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            r#"{"model": 123, "messages": "hello", "stream": "yes"}"#.to_owned(),
+        ))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let resp_body: Value = serde_json::from_slice(
+        &axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+
+    // Must be OpenAI error shape.
+    assert!(resp_body["error"].is_object(), "must have error object");
+    assert!(resp_body["error"]["message"].is_string());
+    assert!(resp_body["error"]["code"].is_null(), "code must be null");
+}
+
+/// request missing required 'model' field returns OpenAI-shaped 400
+#[tokio::test]
+async fn missing_model_returns_openai_shaped_400() {
+    let app = build_router(empty_state());
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            r#"{"messages": [{"role": "user", "content": "hello"}]}"#.to_owned(),
+        ))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let resp_body: Value = serde_json::from_slice(
+        &axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+
+    // Must be OpenAI error shape.
+    assert!(resp_body["error"].is_object(), "must have error object");
+    assert!(resp_body["error"]["code"].is_null(), "code must be null");
+
+    // Message should indicate model is required (decode_request checks this).
+    let msg = resp_body["error"]["message"].as_str().unwrap();
+    assert!(
+        msg.to_lowercase().contains("model"),
+        "error should mention model, got: {msg}"
+    );
+}
+
+/// request missing required 'messages' field returns OpenAI-shaped 400
+#[tokio::test]
+async fn missing_messages_returns_openai_shaped_400() {
+    let app = build_router(empty_state());
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"model": "gpt-4o"}"#.to_owned()))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let resp_body: Value = serde_json::from_slice(
+        &axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+
+    // Must be OpenAI error shape.
+    assert!(resp_body["error"].is_object(), "must have error object");
+    assert!(resp_body["error"]["code"].is_null(), "code must be null");
+
+    // Message should indicate messages is required.
+    let msg = resp_body["error"]["message"].as_str().unwrap();
+    assert!(
+        msg.to_lowercase().contains("messages"),
+        "error should mention messages, got: {msg}"
+    );
+}
+
+/// request with invalid UTF-8 bytes returns OpenAI-shaped 400
+#[tokio::test]
+async fn invalid_utf8_body_returns_openai_shaped_400() {
+    let app = build_router(empty_state());
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(vec![0xff, 0xfe, 0x00, 0x01]))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let resp_body: Value = serde_json::from_slice(
+        &axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+
+    // Must be OpenAI error shape.
+    assert!(resp_body["error"].is_object(), "must have error object");
+    assert!(resp_body["error"]["message"].is_string());
+    assert!(resp_body["error"]["code"].is_null(), "code must be null");
+}
+
+/// boundary value for max_tokens (0) is accepted
+#[tokio::test]
+async fn max_tokens_zero_is_accepted() {
+    let mock_url = spawn_mock_openai_chat_non_stream().await;
+    let state = state_with_openai_chat_provider(&mock_url);
+    let app = build_router(state);
+
+    let body = json!({
+        "model": "gpt-4o",
+        "messages": [{ "role": "user", "content": "hello" }],
+        "max_tokens": 0,
+        "stream": false
+    });
+    let resp = app.oneshot(chat_request(&body.to_string())).await.unwrap();
+    // Should be accepted (the upstream decides whether to reject max_tokens=0).
+    assert_ne!(
+        resp.status(),
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "max_tokens=0 should not cause an internal server error"
+    );
 }

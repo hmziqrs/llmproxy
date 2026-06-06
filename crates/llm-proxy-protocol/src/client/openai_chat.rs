@@ -102,24 +102,23 @@ pub fn decode_request(req: ChatCompletionRequest) -> Result<CoreRequest, Protoco
                     }
                 }
                 for tc in msg.tool_calls {
-                    let tc_id = tc.id.unwrap_or_else(|| {
-                        tracing::warn!("tool_call missing id field; using empty string");
-                        String::new()
-                    });
+                    let tc_id = tc.id.ok_or_else(|| {
+                        ProtocolError::InvalidRequest("tool_call.id is required".into())
+                    })?;
                     let tc_function = tc.function;
                     let (tc_name, tc_args) = if let Some(f) = tc_function {
-                        let name = f.name.unwrap_or_else(|| {
-                            tracing::warn!("tool_call function missing name field; using empty string");
-                            String::new()
-                        });
+                        let name = f.name.ok_or_else(|| {
+                            ProtocolError::InvalidRequest("tool_call.function.name is required".into())
+                        })?;
                         let args: serde_json::Value = f
                             .arguments
                             .and_then(|a| serde_json::from_str(&a).ok())
                             .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
                         (name, args)
                     } else {
-                        tracing::warn!("tool_call missing function field; using defaults");
-                        (String::new(), serde_json::Value::Object(serde_json::Map::new()))
+                        return Err(ProtocolError::InvalidRequest(
+                            "tool_call.function is required".into(),
+                        ));
                     };
                     content.push(CoreContent::ToolUse {
                         id: tc_id,

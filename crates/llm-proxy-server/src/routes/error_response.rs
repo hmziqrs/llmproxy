@@ -39,7 +39,6 @@ pub enum ClientProtocol {
     /// Anthropic Messages API (`/v1/messages`).
     Anthropic,
     /// OpenAI Chat Completions API (`/v1/chat/completions`).
-    #[allow(dead_code)]
     OpenAiChat,
 }
 
@@ -103,6 +102,24 @@ struct AnthropicErrorBody {
 struct AnthropicErrorDetail {
     r#type: String,
     message: String,
+}
+
+/// OpenAI Chat-shaped error body.
+///
+/// Uses a typed struct instead of `serde_json::json!()` for compile-time
+/// field validation and consistency with the Anthropic path.
+#[derive(Serialize)]
+#[serde(deny_unknown_fields)]
+struct OpenAiErrorBody {
+    error: OpenAiErrorDetail,
+}
+
+#[derive(Serialize)]
+#[serde(deny_unknown_fields)]
+struct OpenAiErrorDetail {
+    message: String,
+    r#type: String,
+    code: Option<()>,
 }
 
 // ---------------------------------------------------------------------------
@@ -192,15 +209,12 @@ fn anthropic_error_response(error: RouteError) -> Response<Body> {
 
 /// Build an OpenAI Chat-shaped error response.
 ///
-/// Build an OpenAI Chat-shaped error response.
-///
 /// The error envelope follows the OpenAI error shape:
 /// `{"error":{"message":"...","type":"invalid_request_error","code":null}}`.
 ///
 /// Internal error messages are sanitized: `Internal` and `ProviderDecode`
 /// variants use generic messages in the response body to prevent information
 /// disclosure.
-#[allow(dead_code)]
 fn openai_error_response(error: RouteError) -> Response<Body> {
     let (status, error_type, message) = match error {
         RouteError::InvalidRequest(msg) => {
@@ -226,13 +240,13 @@ fn openai_error_response(error: RouteError) -> Response<Body> {
         }
     };
 
-    let body = serde_json::json!({
-        "error": {
-            "message": message,
-            "type": error_type,
-            "code": null
-        }
-    });
+    let body = OpenAiErrorBody {
+        error: OpenAiErrorDetail {
+            message,
+            r#type: error_type.to_owned(),
+            code: None,
+        },
+    };
 
     // axum::Json already sets Content-Type: application/json. The explicit
     // insert below is defense-in-depth.
@@ -400,6 +414,176 @@ mod tests {
         let err = RouteError::InvalidRequest("bad input".into());
         let response = route_error_response(ClientProtocol::OpenAiChat, err);
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn openai_unknown_model_returns_400() {
+        let err = RouteError::UnknownModel("gpt-99".into());
+        let response = route_error_response(ClientProtocol::OpenAiChat, err);
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn openai_upstream_500_returns_502() {
+        let err = RouteError::Upstream {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            body: "upstream error".into(),
+        };
+        let response = route_error_response(ClientProtocol::OpenAiChat, err);
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[test]
+    fn openai_upstream_429_returns_429() {
+        let err = RouteError::Upstream {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            body: "rate limited".into(),
+        };
+        let response = route_error_response(ClientProtocol::OpenAiChat, err);
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[test]
+    fn openai_provider_decode_returns_502() {
+        let err = RouteError::ProviderDecode("bad frame".into());
+        let response = route_error_response(ClientProtocol::OpenAiChat, err);
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[test]
+    fn openai_internal_returns_500() {
+        let err = RouteError::Internal("config missing".into());
+        let response = route_error_response(ClientProtocol::OpenAiChat, err);
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn openai_rate_limited_returns_429() {
+        let err = RouteError::RateLimited;
+        let response = route_error_response(ClientProtocol::OpenAiChat, err);
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[test]
+    fn openai_conflict_returns_409() {
+        let err = RouteError::Conflict;
+        let response = route_error_response(ClientProtocol::OpenAiChat, err);
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn openai_invalid_request_body_has_correct_structure() {
+        let err = RouteError::InvalidRequest("bad input".into());
+        let response = route_error_response(ClientProtocol::OpenAiChat, err);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .expect("body");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("valid JSON");
+        assert!(json["error"].is_object(), "must have error object");
+        assert_eq!(json["error"]["type"], "invalid_request_error");
+        assert_eq!(json["error"]["message"], "bad input");
+        assert!(json["error"]["code"].is_null(), "code must be null");
+        // Must NOT have Anthropic-shaped fields.
+        assert!(
+            json.get("type").is_none() || json["type"].is_null(),
+            "must not have Anthropic 'type' field"
+        );
+    }
+
+    #[tokio::test]
+    async fn openai_unknown_model_body_has_correct_structure() {
+        let err = RouteError::UnknownModel("gpt-99".into());
+        let response = route_error_response(ClientProtocol::OpenAiChat, err);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .expect("body");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("valid JSON");
+        assert_eq!(json["error"]["type"], "invalid_request_error");
+        assert!(json["error"]["message"].as_str().unwrap().contains("gpt-99"));
+        assert!(json["error"]["code"].is_null());
+    }
+
+    #[tokio::test]
+    async fn openai_upstream_500_body_has_correct_structure() {
+        let err = RouteError::Upstream {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            body: "upstream error".into(),
+        };
+        let response = route_error_response(ClientProtocol::OpenAiChat, err);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .expect("body");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("valid JSON");
+        assert_eq!(json["error"]["type"], "api_error");
+        assert_eq!(json["error"]["message"], "upstream error");
+        assert!(json["error"]["code"].is_null());
+    }
+
+    #[tokio::test]
+    async fn openai_internal_message_is_sanitized() {
+        let err = RouteError::Internal("secret config detail: /etc/proxy.toml".into());
+        let response = route_error_response(ClientProtocol::OpenAiChat, err);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .expect("body");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("valid JSON");
+        let message = json["error"]["message"].as_str().unwrap();
+        assert_eq!(message, INTERNAL_ERROR_CLIENT_MESSAGE);
+        assert!(
+            !message.contains("secret"),
+            "internal error message must not contain internal details"
+        );
+    }
+
+    #[tokio::test]
+    async fn openai_provider_decode_message_is_sanitized() {
+        let err = RouteError::ProviderDecode(
+            "decode response: upstream returned malformed JSON with api_key=sk-ant-abc123".into(),
+        );
+        let response = route_error_response(ClientProtocol::OpenAiChat, err);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .expect("body");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("valid JSON");
+        let message = json["error"]["message"].as_str().unwrap();
+        assert_eq!(message, PROVIDER_DECODE_CLIENT_MESSAGE);
+    }
+
+    #[tokio::test]
+    async fn openai_rate_limited_body_has_correct_structure() {
+        let err = RouteError::RateLimited;
+        let response = route_error_response(ClientProtocol::OpenAiChat, err);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .expect("body");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("valid JSON");
+        assert_eq!(json["error"]["type"], "rate_limit_error");
+        assert_eq!(json["error"]["message"], "rate limit exceeded");
+        assert!(json["error"]["code"].is_null());
+    }
+
+    #[tokio::test]
+    async fn openai_conflict_body_has_correct_structure() {
+        let err = RouteError::Conflict;
+        let response = route_error_response(ClientProtocol::OpenAiChat, err);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .expect("body");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("valid JSON");
+        assert_eq!(json["error"]["type"], "invalid_request_error");
+        assert!(json["error"]["message"].as_str().unwrap().contains("duplicate"));
+        assert!(json["error"]["code"].is_null());
+    }
+
+    #[test]
+    fn openai_error_has_json_content_type() {
+        let err = RouteError::InvalidRequest("test".into());
+        let response = route_error_response(ClientProtocol::OpenAiChat, err);
+        let ct = response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .expect("content-type header");
+        assert_eq!(ct, "application/json");
     }
 
     // -- map_upstream_status ---------------------------------------------------

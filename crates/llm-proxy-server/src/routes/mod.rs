@@ -1,6 +1,6 @@
 use axum::{
     Router,
-    extract::DefaultBodyLimit,
+    extract::{DefaultBodyLimit, Request},
     http::{HeaderValue, StatusCode, header},
     response::IntoResponse,
     routing::{get, post},
@@ -84,23 +84,40 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
-async fn not_found() -> impl IntoResponse {
-    // Note: This fallback returns an Anthropic-shaped error for ALL unmatched
-    // routes. When Phase 9 adds OpenAI Chat routes, consider making this
-    // protocol-aware based on path prefix (e.g. /v1/chat/* returns OpenAI errors).
-    let body = serde_json::json!({
-        "type": "error",
-        "error": {
-            "type": "not_found_error",
-            "message": "not found"
-        }
-    });
-    // axum::Json already sets Content-Type: application/json. The explicit
-    // insert below is defense-in-depth.
-    let mut response = (StatusCode::NOT_FOUND, axum::Json(body)).into_response();
-    response.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("application/json"),
-    );
-    response
+async fn not_found(req: Request) -> impl IntoResponse {
+    // Protocol-aware 404: return OpenAI-shaped errors for /v1/chat/* paths,
+    // Anthropic-shaped errors for everything else.
+    let path = req.uri().path();
+
+    if path.starts_with("/v1/chat") {
+        // OpenAI-shaped error envelope.
+        let body = serde_json::json!({
+            "error": {
+                "message": "not found",
+                "type": "invalid_request_error",
+                "code": null
+            }
+        });
+        let mut response = (StatusCode::NOT_FOUND, axum::Json(body)).into_response();
+        response.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        response
+    } else {
+        // Anthropic-shaped error envelope.
+        let body = serde_json::json!({
+            "type": "error",
+            "error": {
+                "type": "not_found_error",
+                "message": "not found"
+            }
+        });
+        let mut response = (StatusCode::NOT_FOUND, axum::Json(body)).into_response();
+        response.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        response
+    }
 }

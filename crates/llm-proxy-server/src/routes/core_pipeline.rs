@@ -2,7 +2,7 @@
 //!
 //! Provides [`prepare_request`] (rate-limit, dedup, request-ID generation),
 //! [`handle_core_once`] (non-streaming), and [`handle_core_stream`] (streaming)
-//! used by `/v1/messages` and future `/v1/chat/completions`.
+//! used by `/v1/messages` and `/v1/chat/completions`.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -73,6 +73,8 @@ impl ClientStreamEncoder {
                     .and_then(|v| v.get("include_usage"))
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
+                // 0 = epoch fallback; system clock before epoch is effectively
+                // impossible in production.
                 let created = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
@@ -236,8 +238,8 @@ fn resolve_target(
         .ok_or_else(|| RouteError::Internal("provider registry required".to_owned()))?;
 
     let target = resolve_model_route(&app_config.models, &core.model.requested)
-        .map_err(|e| match &e {
-            ModelRouteError::UnknownModel(m) => RouteError::UnknownModel(m.clone()),
+        .map_err(|e| match e {
+            ModelRouteError::UnknownModel(m) => RouteError::UnknownModel(m),
             _ => RouteError::Internal(e.to_string()),
         })?;
 
@@ -984,6 +986,10 @@ fn encode_core_event(
 
 /// Emit an error event into the stream.
 ///
+/// For OpenAI Chat, the StreamEncoder returns `Err` for `CoreEvent::Error`.
+/// Rather than silently dropping the error, we construct a raw SSE error
+/// event directly so the client sees an error indication before `[DONE]`.
+///
 /// After the error event, the encoder's `finished` flag is set to `true` so
 /// that any subsequent `finish()` call returns an empty vec. The error event
 /// itself is the terminal event -- no synthetic message_delta/message_stop
@@ -1001,17 +1007,31 @@ async fn emit_stream_error(
     };
 
     let events = encode_core_event(client_encoder, error_event);
-    for event in events {
-        if tx.send(event).await.is_err() {
-            return;
+    if events.is_empty() && matches!(client_protocol, ClientProtocol::OpenAiChat) {
+        // The OpenAI StreamEncoder returns Err for CoreEvent::Error, which
+        // causes encode_core_event to produce an empty Vec. Construct a raw
+        // SSE error event directly so the OpenAI client sees the error.
+        let error_json = serde_json::json!({
+            "error": {
+                "message": message,
+                "type": "api_error",
+                "code": null
+            }
+        });
+        if let Ok(json_str) = serde_json::to_string(&error_json) {
+            let _ = tx.send(Event::default().data(json_str)).await;
+        }
+    } else {
+        for event in events {
+            if tx.send(event).await.is_err() {
+                return;
+            }
         }
     }
 
     // For OpenAI Chat, emit the [DONE] terminator after an error event.
-    if matches!(client_protocol, ClientProtocol::OpenAiChat) {
-        if tx.send(openai_done_event()).await.is_err() {
-            return;
-        }
+    if matches!(client_protocol, ClientProtocol::OpenAiChat) && tx.send(openai_done_event()).await.is_err() {
+        return;
     }
 
     // Mark the encoder as finished so that subsequent finish() calls return
@@ -1065,14 +1085,10 @@ const MAX_SANITIZE_LEN: usize = 512;
 const SANITIZE_SUFFIX: &str = "...[truncated]";
 const SANITIZE_SUFFIX_LEN: usize = SANITIZE_SUFFIX.len();
 
-/// Compiled regex for URL redaction, initialized once via `OnceLock`.
-static URL_REDACT_REGEX: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-
-fn url_redact_regex() -> &'static regex::Regex {
-    URL_REDACT_REGEX.get_or_init(|| {
-        regex::Regex::new(r"https?://\S+").expect("valid URL redaction regex")
-    })
-}
+/// Compiled regex for URL redaction, initialized once via `LazyLock`.
+static URL_REDACT_REGEX: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r"https?://\S+").expect("valid URL redaction regex")
+});
 
 /// Sanitize non-Api upstream error bodies to prevent information leakage.
 ///
@@ -1097,7 +1113,7 @@ fn sanitize_upstream_error_body(msg: &str) -> String {
 
     // Redact URL-like patterns that may contain hostnames/paths.
     // Matches http:// or https:// followed by any non-whitespace chars.
-    url_redact_regex()
+    URL_REDACT_REGEX
         .replace_all(&truncated, "[url-redacted]")
         .into_owned()
 }

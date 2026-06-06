@@ -47,11 +47,14 @@ async fn handle_chat_completions_inner(
     // Pre-flight: rate limit, dedup, request ID.
     let ctx = core_pipeline::prepare_request(&state, &headers, &body)?;
 
-    // Parse and validate the OpenAI ChatCompletionRequest.
+    // Parse the OpenAI ChatCompletionRequest.
     let req: ChatCompletionRequest = serde_json::from_slice(&body)
         .map_err(|e| RouteError::InvalidRequest(format!("invalid JSON: {e}")))?;
 
     // Decode the OpenAI Chat request into a core request.
+    // Note: ChatCompletionRequest does not have a separate validate() method
+    // (unlike the Anthropic handler). All validation is performed inside
+    // decode_request: it checks for non-empty model and non-empty messages.
     let core = openai_chat::decode_request(req)
         .map_err(core_pipeline::protocol_error_to_route)?;
 
