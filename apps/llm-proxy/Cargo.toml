@@ -32,3 +32,6 @@ libc = "0.2"
 
 [build-dependencies]
 vergen-gix = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

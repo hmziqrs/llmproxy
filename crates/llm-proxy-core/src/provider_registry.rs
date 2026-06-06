@@ -371,6 +371,11 @@ impl ProviderRegistry {
     pub fn get(&self, name: &str) -> Option<&ProviderConfig> {
         self.providers.get(name)
     }
+
+    /// Returns an iterator over all registered provider configs.
+    pub fn iter(&self) -> impl Iterator<Item = &ProviderConfig> {
+        self.providers.values()
+    }
 }
 
 // ===========================================================================

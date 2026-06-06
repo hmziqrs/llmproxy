@@ -2054,6 +2054,7 @@ dependencies = [
  "llm-proxy-server",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",

@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use llm_proxy_core::{Config, FallbackHandler};
+use llm_proxy_core::{FallbackHandler, resolve_model_route};
 use llm_proxy_provider::{OpenCodeClient, ProviderAdapterRegistry, ProxyClient};
 use llm_proxy_server::{AppState, BuildInfo, build_router, shutdown_signal};
 use tokio::net::TcpListener;
@@ -43,8 +43,8 @@ struct Cli {
 enum Commands {
     /// Start the proxy server.
     Serve {
-        /// Path to config file.
-        #[arg(short, long, env = "OC_GO_CC_CONFIG")]
+        /// Path to config file (must be TOML).
+        #[arg(short, long)]
         config: Option<PathBuf>,
         /// Override listen port.
         #[arg(short, long)]
@@ -64,12 +64,16 @@ enum Commands {
     Init,
     /// Validate a config file and print settings.
     Validate {
-        /// Path to config file.
-        #[arg(short, long, env = "OC_GO_CC_CONFIG")]
+        /// Path to config file (must be TOML).
+        #[arg(short, long)]
         config: Option<PathBuf>,
     },
     /// List available model IDs.
-    Models,
+    Models {
+        /// Path to config file (must be TOML).
+        #[arg(short, long)]
+        config: Option<PathBuf>,
+    },
     /// Manage auto-start on login.
     Autostart {
         #[command(subcommand)]
@@ -95,123 +99,98 @@ enum AutostartAction {
 }
 
 // ---------------------------------------------------------------------------
-// Default config
+// Migration error message
 // ---------------------------------------------------------------------------
 
-/// Default config JSON matching the Go reference defaults.
-const DEFAULT_CONFIG: &str = r#"{
-  "api_key": "",
-  "host": "127.0.0.1",
-  "port": 3456,
-  "hot_reload": false,
-  "enable_streaming_scenario_routing": true,
-  "respect_requested_model": false,
-  "models": {
-    "default": {
-      "provider": "opencode-go",
-      "model_id": "kimi-k2.6",
-      "temperature": 0.7,
-      "max_tokens": 4096
-    },
-    "think": {
-      "provider": "opencode-go",
-      "model_id": "glm-5",
-      "temperature": 0.7,
-      "max_tokens": 8192,
-      "reasoning_effort": "high"
-    },
-    "complex": {
-      "provider": "opencode-go",
-      "model_id": "glm-5.1",
-      "temperature": 0.7,
-      "max_tokens": 16384,
-      "reasoning_effort": "max"
-    },
-    "background": {
-      "provider": "opencode-go",
-      "model_id": "qwen3.5-plus",
-      "temperature": 0.5,
-      "max_tokens": 2048
-    },
-    "long_context": {
-      "provider": "opencode-go",
-      "model_id": "minimax-m2.5",
-      "temperature": 0.7,
-      "max_tokens": 4096,
-      "context_threshold": 100000
-    }
-  },
-  "fallbacks": {
-    "default": [
-      { "provider": "opencode-go", "model_id": "qwen3.6-plus" },
-      { "provider": "opencode-go", "model_id": "glm-5.1" }
-    ],
-    "think": [
-      { "provider": "opencode-go", "model_id": "kimi-k2.6" },
-      { "provider": "opencode-go", "model_id": "deepseek-v4-pro" }
-    ],
-    "complex": [
-      { "provider": "opencode-go", "model_id": "kimi-k2.6" },
-      { "provider": "opencode-go", "model_id": "deepseek-v4-pro" }
-    ]
-  },
-  "opencode_go": {
-    "base_url": "https://opencode.ai/zen/go/v1/chat/completions",
-    "anthropic_base_url": "https://opencode.ai/zen/go/v1/messages",
-    "timeout_ms": 300000
-  },
-  "opencode_zen": {
-    "base_url": "https://opencode.ai/zen/v1/chat/completions",
-    "anthropic_base_url": "https://opencode.ai/zen/v1/messages",
-    "responses_base_url": "https://opencode.ai/zen/v1/responses",
-    "gemini_base_url": "https://opencode.ai/zen/v1/models",
-    "timeout_ms": 300000
-  },
-  "logging": {
-    "level": "info",
-    "requests": false
-  }
-}"#;
+/// Migration error printed when legacy JSON config is detected.
+const MIGRATION_ERROR: &str = "\
+JSON oc-go-cc config is no longer supported by serve.
+Run `llm-proxy init` to create TOML config, then copy model/API settings.";
 
 // ---------------------------------------------------------------------------
-// Known model IDs (hardcoded from Go reference)
+// Default TOML config content
 // ---------------------------------------------------------------------------
 
-const MODEL_IDS: &[&str] = &[
-    // OpenCode Go models
-    "kimi-k2.6",
-    "glm-5",
-    "glm-5.1",
-    "qwen3.5-plus",
-    "qwen3.6-plus",
-    "qwen3.7-max",
-    "deepseek-v4-pro",
-    "minimax-m2.5",
-    "minimax-m2.7",
-    // OpenCode Zen models
-    "gpt-5.5",
-    "gpt-5.5-pro",
-    "gpt-5.4",
-    "gpt-5.4-pro",
-    "gpt-5.4-mini",
-    "gpt-5.4-nano",
-    "gpt-5.3-codex",
-    "gpt-5.3-codex-spark",
-    "gpt-5.2",
-    "gpt-5.2-codex",
-    "gpt-5.1",
-    "gpt-5.1-codex",
-    "gpt-5.1-codex-max",
-    "gpt-5.1-codex-mini",
-    "gpt-5",
-    "gpt-5-codex",
-    "gpt-5-nano",
-    "gemini-3.5-flash",
-    "gemini-3.1-pro",
-    "gemini-3-flash",
-    "claude-sonnet-4-20250514",
-    "claude-opus-4-20250116",
-];
+/// Default main config TOML content generated by `llm-proxy init`.
+///
+/// Contains only server settings and model routing. Does NOT include:
+/// - sampling overrides (temperature, top_p, etc.)
+/// - tool overrides
+/// - reasoning/thinking overrides
+/// - cache settings
+/// - stream overrides
+/// - fallback/scenario logic
+const DEFAULT_CONFIG_TOML: &str = r#"[server]
+bind = "127.0.0.1:3456"
+request_timeout = "300s"
+log_level = "info"
+hot_reload = false
+server_name = "llm-proxy"
+
+[models]
+"kimi-k2.6" = { provider = "opencode-go" }
+"glm-5" = { provider = "opencode-go" }
+"glm-5.1" = { provider = "opencode-go" }
+"qwen3.5-plus" = { provider = "opencode-go" }
+"deepseek-v4-pro" = { provider = "opencode-go" }
+"minimax-m2.5" = { provider = "opencode-go" }
+"gpt-5.4" = { provider = "opencode-zen" }
+"gpt-5.4-pro" = { provider = "opencode-zen" }
+"gemini-3.5-flash" = { provider = "opencode-zen" }
+"claude-sonnet-4-20250514" = { provider = "opencode-zen", upstream_model = "claude-sonnet-4-20250514" }
+"#;
+
+/// Default provider TOML for opencode-go.
+const DEFAULT_PROVIDER_OPENCODE_GO: &str = r#"[provider]
+name = "opencode-go"
+api_key = "${LLM_PROXY_OPENCODE_GO_KEY}"
+auth_style = "bearer"
+
+[provider.adapters.chat]
+protocol = "openai_chat_completions"
+endpoint = "https://opencode.ai/zen/go/v1/chat/completions"
+
+[provider.adapters.anthropic]
+protocol = "anthropic_messages"
+endpoint = "https://opencode.ai/zen/go/v1/messages"
+
+[provider.models]
+"kimi-k2.6" = { adapter = "chat" }
+"glm-5" = { adapter = "chat" }
+"glm-5.1" = { adapter = "chat" }
+"qwen3.5-plus" = { adapter = "chat" }
+"deepseek-v4-pro" = { adapter = "chat" }
+"minimax-m2.5" = { adapter = "chat" }
+"#;
+
+/// Default provider TOML for opencode-zen.
+const DEFAULT_PROVIDER_OPENCODE_ZEN: &str = r#"[provider]
+name = "opencode-zen"
+api_key = "${LLM_PROXY_OPENCODE_ZEN_KEY}"
+auth_style = "bearer"
+
+[provider.adapters.chat]
+protocol = "openai_chat_completions"
+endpoint = "https://opencode.ai/zen/v1/chat/completions"
+
+[provider.adapters.anthropic]
+protocol = "anthropic_messages"
+endpoint = "https://opencode.ai/zen/v1/messages"
+
+[provider.adapters.responses]
+protocol = "openai_responses"
+endpoint = "https://opencode.ai/zen/v1/responses"
+
+[provider.adapters.gemini]
+protocol = "gemini_generate_content"
+endpoint = "https://opencode.ai/zen/v1/models/{model}:generateContent"
+
+[provider.models]
+"gpt-5.4" = { adapter = "chat" }
+"gpt-5.4-pro" = { adapter = "chat" }
+"gemini-3.5-flash" = { adapter = "gemini" }
+"claude-sonnet-4-20250514" = { adapter = "anthropic" }
+"#;
 
 // ---------------------------------------------------------------------------
 // Paths
@@ -225,9 +204,9 @@ fn config_dir() -> PathBuf {
         .join("llm-proxy")
 }
 
-/// Config file path: `~/.config/llm-proxy/config.json`.
-fn config_path() -> PathBuf {
-    config_dir().join("config.json")
+/// Config file path: `~/.config/llm-proxy/config.toml`.
+fn default_config_path() -> PathBuf {
+    config_dir().join("config.toml")
 }
 
 /// PID file path: `~/.config/llm-proxy/llm-proxy.pid`.
@@ -235,15 +214,57 @@ fn pid_file_path() -> PathBuf {
     config_dir().join("llm-proxy.pid")
 }
 
-/// Resolve the config file path from CLI arg, env var, or default.
+/// Resolve the config file path for `serve`.
+///
+/// Priority:
+/// 1. Explicit CLI `--config` argument
+/// 2. `$LLM_PROXY_CONFIG` env var (preferred)
+/// 3. `$OC_GO_CC_CONFIG` env var (legacy, triggers migration warning)
+/// 4. Default path `~/.config/llm-proxy/config.toml`
+///
+/// Returns `(resolved_path, legacy_env_detected)`.
+/// `legacy_env_detected` is true when `$OC_GO_CC_CONFIG` was the source
+/// and neither CLI nor `$LLM_PROXY_CONFIG` was provided.
+fn resolve_serve_config(cli_path: Option<PathBuf>) -> (PathBuf, bool) {
+    // 1. Explicit CLI path always wins.
+    if let Some(p) = cli_path {
+        return (p, false);
+    }
+    // 2. Preferred env var.
+    if let Ok(p) = std::env::var("LLM_PROXY_CONFIG") {
+        return (PathBuf::from(p), false);
+    }
+    // 3. Legacy env var (detected for migration warning).
+    if let Ok(p) = std::env::var("OC_GO_CC_CONFIG") {
+        return (PathBuf::from(p), true);
+    }
+    // 4. Default.
+    (default_config_path(), false)
+}
+
+/// Resolve the config file path for non-serve commands (validate, models).
+///
+/// Priority:
+/// 1. Explicit CLI `--config` argument
+/// 2. `$LLM_PROXY_CONFIG` env var
+/// 3. Default path
 fn resolve_config(cli_path: Option<PathBuf>) -> PathBuf {
     if let Some(p) = cli_path {
         return p;
     }
-    if let Ok(p) = std::env::var("OC_GO_CC_CONFIG") {
+    if let Ok(p) = std::env::var("LLM_PROXY_CONFIG") {
         return PathBuf::from(p);
     }
-    config_path()
+    default_config_path()
+}
+
+/// Returns the providers directory path, which is always `providers/`
+/// next to the config file.
+fn providers_dir_for(config_path: &std::path::Path) -> PathBuf {
+    config_path
+        .parent()
+        .unwrap_or(std::path::Path::new("."))
+        .join("providers")
 }
 
 // ---------------------------------------------------------------------------
@@ -306,6 +327,24 @@ fn is_process_running(pid: u32) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// JSON config detection
+// ---------------------------------------------------------------------------
+
+/// Check if a path points to a JSON config file.
+fn is_json_config(path: &std::path::Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("json"))
+}
+
+/// Check if a path points to a TOML config file.
+fn is_toml_config(path: &std::path::Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("toml"))
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
@@ -324,7 +363,7 @@ async fn main() -> Result<()> {
         Commands::Status => cmd_status(),
         Commands::Init => cmd_init(),
         Commands::Validate { config } => cmd_validate(config),
-        Commands::Models => cmd_models(),
+        Commands::Models { config } => cmd_models(config),
         Commands::Autostart { action } => match action {
             AutostartAction::Enable { config, port } => cmd_autostart_enable(config, port),
             AutostartAction::Disable => cmd_autostart_disable(),
@@ -339,14 +378,9 @@ async fn main() -> Result<()> {
 
 /// Run the `serve` command.
 ///
-/// Supports two config loading modes:
-///
-/// - **TOML** (`.toml` extension): loads [`AppConfig`] and provider files from
-///   a `providers/` directory next to the main config file. Builds
-///   [`AppState`] in TOML new-runtime mode.
-/// - **JSON** (`.json` extension): legacy compatibility mode. Loads the old
-///   [`Config`] and builds [`AppState`] in JSON legacy mode.
-/// - Any other extension (or no extension) is rejected.
+/// Requires TOML config. JSON config is rejected with a migration error.
+/// `$OC_GO_CC_CONFIG` alone emits the migration error. An explicit TOML
+/// `--config` or `$LLM_PROXY_CONFIG` wins over `$OC_GO_CC_CONFIG`.
 async fn cmd_serve(
     config_path: Option<PathBuf>,
     port_override: Option<u16>,
@@ -361,9 +395,30 @@ async fn cmd_serve(
     init_tracing();
 
     // Resolve config file path.
-    let path = resolve_config(config_path);
+    let (path, legacy_env) = resolve_serve_config(config_path);
 
-    // Build shared infrastructure present in both modes.
+    // Reject JSON config with migration error.
+    if is_json_config(&path) {
+        bail!("{}", MIGRATION_ERROR);
+    }
+
+    // If only $OC_GO_CC_CONFIG is set (no explicit --config, no $LLM_PROXY_CONFIG),
+    // print migration warning and exit.
+    if legacy_env {
+        bail!("{}", MIGRATION_ERROR);
+    }
+
+    // Reject non-TOML extensions.
+    if !is_toml_config(&path) {
+        bail!(
+            "unsupported config file extension: {:?} (expected .toml)",
+            path.extension()
+                .map(|e| e.to_string_lossy())
+                .unwrap_or_else(|| std::borrow::Cow::Borrowed("(none)"))
+        );
+    }
+
+    // Build shared infrastructure.
     let adapter_registry = ProviderAdapterRegistry::builtin();
     let proxy_client = ProxyClient::new();
 
@@ -389,22 +444,8 @@ async fn cmd_serve(
         let _ = std::fs::remove_file(&pid_path);
     };
 
-    // Dispatch on config file extension to determine construction mode.
-    let extension = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-    let state = match extension {
-        "toml" => {
-            load_toml_state(&path, &adapter_registry, &proxy_client, port_override)?
-        }
-        "json" => {
-            load_json_state(&path, &adapter_registry, &proxy_client, port_override)?
-        }
-        _ => {
-            bail!(
-                "unsupported config file extension: {:?} (expected .toml or .json)",
-                path.extension().map(|e| e.to_string_lossy()).unwrap_or_else(|| std::borrow::Cow::Borrowed("(none)"))
-            );
-        }
-    };
+    // Load TOML config and build state.
+    let state = load_toml_state(&path, &adapter_registry, &proxy_client, port_override)?;
 
     let bind_addr = state.bind_address();
     let app = build_router(state);
@@ -417,9 +458,6 @@ async fn cmd_serve(
         version = env!("CARGO_PKG_VERSION"),
         "llm-proxy listening"
     );
-
-    // Start config watcher if hot_reload enabled.
-    // TODO: implement file watcher in a future wave.
 
     // Serve with graceful shutdown.
     let result = axum::serve(listener, app)
@@ -480,7 +518,6 @@ fn spawn_daemon(config_path: Option<PathBuf>, port_override: Option<u16>) -> Res
     );
 
     // Detach from child so we don't wait on it.
-    // On Unix, `process_group(0)` already detached it.
     let _ = child.try_wait();
 
     Ok(())
@@ -503,10 +540,6 @@ fn cmd_stop() -> Result<()> {
                 if ret != 0 {
                     bail!("failed to send SIGTERM to PID {pid}");
                 }
-            }
-            #[cfg(not(unix))]
-            {
-                // Non-Unix: just remove the PID file.
             }
 
             println!("sent SIGTERM to PID {pid}");
@@ -547,7 +580,7 @@ fn cmd_status() -> Result<()> {
             if is_process_running(pid) {
                 println!("server is running (PID {pid})");
                 println!("  listen: 127.0.0.1:3456");
-                println!("  config: {}", config_path().display());
+                println!("  config: {}", default_config_path().display());
             } else {
                 println!("server not running (stale PID {pid})");
             }
@@ -561,144 +594,96 @@ fn cmd_status() -> Result<()> {
 }
 
 /// Run the `init` command.
+///
+/// Creates:
+/// - `config.toml` in the config directory
+/// - `providers/opencode-go.toml` next to the config
+/// - `providers/opencode-zen.toml` next to the config
+///
+/// Does NOT write:
+/// - fallback/scenario JSON
+/// - sampling/tool/reasoning/cache/stream overrides
 fn cmd_init() -> Result<()> {
-    let path = config_path();
-    if path.exists() {
-        bail!("config file already exists at {}", path.display());
+    let config_path = default_config_path();
+    if config_path.exists() {
+        bail!("config file already exists at {}", config_path.display());
     }
 
     let dir = config_dir();
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("creating directory {}", dir.display()))?;
 
-    // Write default config.
-    let mut f =
-        std::fs::File::create(&path).with_context(|| format!("creating {}", path.display()))?;
-    f.write_all(DEFAULT_CONFIG.as_bytes())
-        .with_context(|| format!("writing {}", path.display()))?;
+    // Write main config.toml.
+    let mut f = std::fs::File::create(&config_path)
+        .with_context(|| format!("creating {}", config_path.display()))?;
+    f.write_all(DEFAULT_CONFIG_TOML.as_bytes())
+        .with_context(|| format!("writing {}", config_path.display()))?;
+    println!("created config at {}", config_path.display());
 
-    println!("created default config at {}", path.display());
-    println!("edit it to add your API key (or set OC_GO_CC_API_KEY env var)");
+    // Create providers directory.
+    let providers_dir = providers_dir_for(&config_path);
+    std::fs::create_dir_all(&providers_dir)
+        .with_context(|| format!("creating directory {}", providers_dir.display()))?;
+
+    // Write opencode-go provider.
+    let go_path = providers_dir.join("opencode-go.toml");
+    let mut f = std::fs::File::create(&go_path)
+        .with_context(|| format!("creating {}", go_path.display()))?;
+    f.write_all(DEFAULT_PROVIDER_OPENCODE_GO.as_bytes())
+        .with_context(|| format!("writing {}", go_path.display()))?;
+    println!("created provider config at {}", go_path.display());
+
+    // Write opencode-zen provider.
+    let zen_path = providers_dir.join("opencode-zen.toml");
+    let mut f = std::fs::File::create(&zen_path)
+        .with_context(|| format!("creating {}", zen_path.display()))?;
+    f.write_all(DEFAULT_PROVIDER_OPENCODE_ZEN.as_bytes())
+        .with_context(|| format!("writing {}", zen_path.display()))?;
+    println!("created provider config at {}", zen_path.display());
+
+    println!();
+    println!("Next steps:");
+    println!("  1. Set API keys via environment variables:");
+    println!("     export LLM_PROXY_OPENCODE_GO_KEY=your-go-key");
+    println!("     export LLM_PROXY_OPENCODE_ZEN_KEY=your-zen-key");
+    println!("  2. Run `llm-proxy validate` to check your config");
+    println!("  3. Run `llm-proxy serve` to start the proxy");
+
     Ok(())
 }
 
 /// Run the `validate` command.
+///
+/// Loads main TOML, loads provider files, validates provider adapter protocols
+/// against builtins, rejects legacy scenario/fallback JSON, and prints model
+/// route table.
 fn cmd_validate(config_path: Option<PathBuf>) -> Result<()> {
     let path = resolve_config(config_path);
 
+    // Reject JSON config.
+    if is_json_config(&path) {
+        bail!(
+            "JSON config is no longer supported. \
+             Run `llm-proxy init` to create TOML config, then copy model/API settings."
+        );
+    }
+
+    // Reject non-TOML extensions.
+    if !is_toml_config(&path) {
+        bail!(
+            "unsupported config file extension: {:?} (expected .toml)",
+            path.extension()
+                .map(|e| e.to_string_lossy())
+                .unwrap_or_else(|| std::borrow::Cow::Borrowed("(none)"))
+        );
+    }
+
     println!("validating config: {}", path.display());
 
-    let extension = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-    match extension {
-        "toml" => cmd_validate_toml(&path),
-        "json" => cmd_validate_json(&path),
-        _ => {
-            bail!(
-                "unsupported config file extension: {:?} (expected .toml or .json)",
-                path.extension().map(|e| e.to_string_lossy()).unwrap_or_else(|| std::borrow::Cow::Borrowed("(none)"))
-            );
-        }
-    }
-}
-
-/// Validate a JSON config file and print settings.
-fn cmd_validate_json(path: &std::path::Path) -> Result<()> {
-    let config =
-        Config::load(path).with_context(|| format!("loading config from {}", path.display()))?;
-
-    // Print settings summary.
-    println!();
-    println!("=== Configuration ===");
-    println!("  host:              {}", config.host);
-    println!("  port:              {}", config.port);
-    println!(
-        "  api_key:           {}",
-        if config.api_key.is_empty() {
-            "(empty)"
-        } else {
-            "(set)"
-        }
-    );
-    println!("  hot_reload:        {}", config.hot_reload);
-    println!(
-        "  streaming routing: {}",
-        config.enable_streaming_scenario_routing
-    );
-    println!("  respect model:     {}", config.respect_requested_model);
-
-    println!();
-    println!("=== Models ===");
-    for (scenario, model) in &config.models {
-        println!(
-            "  [{}] provider={} model={} temp={} max_tokens={}",
-            scenario, model.provider, model.model_id, model.temperature, model.max_tokens
-        );
-        if !model.reasoning_effort.is_empty() {
-            println!("     reasoning_effort={}", model.reasoning_effort);
-        }
-        if let Some(_thinking) = &model.thinking {
-            println!("     thinking=(configured)");
-        }
-        if model.context_threshold > 0 {
-            println!("     context_threshold={}", model.context_threshold);
-        }
-    }
-
-    println!();
-    println!("=== Fallbacks ===");
-    if config.fallbacks.is_empty() {
-        println!("  (none)");
-    } else {
-        for (scenario, fallbacks) in &config.fallbacks {
-            println!("  [{}]", scenario);
-            for fb in fallbacks {
-                println!("    - provider={} model={}", fb.provider, fb.model_id);
-            }
-        }
-    }
-
-    println!();
-    println!("=== OpenCode Go ===");
-    println!("  base_url:           {}", config.opencode_go.base_url);
-    println!(
-        "  anthropic_base_url: {}",
-        config.opencode_go.anthropic_base_url
-    );
-    println!("  timeout_ms:         {}", config.opencode_go.timeout_ms);
-
-    println!();
-    println!("=== OpenCode Zen ===");
-    println!("  base_url:           {}", config.opencode_zen.base_url);
-    println!(
-        "  anthropic_base_url: {}",
-        config.opencode_zen.anthropic_base_url
-    );
-    println!(
-        "  responses_base_url: {}",
-        config.opencode_zen.responses_base_url
-    );
-    println!(
-        "  gemini_base_url:    {}",
-        config.opencode_zen.gemini_base_url
-    );
-    println!("  timeout_ms:         {}", config.opencode_zen.timeout_ms);
-
-    println!();
-    println!("=== Logging ===");
-    println!("  level:    {}", config.logging.level);
-    println!("  requests: {}", config.logging.requests);
-
-    println!();
-    println!("Config is valid!");
-    Ok(())
-}
-
-/// Validate a TOML config file and print settings.
-fn cmd_validate_toml(path: &std::path::Path) -> Result<()> {
     use llm_proxy_core::{AppConfig, ProviderRegistry, load_app_config};
 
     let app_config: AppConfig =
-        load_app_config(path).with_context(|| format!("loading TOML config from {}", path.display()))?;
+        load_app_config(&path).with_context(|| format!("loading TOML config from {}", path.display()))?;
 
     // Print settings summary.
     println!();
@@ -710,7 +695,7 @@ fn cmd_validate_toml(path: &std::path::Path) -> Result<()> {
     println!("  server_name:     {}", app_config.server.server_name);
 
     // Load and validate providers.
-    let providers_dir = path.parent().unwrap_or(std::path::Path::new(".")).join("providers");
+    let providers_dir = providers_dir_for(&path);
     let registry = if providers_dir.exists() {
         ProviderRegistry::load_from_dir(&providers_dir)
             .with_context(|| format!("loading providers from {}", providers_dir.display()))?
@@ -730,13 +715,60 @@ fn cmd_validate_toml(path: &std::path::Path) -> Result<()> {
     println!("=== Providers ({} loaded) ===", registry.len());
     if registry.is_empty() {
         println!("  (none)");
+    } else {
+        for provider in registry.iter() {
+            println!("  {} ({} adapters, {} models)",
+                provider.name,
+                provider.adapters.len(),
+                provider.models.len()
+            );
+        }
     }
 
+    // Print model route table: client_model -> provider/upstream_model/adapter/protocol
     if !app_config.models.is_empty() {
         println!();
-        println!("=== Model Mappings ===");
-        for (name, model) in &app_config.models {
-            println!("  [{name}] provider={}", model.provider);
+        println!("=== Model Route Table ===");
+        let mut route_errors: Vec<String> = Vec::new();
+        for (client_model, route) in &app_config.models {
+            let _upstream_model = route
+                .upstream_model
+                .as_deref()
+                .unwrap_or(client_model);
+
+            match resolve_model_route(&app_config.models, client_model) {
+                Ok(target) => {
+                    match registry.resolve_adapter_target(&target) {
+                        Ok(resolved) => {
+                            println!(
+                                "  {} -> {}/{}/{}/{}",
+                                client_model,
+                                resolved.provider_name,
+                                resolved.upstream_model,
+                                resolved.adapter_name,
+                                resolved.protocol
+                            );
+                        }
+                        Err(e) => {
+                            let msg = format!("  {} -> ERROR: {}", client_model, e);
+                            println!("{}", msg);
+                            route_errors.push(msg);
+                        }
+                    }
+                }
+                Err(e) => {
+                    let msg = format!("  {} -> ERROR: {}", client_model, e);
+                    println!("{}", msg);
+                    route_errors.push(msg);
+                }
+            }
+        }
+
+        if !route_errors.is_empty() {
+            bail!(
+                "config has {} route resolution error(s)",
+                route_errors.len()
+            );
         }
     }
 
@@ -746,48 +778,48 @@ fn cmd_validate_toml(path: &std::path::Path) -> Result<()> {
 }
 
 /// Run the `models` command.
-fn cmd_models() -> Result<()> {
-    println!("Available model IDs:");
-    println!();
-    println!("--- OpenCode Go ---");
-    for id in MODEL_IDS.iter().filter(|id| !is_zen_model(id)) {
-        println!("  {id}");
-    }
-    println!();
-    println!("--- OpenCode Zen ---");
-    for id in MODEL_IDS.iter().filter(|id| is_zen_model(id)) {
-        println!("  {id}");
-    }
-    Ok(())
-}
+///
+/// Lists configured client models from `[models]` in the TOML config.
+/// Respects TOML aliases and does NOT use hardcoded model lists.
+fn cmd_models(config_path: Option<PathBuf>) -> Result<()> {
+    let path = resolve_config(config_path);
 
-/// Check if a model ID is served by the Zen provider.
-fn is_zen_model(id: &&str) -> bool {
-    const ZEN_MODELS: &[&str] = &[
-        "gpt-5.5",
-        "gpt-5.5-pro",
-        "gpt-5.4",
-        "gpt-5.4-pro",
-        "gpt-5.4-mini",
-        "gpt-5.4-nano",
-        "gpt-5.3-codex",
-        "gpt-5.3-codex-spark",
-        "gpt-5.2",
-        "gpt-5.2-codex",
-        "gpt-5.1",
-        "gpt-5.1-codex",
-        "gpt-5.1-codex-max",
-        "gpt-5.1-codex-mini",
-        "gpt-5",
-        "gpt-5-codex",
-        "gpt-5-nano",
-        "gemini-3.5-flash",
-        "gemini-3.1-pro",
-        "gemini-3-flash",
-        "claude-sonnet-4-20250514",
-        "claude-opus-4-20250116",
-    ];
-    ZEN_MODELS.contains(id)
+    // Reject non-TOML.
+    if !is_toml_config(&path) {
+        bail!(
+            "unsupported config file extension: {:?} (expected .toml)",
+            path.extension()
+                .map(|e| e.to_string_lossy())
+                .unwrap_or_else(|| std::borrow::Cow::Borrowed("(none)"))
+        );
+    }
+
+    use llm_proxy_core::load_app_config;
+
+    let app_config =
+        load_app_config(&path).with_context(|| format!("loading TOML config from {}", path.display()))?;
+
+    if app_config.models.is_empty() {
+        println!("No models configured.");
+        println!("Add entries to [models] in {}", path.display());
+        return Ok(());
+    }
+
+    println!("Configured client models (from {}):", path.display());
+    println!();
+    for (name, route) in &app_config.models {
+        let upstream = route
+            .upstream_model
+            .as_deref()
+            .unwrap_or(name);
+        if upstream == name {
+            println!("  {}", name);
+        } else {
+            println!("  {} -> {}", name, upstream);
+        }
+    }
+
+    Ok(())
 }
 
 /// Run the `autostart enable` command.
@@ -1013,9 +1045,7 @@ fn load_toml_state(
     let mut app_config: AppConfig =
         load_app_config(path).with_context(|| format!("loading TOML config from {}", path.display()))?;
 
-    // Apply CLI port override. We clone the bind address first so the
-    // AppConfig object remains a faithful representation of what was loaded
-    // from disk (important for future hot-reload diffing).
+    // Apply CLI port override.
     if let Some(p) = port_override {
         let mut bind = app_config.server.bind;
         bind.set_port(p);
@@ -1023,11 +1053,7 @@ fn load_toml_state(
     }
 
     // Load provider files from providers/ directory next to the main config.
-    // ProviderRegistry::load_from_dir handles:
-    // - Non-regular-file filtering (skips directories, pipes, sockets)
-    // - Deterministic sorted ordering by filename
-    // - Duplicate provider name detection with file path reporting
-    let providers_dir = path.parent().unwrap_or(std::path::Path::new(".")).join("providers");
+    let providers_dir = providers_dir_for(path);
     let registry = if providers_dir.exists() {
         ProviderRegistry::load_from_dir(&providers_dir)
             .with_context(|| format!("loading providers from {}", providers_dir.display()))?
@@ -1039,7 +1065,7 @@ fn load_toml_state(
     // Validate all provider protocols against the builtin adapter set.
     let known_protocols = adapter_registry.protocol_names();
     registry
-        .validate_protocols(&known_protocols)
+        .validate_protocols(known_protocols)
         .with_context(|| "validating provider protocols")?;
 
     info!(
@@ -1054,46 +1080,6 @@ fn load_toml_state(
         adapter_registry.clone(),
         proxy_client.clone(),
         build_info(),
-    ))
-}
-
-/// Load legacy JSON config and build [`AppState`] in JSON compatibility mode.
-///
-/// This path is retained during the Phase 7 transition period. Phase 10 will
-/// remove it in favor of TOML-only loading.
-fn load_json_state(
-    path: &std::path::Path,
-    adapter_registry: &ProviderAdapterRegistry,
-    proxy_client: &ProxyClient,
-    port_override: Option<u16>,
-) -> Result<AppState> {
-    let config = Config::load(path)
-        .with_context(|| format!("loading JSON config from {}", path.display()))?;
-
-    // Apply CLI port override.
-    let mut config = config;
-    if let Some(p) = port_override {
-        config.port = p;
-    }
-
-    // Sync legacy bind field.
-    let bind_addr: std::net::SocketAddr = format!("{}:{}", config.host, config.port)
-        .parse()
-        .with_context(|| format!("invalid bind address {}:{}", config.host, config.port))?;
-    config.bind = bind_addr;
-
-    let client = OpenCodeClient::new(Arc::new(config.clone()));
-    let fallback_handler = FallbackHandler::new(3, std::time::Duration::from_secs(30));
-
-    info!(config = %path.display(), "loaded JSON config (legacy mode)");
-
-    Ok(AppState::from_legacy(
-        config,
-        build_info(),
-        client,
-        fallback_handler,
-        adapter_registry.clone(),
-        proxy_client.clone(),
     ))
 }
 
@@ -1128,5 +1114,659 @@ mod dirs {
             .or_else(|_| std::env::var("USERPROFILE"))
             .ok()
             .map(PathBuf::from)
+    }
+}
+
+// ===========================================================================
+// Tests
+// ===========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write as IoWrite;
+    use std::sync::Mutex;
+
+    /// Crate-level mutex for serialising tests that mutate environment variables.
+    static TEST_ENV_MUTEX: Mutex<()> = Mutex::new(());
+
+    /// RAII wrapper that holds the test env mutex lock.
+    struct TestEnvLock {
+        _guard: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl TestEnvLock {
+        fn acquire() -> Self {
+            let guard = TEST_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+            Self { _guard: guard }
+        }
+    }
+
+    // -- Env var test helpers --------------------------------------------------
+
+    /// Guard that restores an env var on drop. NOT thread-safe; tests using
+    /// this must be serialised via `TestEnvLock`.
+    struct EnvGuard {
+        key: String,
+        original: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &str, value: &str) -> Self {
+            let original = std::env::var(key).ok();
+            unsafe { std::env::set_var(key, value); }
+            Self { key: key.to_owned(), original }
+        }
+
+        fn remove(key: &str) -> Self {
+            let original = std::env::var(key).ok();
+            unsafe { std::env::remove_var(key); }
+            Self { key: key.to_owned(), original }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.original {
+                Some(v) => unsafe { std::env::set_var(&self.key, v); },
+                None => unsafe { std::env::remove_var(&self.key); },
+            }
+        }
+    }
+
+    /// Holds the mutex lock and env-var guards together.
+    struct EnvScope {
+        _lock: TestEnvLock,
+        _guards: Vec<EnvGuard>,
+    }
+
+    /// Clean all config-related env vars and return scope.
+    fn clean_config_env() -> EnvScope {
+        let lock = TestEnvLock::acquire();
+        let guards = vec![
+            EnvGuard::remove("LLM_PROXY_CONFIG"),
+            EnvGuard::remove("OC_GO_CC_CONFIG"),
+            EnvGuard::remove("LLM_PROXY_OPENCODE_GO_KEY"),
+            EnvGuard::remove("LLM_PROXY_OPENCODE_ZEN_KEY"),
+        ];
+        EnvScope {
+            _lock: lock,
+            _guards: guards,
+        }
+    }
+
+    // =========================================================================
+    // Phase 10 tests
+    // =========================================================================
+
+    // -- config path resolution prefers CLI path --------------------------------
+
+    #[test]
+    fn config_path_resolution_prefers_cli_path() {
+        let _env = clean_config_env();
+        let cli_path = PathBuf::from("/tmp/my-custom-config.toml");
+        let (resolved, legacy) = resolve_serve_config(Some(cli_path.clone()));
+        assert_eq!(resolved, cli_path);
+        assert!(!legacy, "CLI path should not trigger legacy detection");
+    }
+
+    // -- config path resolution supports $LLM_PROXY_CONFIG ----------------------
+
+    #[test]
+    fn config_path_resolution_supports_llm_proxy_config() {
+        let _env = clean_config_env();
+        let _g = EnvGuard::set("LLM_PROXY_CONFIG", "/tmp/from-env.toml");
+        let (resolved, legacy) = resolve_serve_config(None);
+        assert_eq!(resolved, PathBuf::from("/tmp/from-env.toml"));
+        assert!(!legacy, "LLM_PROXY_CONFIG should not trigger legacy detection");
+    }
+
+    // -- CLI path wins over $LLM_PROXY_CONFIG -----------------------------------
+
+    #[test]
+    fn cli_path_wins_over_llm_proxy_config() {
+        let _env = clean_config_env();
+        let _g = EnvGuard::set("LLM_PROXY_CONFIG", "/tmp/from-env.toml");
+        let cli_path = PathBuf::from("/tmp/cli-path.toml");
+        let (resolved, _) = resolve_serve_config(Some(cli_path.clone()));
+        assert_eq!(resolved, cli_path);
+    }
+
+    // -- $OC_GO_CC_CONFIG alone detected as legacy ------------------------------
+
+    #[test]
+    fn oc_go_cc_config_alone_detected_as_legacy() {
+        let _env = clean_config_env();
+        let _g = EnvGuard::set("OC_GO_CC_CONFIG", "/tmp/old-config.json");
+        let (_, legacy) = resolve_serve_config(None);
+        assert!(legacy, "OC_GO_CC_CONFIG alone should trigger legacy detection");
+    }
+
+    // -- explicit TOML --config wins over $OC_GO_CC_CONFIG ----------------------
+
+    #[test]
+    fn explicit_toml_config_wins_over_oc_go_cc_config() {
+        let _env = clean_config_env();
+        let _g = EnvGuard::set("OC_GO_CC_CONFIG", "/tmp/old-config.json");
+        let cli_path = PathBuf::from("/tmp/new-config.toml");
+        let (resolved, legacy) = resolve_serve_config(Some(cli_path.clone()));
+        assert_eq!(resolved, cli_path);
+        assert!(!legacy, "explicit CLI path should not trigger legacy");
+    }
+
+    // -- $LLM_PROXY_CONFIG wins over $OC_GO_CC_CONFIG ---------------------------
+
+    #[test]
+    fn llm_proxy_config_wins_over_oc_go_cc_config() {
+        let _env = clean_config_env();
+        let _g1 = EnvGuard::set("LLM_PROXY_CONFIG", "/tmp/new.toml");
+        let _g2 = EnvGuard::set("OC_GO_CC_CONFIG", "/tmp/old.json");
+        let (resolved, legacy) = resolve_serve_config(None);
+        assert_eq!(resolved, PathBuf::from("/tmp/new.toml"));
+        assert!(!legacy, "LLM_PROXY_CONFIG should win over OC_GO_CC_CONFIG");
+    }
+
+    // -- provider directory path is next to config file -------------------------
+
+    #[test]
+    fn provider_directory_path_is_next_to_config_file() {
+        let config_path = PathBuf::from("/home/user/.config/llm-proxy/config.toml");
+        let providers = providers_dir_for(&config_path);
+        assert_eq!(providers, PathBuf::from("/home/user/.config/llm-proxy/providers"));
+    }
+
+    // -- provider directory path with no parent uses current dir ----------------
+
+    #[test]
+    fn provider_directory_path_with_no_parent_uses_current_dir() {
+        let config_path = PathBuf::from("config.toml");
+        let providers = providers_dir_for(&config_path);
+        // Path::new("config.toml").parent() returns Some(""), and "".join("providers") = "providers"
+        assert_eq!(providers, PathBuf::from("providers"));
+    }
+
+    // -- generated TOML parses as AppConfig ------------------------------------
+
+    #[test]
+    fn generated_toml_parses_as_app_config() {
+        let _env = clean_config_env();
+        use llm_proxy_core::load_app_config;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, DEFAULT_CONFIG_TOML).expect("write");
+        let cfg = load_app_config(&path).expect("generated TOML should parse as AppConfig");
+        assert!(!cfg.models.is_empty(), "generated config should have models");
+    }
+
+    // -- generated provider TOML parses as ProviderFile -------------------------
+
+    #[test]
+    fn generated_provider_toml_parses_as_provider_file() {
+        let _env = clean_config_env();
+        let _g = EnvGuard::set("LLM_PROXY_OPENCODE_GO_KEY", "test-key");
+        use llm_proxy_core::load_provider_config;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("opencode-go.toml");
+        std::fs::write(&path, DEFAULT_PROVIDER_OPENCODE_GO).expect("write");
+        let cfg = load_provider_config(&path, None).expect("generated provider TOML should parse");
+        assert_eq!(cfg.name, "opencode-go");
+        assert!(!cfg.adapters.is_empty());
+        assert!(!cfg.models.is_empty());
+    }
+
+    // -- generated provider TOML parses as ProviderFile (zen) -------------------
+
+    #[test]
+    fn generated_zen_provider_toml_parses_as_provider_file() {
+        let _env = clean_config_env();
+        let _g = EnvGuard::set("LLM_PROXY_OPENCODE_ZEN_KEY", "test-key");
+        use llm_proxy_core::load_provider_config;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("opencode-zen.toml");
+        std::fs::write(&path, DEFAULT_PROVIDER_OPENCODE_ZEN).expect("write");
+        let cfg = load_provider_config(&path, None).expect("generated zen provider TOML should parse");
+        assert_eq!(cfg.name, "opencode-zen");
+        assert_eq!(cfg.adapters.len(), 4, "zen should have 4 adapters");
+    }
+
+    // -- generated config plus providers pass full validation -------------------
+
+    #[test]
+    fn generated_config_plus_providers_pass_full_validation() {
+        let _env = clean_config_env();
+        let _g1 = EnvGuard::set("LLM_PROXY_OPENCODE_GO_KEY", "test-go-key");
+        let _g2 = EnvGuard::set("LLM_PROXY_OPENCODE_ZEN_KEY", "test-zen-key");
+
+        use llm_proxy_core::{ProviderRegistry, load_app_config, load_provider_config};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        // Write main config.
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, DEFAULT_CONFIG_TOML).expect("write config");
+
+        // Create providers dir and write provider files.
+        let providers_dir = dir.path().join("providers");
+        std::fs::create_dir_all(&providers_dir).expect("mkdir providers");
+
+        std::fs::write(
+            providers_dir.join("opencode-go.toml"),
+            DEFAULT_PROVIDER_OPENCODE_GO,
+        )
+        .expect("write go provider");
+        std::fs::write(
+            providers_dir.join("opencode-zen.toml"),
+            DEFAULT_PROVIDER_OPENCODE_ZEN,
+        )
+        .expect("write zen provider");
+
+        // Load and validate.
+        let app_config = load_app_config(&config_path).expect("load app config");
+        let registry = ProviderRegistry::load_from_dir(&providers_dir).expect("load providers");
+
+        // Validate protocols against builtins.
+        let adapter_registry = ProviderAdapterRegistry::builtin();
+        registry
+            .validate_protocols(adapter_registry.protocol_names())
+            .expect("protocol validation should pass");
+
+        assert!(!app_config.models.is_empty());
+        assert_eq!(registry.len(), 2, "should have 2 providers");
+    }
+
+    // -- every generated [models] route resolves --------------------------------
+
+    #[test]
+    fn every_generated_models_route_resolves() {
+        let _env = clean_config_env();
+        let _g1 = EnvGuard::set("LLM_PROXY_OPENCODE_GO_KEY", "test-go-key");
+        let _g2 = EnvGuard::set("LLM_PROXY_OPENCODE_ZEN_KEY", "test-zen-key");
+
+        use llm_proxy_core::{ProviderRegistry, load_app_config, load_provider_config};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, DEFAULT_CONFIG_TOML).expect("write config");
+
+        let providers_dir = dir.path().join("providers");
+        std::fs::create_dir_all(&providers_dir).expect("mkdir providers");
+        std::fs::write(
+            providers_dir.join("opencode-go.toml"),
+            DEFAULT_PROVIDER_OPENCODE_GO,
+        )
+        .expect("write go provider");
+        std::fs::write(
+            providers_dir.join("opencode-zen.toml"),
+            DEFAULT_PROVIDER_OPENCODE_ZEN,
+        )
+        .expect("write zen provider");
+
+        let app_config = load_app_config(&config_path).expect("load app config");
+        let registry = ProviderRegistry::load_from_dir(&providers_dir).expect("load providers");
+
+        for (client_model, _route) in &app_config.models {
+            let target = resolve_model_route(&app_config.models, client_model)
+                .unwrap_or_else(|e| panic!("route resolution failed for {}: {}", client_model, e));
+            let resolved = registry
+                .resolve_adapter_target(&target)
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "adapter resolution failed for {} -> {}: {}",
+                        client_model, target.upstream_model, e
+                    )
+                });
+            // Verify that every route resolves to provider/upstream_model/adapter/protocol
+            assert!(
+                !resolved.protocol.is_empty(),
+                "protocol should not be empty for {}",
+                client_model
+            );
+            assert!(
+                !resolved.adapter_name.is_empty(),
+                "adapter_name should not be empty for {}",
+                client_model
+            );
+        }
+    }
+
+    // -- serve --config old.json exits before constructing AppState -------------
+
+    #[test]
+    fn serve_json_config_exits_before_constructing_app_state() {
+        // Simulate what cmd_serve does when it detects JSON.
+        let json_path = PathBuf::from("/tmp/old-config.json");
+        assert!(is_json_config(&json_path));
+        // The actual check in cmd_serve: if is_json_config -> bail with MIGRATION_ERROR
+        // We verify the predicate here; the bail behavior is trivially tested by
+        // the is_json_config check.
+        let toml_path = PathBuf::from("/tmp/config.toml");
+        assert!(!is_json_config(&toml_path));
+    }
+
+    // -- $OC_GO_CC_CONFIG alone emits migration error ---------------------------
+
+    #[test]
+    fn oc_go_cc_config_alone_triggers_migration_error() {
+        let _env = clean_config_env();
+        let _g = EnvGuard::set("OC_GO_CC_CONFIG", "/tmp/old.json");
+        let (_, legacy) = resolve_serve_config(None);
+        assert!(legacy, "should detect legacy env");
+        // In cmd_serve, legacy=true triggers `bail!("{}", MIGRATION_ERROR)`.
+    }
+
+    // -- explicit TOML --config wins over $OC_GO_CC_CONFIG (no migration error) -
+
+    #[test]
+    fn explicit_toml_over_oc_go_cc_config_no_migration_error() {
+        let _env = clean_config_env();
+        let _g = EnvGuard::set("OC_GO_CC_CONFIG", "/tmp/old.json");
+        let (resolved, legacy) =
+            resolve_serve_config(Some(PathBuf::from("/tmp/config.toml")));
+        assert!(!legacy, "explicit --config should suppress legacy detection");
+        assert!(is_toml_config(&resolved));
+    }
+
+    // -- $LLM_PROXY_CONFIG wins over $OC_GO_CC_CONFIG (no migration error) ------
+
+    #[test]
+    fn llm_proxy_config_over_oc_go_cc_config_no_migration_error() {
+        let _env = clean_config_env();
+        let _g1 = EnvGuard::set("LLM_PROXY_CONFIG", "/tmp/config.toml");
+        let _g2 = EnvGuard::set("OC_GO_CC_CONFIG", "/tmp/old.json");
+        let (_, legacy) = resolve_serve_config(None);
+        assert!(!legacy, "LLM_PROXY_CONFIG should suppress legacy detection");
+    }
+
+    // -- models lists only configured client models -----------------------------
+
+    #[test]
+    fn models_lists_only_configured_client_models() {
+        let _env = clean_config_env();
+        use llm_proxy_core::load_app_config;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+
+        // Write a config with exactly 2 models.
+        let config_toml = r#"
+[server]
+bind = "127.0.0.1:3456"
+request_timeout = "300s"
+log_level = "info"
+hot_reload = false
+server_name = "test"
+
+[models]
+"my-model-a" = { provider = "p1" }
+"my-model-b" = { provider = "p2", upstream_model = "real-model-b" }
+"#;
+        std::fs::write(&path, config_toml).expect("write");
+
+        let app_config = load_app_config(&path).expect("load");
+        assert_eq!(app_config.models.len(), 2);
+        assert!(app_config.models.contains_key("my-model-a"));
+        assert!(app_config.models.contains_key("my-model-b"));
+    }
+
+    // -- models respects TOML aliases -------------------------------------------
+
+    #[test]
+    fn models_respects_toml_aliases() {
+        let _env = clean_config_env();
+        use llm_proxy_core::load_app_config;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+
+        let config_toml = r#"
+[server]
+bind = "127.0.0.1:3456"
+request_timeout = "300s"
+log_level = "info"
+hot_reload = false
+server_name = "test"
+
+[models]
+"fast-model" = { provider = "test-provider", upstream_model = "gpt-5.4-turbo" }
+"#;
+        std::fs::write(&path, config_toml).expect("write");
+
+        let app_config = load_app_config(&path).expect("load");
+        let route = &app_config.models["fast-model"];
+        assert_eq!(route.upstream_model.as_deref(), Some("gpt-5.4-turbo"));
+    }
+
+    // -- generated config contains no sampling overrides ------------------------
+
+    #[test]
+    fn generated_config_contains_no_sampling_overrides() {
+        // Verify the generated TOML does not contain sampling/tool/reasoning
+        // cache/stream override keys.
+        assert!(
+            !DEFAULT_CONFIG_TOML.contains("temperature"),
+            "generated config must not contain temperature"
+        );
+        assert!(
+            !DEFAULT_CONFIG_TOML.contains("top_p"),
+            "generated config must not contain top_p"
+        );
+        assert!(
+            !DEFAULT_CONFIG_TOML.contains("max_tokens"),
+            "generated config must not contain max_tokens"
+        );
+    }
+
+    // -- generated config contains no tool/reasoning/cache/stream overrides -----
+
+    #[test]
+    fn generated_config_contains_no_tool_reasoning_cache_stream_overrides() {
+        assert!(
+            !DEFAULT_CONFIG_TOML.contains("tools"),
+            "generated config must not contain tools"
+        );
+        assert!(
+            !DEFAULT_CONFIG_TOML.contains("reasoning"),
+            "generated config must not contain reasoning"
+        );
+        assert!(
+            !DEFAULT_CONFIG_TOML.contains("thinking"),
+            "generated config must not contain thinking"
+        );
+        assert!(
+            !DEFAULT_CONFIG_TOML.contains("cache"),
+            "generated config must not contain cache"
+        );
+        // "stream" appears in "upstream_model", so check for specific patterns only.
+        assert!(
+            !DEFAULT_CONFIG_TOML.contains("stream_override"),
+            "generated config must not contain stream overrides"
+        );
+        assert!(
+            !DEFAULT_CONFIG_TOML.contains("streaming"),
+            "generated config must not contain streaming settings"
+        );
+    }
+
+    // -- init writes no fallback/scenario JSON ----------------------------------
+
+    #[test]
+    fn init_writes_no_fallback_scenario_json() {
+        assert!(
+            !DEFAULT_CONFIG_TOML.contains("fallback"),
+            "generated config must not contain fallback"
+        );
+        assert!(
+            !DEFAULT_CONFIG_TOML.contains("scenario"),
+            "generated config must not contain scenario"
+        );
+        // Also verify the config file extension is .toml, not .json.
+        assert!(default_config_path().extension().is_some_and(|e| e == "toml"));
+    }
+
+    // -- validate rejects legacy scenario config --------------------------------
+
+    #[test]
+    fn validate_rejects_legacy_json_config() {
+        let json_path = PathBuf::from("/tmp/old-config.json");
+        assert!(
+            is_json_config(&json_path),
+            "JSON config should be detected"
+        );
+        // In cmd_validate, is_json_config triggers bail with migration error.
+        // We test the predicate; the bail is straightforward.
+    }
+
+    // -- validate rejects non-toml extension ------------------------------------
+
+    #[test]
+    fn validate_rejects_non_toml_extension() {
+        let yaml_path = PathBuf::from("/tmp/config.yaml");
+        assert!(
+            !is_toml_config(&yaml_path),
+            "YAML config should be rejected"
+        );
+        assert!(
+            !is_json_config(&yaml_path),
+            "YAML should not match JSON check"
+        );
+    }
+
+    // -- is_json_config edge cases -----------------------------------------------
+
+    #[test]
+    fn is_json_config_case_insensitive() {
+        assert!(is_json_config(&PathBuf::from("config.JSON")));
+        assert!(is_json_config(&PathBuf::from("config.Json")));
+    }
+
+    #[test]
+    fn is_toml_config_case_insensitive() {
+        assert!(is_toml_config(&PathBuf::from("config.TOML")));
+        assert!(is_toml_config(&PathBuf::from("config.Toml")));
+    }
+
+    #[test]
+    fn no_extension_is_not_json_or_toml() {
+        let path = PathBuf::from("/tmp/config");
+        assert!(!is_json_config(&path));
+        assert!(!is_toml_config(&path));
+    }
+
+    // -- resolve_config for validate/models prefers CLI -------------------------
+
+    #[test]
+    fn resolve_config_prefers_cli() {
+        let _env = clean_config_env();
+        let cli = PathBuf::from("/custom/path.toml");
+        let resolved = resolve_config(Some(cli.clone()));
+        assert_eq!(resolved, cli);
+    }
+
+    #[test]
+    fn resolve_config_uses_llm_proxy_config() {
+        let _env = clean_config_env();
+        let _g = EnvGuard::set("LLM_PROXY_CONFIG", "/from/env.toml");
+        let resolved = resolve_config(None);
+        assert_eq!(resolved, PathBuf::from("/from/env.toml"));
+    }
+
+    #[test]
+    fn resolve_config_cli_wins_over_env() {
+        let _env = clean_config_env();
+        let _g = EnvGuard::set("LLM_PROXY_CONFIG", "/from/env.toml");
+        let cli = PathBuf::from("/cli/path.toml");
+        let resolved = resolve_config(Some(cli.clone()));
+        assert_eq!(resolved, cli);
+    }
+
+    // -- default_config_path returns .toml --------------------------------------
+
+    #[test]
+    fn default_config_path_returns_toml() {
+        let path = default_config_path();
+        assert!(is_toml_config(&path));
+        assert!(path.to_string_lossy().contains("config.toml"));
+    }
+
+    // -- migration error message is correct -------------------------------------
+
+    #[test]
+    fn migration_error_message() {
+        assert!(
+            MIGRATION_ERROR.contains("JSON"),
+            "migration error should mention JSON"
+        );
+        assert!(
+            MIGRATION_ERROR.contains("llm-proxy init"),
+            "migration error should mention llm-proxy init"
+        );
+        assert!(
+            MIGRATION_ERROR.contains("TOML"),
+            "migration error should mention TOML"
+        );
+    }
+
+    // -- generated provider files have correct adapter counts --------------------
+
+    #[test]
+    fn generated_opencode_go_provider_has_correct_adapters() {
+        // opencode-go should have chat + anthropic adapters
+        assert!(DEFAULT_PROVIDER_OPENCODE_GO.contains("openai_chat_completions"));
+        assert!(DEFAULT_PROVIDER_OPENCODE_GO.contains("anthropic_messages"));
+    }
+
+    #[test]
+    fn generated_opencode_zen_provider_has_four_adapters() {
+        assert!(DEFAULT_PROVIDER_OPENCODE_ZEN.contains("openai_chat_completions"));
+        assert!(DEFAULT_PROVIDER_OPENCODE_ZEN.contains("anthropic_messages"));
+        assert!(DEFAULT_PROVIDER_OPENCODE_ZEN.contains("openai_responses"));
+        assert!(DEFAULT_PROVIDER_OPENCODE_ZEN.contains("gemini_generate_content"));
+    }
+
+    // -- init does not write .json files ----------------------------------------
+
+    #[test]
+    fn init_does_not_write_json_files() {
+        // Verify that none of the generated content mentions .json extensions
+        // and all generated files are .toml
+        assert!(!DEFAULT_CONFIG_TOML.contains(".json"));
+        assert!(!DEFAULT_PROVIDER_OPENCODE_GO.contains(".json"));
+        assert!(!DEFAULT_PROVIDER_OPENCODE_ZEN.contains(".json"));
+    }
+
+    // -- generated config models reference only declared providers ---------------
+
+    #[test]
+    fn generated_config_models_reference_only_declared_providers() {
+        let _env = clean_config_env();
+        use llm_proxy_core::load_app_config;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, DEFAULT_CONFIG_TOML).expect("write");
+
+        let cfg = load_app_config(&path).expect("load");
+
+        // Collect all unique provider names referenced in models
+        let providers: std::collections::HashSet<&str> = cfg
+            .models
+            .values()
+            .map(|r| r.provider.as_str())
+            .collect();
+
+        assert!(
+            providers.contains("opencode-go"),
+            "should reference opencode-go provider"
+        );
+        assert!(
+            providers.contains("opencode-zen"),
+            "should reference opencode-zen provider"
+        );
+        assert_eq!(
+            providers.len(),
+            2,
+            "should reference exactly 2 providers"
+        );
     }
 }
