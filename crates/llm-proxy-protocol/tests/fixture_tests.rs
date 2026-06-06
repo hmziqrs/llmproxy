@@ -18,12 +18,12 @@
 //! while provider fixtures test adapter decode output against human-readable expected
 //! values. This is a deliberate design choice.
 
-use llm_proxy_protocol::anthropic::MessageRequest as AnthropicMessageRequest;
+use llm_proxy_protocol::anthropic::{MessageEvent, MessageRequest as AnthropicMessageRequest};
 use llm_proxy_protocol::client::{anthropic as anthropic_adapter, openai_chat as openai_adapter};
 use llm_proxy_protocol::core::{
     CoreContent, CoreEvent, CoreResponse, ModelRef, StopReason, Usage, UsageProvenance,
 };
-use llm_proxy_protocol::openai::ChatCompletionRequest;
+use llm_proxy_protocol::openai::{ChatCompletionChunk, ChatCompletionRequest};
 
 use std::fs;
 use std::path::Path;
@@ -77,16 +77,23 @@ fn assert_decode_matches_core(
 }
 
 /// Verify that a malformed input produces a ProtocolError.
+///
+/// Both serde deserialization failures AND semantic validation errors
+/// (e.g. empty model, empty messages) are treated as expected errors.
 fn assert_malformed_returns_error(adapter: &str, input_json: &serde_json::Value) {
     let result = match adapter {
         "anthropic" => {
-            let req: AnthropicMessageRequest = serde_json::from_value(input_json.clone())
-                .unwrap_or_else(|e| panic!("failed to parse Anthropic malformed input: {e}"));
+            let req: AnthropicMessageRequest = match serde_json::from_value(input_json.clone()) {
+                Ok(r) => r,
+                Err(_) => return, // serde parse failure is also a valid error
+            };
             anthropic_adapter::decode_request(req)
         }
         "openai_chat" => {
-            let req: ChatCompletionRequest = serde_json::from_value(input_json.clone())
-                .unwrap_or_else(|e| panic!("failed to parse OpenAI malformed input: {e}"));
+            let req: ChatCompletionRequest = match serde_json::from_value(input_json.clone()) {
+                Ok(r) => r,
+                Err(_) => return, // serde parse failure is also a valid error
+            };
             openai_adapter::decode_request(req)
         }
         _ => panic!("unknown adapter: {adapter}"),
@@ -199,7 +206,7 @@ fn build_core_response_from_output(adapter: &str, output_json: &serde_json::Valu
             let stop_reason = match output_json
                 .get("stop_reason")
                 .and_then(|v| v.as_str())
-                .unwrap_or("end_turn")
+                .unwrap_or_else(|| panic!("anthropic output.json must contain 'stop_reason' field"))
             {
                 "end_turn" => StopReason::EndTurn,
                 "max_tokens" => StopReason::MaxTokens,
@@ -301,7 +308,7 @@ fn build_core_response_from_output(adapter: &str, output_json: &serde_json::Valu
             let finish_reason = choice
                 .and_then(|c| c.get("finish_reason"))
                 .and_then(|v| v.as_str())
-                .unwrap_or("stop");
+                .unwrap_or_else(|| panic!("openai_chat output.json must contain 'finish_reason' in choices[0]"));
             let stop_reason = match finish_reason {
                 "stop" => StopReason::EndTurn,
                 "length" => StopReason::MaxTokens,
@@ -474,13 +481,14 @@ fn assert_encode_matches_output(
 fn run_non_stream_fixture(adapter: &str, case: &str) {
     let dir = Path::new(FIXTURE_ROOT).join(adapter).join(case);
     let input = read_fixture(&dir, "input.json");
-    let core = read_fixture(&dir, "core.json");
 
-    // Special handling for malformed cases
+    // Special handling for malformed cases -- only input.json is needed.
     if case == "malformed" {
         assert_malformed_returns_error(adapter, &input);
         return;
     }
+
+    let core = read_fixture(&dir, "core.json");
 
     assert_decode_matches_core(adapter, &input, &core);
 
@@ -634,11 +642,11 @@ fn all_anthropic_non_stream_fixtures_have_required_files() {
             dir.join("input.json").exists(),
             "anthropic/{case}/input.json is missing"
         );
-        assert!(
-            dir.join("core.json").exists(),
-            "anthropic/{case}/core.json is missing"
-        );
         if *case != "malformed" {
+            assert!(
+                dir.join("core.json").exists(),
+                "anthropic/{case}/core.json is missing"
+            );
             assert!(
                 dir.join("output.json").exists(),
                 "anthropic/{case}/output.json is missing"
@@ -667,11 +675,11 @@ fn all_openai_non_stream_fixtures_have_required_files() {
             dir.join("input.json").exists(),
             "openai_chat/{case}/input.json is missing"
         );
-        assert!(
-            dir.join("core.json").exists(),
-            "openai_chat/{case}/core.json is missing"
-        );
         if *case != "malformed" {
+            assert!(
+                dir.join("core.json").exists(),
+                "openai_chat/{case}/core.json is missing"
+            );
             assert!(
                 dir.join("output.json").exists(),
                 "openai_chat/{case}/output.json is missing"
@@ -680,6 +688,14 @@ fn all_openai_non_stream_fixtures_have_required_files() {
     }
 }
 
+/// Verify that all streaming fixtures have the required files.
+///
+/// Client streaming fixtures require:
+/// - `input.sse`: Optional reference file showing the corresponding provider wire
+///   format. Not consumed by any test, but serves as documentation of the provider
+///   stream that would produce these CoreEvents.
+/// - `core-events.json`: The CoreEvent sequence to encode through the StreamEncoder.
+/// - `output.sse`: The expected SSE output from the StreamEncoder.
 #[test]
 fn all_streaming_fixtures_have_required_files() {
     let streaming_cases = [
@@ -735,7 +751,7 @@ fn required_client_non_stream_cases() -> Vec<(&'static str, Vec<&'static str>)> 
         ("tool-choice", vec!["input.json", "core.json", "output.json"]),
         ("stop-reason", vec!["input.json", "core.json", "output.json"]),
         ("usage", vec!["input.json", "core.json", "output.json"]),
-        ("malformed", vec!["input.json", "core.json"]),
+        ("malformed", vec!["input.json"]),
         // TODO: Additional cases for the next audit round:
         //   multiple-messages, refusal, redacted-thinking, image/document/audio/video
         //   content, sampling-intent, model-mapping, stop-sequence.
@@ -894,6 +910,9 @@ fn streaming_sse_fixtures_are_well_formed() {
 /// output with output.sse because the encoder may emit additional framing
 /// events (e.g. content_block_start/stop) that are not explicit in the
 /// minimal core-events.json representation.
+///
+/// The test covers error and ping events in addition to text/tool/usage/thinking
+/// events to ensure the encode path handles all CoreEvent variants.
 #[test]
 fn streaming_encode_round_trip() {
     // Cases where output.sse is non-empty.
@@ -902,10 +921,14 @@ fn streaming_encode_round_trip() {
         ("anthropic", "streaming-tool"),
         ("anthropic", "streaming-usage"),
         ("anthropic", "streaming-thinking"),
+        ("anthropic", "streaming-error"),
+        ("anthropic", "streaming-ping"),
         ("openai_chat", "streaming-text"),
         ("openai_chat", "streaming-tool"),
         ("openai_chat", "streaming-usage"),
         ("openai_chat", "streaming-thinking"),
+        ("openai_chat", "streaming-error"),
+        ("openai_chat", "streaming-ping"),
     ];
 
     for (adapter, case) in &cases {
@@ -915,17 +938,23 @@ fn streaming_encode_round_trip() {
         let events: Vec<CoreEvent> = serde_json::from_str(&core_events_raw)
             .unwrap_or_else(|e| panic!("failed to parse {adapter}/{case}/core-events.json: {e}"));
 
+        // Extract msg_id and model from MessageStart event (or use defaults).
+        let default_id = if *adapter == "anthropic" {
+            "msg_default".to_owned()
+        } else {
+            "chatcmpl-default".to_owned()
+        };
+        let msg_id = events.iter().find_map(|e| match e {
+            CoreEvent::MessageStart { id, .. } => id.clone(),
+            _ => None,
+        }).unwrap_or(default_id);
+        let model = events.iter().find_map(|e| match e {
+            CoreEvent::MessageStart { model, .. } => Some(model.requested.clone()),
+            _ => None,
+        }).unwrap_or_else(|| "unknown".to_owned());
+
         match *adapter {
             "anthropic" => {
-                let msg_id = events.iter().find_map(|e| match e {
-                    CoreEvent::MessageStart { id, .. } => id.clone(),
-                    _ => None,
-                }).unwrap_or_else(|| "msg_default".to_owned());
-                let model = events.iter().find_map(|e| match e {
-                    CoreEvent::MessageStart { model, .. } => Some(model.requested.clone()),
-                    _ => None,
-                }).unwrap_or_else(|| "unknown".to_owned());
-
                 let mut encoder = anthropic_adapter::StreamEncoder::new(msg_id, model);
                 let mut total_data_lines = 0;
 
@@ -933,96 +962,99 @@ fn streaming_encode_round_trip() {
                     let message_events = encoder.encode_event(event.clone())
                         .unwrap_or_else(|e| panic!("encode_event failed for {adapter}/{case}: {e}"));
                     for me in &message_events {
-                        // Verify each MessageEvent serializes to valid JSON
-                        let json = serde_json::to_string(me)
-                            .unwrap_or_else(|e| panic!("failed to serialize MessageEvent for {adapter}/{case}: {e}"));
-                        // Verify event type is a known Anthropic event type
-                        let known_types = [
-                            "message_start", "content_block_start", "content_block_delta",
-                            "content_block_stop", "message_delta", "message_stop", "ping", "error",
-                        ];
-                        assert!(
-                            known_types.contains(&me.r#type.as_str()),
-                            "{adapter}/{case}: unknown event type '{}'",
-                            me.r#type
-                        );
-                        // Verify the JSON starts with {" and ends with "}
-                        assert!(
-                            json.starts_with('{') && json.ends_with('}'),
-                            "{adapter}/{case}: MessageEvent JSON should be an object, got: {json}"
-                        );
+                        verify_anthropic_event_json(adapter, case, me);
                         total_data_lines += 1;
                     }
                 }
 
-                // Also call finish() to emit any remaining events
                 let final_events = encoder.finish()
                     .unwrap_or_else(|e| panic!("finish failed for {adapter}/{case}: {e}"));
                 for me in &final_events {
-                    let json = serde_json::to_string(me)
-                        .unwrap_or_else(|e| panic!("failed to serialize final MessageEvent for {adapter}/{case}: {e}"));
-                    assert!(
-                        json.starts_with('{') && json.ends_with('}'),
-                        "{adapter}/{case}: final MessageEvent JSON should be an object, got: {json}"
-                    );
+                    verify_anthropic_event_json(adapter, case, me);
                     total_data_lines += 1;
                 }
 
-                // Verify at least some events were produced
                 assert!(
                     total_data_lines > 0,
                     "{adapter}/{case}: encoder should produce at least one SSE event"
                 );
             }
             "openai_chat" => {
-                let msg_id = events.iter().find_map(|e| match e {
-                    CoreEvent::MessageStart { id, .. } => id.clone(),
-                    _ => None,
-                }).unwrap_or_else(|| "chatcmpl-default".to_owned());
-                let model = events.iter().find_map(|e| match e {
-                    CoreEvent::MessageStart { model, .. } => Some(model.requested.clone()),
-                    _ => None,
-                }).unwrap_or_else(|| "unknown".to_owned());
-
                 let mut encoder = openai_adapter::StreamEncoder::new(
                     msg_id, model, 1000, false,
                 );
                 let mut total_data_lines = 0;
 
                 for event in &events {
-                    let chunks = encoder.encode_event(event.clone())
-                        .unwrap_or_else(|e| panic!("encode_event failed for {adapter}/{case}: {e}"));
-                    for chunk in &chunks {
-                        let json = serde_json::to_string(chunk)
-                            .unwrap_or_else(|e| panic!("failed to serialize ChatCompletionChunk for {adapter}/{case}: {e}"));
-                        assert!(
-                            json.starts_with('{') && json.ends_with('}'),
-                            "{adapter}/{case}: ChatCompletionChunk JSON should be an object, got: {json}"
-                        );
-                        total_data_lines += 1;
+                    // OpenAI encoder returns Err for CoreEvent::Error by design --
+                    // errors are handled at the transport level (HTTP status codes),
+                    // not in stream encoding. We accept the Err gracefully and
+                    // verify that non-error events still encode correctly.
+                    match encoder.encode_event(event.clone()) {
+                        Ok(chunks) => {
+                            for chunk in &chunks {
+                                verify_openai_chunk_json(adapter, case, chunk);
+                                total_data_lines += 1;
+                            }
+                        }
+                        Err(_) => {
+                            // Expected for CoreEvent::Error on OpenAI Chat.
+                            // Verify this was indeed an error event.
+                            assert!(
+                                matches!(event, CoreEvent::Error { .. }),
+                                "{adapter}/{case}: encode_event failed for non-error event"
+                            );
+                        }
                     }
                 }
 
-                // Call finish() to emit the [DONE] sentinel
                 let final_chunks = encoder.finish()
                     .unwrap_or_else(|e| panic!("finish failed for {adapter}/{case}: {e}"));
                 for chunk in &final_chunks {
-                    let json = serde_json::to_string(chunk)
-                        .unwrap_or_else(|e| panic!("failed to serialize final ChatCompletionChunk for {adapter}/{case}: {e}"));
-                    assert!(
-                        json.starts_with('{') && json.ends_with('}'),
-                        "{adapter}/{case}: final ChatCompletionChunk JSON should be an object, got: {json}"
-                    );
+                    verify_openai_chunk_json(adapter, case, chunk);
                     total_data_lines += 1;
                 }
 
-                // Verify at least some chunks were produced
-                assert!(
-                    total_data_lines > 0,
-                    "{adapter}/{case}: encoder should produce at least one SSE chunk"
-                );
+                // Verify at least some chunks were produced, unless the fixture
+                // is an error-only case where OpenAI intentionally returns Err.
+                let is_error_only = events.iter().all(|e| matches!(e, CoreEvent::Error { .. } | CoreEvent::Ping));
+                if !is_error_only {
+                    assert!(
+                        total_data_lines > 0,
+                        "{adapter}/{case}: encoder should produce at least one SSE chunk"
+                    );
+                }
             }
             _ => panic!("unknown adapter: {adapter}"),
         }
     }
+}
+
+/// Verify an Anthropic MessageEvent is valid JSON with a known event type.
+fn verify_anthropic_event_json(adapter: &str, case: &str, me: &MessageEvent) {
+    let json = serde_json::to_string(me)
+        .unwrap_or_else(|e| panic!("failed to serialize MessageEvent for {adapter}/{case}: {e}"));
+    let known_types = [
+        "message_start", "content_block_start", "content_block_delta",
+        "content_block_stop", "message_delta", "message_stop", "ping", "error",
+    ];
+    assert!(
+        known_types.contains(&me.r#type.as_str()),
+        "{adapter}/{case}: unknown event type '{}'",
+        me.r#type
+    );
+    assert!(
+        json.starts_with('{') && json.ends_with('}'),
+        "{adapter}/{case}: MessageEvent JSON should be an object, got: {json}"
+    );
+}
+
+/// Verify an OpenAI ChatCompletionChunk is valid JSON.
+fn verify_openai_chunk_json(adapter: &str, case: &str, chunk: &ChatCompletionChunk) {
+    let json = serde_json::to_string(chunk)
+        .unwrap_or_else(|e| panic!("failed to serialize ChatCompletionChunk for {adapter}/{case}: {e}"));
+    assert!(
+        json.starts_with('{') && json.ends_with('}'),
+        "{adapter}/{case}: ChatCompletionChunk JSON should be an object, got: {json}"
+    );
 }

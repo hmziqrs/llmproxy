@@ -31,7 +31,7 @@ use crate::middleware::get_client_ip;
 use crate::state::AppState;
 
 use super::error_response::{
-    ClientProtocol, PROVIDER_DECODE_CLIENT_MESSAGE, RouteError, openai_stream_error_json,
+    ClientProtocol, PROVIDER_DECODE_CLIENT_MESSAGE, RouteError, openai_stream_error_json_with_type,
     truncate_with_suffix,
 };
 
@@ -220,6 +220,7 @@ pub(crate) fn prepare_request(
     state: &AppState,
     headers: &HeaderMap,
     body: &[u8],
+    path: &str,
 ) -> Result<RequestContext, RouteError> {
     let request_id = state.request_id_gen.next_id();
     let client_ip = get_client_ip(headers, None);
@@ -229,7 +230,7 @@ pub(crate) fn prepare_request(
         return Err(RouteError::RateLimited);
     }
 
-    if state.request_dedup.is_duplicate(body) {
+    if state.request_dedup.is_duplicate_with_path(path, body) {
         state.metrics.record_deduplicated();
         return Err(RouteError::Conflict);
     }
@@ -1011,7 +1012,11 @@ async fn emit_stream_error(
         // causes encode_core_event to produce an empty Vec. Construct an SSE
         // error event using the same typed structs as the HTTP error path so
         // both paths stay consistent at compile time.
-        if let Some(json_str) = openai_stream_error_json(message) {
+        //
+        // Use "server_error" as the error type to match the HTTP 500 path's
+        // convention in openai_error_response, since in-band stream errors are
+        // always upstream/internal issues.
+        if let Some(json_str) = openai_stream_error_json_with_type(message, "server_error") {
             let _ = tx.send(Event::default().data(json_str)).await;
         }
     } else {

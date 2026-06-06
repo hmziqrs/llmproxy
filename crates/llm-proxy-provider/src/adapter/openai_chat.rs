@@ -329,7 +329,12 @@ impl OpenAiChatAdapter {
         // System messages.
         for sys_content in &core.system {
             match sys_content {
-                CoreContent::Text { text, .. } => {
+                CoreContent::Text { text, cache } => {
+                    if cache.is_some() {
+                        tracing::warn!(
+                            "OpenAI Chat: cache_control is not supported, dropping cache marker on system message"
+                        );
+                    }
                     if !text.is_empty() {
                         messages.push(ChatMessage {
                             role: "system".to_owned(),
@@ -743,7 +748,12 @@ fn collect_text(content: &[CoreContent]) -> String {
     let mut text = String::new();
     for c in content {
         match c {
-            CoreContent::Text { text: t, .. } => {
+            CoreContent::Text { text: t, cache } => {
+                if cache.is_some() {
+                    tracing::warn!(
+                        "OpenAI Chat: cache_control is not supported, dropping cache marker"
+                    );
+                }
                 text.push_str(t);
             }
             other => {

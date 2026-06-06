@@ -58,7 +58,7 @@ async fn count_tokens_inner(
     body: axum::body::Bytes,
 ) -> Result<Response<Body>, RouteError> {
     // Pre-flight: rate limit, dedup, request ID.
-    let ctx = core_pipeline::prepare_request(state, headers, &body)?;
+    let ctx = core_pipeline::prepare_request(state, headers, &body, "/v1/messages/count_tokens")?;
     // Parse and validate the Anthropic MessageRequest.
     let req: MessageRequest = serde_json::from_slice(&body)
         .map_err(|e| RouteError::InvalidRequest(format!("invalid JSON: {e}")))?;

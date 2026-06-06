@@ -212,12 +212,15 @@ fn parse_core_content(v: &serde_json::Value) -> CoreContent {
             let cache = obj.get("cache").and_then(|v| {
                 let ctrl = v.as_object()?;
                 let typ = ctrl.get("type")?.as_str()?;
-                Some(CacheControl {
-                    r#type: match typ {
-                        "ephemeral" => CacheControlType::Ephemeral,
-                        _ => CacheControlType::Ephemeral,
-                    },
-                })
+                match typ {
+                    "ephemeral" => Some(CacheControl {
+                        r#type: CacheControlType::Ephemeral,
+                    }),
+                    other => panic!(
+                        "parse_core_content: unknown cache control type '{other}' in fixture. \
+                         Use 'ephemeral' or add a branch for this type."
+                    ),
+                }
             });
             CoreContent::Text {
                 text: obj
@@ -260,7 +263,6 @@ fn parse_core_content(v: &serde_json::Value) -> CoreContent {
         "thinking" => CoreContent::Thinking {
             text: obj
                 .get("text")
-                .or_else(|| obj.get("thinking"))
                 .and_then(|t| t.as_str())
                 .unwrap_or("")
                 .to_owned(),
@@ -327,7 +329,10 @@ fn parse_core_message(v: &serde_json::Value) -> CoreMessage {
         "assistant" => CoreRole::Assistant,
         "system" => CoreRole::System,
         "tool" => CoreRole::Tool,
-        _ => CoreRole::User,
+        other => panic!(
+            "parse_core_message: unknown role '{other}' in fixture. \
+             Use 'user', 'assistant', 'system', or 'tool'."
+        ),
     };
     let content: Vec<CoreContent> = obj
         .get("content")
@@ -551,30 +556,139 @@ fn run_encode_request_fixture(adapter_name: &str, case: &str) {
                 exp_msg.get("role"),
                 "{adapter_name}/{case}: messages[{i}].role mismatch"
             );
+            // Compare message content.
+            // Provider wire formats allow content as either a plain string or
+            // an array of content blocks. Normalize both to text for comparison
+            // when the expected content is a simple string.
+            if let Some(exp_content) = exp_msg.get("content") {
+                if let Some(act_content) = act_msg.get("content") {
+                    // If expected is a string, accept either a matching string
+                    // or an array whose text blocks concatenate to the same string.
+                    if exp_content.is_string() {
+                        let act_text = if act_content.is_string() {
+                            act_content.as_str().unwrap_or("").to_owned()
+                        } else if act_content.is_array() {
+                            act_content.as_array()
+                                .unwrap()
+                                .iter()
+                                .filter_map(|b| {
+                                    if b.get("type").and_then(|t| t.as_str()) == Some("text") {
+                                        b.get("text").and_then(|t| t.as_str())
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .collect::<Vec<_>>()
+                                .join("")
+                        } else {
+                            String::new()
+                        };
+                        assert_eq!(
+                            act_text,
+                            exp_content.as_str().unwrap_or(""),
+                            "{adapter_name}/{case}: messages[{i}].content text mismatch"
+                        );
+                    } else {
+                        // For non-string expected content, require exact match.
+                        assert_eq!(
+                            act_content, exp_content,
+                            "{adapter_name}/{case}: messages[{i}].content mismatch"
+                        );
+                    }
+                } else {
+                    panic!(
+                        "{adapter_name}/{case}: messages[{i}] missing content field"
+                    );
+                }
+            }
+            // Compare tool_calls if present
+            if let Some(exp_tcs) = exp_msg.get("tool_calls").and_then(|v| v.as_array()) {
+                let act_tcs = act_msg.get("tool_calls").and_then(|v| v.as_array())
+                    .map(|a| a.as_slice())
+                    .unwrap_or(&[]);
+                assert_eq!(
+                    act_tcs.len(),
+                    exp_tcs.len(),
+                    "{adapter_name}/{case}: messages[{i}].tool_calls count mismatch"
+                );
+                for (j, exp_tc) in exp_tcs.iter().enumerate() {
+                    let act_tc = &act_tcs[j];
+                    if exp_tc.get("id").is_some() {
+                        assert_eq!(
+                            act_tc.get("id"), exp_tc.get("id"),
+                            "{adapter_name}/{case}: messages[{i}].tool_calls[{j}].id mismatch"
+                        );
+                    }
+                    if let Some(exp_fn) = exp_tc.get("function") {
+                        if let Some(act_fn) = act_tc.get("function") {
+                            assert_eq!(
+                                act_fn.get("name"), exp_fn.get("name"),
+                                "{adapter_name}/{case}: messages[{i}].tool_calls[{j}].function.name mismatch"
+                            );
+                        }
+                    }
+                }
+            }
         }
     }
 
-    // Compare model field if present in output.json.
-    // Note: the encoded model comes from the test target's upstream_model,
-    // which may differ from the fixture's expected model.  We only verify
-    // that the model is present and non-empty, since the exact value depends
-    // on the test target configuration.
-    if let Some(_expected_model) = output_json.get("model").and_then(|v| v.as_str()) {
-        let _ = _expected_model; // suppress unused warning
-        // Verify model exists in body or URL (already checked above).
+    // Compare system prompt content if present in output.json.
+    if let Some(expected_sys) = output_json.get("system") {
+        assert_eq!(
+            actual.get("system"),
+            Some(expected_sys),
+            "{adapter_name}/{case}: system prompt mismatch"
+        );
     }
 
-    // Compare tools count if present in output.json.
+    // Compare model field if present in output.json.
+    // Verify that the encoded body or URL contains a model name. The exact
+    // value comes from the test target's upstream_model, which may differ
+    // from the fixture's expected model, so we only check presence.
+    if output_json.get("model").and_then(|v| v.as_str()).is_some() {
+        // Model presence already verified by the has_model assertion above.
+    }
+
+    // Compare tools count and key fields if present in output.json.
     if let Some(expected_tools) = output_json.get("tools").and_then(|v| v.as_array()) {
         let actual_tools = actual
             .get("tools")
             .and_then(|v| v.as_array())
-            .map(|a| a.len())
-            .unwrap_or(0);
+            .map(|a| a.as_slice())
+            .unwrap_or(&[]);
         assert_eq!(
-            actual_tools, expected_tools.len(),
+            actual_tools.len(),
+            expected_tools.len(),
             "{adapter_name}/{case}: tools count mismatch"
         );
+        for (i, exp_tool) in expected_tools.iter().enumerate() {
+            let act_tool = &actual_tools[i];
+            // Compare tool name
+            assert_eq!(
+                act_tool.get("name"),
+                exp_tool.get("name"),
+                "{adapter_name}/{case}: tools[{i}].name mismatch"
+            );
+            // Compare tool description if present in expected
+            if exp_tool.get("description").is_some() {
+                assert_eq!(
+                    act_tool.get("description"),
+                    exp_tool.get("description"),
+                    "{adapter_name}/{case}: tools[{i}].description mismatch"
+                );
+            }
+            // Compare tool input_schema if present in expected
+            if exp_tool.get("input_schema").is_some() || exp_tool.get("parameters").is_some() {
+                let act_schema = act_tool.get("input_schema")
+                    .or_else(|| act_tool.get("parameters"));
+                let exp_schema = exp_tool.get("input_schema")
+                    .or_else(|| exp_tool.get("parameters"));
+                assert_eq!(
+                    act_schema, exp_schema,
+                    "{adapter_name}/{case}: tools[{i}].schema mismatch"
+                );
+            }
+        }
     }
 
     // Compare sampling fields if present in output.json.
@@ -650,21 +764,25 @@ fn run_decode_response_fixture(adapter_name: &str, case: &str) {
     }
 
     // Compare model if present in output.json.
-    // Note: the decoded model.requested may differ from the output.json model
-    // because adapters may use the target's upstream_model instead of the
-    // provider-returned model.  We only verify that the model field exists
-    // and has a non-empty requested value.
+    // Adapters may override the model with the target's upstream_model, so
+    // we only verify that the model field exists and has a non-empty
+    // requested value. Direct string comparison is skipped because the
+    // decoded model depends on ProviderAdapterTarget configuration.
     if let Some(expected_model) = output_json.get("model") {
         if let Some(expected_str) = expected_model.as_str() {
             let actual_model = actual.get("model");
             if let Some(am) = actual_model {
                 if let Some(am_req) = am.get("requested").and_then(|v| v.as_str()) {
-                    // Only compare if both are non-empty; some adapters override
-                    // the model with the target's upstream_model.
-                    if !expected_str.is_empty() && !am_req.is_empty() {
-                        // Model may be overridden by the adapter, so we just
-                        // verify both are present and non-empty.
-                    }
+                    // Verify both are non-empty; the actual model may be
+                    // overridden by the adapter's target configuration.
+                    assert!(
+                        !expected_str.is_empty() || am_req.is_empty(),
+                        "{adapter_name}/{case}: expected model is empty but actual is '{am_req}'"
+                    );
+                    assert!(
+                        !am_req.is_empty() || expected_str.is_empty(),
+                        "{adapter_name}/{case}: actual model is empty but expected is '{expected_str}'"
+                    );
                 }
             }
         }
@@ -1020,10 +1138,16 @@ fn run_stream_decode_fixture(adapter_name: &str, case: &str) {
                     );
                 }
                 if let Some(exp_kind) = expected.get("kind").and_then(|v| v.as_str()) {
-                    // Normalize both to lowercase for comparison since Debug
-                    // formatting produces PascalCase (e.g. "Text") while the
-                    // fixture uses lowercase (e.g. "text").
-                    let actual_kind = format!("{kind:?}").to_lowercase();
+                    // Use an explicit match on ContentKind to produce the expected
+                    // string, rather than relying on Debug formatting which could
+                    // change if the Debug impl is modified.
+                    let actual_kind = match kind {
+                        llm_proxy_protocol::core::ContentKind::Text => "text",
+                        llm_proxy_protocol::core::ContentKind::ToolUse => "tool_use",
+                        llm_proxy_protocol::core::ContentKind::Thinking => "thinking",
+                        llm_proxy_protocol::core::ContentKind::Refusal => "refusal",
+                        _ => "unknown",
+                    };
                     assert_eq!(
                         actual_kind, exp_kind,
                         "{adapter_name}/{case}: event[{i}] ContentStart.kind mismatch"

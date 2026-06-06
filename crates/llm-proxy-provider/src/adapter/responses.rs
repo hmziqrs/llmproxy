@@ -410,7 +410,12 @@ impl ResponsesAdapter {
 
             for c in &msg.content {
                 match c {
-                    CoreContent::Text { text, .. } => {
+                    CoreContent::Text { text, cache } => {
+                        if cache.is_some() {
+                            tracing::warn!(
+                                "Responses: cache_control is not supported, dropping cache marker"
+                            );
+                        }
                         if !text.is_empty() {
                             text_parts.push(text.as_str());
                         }
@@ -610,6 +615,10 @@ impl ResponsesAdapter {
                                     }
                                 }
                                 _ => {
+                                    tracing::warn!(
+                                        block_type = block.r#type,
+                                        "Responses: unknown content block type in message output, extracting text if present"
+                                    );
                                     if let Some(ref text) = block.text {
                                         content.push(CoreContent::Text {
                                             text: text.clone(),
@@ -634,7 +643,12 @@ impl ResponsesAdapter {
                         input,
                     });
                 }
-                _ => {}
+                _ => {
+                    tracing::warn!(
+                        output_type = output.r#type,
+                        "Responses: skipping unknown output type in decode_response"
+                    );
+                }
             }
         }
 

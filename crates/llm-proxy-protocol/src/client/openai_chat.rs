@@ -335,11 +335,13 @@ pub fn encode_response(resp: CoreResponse) -> Result<ChatCompletionResponse, Pro
         );
     }
 
-    if resp.stop_sequence.as_ref().is_some_and(|s| !s.is_empty()) {
-        tracing::warn!(
-            stop_sequence = resp.stop_sequence.as_deref().unwrap(),
-            "OpenAI Chat Completions has no stop_sequence field on responses; dropping"
-        );
+    if let Some(seq) = resp.stop_sequence.as_deref() {
+        if !seq.is_empty() {
+            tracing::warn!(
+                stop_sequence = seq,
+                "OpenAI Chat Completions has no stop_sequence field on responses; dropping"
+            );
+        }
     }
 
     let id = resp

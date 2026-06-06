@@ -246,20 +246,19 @@ fn openai_error_response(error: RouteError) -> Response<Body> {
 
 /// Build an OpenAI-shaped SSE error JSON string for in-band stream errors.
 ///
+/// Defaults to `"api_error"` as the error type. For other error types, use
+/// [`openai_stream_error_json_with_type`] directly.
+///
 /// Reuses the same typed structs (`OpenAiErrorBody`, `OpenAiErrorDetail`) as
 /// the HTTP error path so both paths go through the same compile-time-validated
-/// serialization. This avoids raw `serde_json::json!()` which could silently
-/// produce a malformed envelope if field names change.
-///
-/// The `error_type` parameter controls the `"type"` field in the error envelope.
-/// For consistency with the HTTP error path, callers should pass `"server_error"`
-/// for internal errors and `"api_error"` for upstream/decode errors.
+/// serialization.
+#[allow(dead_code)]
 pub fn openai_stream_error_json(message: &str) -> Option<String> {
     openai_stream_error_json_with_type(message, "api_error")
 }
 
 /// Build an OpenAI-shaped SSE error JSON string with a custom error type.
-fn openai_stream_error_json_with_type(message: &str, error_type: &str) -> Option<String> {
+pub fn openai_stream_error_json_with_type(message: &str, error_type: &str) -> Option<String> {
     let body = OpenAiErrorBody {
         error: OpenAiErrorDetail {
             message: truncate_error_body(message),

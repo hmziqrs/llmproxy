@@ -273,7 +273,12 @@ impl GeminiAdapter {
             let mut parts: Vec<GeminiPart> = Vec::new();
             for c in &msg.content {
                 match c {
-                    CoreContent::Text { text, .. } => {
+                    CoreContent::Text { text, cache } => {
+                        if cache.is_some() {
+                            tracing::warn!(
+                                "Gemini: cache_control is not supported, dropping cache marker"
+                            );
+                        }
                         if !text.is_empty() {
                             parts.push(GeminiPart::text(text.clone()));
                         }
