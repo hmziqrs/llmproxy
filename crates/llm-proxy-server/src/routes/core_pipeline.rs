@@ -372,7 +372,9 @@ pub(crate) async fn handle_core_stream(
     // errors; errors after this point become in-band SSE error events.
     let first_event = first_byte_rx.await.map_err(|_| {
         state.metrics.record_failure();
-        RouteError::Internal("stream task panicked before first event".to_owned())
+        RouteError::Internal(
+            "stream task exited unexpectedly before first event (possible panic)".to_owned(),
+        )
     })?;
 
     match first_event {
@@ -778,11 +780,19 @@ fn build_sse_output_stream(
         }
 
         // If the stream ended without ever sending a first byte (empty stream
-        // with no errors), close the first_byte channel gracefully. The handler
-        // will see a RecvError and treat it as an internal error. We don't send
-        // a PreStreamError here because the stream didn't fail -- it was just
-        // empty. Dropping the sender signals the handler.
-        drop(first_byte_tx);
+        // with no errors), send a PreStreamError with a descriptive message.
+        // The handler will return this as a 502 Bad Gateway to the client.
+        // This is preferable to silently dropping the channel (which produces
+        // a misleading "stream task panicked" error).
+        if !first_byte_sent {
+            if let Some(tx) = first_byte_tx.take() {
+                let _ = tx.send(FirstByteResult::PreStreamError(
+                    RouteError::ProviderDecode(
+                        "upstream returned an empty stream with no events".to_owned(),
+                    ),
+                ));
+            }
+        }
     });
 
     // Wrap the receiver so that dropping it cancels the spawned task.
