@@ -10,12 +10,14 @@ use tower_http::{timeout::TimeoutLayer, trace::TraceLayer};
 
 use crate::state::AppState;
 
+mod chat;
 mod core_pipeline;
 mod error_response;
 mod health;
 mod messages;
 mod token_count;
 
+use chat::handle_chat_completions;
 use health::{health, ready, version};
 use messages::handle_messages;
 use token_count::count_tokens;
@@ -72,6 +74,7 @@ pub fn router(state: AppState) -> Router {
     let api = Router::new()
         .route("/v1/messages", post(handle_messages))
         .route("/v1/messages/count_tokens", post(count_tokens))
+        .route("/v1/chat/completions", post(handle_chat_completions))
         .layer(api_middleware);
 
     Router::new()

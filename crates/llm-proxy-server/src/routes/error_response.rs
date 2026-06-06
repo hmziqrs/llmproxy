@@ -192,40 +192,45 @@ fn anthropic_error_response(error: RouteError) -> Response<Body> {
 
 /// Build an OpenAI Chat-shaped error response.
 ///
-/// Note: Phase 9 will fully implement the OpenAI Chat error shape. This stub
-/// produces a minimal but valid JSON response so the core pipeline compiles.
+/// Build an OpenAI Chat-shaped error response.
+///
+/// The error envelope follows the OpenAI error shape:
+/// `{"error":{"message":"...","type":"invalid_request_error","code":null}}`.
+///
+/// Internal error messages are sanitized: `Internal` and `ProviderDecode`
+/// variants use generic messages in the response body to prevent information
+/// disclosure.
 #[allow(dead_code)]
 fn openai_error_response(error: RouteError) -> Response<Body> {
-    let (status, message) = match error {
-        RouteError::InvalidRequest(msg) => (StatusCode::BAD_REQUEST, msg),
-        RouteError::UnknownModel(model) => (
-            StatusCode::BAD_REQUEST,
-            format!("unknown model: {model}"),
-        ),
+    let (status, error_type, message) = match error {
+        RouteError::InvalidRequest(msg) => {
+            (StatusCode::BAD_REQUEST, "invalid_request_error", msg)
+        }
+        RouteError::UnknownModel(model) => {
+            (StatusCode::BAD_REQUEST, "invalid_request_error", format!("unknown model: {model}"))
+        }
         RouteError::Upstream { status, body } => {
-            (map_upstream_status(status), truncate_error_body(&body))
+            (map_upstream_status(status), "api_error", truncate_error_body(&body))
         }
         RouteError::ProviderDecode(_msg) => {
-            (StatusCode::BAD_GATEWAY, PROVIDER_DECODE_CLIENT_MESSAGE.to_owned())
+            (StatusCode::BAD_GATEWAY, "api_error", PROVIDER_DECODE_CLIENT_MESSAGE.to_owned())
         }
         RouteError::Internal(_msg) => {
-            (StatusCode::INTERNAL_SERVER_ERROR, INTERNAL_ERROR_CLIENT_MESSAGE.to_owned())
+            (StatusCode::INTERNAL_SERVER_ERROR, "server_error", INTERNAL_ERROR_CLIENT_MESSAGE.to_owned())
         }
-        RouteError::RateLimited => (
-            StatusCode::TOO_MANY_REQUESTS,
-            "rate limit exceeded".to_owned(),
-        ),
-        RouteError::Conflict => (
-            StatusCode::CONFLICT,
-            "duplicate request, please retry".to_owned(),
-        ),
+        RouteError::RateLimited => {
+            (StatusCode::TOO_MANY_REQUESTS, "rate_limit_error", "rate limit exceeded".to_owned())
+        }
+        RouteError::Conflict => {
+            (StatusCode::CONFLICT, "invalid_request_error", "duplicate request, please retry".to_owned())
+        }
     };
 
     let body = serde_json::json!({
         "error": {
             "message": message,
-            "type": "error",
-            "code": status.canonical_reason().unwrap_or("error").to_lowercase()
+            "type": error_type,
+            "code": null
         }
     });
 

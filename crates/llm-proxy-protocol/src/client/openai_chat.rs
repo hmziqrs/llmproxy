@@ -789,6 +789,13 @@ impl StreamEncoder {
             usage: None,
         }
     }
+
+    /// Mark the encoder as finished so that subsequent `finish()` calls return
+    /// empty events. This is used after emitting an in-band error event to
+    /// prevent the finalization path from emitting synthetic terminal events.
+    pub fn mark_finished(&mut self) {
+        self.finished = true;
+    }
 }
 
 // ===========================================================================

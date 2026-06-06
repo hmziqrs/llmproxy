@@ -16,7 +16,9 @@ use futures::stream::{BoxStream, StreamExt};
 use llm_proxy_core::model_route::{ModelRouteError, resolve_model_route};
 use llm_proxy_core::Metrics;
 use llm_proxy_protocol::client::anthropic;
-use llm_proxy_protocol::client::anthropic::StreamEncoder;
+use llm_proxy_protocol::client::anthropic::StreamEncoder as AnthropicStreamEncoder;
+use llm_proxy_protocol::client::openai_chat;
+use llm_proxy_protocol::client::openai_chat::StreamEncoder as OpenAiStreamEncoder;
 use llm_proxy_protocol::core::{CoreEvent, CoreRequest};
 use llm_proxy_provider::adapter::{ProviderAdapter, ProviderAdapterTarget, ProviderProtocol, ProviderStreamDecoder};
 use llm_proxy_provider::sse::SseFramer;
@@ -27,6 +29,146 @@ use crate::middleware::get_client_ip;
 use crate::state::AppState;
 
 use super::error_response::{ClientProtocol, RouteError};
+
+// ---------------------------------------------------------------------------
+// ClientStreamEncoder — protocol-agnostic stream encoder wrapper
+// ---------------------------------------------------------------------------
+
+/// Protocol-agnostic wrapper around the Anthropic and OpenAI stream encoders.
+///
+/// Both encoders share the same interface (`encode_event`, `finish`,
+/// `mark_finished`) but produce different output types. This enum dispatches
+/// to the correct encoder based on the client protocol.
+enum ClientStreamEncoder {
+    Anthropic(AnthropicStreamEncoder),
+    OpenAi(OpenAiStreamEncoder),
+}
+
+/// Output produced by a client stream encoder. Each variant carries the data
+/// needed to construct an SSE `Event` for that protocol.
+enum ClientEncodedEvent {
+    /// Anthropic SSE: requires `event:` line (e.g. `event: message_start`) and
+    /// JSON data. The `event_type` is the SSE event name.
+    Anthropic { event_type: String, json: String },
+    /// OpenAI SSE: just `data: <json>`. No event type field. The caller must
+    /// also emit `data: [DONE]` as the terminal frame after the stream ends.
+    OpenAi { json: String },
+}
+
+impl ClientStreamEncoder {
+    /// Create a new encoder for the given protocol.
+    ///
+    /// For Anthropic, `msg_id` and `model` are used directly.
+    /// For OpenAI, `include_usage` is extracted from `provider_hints` if present.
+    fn new(protocol: ClientProtocol, msg_id: String, model: String, core: &CoreRequest) -> Self {
+        match protocol {
+            ClientProtocol::Anthropic => {
+                Self::Anthropic(AnthropicStreamEncoder::new(msg_id, model))
+            }
+            ClientProtocol::OpenAiChat => {
+                let include_usage = core
+                    .provider_hints
+                    .raw
+                    .get("stream_options")
+                    .and_then(|v| v.get("include_usage"))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let created = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as i64;
+                Self::OpenAi(OpenAiStreamEncoder::new(msg_id, model, created, include_usage))
+            }
+        }
+    }
+
+    /// Encode a single [`CoreEvent`] into zero or more protocol-specific events.
+    fn encode_event(&mut self, event: CoreEvent) -> Result<Vec<ClientEncodedEvent>, llm_proxy_protocol::client::ProtocolError> {
+        match self {
+            Self::Anthropic(enc) => {
+                let msg_events = enc.encode_event(event)?;
+                Ok(msg_events
+                    .into_iter()
+                    .filter_map(|me| {
+                        serde_json::to_string(&me).ok().map(|json| {
+                            ClientEncodedEvent::Anthropic {
+                                event_type: me.r#type.clone(),
+                                json,
+                            }
+                        })
+                    })
+                    .collect())
+            }
+            Self::OpenAi(enc) => {
+                let chunks = enc.encode_event(event)?;
+                Ok(chunks
+                    .into_iter()
+                    .filter_map(|chunk| {
+                        serde_json::to_string(&chunk).ok().map(|json| {
+                            ClientEncodedEvent::OpenAi { json }
+                        })
+                    })
+                    .collect())
+            }
+        }
+    }
+
+    /// Flush any remaining buffered events (synthetic terminal if needed).
+    fn finish(&mut self) -> Result<Vec<ClientEncodedEvent>, llm_proxy_protocol::client::ProtocolError> {
+        match self {
+            Self::Anthropic(enc) => {
+                let msg_events = enc.finish()?;
+                Ok(msg_events
+                    .into_iter()
+                    .filter_map(|me| {
+                        serde_json::to_string(&me).ok().map(|json| {
+                            ClientEncodedEvent::Anthropic {
+                                event_type: me.r#type.clone(),
+                                json,
+                            }
+                        })
+                    })
+                    .collect())
+            }
+            Self::OpenAi(enc) => {
+                let chunks = enc.finish()?;
+                Ok(chunks
+                    .into_iter()
+                    .filter_map(|chunk| {
+                        serde_json::to_string(&chunk).ok().map(|json| {
+                            ClientEncodedEvent::OpenAi { json }
+                        })
+                    })
+                    .collect())
+            }
+        }
+    }
+
+    /// Mark the encoder as finished so subsequent `finish()` returns empty.
+    fn mark_finished(&mut self) {
+        match self {
+            Self::Anthropic(enc) => enc.mark_finished(),
+            Self::OpenAi(enc) => enc.mark_finished(),
+        }
+    }
+}
+
+/// Convert a [`ClientEncodedEvent`] into an axum SSE [`Event`].
+fn client_event_to_sse(encoded: ClientEncodedEvent) -> Event {
+    match encoded {
+        ClientEncodedEvent::Anthropic { event_type, json } => {
+            Event::default().event(&event_type).data(json)
+        }
+        ClientEncodedEvent::OpenAi { json } => {
+            Event::default().data(json)
+        }
+    }
+}
+
+/// Build the terminal `[DONE]` event for OpenAI Chat streams.
+fn openai_done_event() -> Event {
+    Event::default().data("[DONE]")
+}
 
 // ---------------------------------------------------------------------------
 // RequestContext
@@ -214,10 +356,10 @@ pub(crate) async fn handle_core_once(
                 .map_err(|e| RouteError::Internal(format!("serialize: {e}")))?
         }
         ClientProtocol::OpenAiChat => {
-            // Phase 9 will implement OpenAI Chat response encoding.
-            return Err(RouteError::Internal(
-                "OpenAI Chat response encoding not yet implemented".to_owned(),
-            ));
+            let chat_resp = openai_chat::encode_response(core_resp)
+                .map_err(|e| RouteError::Internal(format!("client encode: {e}")))?;
+            serde_json::to_vec(&chat_resp)
+                .map_err(|e| RouteError::Internal(format!("serialize: {e}")))?
         }
     };
 
@@ -342,8 +484,12 @@ pub(crate) async fn handle_core_stream(
     // instead, so clients tracking message IDs for conversation continuity
     // see the real ID. See issue tracker for future improvement.
     let msg_id = format!("msg_{}", uuid::Uuid::new_v4());
-    let model_name = core.model.requested;
-    let client_encoder = StreamEncoder::new(msg_id, model_name);
+    let client_encoder = ClientStreamEncoder::new(
+        client_protocol,
+        msg_id,
+        core.model.requested.clone(),
+        &core,
+    );
 
     // ctx is consumed after this point. request_id is cloned once for the
     // spawned task and once for the response header (both are needed).
@@ -441,7 +587,7 @@ fn build_sse_output_stream(
     byte_stream: std::pin::Pin<Box<dyn futures::Stream<Item = Result<Bytes, llm_proxy_provider::error::ProviderError>> + Send + 'static>>,
     mut provider_decoder: Box<dyn ProviderStreamDecoder + Send>,
     mut sse_framer: SseFramer,
-    mut client_encoder: StreamEncoder,
+    mut client_encoder: ClientStreamEncoder,
     client_protocol: ClientProtocol,
     request_id: String,
     stream_metrics: StreamMetrics,
@@ -581,7 +727,6 @@ fn build_sse_output_stream(
                                 for core_event in core_events {
                                     let client_events = encode_core_event(
                                         &mut client_encoder,
-                                        &client_protocol,
                                         core_event,
                                     );
                                     for event in client_events {
@@ -667,7 +812,6 @@ fn build_sse_output_stream(
                         for core_event in core_events {
                             let client_events = encode_core_event(
                                 &mut client_encoder,
-                                &client_protocol,
                                 core_event,
                             );
                             for event in client_events {
@@ -704,7 +848,6 @@ fn build_sse_output_stream(
                     for core_event in final_events {
                         let client_events = encode_core_event(
                             &mut client_encoder,
-                            &client_protocol,
                             core_event,
                         );
                         for event in client_events {
@@ -736,28 +879,44 @@ fn build_sse_output_stream(
 
             // Emit any remaining client encoder events (synthetic terminal if needed).
             match client_encoder.finish() {
-                Ok(final_msg_events) => {
-                    for me in final_msg_events {
-                        if let Ok(json) = serde_json::to_string(&me) {
-                            let event = Event::default()
-                                .event(&me.r#type)
-                                .data(json);
-                            if !first_byte_sent {
-                                if send_first_event(
-                                    &mut first_byte_tx,
-                                    event,
-                                ).await {
-                                    first_byte_sent = true;
-                                } else {
-                                    stream_metrics.metrics.record_failure();
-                                    return;
-                                }
-                            } else if tx.send(event).await.is_err() {
+                Ok(final_encoded_events) => {
+                    for encoded in final_encoded_events {
+                        let event = client_event_to_sse(encoded);
+                        if !first_byte_sent {
+                            if send_first_event(
+                                &mut first_byte_tx,
+                                event,
+                            ).await {
+                                first_byte_sent = true;
+                            } else {
                                 stream_metrics.metrics.record_failure();
                                 return;
                             }
+                        } else if tx.send(event).await.is_err() {
+                            stream_metrics.metrics.record_failure();
+                            return;
                         }
                     }
+
+                    // For OpenAI Chat, emit the [DONE] terminator after all chunks.
+                    if matches!(client_protocol, ClientProtocol::OpenAiChat) {
+                        let done_event = openai_done_event();
+                        if !first_byte_sent {
+                            if send_first_event(
+                                &mut first_byte_tx,
+                                done_event,
+                            ).await {
+                                first_byte_sent = true;
+                            } else {
+                                stream_metrics.metrics.record_failure();
+                                return;
+                            }
+                        } else if tx.send(done_event).await.is_err() {
+                            stream_metrics.metrics.record_failure();
+                            return;
+                        }
+                    }
+
                     stream_succeeded = true;
                 }
                 Err(e) => {
@@ -807,59 +966,17 @@ fn build_sse_output_stream(
 }
 
 /// Encode a single [`CoreEvent`] using the appropriate client stream encoder.
-///
-/// TODO(Phase 9): Dispatch on `client_protocol` to choose the correct encoder.
-/// Currently always delegates to the Anthropic `StreamEncoder`. When Phase 9
-/// adds OpenAI Chat support, this function must match on `client_protocol` and
-/// use the appropriate encoder for each protocol.
 fn encode_core_event(
-    client_encoder: &mut StreamEncoder,
-    client_protocol: &ClientProtocol,
+    client_encoder: &mut ClientStreamEncoder,
     event: CoreEvent,
 ) -> Vec<Event> {
-    // Runtime guard: only Anthropic protocol is supported until Phase 9.
-    // In debug builds, debug_assert catches programming errors. In release
-    // builds, the match below returns an empty vec for unsupported protocols.
-    debug_assert!(
-        matches!(client_protocol, ClientProtocol::Anthropic),
-        "encode_core_event only supports ClientProtocol::Anthropic until Phase 9"
-    );
-
-    if !matches!(client_protocol, ClientProtocol::Anthropic) {
-        warn!(
-            protocol = ?client_protocol,
-            "encode_core_event called with unsupported protocol, returning empty events"
-        );
-        return Vec::new();
-    }
-
     match client_encoder.encode_event(event) {
-        Ok(msg_events) => msg_events
+        Ok(encoded_events) => encoded_events
             .into_iter()
-            .filter_map(|me| {
-                match serde_json::to_string(&me) {
-                    Ok(json) => {
-                        // The Anthropic SSE protocol requires the `event:` field
-                        // (e.g. `event: message_start`, `event: content_block_delta`).
-                        // Without it, Anthropic client SDKs cannot dispatch events.
-                        Some(Event::default().event(&me.r#type).data(json))
-                    }
-                    Err(e) => {
-                        // Terminal events (message_delta, message_stop) must not be
-                        // silently dropped, as clients may hang waiting for them.
-                        // Emit a warning with the event type for diagnostics.
-                        warn!(
-                            event_type = %me.r#type,
-                            error = %e,
-                            "MsgEvent serialization failed, dropping event"
-                        );
-                        None
-                    }
-                }
-            })
+            .map(client_event_to_sse)
             .collect(),
         Err(e) => {
-            warn!("client stream encode error: {e}");
+            warn!(error = %e, "client stream encode error");
             Vec::new()
         }
     }
@@ -871,38 +988,28 @@ fn encode_core_event(
 /// that any subsequent `finish()` call returns an empty vec. The error event
 /// itself is the terminal event -- no synthetic message_delta/message_stop
 /// pair should follow an error.
-///
-/// TODO(Phase 9): Dispatch on `client_protocol` to choose the correct encoder.
-/// Currently always delegates to the Anthropic `StreamEncoder`.
 async fn emit_stream_error(
-    client_encoder: &mut StreamEncoder,
+    client_encoder: &mut ClientStreamEncoder,
     tx: &tokio::sync::mpsc::Sender<Event>,
     client_protocol: &ClientProtocol,
     message: &str,
 ) {
-    // Runtime guard: only Anthropic protocol is supported until Phase 9.
-    debug_assert!(
-        matches!(client_protocol, ClientProtocol::Anthropic),
-        "emit_stream_error only supports ClientProtocol::Anthropic until Phase 9"
-    );
-
-    if !matches!(client_protocol, ClientProtocol::Anthropic) {
-        warn!(
-            protocol = ?client_protocol,
-            "emit_stream_error called with unsupported protocol, skipping error event"
-        );
-        return;
-    }
-
     use llm_proxy_protocol::core::{CoreStreamError, CoreStreamErrorKind};
 
     let error_event = CoreEvent::Error {
         error: CoreStreamError::new(CoreStreamErrorKind::Upstream, message.to_owned()),
     };
 
-    let events = encode_core_event(client_encoder, client_protocol, error_event);
+    let events = encode_core_event(client_encoder, error_event);
     for event in events {
         if tx.send(event).await.is_err() {
+            return;
+        }
+    }
+
+    // For OpenAI Chat, emit the [DONE] terminator after an error event.
+    if matches!(client_protocol, ClientProtocol::OpenAiChat) {
+        if tx.send(openai_done_event()).await.is_err() {
             return;
         }
     }
@@ -1188,10 +1295,11 @@ mod tests {
     #[test]
     fn encode_core_event_ping_produces_event() {
         use llm_proxy_protocol::core::CoreEvent;
-        let mut encoder = StreamEncoder::new("msg_test".to_owned(), "test-model".to_owned());
+        let mut encoder = ClientStreamEncoder::Anthropic(
+            AnthropicStreamEncoder::new("msg_test".to_owned(), "test-model".to_owned()),
+        );
         let events = encode_core_event(
             &mut encoder,
-            &ClientProtocol::Anthropic,
             CoreEvent::Ping,
         );
         // Ping may or may not produce output depending on the encoder impl.

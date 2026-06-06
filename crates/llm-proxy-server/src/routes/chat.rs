@@ -1,133 +1,159 @@
-//! OpenAI Chat Completions route (placeholder).
+//! `/v1/chat/completions` handler using the core pipeline.
 //!
-//! Note: This route is **not mounted** in the router until Phase 9.
-//! The types defined here (`ChatRequest`, `ChatMessage`, `ChatResponse`, etc.)
-//! are placeholders that shadow the protocol crate types. When Phase 9 mounts
-//! this route, these types should be replaced by the protocol crate types
-//! (`llm_proxy_protocol::openai::*`) to avoid maintaining parallel type
-//! definitions.
+//! This is the Phase 9 implementation: the handler parses the incoming OpenAI
+//! `ChatCompletionRequest`, decodes it into a `CoreRequest` via the OpenAI Chat
+//! client adapter, and then dispatches through the shared core pipeline
+//! ([`handle_core_once`] or [`handle_core_stream`]).
+//!
+//! **No legacy imports**: no scenario detection, endpoint classification,
+//! fallback chains, legacy HTTP client, or provider-specific stream handlers.
 
-#![allow(dead_code)] // Intentionally unmounted until Phase 9.
-
+use axum::body::Body;
 use axum::extract::State;
-use axum_serde::Sonic;
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
-use tracing::warn;
-use uuid::Uuid;
+use axum::http::{HeaderMap, Response};
+use llm_proxy_protocol::client::openai_chat;
+use llm_proxy_protocol::openai::ChatCompletionRequest;
+use tracing::info;
 
-use crate::error::ApiError;
 use crate::state::AppState;
 
-/// OpenAI-shaped chat completion request.
-#[derive(Deserialize)]
-pub(crate) struct ChatRequest {
-    model: String,
-    messages: Vec<ChatMessage>,
-    #[serde(default)]
-    stream: bool,
-}
+use super::core_pipeline;
+use super::error_response::{ClientProtocol, RouteError, route_error_response};
 
-/// A single message in the chat request.
-#[derive(Deserialize)]
-pub(crate) struct ChatMessage {
-    role: String,
-    content: Value,
-}
-
-/// OpenAI-shaped chat completion response.
-#[derive(Serialize)]
-pub(crate) struct ChatResponse {
-    id: String,
-    object: &'static str,
-    created: i64,
-    model: String,
-    choices: Vec<Choice>,
-    usage: Usage,
-}
-
-/// A single choice in the response.
-#[derive(Serialize)]
-pub(crate) struct Choice {
-    index: u32,
-    message: ResponseMessage,
-    finish_reason: &'static str,
-}
-
-/// The assistant response message.
-#[derive(Serialize)]
-pub(crate) struct ResponseMessage {
-    role: &'static str,
-    content: String,
-}
-
-/// Token usage statistics.
-#[derive(Serialize)]
-pub(crate) struct Usage {
-    prompt_tokens: u32,
-    completion_tokens: u32,
-    total_tokens: u32,
-}
-
-/// POST /v1/chat/completions — non-streaming echo.
+/// POST `/v1/chat/completions`
 ///
-/// Accepts any well-formed JSON, rejects `stream: true` with 400,
-/// otherwise returns the last user message echoed back wrapped in
-/// the OpenAI chat completion shape. Uses `Sonic` (sonic-rs, SIMD) on
-/// both the request and response — this is the one route where payload
-/// size justifies it; ops/error routes stay on serde_json's `Json`.
-pub async fn echo_chat(
-    State(_state): State<AppState>,
-    Sonic(req): Sonic<ChatRequest>,
-) -> Result<Sonic<ChatResponse>, ApiError> {
-    if req.stream {
-        return Err(ApiError::BadRequest(
-            "streaming not supported in this build".to_string(),
-        ));
-    }
-    let last_user = req
-        .messages
-        .iter()
-        .rev()
-        .find(|m| m.role == "user")
-        .ok_or_else(|| ApiError::BadRequest("no user message in request".to_string()))?;
-    let text = match &last_user.content {
-        Value::String(s) => s.clone(),
-        other => {
-            warn!(?other, "non-string user content coerced to JSON");
-            other.to_string()
+/// Accepts an OpenAI-format [`ChatCompletionRequest`], decodes it through the
+/// core pipeline, and returns an OpenAI-shaped response.
+pub async fn handle_chat_completions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response<Body> {
+    match handle_chat_completions_inner(state, headers, body).await {
+        Ok(response) => response,
+        Err(error) => {
+            info!(error = %error, "request failed");
+            route_error_response(ClientProtocol::OpenAiChat, error)
         }
-    };
-    Ok(Sonic(ChatResponse {
-        id: format!("chatcmpl-{}", Uuid::new_v4()),
-        object: "chat.completion",
-        created: now_unix(),
-        model: req.model,
-        choices: vec![Choice {
-            index: 0,
-            message: ResponseMessage {
-                role: "assistant",
-                content: text,
-            },
-            finish_reason: "stop",
-        }],
-        usage: Usage {
-            prompt_tokens: 0,
-            completion_tokens: 0,
-            total_tokens: 0,
-        },
-    }))
+    }
 }
 
-/// Current Unix time in seconds. The `unwrap_or(0)` is a documented
-/// exception to the no-`unwrap` rule (Ch. 4.2): `duration_since`
-/// only errors if the wall clock is set before 1970, which we treat
-/// as a benign `0` rather than panicking. (Note: `SystemTime` is the
-/// wall clock and can move backwards — that is exactly why this
-/// returns a `Result` we must handle.)
-fn now_unix() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
+/// Inner handler that returns `Result` so errors can be mapped uniformly.
+async fn handle_chat_completions_inner(
+    state: AppState,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<Response<Body>, RouteError> {
+    // Pre-flight: rate limit, dedup, request ID.
+    let ctx = core_pipeline::prepare_request(&state, &headers, &body)?;
+
+    // Parse and validate the OpenAI ChatCompletionRequest.
+    let req: ChatCompletionRequest = serde_json::from_slice(&body)
+        .map_err(|e| RouteError::InvalidRequest(format!("invalid JSON: {e}")))?;
+
+    // Decode the OpenAI Chat request into a core request.
+    let core = openai_chat::decode_request(req)
+        .map_err(core_pipeline::protocol_error_to_route)?;
+
+    let is_streaming = core.stream;
+    info!(
+        request_id = %ctx.request_id,
+        model = %core.model.requested,
+        streaming = is_streaming,
+        "decoded OpenAI Chat request into CoreRequest"
+    );
+
+    // Dispatch to streaming or non-streaming pipeline.
+    if is_streaming {
+        core_pipeline::handle_core_stream(state, ctx, core, ClientProtocol::OpenAiChat).await
+    } else {
+        core_pipeline::handle_core_once(state, ctx, core, ClientProtocol::OpenAiChat).await
+    }
+}
+
+// ===========================================================================
+// Tests
+// ===========================================================================
+
+#[cfg(test)]
+mod tests {
+    // -- Source guard: no legacy imports ---------------------------------------
+
+    #[test]
+    fn source_guard_no_legacy_imports() {
+        let source = include_str!("chat.rs");
+        let prod = source
+            .split_once("#[cfg(test)]")
+            .map(|(p, _)| p)
+            .unwrap_or(source);
+
+        assert!(
+            !prod.contains("llm_proxy_core::router"),
+            "chat.rs must not import legacy router (scenario/fallback)"
+        );
+        assert!(
+            !prod.contains("detect_scenario"),
+            "chat.rs must not use detect_scenario"
+        );
+        assert!(
+            !prod.contains("route_for_streaming"),
+            "chat.rs must not use route_for_streaming"
+        );
+        assert!(
+            !prod.contains("classify_endpoint"),
+            "chat.rs must not use classify_endpoint"
+        );
+        assert!(
+            !prod.contains("EndpointType"),
+            "chat.rs must not use EndpointType"
+        );
+        assert!(
+            !prod.contains("OpenCodeClient"),
+            "chat.rs production code must not use OpenCodeClient"
+        );
+        assert!(
+            !prod.contains("transformer"),
+            "chat.rs must not use legacy transformer module"
+        );
+        assert!(
+            !prod.contains("StreamProxy"),
+            "chat.rs must not use StreamProxy"
+        );
+        assert!(
+            !prod.contains("spawn_proxy_task"),
+            "chat.rs must not use spawn_proxy_task"
+        );
+        assert!(
+            !prod.contains("handle_anthropic_streaming"),
+            "chat.rs must not use provider-specific stream handlers"
+        );
+        assert!(
+            !prod.contains("handle_openai_streaming"),
+            "chat.rs must not use provider-specific stream handlers"
+        );
+        assert!(
+            !prod.contains("handle_responses_streaming"),
+            "chat.rs must not use provider-specific stream handlers"
+        );
+        assert!(
+            !prod.contains("handle_gemini_streaming"),
+            "chat.rs must not use provider-specific stream handlers"
+        );
+        assert!(
+            !prod.contains("ApiError"),
+            "chat.rs must not use legacy ApiError"
+        );
+        assert!(
+            !prod.contains("ScenarioConfig"),
+            "chat.rs must not use ScenarioConfig"
+        );
+        assert!(
+            !prod.contains("axum_serde"),
+            "chat.rs must not use axum_serde (legacy echo handler)"
+        );
+        assert!(
+            !prod.contains("Sonic"),
+            "chat.rs must not use Sonic (legacy echo handler)"
+        );
+    }
 }
