@@ -24,6 +24,14 @@ use token_count::count_tokens;
 
 const MAX_BODY_BYTES: usize = 32 * 1024 * 1024; // 32 MiB
 
+/// Maximum body size to drain for 404 fallback responses.
+///
+/// Deliberately smaller than [`MAX_BODY_BYTES`] because 404 responses are
+/// never processed -- the body is only drained to clean up the connection.
+/// 1 KiB is enough to read any reasonable probe or small payload while
+/// avoiding wasting memory on large accidental uploads to wrong paths.
+const NOT_FOUND_BODY_DRAIN_LIMIT: usize = 1024;
+
 /// Build the full router.
 ///
 /// Middleware order (outermost to innermost per group):
@@ -99,11 +107,18 @@ async fn not_found(req: Request) -> impl IntoResponse {
     // Boundary note: the starts_with("/v1/chat/") check covers future routes
     // like /v1/chat/edits. If a non-OpenAI protocol is ever mounted under
     // /v1/chat/, this heuristic must be updated.
+    //
+    // NOTE: This heuristic is fragile and depends on path-prefix conventions
+    // rather than a registered route registry. A more robust approach would
+    // be to maintain a route-to-protocol mapping that is consulted by the
+    // fallback handler. For now, the prefix-based approach is sufficient
+    // because only two protocols are mounted and their paths are disjoint.
     let path = req.uri().path().to_owned();
 
     // Drain the body to ensure the connection is cleaned up promptly.
-    // POST requests to nonexistent endpoints may carry non-trivial bodies.
-    let _body = axum::body::to_bytes(req.into_body(), MAX_BODY_BYTES).await;
+    // Use a small limit since 404 responses never process the body content;
+    // we only need to consume it so the connection can be reused.
+    let _body = axum::body::to_bytes(req.into_body(), NOT_FOUND_BODY_DRAIN_LIMIT).await;
 
     if path == "/v1/chat/completions" || path.starts_with("/v1/chat/") {
         error_response::route_error_response(

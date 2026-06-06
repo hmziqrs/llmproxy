@@ -317,8 +317,8 @@ fn decode_tool_choice(value: serde_json::Value) -> CoreToolChoice {
 ///
 /// - Multiple `CoreContent::Text` blocks are concatenated into a single string
 ///   without separator, since OpenAI's `content` field is a single string.
-/// - Multiple `CoreContent::Thinking` blocks: only the last one is preserved
-///   (overwritten). If this becomes common, consider concatenating them.
+/// - Multiple `CoreContent::Thinking` blocks are concatenated with a newline
+///   separator into a single string for `reasoning_content`.
 /// - `stop_sequence` is silently dropped since OpenAI has no native field for it.
 /// - `provider_meta` is silently dropped (for provider adapters only).
 pub fn encode_response(resp: CoreResponse) -> Result<ChatCompletionResponse, ProtocolError> {
@@ -353,14 +353,19 @@ pub fn encode_response(resp: CoreResponse) -> Result<ChatCompletionResponse, Pro
                 content_text.push_str(&text);
             }
             CoreContent::Thinking { text, .. } => {
-                // Only the last Thinking block is preserved. If multiple
-                // thinking blocks are present, earlier ones are overwritten.
+                // Concatenate multiple Thinking blocks with a newline separator
+                // rather than silently overwriting earlier blocks. OpenAI exposes
+                // reasoning_content as a single string, so concatenation is the
+                // least-lossy approach.
                 if reasoning.is_some() {
                     tracing::warn!(
-                        "multiple Thinking blocks in response; earlier blocks overwritten"
+                        "multiple Thinking blocks in response; concatenating with newline separator"
                     );
                 }
-                reasoning = Some(text);
+                reasoning = Some(match reasoning {
+                    Some(prev) => format!("{prev}\n{text}"),
+                    None => text,
+                });
             }
             CoreContent::ToolUse { id, name, input } => {
                 let args_str = serde_json::to_string(&input).unwrap_or_else(|_| "{}".to_owned());
@@ -490,9 +495,19 @@ fn encode_usage(usage: &Usage) -> UsageInfo {
         prompt_tokens: usage.input_tokens,
         completion_tokens: usage.output_tokens,
         total_tokens: usage.input_tokens.saturating_add(usage.output_tokens),
-        // cache_creation_input_tokens (writing to cache) maps to prompt_cache_miss_tokens.
-        // These are semantically related because a cache miss results in a cache write.
-        // This mapping is intentional: the proxy treats cache creation as the cache-miss cost.
+        // Cache token mapping:
+        //
+        //   cache_creation_input_tokens -> prompt_cache_miss_tokens
+        //   cache_read_input_tokens    -> prompt_cache_hit_tokens
+        //
+        // This is an intentional semantic mapping: cache_creation means the prompt was
+        // NOT in the cache (a miss), and the cache was populated as a side effect.
+        // Therefore cache_creation_input_tokens represents the cache-miss cost.
+        //
+        // Operators correlating upstream provider usage with downstream client usage
+        // should be aware that these fields are inverses of each other:
+        //   - Upstream "creation" = Downstream "miss"  (same tokens, different label)
+        //   - Upstream "read"     = Downstream "hit"    (same tokens, same label)
         prompt_cache_hit_tokens: usage.cache_read_input_tokens,
         prompt_cache_miss_tokens: usage.cache_creation_input_tokens,
     }
@@ -1991,7 +2006,7 @@ mod tests {
     }
 
     #[test]
-    fn encode_multiple_thinking_blocks_keeps_last() {
+    fn encode_multiple_thinking_blocks_concatenates() {
         let resp = CoreResponse {
             id: Some("chatcmpl-123".into()),
             model: ModelRef {
@@ -2015,8 +2030,8 @@ mod tests {
         };
         let out = encode_response(resp).unwrap();
         let msg = out.choices[0].message.as_ref().unwrap();
-        // Only the last Thinking block is preserved.
-        assert_eq!(msg.reasoning_content.as_deref(), Some("second"));
+        // Multiple Thinking blocks are concatenated with newline separator.
+        assert_eq!(msg.reasoning_content.as_deref(), Some("first\nsecond"));
     }
 
     #[test]

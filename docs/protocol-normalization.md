@@ -142,7 +142,7 @@ struct CoreResponse {
     content: Vec<CoreContent>,
     stop_reason: StopReason,
     usage: Usage,
-    provider_meta: JsonValue,
+    provider_meta: Map<String, Value>,
 }
 ```
 
@@ -183,8 +183,8 @@ enum CoreEvent {
     ToolCallDelta { index: usize, args_delta: String },
     ToolCallStop { index: usize },
     ThinkingDelta { index: usize, text: String },
-    UsageDelta { usage: Usage },
-    MessageStop { stop_reason: StopReason },
+    Usage { usage: Usage },
+    MessageStop { stop_reason: StopReason, stop_sequence: Option<String> },
     Error { error: CoreError },
     Ping,
 }

@@ -80,6 +80,10 @@ impl ClientStreamEncoder {
                     .unwrap_or(false);
                 // The u64 -> i64 cast is safe: u64::MAX corresponds to a date
                 // ~584 billion years in the future, unreachable in any real timeline.
+                // The unwrap_or_default() handles the unlikely case of a system
+                // clock set before UNIX_EPOCH (e.g. clock skew after boot) by
+                // falling back to 0, which produces a valid but incorrect timestamp.
+                // This is acceptable because `created` is informational only.
                 let created = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
@@ -486,13 +490,20 @@ pub(crate) async fn handle_core_stream(
     let sse_framer = SseFramer::new();
 
     // Create the client stream encoder.
-    // NOTE: This generates a synthetic message ID. The prefix is chosen based
-    // on the client protocol so it matches the expected convention:
+    //
+    // NOTE: This generates a synthetic message ID because the stream encoder
+    // needs an ID before any events arrive. The prefix is chosen based on the
+    // client protocol so it matches the expected convention:
     //   - OpenAI Chat uses `chatcmpl-` prefix
     //   - Anthropic uses `msg_` prefix
-    // When available, the upstream provider's message ID should be extracted
-    // from the first CoreEvent::MessageStart instead, so clients tracking
-    // message IDs for conversation continuity see the real ID.
+    //
+    // Trade-off: the upstream provider's real message ID (available in
+    // CoreEvent::MessageStart) is not used because: (a) the encoder needs an
+    // ID at construction time, and (b) extracting it would require buffering
+    // the first event. Clients tracking message IDs for conversation continuity
+    // will see the proxy-generated ID instead. This is acceptable for v1;
+    // a future improvement could pre-flight the first event to extract the
+    // real upstream ID before constructing the encoder.
     let msg_id = match client_protocol {
         ClientProtocol::OpenAiChat => format!("chatcmpl-{}", uuid::Uuid::new_v4()),
         ClientProtocol::Anthropic => format!("msg_{}", uuid::Uuid::new_v4()),
@@ -941,6 +952,18 @@ fn build_sse_output_stream(
 }
 
 /// Encode a single [`CoreEvent`] using the appropriate client stream encoder.
+///
+/// # Silently dropped events
+///
+/// If encoding fails (e.g. the encoder encounters an invalid state), the event
+/// is logged at warn level and silently dropped. This prevents a single
+/// malformed event from terminating the entire SSE stream. The trade-off is
+/// that clients may miss events without explicit notification. This is
+/// acceptable because:
+/// 1. Encoding failures indicate a proxy bug, not a transient client issue.
+/// 2. The stream will still terminate normally (with `finish()`) rather than
+///    abruptly mid-frame.
+/// 3. The `warn!` log ensures operators can diagnose the root cause.
 fn encode_core_event(client_encoder: &mut ClientStreamEncoder, event: CoreEvent) -> Vec<Event> {
     match client_encoder.encode_event(event) {
         Ok(encoded_events) => encoded_events

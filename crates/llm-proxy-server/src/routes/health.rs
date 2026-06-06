@@ -5,6 +5,17 @@ use std::collections::HashMap;
 use crate::state::AppState;
 
 /// Health check response body.
+///
+/// Note: `#[serde(deny_unknown_fields)]` is intentionally omitted because these
+/// structs are outbound-only (`Serialize`, never `Deserialize` from external
+/// input). The attribute has no runtime effect on Serialize-only types.
+///
+/// # Security note on model_counts
+///
+/// The `model_counts` field exposes internal model routing information
+/// (model name -> request count). In a future phase, this should be gated
+/// behind authentication or redacted for unauthenticated access, as it
+/// reveals which models are configured and their relative usage.
 #[derive(Serialize)]
 pub(crate) struct HealthBody {
     status: &'static str,
@@ -14,6 +25,8 @@ pub(crate) struct HealthBody {
 }
 
 /// Metrics snapshot included in the health response.
+///
+/// Note: `#[serde(deny_unknown_fields)]` is intentionally omitted (Serialize-only type).
 #[derive(Serialize)]
 struct HealthMetrics {
     requests_received: i64,
@@ -49,6 +62,8 @@ pub async fn health(State(state): State<AppState>) -> (StatusCode, Json<HealthBo
 }
 
 /// Readiness response body.
+///
+/// Note: `#[serde(deny_unknown_fields)]` is intentionally omitted (Serialize-only type).
 #[derive(Serialize)]
 pub(crate) struct ReadyBody {
     status: &'static str,
@@ -61,6 +76,8 @@ pub async fn ready() -> (StatusCode, Json<ReadyBody>) {
 }
 
 /// Version response body.
+///
+/// Note: `#[serde(deny_unknown_fields)]` is intentionally omitted (Serialize-only type).
 #[derive(Serialize)]
 pub(crate) struct VersionBody {
     /// Public server name, from `config.server_name`.

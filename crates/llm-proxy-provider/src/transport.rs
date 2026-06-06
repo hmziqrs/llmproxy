@@ -79,7 +79,9 @@ impl fmt::Debug for ProxyRequest {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // NOTE: The URL field is not sanitized for query-string secrets.
         // Callers must never include API keys in query parameters; use
-        // AuthHeaders instead.
+        // AuthHeaders instead.  If URL redaction becomes necessary (e.g.
+        // for structured logging), add a regex-based redaction step here
+        // similar to `sanitize_upstream_error_body` in the server crate.
         f.debug_struct("ProxyRequest")
             .field("url", &self.url)
             .field("auth", &self.auth)

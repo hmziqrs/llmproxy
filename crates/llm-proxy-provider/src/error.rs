@@ -62,9 +62,30 @@ pub enum ProviderError {
 /// (the `...[truncated]` suffix is included within this budget).
 pub(crate) const MAX_API_ERROR_BODY_LEN: usize = 512;
 
-/// Length of the `...[truncated]` suffix appended when a body exceeds the limit.
+/// Suffix appended when a body exceeds the truncation limit.
 const TRUNCATED_SUFFIX: &str = "...[truncated]";
-const TRUNCATED_SUFFIX_LEN: usize = TRUNCATED_SUFFIX.len();
+
+/// Truncate a string to `max_len` bytes, appending `suffix` if truncation occurs.
+///
+/// The final string is at most `max_len` bytes (the suffix is included within
+/// this budget). Respects UTF-8 char boundaries to prevent panics on multi-byte
+/// characters.
+///
+/// This is the same logic as `llm_proxy_server::routes::error_response::truncate_with_suffix`.
+/// Both implementations must stay in sync. If a shared utility crate is
+/// introduced in a future phase, both should call into it.
+fn truncate_with_suffix(s: &str, max_len: usize, suffix: &str) -> String {
+    if s.len() <= max_len {
+        s.to_owned()
+    } else {
+        let max_content = max_len - suffix.len();
+        let mut end = max_content;
+        while !s.is_char_boundary(end) && end > 0 {
+            end -= 1;
+        }
+        format!("{}{}", &s[..end], suffix)
+    }
+}
 
 /// Redaction patterns compiled once via `OnceLock`.
 ///
@@ -97,6 +118,10 @@ fn redaction_patterns() -> &'static Vec<regex::Regex> {
             r"key-[A-Za-z0-9_-]{20,}",
             // Bearer token values echoed in error responses
             r"Bearer [A-Za-z0-9_-]{20,}",
+            // Generic key= assignment patterns (key=VALUE with 20+ chars)
+            r"(?i)key=[A-Za-z0-9_-]{20,}",
+            // Generic token= assignment patterns (token=VALUE with 20+ chars)
+            r"(?i)token=[A-Za-z0-9_-]{20,}",
         ]
         .iter()
         // SAFETY: all patterns are static string literals known at compile time,
@@ -109,12 +134,28 @@ fn redaction_patterns() -> &'static Vec<regex::Regex> {
 /// Sanitize an upstream API error body: strip common key patterns and
 /// truncate to [`MAX_API_ERROR_BODY_LEN`].
 ///
-/// Covers:
+/// # Ordering rationale
+///
+/// Redaction runs BEFORE truncation. This means if a key pattern appears in
+/// the portion that would be truncated away, the pattern survives because
+/// truncation happens after redaction. This is acceptable because:
+/// 1. The truncation limit (512 bytes) is large enough to cover the vast
+///    majority of real error messages.
+/// 2. The redaction patterns target key *prefixes* (e.g. `sk-ant-`) which
+///    typically appear near the start of error bodies, not near the end.
+/// 3. Even if a partial key survives in the truncated tail, the key is
+///    incomplete and unlikely to be the full secret.
+///
+/// # Covered patterns
+///
 /// - OpenAI keys: `sk-live-...`, `sk-test-...`, `sk_live_...`, `sk_test_...`,
 ///   generic `sk-...` (only when followed by 20+ alphanumeric chars).
 /// - Anthropic keys: `sk-ant-api03-...`, `sk-ant-...`
 /// - Google API keys: `AIza...` (only when followed by 30+ chars)
 /// - Generic key prefixes: `key-...` (only when followed by 20+ chars)
+/// - Generic assignment patterns: `key=...`, `token=...` (case-insensitive,
+///   only when followed by 20+ chars)
+/// - Bearer token values: `Bearer ...` (only when followed by 20+ chars)
 ///
 /// Uses regex-based matching to avoid false-positive redaction of short
 /// substrings like `sk-` or `key-` that appear in ordinary words.
@@ -125,15 +166,12 @@ pub(crate) fn sanitize_api_error_body(mut body: String) -> String {
     }
 
     // Truncate if the sanitized body exceeds the limit.
-    // Account for the suffix so the final string is at most MAX_API_ERROR_BODY_LEN bytes.
+    // Uses the same truncate-with-suffix logic as
+    // `llm_proxy_server::routes::error_response::truncate_with_suffix`.
+    // Both implementations must stay in sync. If a shared utility crate is
+    // introduced in a future phase, both should call into it.
     if body.len() > MAX_API_ERROR_BODY_LEN {
-        let max_content = MAX_API_ERROR_BODY_LEN - TRUNCATED_SUFFIX_LEN;
-        let mut end = max_content;
-        while !body.is_char_boundary(end) && end > 0 {
-            end -= 1;
-        }
-        body.truncate(end);
-        body.push_str(TRUNCATED_SUFFIX);
+        body = truncate_with_suffix(&body, MAX_API_ERROR_BODY_LEN, TRUNCATED_SUFFIX);
     }
     body
 }
@@ -328,5 +366,49 @@ mod tests {
             "Must contain redaction marker: {}",
             result
         );
+    }
+
+    #[test]
+    fn sanitize_redacts_generic_key_assignment() {
+        let body = r#"error: key=sk_live_abc123def456ghi789jkl012mno345"#.to_owned();
+        let result = sanitize_api_error_body(body);
+        assert!(
+            !result.contains("sk_live_abc123def456ghi789"),
+            "key= assignment must be redacted: {}",
+            result
+        );
+        assert!(result.contains("***"));
+    }
+
+    #[test]
+    fn sanitize_redacts_generic_token_assignment() {
+        let body = r#"error: token=abc123def456ghi789jkl012mno345pqr"#.to_owned();
+        let result = sanitize_api_error_body(body);
+        assert!(
+            !result.contains("abc123def456ghi789jkl012"),
+            "token= assignment must be redacted: {}",
+            result
+        );
+        assert!(result.contains("***"));
+    }
+
+    #[test]
+    fn sanitize_redacts_key_assignment_case_insensitive() {
+        let body = r#"error: KEY=abc123def456ghi789jkl012mno345pqr"#.to_owned();
+        let result = sanitize_api_error_body(body);
+        assert!(
+            !result.contains("abc123def456ghi789jkl012"),
+            "KEY= (uppercase) must be redacted: {}",
+            result
+        );
+        assert!(result.contains("***"));
+    }
+
+    #[test]
+    fn sanitize_does_not_redact_short_key_assignment() {
+        // "key=short" should NOT be redacted -- under 20 chars.
+        let body = "error: key=shortvalue".to_owned();
+        let result = sanitize_api_error_body(body.clone());
+        assert_eq!(result, body);
     }
 }

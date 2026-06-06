@@ -81,6 +81,12 @@ impl std::fmt::Debug for AppState {
     // Debug. The redaction chain documented on the struct must be maintained.
     // The test `app_state_debug_does_not_leak_api_key` provides regression
     // coverage. See struct-level doc comment for the full chain.
+    //
+    // NOTE: A `redacted_debug!()` macro could reduce boilerplate for types
+    // with sensitive fields, but would add a procedural-macro dependency.
+    // The manual impl is preferred for now because: (a) AppState has few
+    // fields, (b) the redaction chain is explicitly documented and tested,
+    // and (c) a macro would obscure the security-critical delegation paths.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AppState")
             .field("app_config", &self.app_config)
@@ -246,6 +252,39 @@ mod tests {
             debug_output.contains("[REDACTED]"),
             "Debug output must show [REDACTED] for api_key, got: {debug_output}"
         );
+    }
+
+    #[test]
+    fn app_state_debug_covers_all_fields() {
+        // Regression test: verify that the Debug impl actually outputs all
+        // field names. If a field is added to AppState but missing from the
+        // manual Debug impl, this test catches it.
+        let state = AppState::new(
+            make_app_config(),
+            make_provider_registry(),
+            ProviderAdapterRegistry::builtin(),
+            ProxyClient::new(),
+            make_build_info(),
+        );
+        let debug_output = format!("{:?}", state);
+        // All fields that should appear in the Debug output.
+        for field in [
+            "app_config",
+            "providers",
+            "provider_adapters",
+            "proxy_client",
+            "build",
+            "token_counter",
+            "metrics",
+            "rate_limiter",
+            "request_dedup",
+            "request_id_gen",
+        ] {
+            assert!(
+                debug_output.contains(field),
+                "Debug output must contain field '{field}', got: {debug_output}"
+            );
+        }
     }
 
     // -- Provider adapters are populated --------------------------------------

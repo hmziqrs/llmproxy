@@ -192,19 +192,81 @@ fn decode_content_block(block: ContentBlock) -> Result<CoreContent, ProtocolErro
                 .unwrap_or(serde_json::Value::Object(serde_json::Map::new())),
         }),
         "tool_result" => {
-            // TODO: The Anthropic API allows tool_result content to be an array of
-            // content blocks (text, image, etc.), but we currently extract only the
-            // text via text_content(). Non-text content blocks (e.g. image results)
-            // inside tool_result content arrays are lost. This should be updated to
-            // iterate the content array and produce a Vec<CoreContent>.
-            let inner_text = block.text_content();
             let is_error = block.is_error.unwrap_or(false);
+            let inner_content = if let Some(ref content_val) = block.content {
+                match content_val {
+                    // Plain string content.
+                    serde_json::Value::String(s) => {
+                        vec![CoreContent::Text {
+                            text: s.clone(),
+                            cache: None,
+                        }]
+                    }
+                    // Array of content blocks -- iterate and decode each one.
+                    serde_json::Value::Array(arr) => {
+                        let mut blocks = Vec::with_capacity(arr.len());
+                        for item in arr {
+                            if let Ok(cb) =
+                                serde_json::from_value::<crate::anthropic::ContentBlock>(item.clone())
+                            {
+                                // Recursively decode each inner block. Errors from
+                                // unknown block types are logged and skipped rather
+                                // than failing the entire tool_result decode.
+                                match decode_content_block(cb) {
+                                    Ok(core) => blocks.push(core),
+                                    Err(ProtocolError::Decode(msg)) => {
+                                        let truncated = if msg.len() > 64 {
+                                            &msg[..64]
+                                        } else {
+                                            &msg
+                                        };
+                                        tracing::warn!(
+                                            block_type = truncated,
+                                            "skipping unknown block inside tool_result content array"
+                                        );
+                                    }
+                                    Err(other) => return Err(other),
+                                }
+                            }
+                        }
+                        if blocks.is_empty() {
+                            vec![CoreContent::Text {
+                                text: String::new(),
+                                cache: None,
+                            }]
+                        } else {
+                            blocks
+                        }
+                    }
+                    // Fallback: try text_content() for any other shape.
+                    _ => {
+                        let text = block.text_content();
+                        if text.is_empty() {
+                            vec![]
+                        } else {
+                            vec![CoreContent::Text {
+                                text,
+                                cache: None,
+                            }]
+                        }
+                    }
+                }
+            } else {
+                // No content field -- fall back to text_content() which checks
+                // the deprecated output field.
+                let text = block.text_content();
+                if text.is_empty() {
+                    vec![]
+                } else {
+                    vec![CoreContent::Text {
+                        text,
+                        cache: None,
+                    }]
+                }
+            };
             Ok(CoreContent::ToolResult {
                 tool_use_id: block.tool_use_id.unwrap_or_default(),
-                content: vec![CoreContent::Text {
-                    text: inner_text,
-                    cache: None,
-                }],
+                content: inner_content,
                 is_error,
             })
         }

@@ -19,6 +19,14 @@ use sha2::{Digest, Sha256};
 /// Tracks in-flight request hashes with a 500 ms deduplication window.
 /// If a second request with the same body arrives while the first is still
 /// in-flight, the duplicate is rejected.
+///
+/// # Why `std::sync::Mutex`?
+///
+/// Uses `std::sync::Mutex` rather than `tokio::sync::Mutex` because the
+/// critical section is purely in-memory HashMap operations (insert, remove,
+/// retain) that complete in microseconds. `tokio::sync::Mutex` would add
+/// unnecessary async overhead for a non-I/O-bound lock. The mutex is never
+/// held across `.await` points.
 #[derive(Debug)]
 pub struct RequestDeduplicator {
     /// SHA-256 hex digest -> insertion time.
@@ -44,7 +52,10 @@ impl RequestDeduplicator {
         let hash = Self::hash_body(body);
         let now = Instant::now();
 
-        let mut map = self.in_flight.lock().unwrap_or_else(|e| e.into_inner());
+        let mut map = self.in_flight.lock().unwrap_or_else(|e| {
+            tracing::warn!("request deduplicator mutex poisoned; recovering from panic");
+            e.into_inner()
+        });
 
         // Prune expired entries.
         map.retain(|_, t| now.duration_since(*t).as_millis() < self.window_ms as u128);
@@ -139,16 +150,19 @@ impl RateLimiter {
     ///
     /// Returns `true` if the request is allowed, `false` if rate-limited.
     pub fn is_allowed(&self, client_ip: &str) -> bool {
-        let mut buckets = self.buckets.lock().unwrap_or_else(|e| e.into_inner());
+        let mut buckets = self.buckets.lock().unwrap_or_else(|e| {
+            tracing::warn!("rate limiter mutex poisoned; recovering from panic");
+            e.into_inner()
+        });
 
-        // Evict stale entries periodically to prevent unbounded memory growth.
-        // Prune entries not accessed within the last 5 minutes.
-        if buckets.len() > 1000 {
-            let now = std::time::Instant::now();
-            buckets.retain(|_, bucket| {
-                now.duration_since(bucket.last_refill) < std::time::Duration::from_secs(300)
-            });
-        }
+        // Evict stale entries to prevent unbounded memory growth.
+        // Prune entries not accessed within the last 5 minutes. Always prune
+        // (not just when above a threshold) so stale entries from low but
+        // steady traffic do not accumulate indefinitely.
+        let now = std::time::Instant::now();
+        buckets.retain(|_, bucket| {
+            now.duration_since(bucket.last_refill) < std::time::Duration::from_secs(300)
+        });
 
         // Refill rate: tokens per second.
         let refill_rate = self.max_requests_per_minute / 60.0;
@@ -217,8 +231,11 @@ impl Default for RequestIdGenerator {
 /// validation. If the proxy is deployed behind a reverse proxy, these headers
 /// can be spoofed by clients to bypass rate limiting. The proxy should only
 /// be deployed behind a trusted reverse proxy that overwrites these headers.
-/// Consider adding a config option to control whether `X-Forwarded-For` is
-/// trusted.
+///
+/// TODO(future): Add a `trust_forwarded_headers` config option (default: true)
+/// that, when disabled, skips `X-Forwarded-For` and `X-Real-IP` and relies
+/// solely on connection info. This is needed for deployments where the proxy
+/// is directly exposed to the internet without a trusted reverse proxy.
 pub fn get_client_ip(
     headers: &axum::http::HeaderMap,
     connect_info: Option<&axum::extract::ConnectInfo<std::net::SocketAddr>>,

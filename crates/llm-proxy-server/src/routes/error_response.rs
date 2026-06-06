@@ -205,6 +205,14 @@ fn anthropic_error_response(error: RouteError) -> Response<Body> {
 /// 2. This function then overrides `error_type` for specific status codes
 ///    to match OpenAI conventions: 500 becomes `"server_error"` and 404
 ///    becomes `"invalid_request_error"`.
+///
+/// # Why 502 Bad Gateway for upstream errors?
+///
+/// When the upstream provider returns 4xx/5xx, the proxy maps most of these
+/// to 502 Bad Gateway (except 429 which is passed through). This signals to
+/// the client that the failure is between the proxy and the upstream, not a
+/// client error. The original upstream status is preserved in server-side
+/// logs for debugging.
 fn openai_error_response(error: RouteError) -> Response<Body> {
     let (status, error_type, message) = extract_error_fields(error);
     // OpenAI uses "server_error" for internal errors instead of "api_error".

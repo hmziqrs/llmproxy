@@ -4,7 +4,7 @@
 //! OpenAI Chat Completions API, Responses API, Google Gemini API,
 //! and the normalised core protocol types.
 
-#![warn(missing_docs)]
+#![deny(missing_docs)]
 
 pub mod anthropic;
 pub mod client;

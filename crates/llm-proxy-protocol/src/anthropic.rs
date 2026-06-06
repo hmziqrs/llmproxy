@@ -97,13 +97,18 @@ impl MessageRequest {
 
     /// Validates that required fields are present.
     ///
-    /// Returns an error message if `model` is empty or `messages` is empty.
-    pub fn validate(&self) -> Result<(), String> {
+    /// Returns `Ok(())` if all required fields are present, or a
+    /// `ProtocolError::InvalidRequest` with a description of the problem.
+    pub fn validate(&self) -> Result<(), crate::client::ProtocolError> {
         if self.model.is_empty() {
-            return Err("model is required".to_owned());
+            return Err(crate::client::ProtocolError::InvalidRequest(
+                "model is required".to_owned(),
+            ));
         }
         if self.messages.is_empty() {
-            return Err("messages is required".to_owned());
+            return Err(crate::client::ProtocolError::InvalidRequest(
+                "messages is required".to_owned(),
+            ));
         }
         Ok(())
     }
@@ -929,7 +934,9 @@ mod tests {
             tool_choice: None,
         };
         let err = req.validate().unwrap_err();
-        assert_eq!(err, "model is required");
+        assert!(
+            matches!(err, crate::client::ProtocolError::InvalidRequest(ref msg) if msg == "model is required")
+        );
     }
 
     #[test]
@@ -948,7 +955,9 @@ mod tests {
             tool_choice: None,
         };
         let err = req.validate().unwrap_err();
-        assert_eq!(err, "messages is required");
+        assert!(
+            matches!(err, crate::client::ProtocolError::InvalidRequest(ref msg) if msg == "messages is required")
+        );
     }
 
     // -- ContentBlock custom serialize --------------------------------------

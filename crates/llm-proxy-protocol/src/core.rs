@@ -610,7 +610,17 @@ impl fmt::Debug for RedactedMap<'_> {
 
 /// Opaque hints consumed only by provider adapters.
 ///
-/// No adapter may special-case another protocol's hints.
+/// Provider hints carry client-side metadata that influences how a provider
+/// adapter encodes a request, but which does not belong in the canonical
+/// `CoreRequest` fields.  Examples include:
+///
+/// - `stream_options` (OpenAI Chat: `{"include_usage": true}`)
+/// - ` thinking` configuration passthrough
+/// - provider-specific flags like `reasoning_effort` mapping hints
+///
+/// **Architectural rule:** No adapter may special-case another protocol's
+/// hints.  Client adapters write hints; provider adapters read only the
+/// hints they understand.  Unknown keys must be silently ignored.
 #[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderHints {

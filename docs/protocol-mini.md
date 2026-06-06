@@ -78,7 +78,7 @@ struct CoreChatResponse {
     content: Vec<CoreContent>,
     stop_reason: StopReason,
     usage: Usage,
-    provider_meta: serde_json::Value,
+    provider_meta: serde_json::Map<String, serde_json::Value>,
 }
 ```
 
@@ -136,6 +136,7 @@ enum CoreChatEvent {
     },
     MessageStop {
         stop_reason: StopReason,
+        stop_sequence: Option<String>,
     },
     Error {
         error: CoreError,

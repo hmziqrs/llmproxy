@@ -54,7 +54,7 @@ async fn handle_messages_inner(
     // Defense-in-depth: validate() checks for empty model/messages before
     // decode_request also validates the same fields. This catches issues
     // early with a clearer error message.
-    req.validate().map_err(RouteError::InvalidRequest)?;
+    req.validate().map_err(|e| RouteError::InvalidRequest(e.to_string()))?;
 
     // Decode the Anthropic request into a core request.
     let core = anthropic::decode_request(req).map_err(core_pipeline::protocol_error_to_route)?;

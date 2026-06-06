@@ -8,8 +8,7 @@
 //!   including streaming chunk support.
 //!
 //! Every struct derives `Debug`, `Clone`, `Serialize`, and `Deserialize`
-//! so they can be used directly as Axum extractors / response bodies via
-//! `axum-serde`.
+//! so they can be serialized/deserialized directly via `serde_json`.
 
 use serde::{Deserialize, Serialize};
 
@@ -140,9 +139,11 @@ pub struct ResponsesUsage {
 /// field carries incremental text for `response.output_text.delta` events.
 /// For `response.function_call_arguments.delta` events, the delta is also a
 /// string -- this is a known gap: the stream decoding layer does not currently
-/// handle function call streaming for the Responses API (see
-/// `responses_function_call_stream` test). Phase 2/5/12 should add the right
-/// adapter fixtures for this.
+/// handle function call streaming for the Responses API. Function call arguments
+/// are accumulated via the `delta` field but the Responses API provider adapter
+/// does not emit `CoreEvent::ToolCallStart`/`ToolCallDelta` events for them.
+/// This should be addressed in a future phase by adding proper event type
+/// handling in the Responses API stream decoder.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResponsesChunk {
     /// Chunk type discriminator.

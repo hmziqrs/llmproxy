@@ -290,6 +290,15 @@ impl ProviderAdapterRegistry {
 /// dots, hyphens, underscores) to prevent path traversal injection.  Returns
 /// an error if the model name contains characters that could enable SSRF or
 /// path-traversal attacks (e.g. `/`, `..`, control characters).
+///
+/// # Path canonicalization
+///
+/// The expanded URL is **not** canonicalized (no `..` resolution, no double-slash
+/// collapse). This is acceptable because the model name validation above rejects
+/// `..` and `/`, so the only way `..` can appear in the URL is via the template
+/// itself, which is a static config value controlled by the operator. If user-
+/// controlled input is ever interpolated into URLs beyond the model name, path
+/// canonicalization must be added here.
 pub(crate) fn expand_url_template(
     template: &str,
     target: &ProviderAdapterTarget,
@@ -327,11 +336,16 @@ pub(crate) fn map_openai_finish_reason(reason: &str) -> StopReason {
 }
 
 /// Map a Gemini finish reason string to a core StopReason.
+///
+/// SAFETY and RECITATION indicate content was filtered by safety systems.
+/// These map to `StopReason::Refusal` because the model refused to complete
+/// the response due to content policy, which is semantically closer to a
+/// refusal than a normal end-of-turn.
 pub(crate) fn map_gemini_finish_reason(reason: &str) -> StopReason {
     match reason {
         "STOP" => StopReason::EndTurn,
         "MAX_TOKENS" => StopReason::MaxTokens,
-        "SAFETY" | "RECITATION" => StopReason::EndTurn,
+        "SAFETY" | "RECITATION" => StopReason::Refusal,
         _ => StopReason::Unknown,
     }
 }
@@ -619,8 +633,8 @@ mod tests {
             map_gemini_finish_reason("MAX_TOKENS"),
             StopReason::MaxTokens
         );
-        assert_eq!(map_gemini_finish_reason("SAFETY"), StopReason::EndTurn);
-        assert_eq!(map_gemini_finish_reason("RECITATION"), StopReason::EndTurn);
+        assert_eq!(map_gemini_finish_reason("SAFETY"), StopReason::Refusal);
+        assert_eq!(map_gemini_finish_reason("RECITATION"), StopReason::Refusal);
         assert_eq!(map_gemini_finish_reason("other"), StopReason::Unknown);
     }
 
