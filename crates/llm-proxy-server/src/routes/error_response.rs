@@ -192,6 +192,15 @@ fn anthropic_error_response(error: RouteError) -> Response<Body> {
 /// Internal error messages are sanitized: `Internal` and `ProviderDecode`
 /// variants use generic messages in the response body to prevent information
 /// disclosure.
+///
+/// # Two-stage error mapping
+///
+/// 1. [`extract_error_fields`] first converts the [`RouteError`] into a
+///    (status, error_type, message) tuple. Upstream errors go through
+///    [`map_upstream_status`] which converts most upstream codes to 502.
+/// 2. This function then overrides `error_type` for specific status codes
+///    to match OpenAI conventions: 500 becomes `"server_error"` and 404
+///    becomes `"invalid_request_error"`.
 fn openai_error_response(error: RouteError) -> Response<Body> {
     let (status, error_type, message) = extract_error_fields(error);
     // OpenAI uses "server_error" for internal errors instead of "api_error".

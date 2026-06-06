@@ -93,7 +93,10 @@ async fn not_found(req: Request) -> impl IntoResponse {
     // like /v1/chat/edits. If a non-OpenAI protocol is ever mounted under
     // /v1/chat/, this heuristic must be updated.
     let path = req.uri().path().to_owned();
-    let _ = req; // Request must be consumed (moved) for IntoResponse; body intentionally ignored
+
+    // Drain the body to ensure the connection is cleaned up promptly.
+    // POST requests to nonexistent endpoints may carry non-trivial bodies.
+    let _body = axum::body::to_bytes(req.into_body(), MAX_BODY_BYTES).await;
 
     if path == "/v1/chat/completions" || path.starts_with("/v1/chat/") {
         error_response::route_error_response(

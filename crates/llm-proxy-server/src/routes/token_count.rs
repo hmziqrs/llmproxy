@@ -43,10 +43,10 @@ pub(crate) struct TokenCountResponse {
 /// without legacy state.
 pub async fn count_tokens(
     State(state): State<AppState>,
-    _headers: HeaderMap,
+    headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response<Body> {
-    match count_tokens_inner(&state, body).await {
+    match count_tokens_inner(&state, &headers, body).await {
         Ok(response) => response,
         Err(error) => route_error_response(ClientProtocol::Anthropic, error),
     }
@@ -54,8 +54,11 @@ pub async fn count_tokens(
 
 async fn count_tokens_inner(
     state: &AppState,
+    headers: &HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<Response<Body>, RouteError> {
+    // Pre-flight: rate limit, dedup, request ID.
+    let ctx = core_pipeline::prepare_request(state, headers, &body)?;
     // Parse and validate the Anthropic MessageRequest.
     let req: MessageRequest = serde_json::from_slice(&body)
         .map_err(|e| RouteError::InvalidRequest(format!("invalid JSON: {e}")))?;
@@ -149,7 +152,17 @@ async fn count_tokens_inner(
         token_count: count,
     });
 
-    Ok(response.into_response())
+    let mut response = response.into_response();
+
+    // Insert the request ID header safely.
+    response.headers_mut().insert(
+        "x-request-id",
+        ctx.request_id
+            .parse()
+            .unwrap_or_else(|_| axum::http::HeaderValue::from_static("unknown")),
+    );
+
+    Ok(response)
 }
 
 // ===========================================================================
