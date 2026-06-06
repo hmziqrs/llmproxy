@@ -563,10 +563,18 @@ impl OpenAiChatAdapter {
             extra: serde_json::Map::new(),
         };
 
-        // Add stream_options with include_usage for streaming.
+        // Propagate the client's include_usage preference to the upstream request.
+        // If the client didn't request usage, we don't ask upstream for it either.
         if core.stream {
+            let include_usage = core
+                .provider_hints
+                .raw
+                .get("stream_options")
+                .and_then(|v| v.get("include_usage"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
             req.stream_options = Some(StreamOptions {
-                include_usage: Some(true),
+                include_usage: Some(include_usage),
             });
         }
 
@@ -904,6 +912,11 @@ mod tests {
             }],
         }]);
         core.stream = true;
+        // Simulate the client requesting usage via provider_hints.
+        core.provider_hints.raw.insert(
+            "stream_options".into(),
+            serde_json::json!({"include_usage": true}),
+        );
         let adapter = OpenAiChatAdapter;
         let target = make_target();
         let proxy_req = adapter.encode_request(&core, &target).unwrap();
@@ -916,6 +929,30 @@ mod tests {
             Some(true)
         );
         assert!(proxy_req.stream);
+    }
+
+    #[test]
+    fn encode_stream_without_usage_hint_omits_usage() {
+        let mut core = make_core_request(vec![CoreMessage {
+            role: CoreRole::User,
+            content: vec![CoreContent::Text {
+                text: "hi".into(),
+                cache: None,
+            }],
+        }]);
+        core.stream = true;
+        // No provider_hints set -- include_usage should default to false.
+        let adapter = OpenAiChatAdapter;
+        let target = make_target();
+        let proxy_req = adapter.encode_request(&core, &target).unwrap();
+
+        let body: ChatCompletionRequest = serde_json::from_slice(&proxy_req.body).unwrap();
+        assert_eq!(body.stream, Some(true));
+        assert!(body.stream_options.is_some());
+        assert_eq!(
+            body.stream_options.unwrap().include_usage,
+            Some(false)
+        );
     }
 
     #[test]

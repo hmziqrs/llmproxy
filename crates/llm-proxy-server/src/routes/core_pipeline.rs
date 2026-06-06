@@ -28,7 +28,7 @@ use tracing::{info, warn};
 use crate::middleware::get_client_ip;
 use crate::state::AppState;
 
-use super::error_response::{ClientProtocol, RouteError};
+use super::error_response::{ClientProtocol, RouteError, PROVIDER_DECODE_CLIENT_MESSAGE, truncate_with_suffix};
 
 // ---------------------------------------------------------------------------
 // ClientStreamEncoder — protocol-agnostic stream encoder wrapper
@@ -92,12 +92,14 @@ impl ClientStreamEncoder {
                 Ok(msg_events
                     .into_iter()
                     .filter_map(|me| {
-                        serde_json::to_string(&me).ok().map(|json| {
-                            ClientEncodedEvent::Anthropic {
-                                event_type: me.r#type.clone(),
-                                json,
+                        let event_type = me.r#type.clone();
+                        match serde_json::to_string(&me) {
+                            Ok(json) => Some(ClientEncodedEvent::Anthropic { event_type, json }),
+                            Err(e) => {
+                                warn!(error = %e, "failed to serialize Anthropic SSE event; dropping");
+                                None
                             }
-                        })
+                        }
                     })
                     .collect())
             }
@@ -106,9 +108,13 @@ impl ClientStreamEncoder {
                 Ok(chunks
                     .into_iter()
                     .filter_map(|chunk| {
-                        serde_json::to_string(&chunk).ok().map(|json| {
-                            ClientEncodedEvent::OpenAi { json }
-                        })
+                        match serde_json::to_string(&chunk) {
+                            Ok(json) => Some(ClientEncodedEvent::OpenAi { json }),
+                            Err(e) => {
+                                warn!(error = %e, "failed to serialize OpenAI SSE chunk; dropping");
+                                None
+                            }
+                        }
                     })
                     .collect())
             }
@@ -123,12 +129,14 @@ impl ClientStreamEncoder {
                 Ok(msg_events
                     .into_iter()
                     .filter_map(|me| {
-                        serde_json::to_string(&me).ok().map(|json| {
-                            ClientEncodedEvent::Anthropic {
-                                event_type: me.r#type.clone(),
-                                json,
+                        let event_type = me.r#type.clone();
+                        match serde_json::to_string(&me) {
+                            Ok(json) => Some(ClientEncodedEvent::Anthropic { event_type, json }),
+                            Err(e) => {
+                                warn!(error = %e, "failed to serialize Anthropic SSE event in finish; dropping");
+                                None
                             }
-                        })
+                        }
                     })
                     .collect())
             }
@@ -137,9 +145,13 @@ impl ClientStreamEncoder {
                 Ok(chunks
                     .into_iter()
                     .filter_map(|chunk| {
-                        serde_json::to_string(&chunk).ok().map(|json| {
-                            ClientEncodedEvent::OpenAi { json }
-                        })
+                        match serde_json::to_string(&chunk) {
+                            Ok(json) => Some(ClientEncodedEvent::OpenAi { json }),
+                            Err(e) => {
+                                warn!(error = %e, "failed to serialize OpenAI SSE chunk in finish; dropping");
+                                None
+                            }
+                        }
                     })
                     .collect())
             }
@@ -264,7 +276,7 @@ fn resolve_target(
                 adapter_target_config.protocol
             ))
         })?
-        .clone();
+        .clone(); // ProviderAdapter is Arc-like: clone is a cheap reference count increment, not a deep copy.
 
     let provider_target = ProviderAdapterTarget {
         provider_name: adapter_target_config.provider_name,
@@ -481,11 +493,17 @@ pub(crate) async fn handle_core_stream(
     let sse_framer = SseFramer::new();
 
     // Create the client stream encoder.
-    // NOTE: This generates a synthetic message ID. When available, the
-    // upstream provider's message ID should be extracted from the response
-    // instead, so clients tracking message IDs for conversation continuity
-    // see the real ID. See issue tracker for future improvement.
-    let msg_id = format!("msg_{}", uuid::Uuid::new_v4());
+    // NOTE: This generates a synthetic message ID. The prefix is chosen based
+    // on the client protocol so it matches the expected convention:
+    //   - OpenAI Chat uses `chatcmpl-` prefix
+    //   - Anthropic uses `msg_` prefix
+    // When available, the upstream provider's message ID should be extracted
+    // from the first CoreEvent::MessageStart instead, so clients tracking
+    // message IDs for conversation continuity see the real ID.
+    let msg_id = match client_protocol {
+        ClientProtocol::OpenAiChat => format!("chatcmpl-{}", uuid::Uuid::new_v4()),
+        ClientProtocol::Anthropic => format!("msg_{}", uuid::Uuid::new_v4()),
+    };
     let client_encoder = ClientStreamEncoder::new(
         client_protocol,
         msg_id,
@@ -543,6 +561,13 @@ pub(crate) async fn handle_core_stream(
             let (mut parts, body) = response.into_parts();
 
             // Add custom headers.
+            // Defense-in-depth: explicitly set Content-Type even though
+            // Sse::into_response() sets it internally. This guards against
+            // axum version changes and makes the intent explicit.
+            parts.headers.insert(
+                header::CONTENT_TYPE,
+                axum::http::HeaderValue::from_static("text/event-stream"),
+            );
             parts.headers.insert(
                 "x-accel-buffering",
                 axum::http::HeaderValue::from_static("no"),
@@ -680,11 +705,13 @@ fn build_sse_output_stream(
                                         );
                                     } else {
                                         // Error after first byte: in-band SSE error event.
+                                        // Sanitize the error message to prevent leaking
+                                        // internal details (adapter names, URLs, etc.).
                                         emit_stream_error(
                                             &mut client_encoder,
                                             &tx,
                                             &client_protocol,
-                                            &format!("stream framing error: {e}"),
+                                            PROVIDER_DECODE_CLIENT_MESSAGE,
                                         ).await;
                                         stream_metrics.metrics.record_failure();
                                     }
@@ -713,11 +740,13 @@ fn build_sse_output_stream(
                                             );
                                         } else {
                                             // Error after first byte: in-band SSE error event.
+                                            // Sanitize the error message to prevent leaking
+                                            // internal details (adapter names, URLs, etc.).
                                             emit_stream_error(
                                                 &mut client_encoder,
                                                 &tx,
                                                 &client_protocol,
-                                                &format!("provider decode error: {e}"),
+                                                PROVIDER_DECODE_CLIENT_MESSAGE,
                                             ).await;
                                             stream_metrics.metrics.record_failure();
                                         }
@@ -768,11 +797,14 @@ fn build_sse_output_stream(
                                 );
                             } else {
                                 // Error after first byte: in-band SSE error event.
+                                // Sanitize the error message to prevent leaking
+                                // upstream hostnames, URL paths, or connection details.
+                                let sanitized = sanitize_upstream_error_body(&e.to_string());
                                 emit_stream_error(
                                     &mut client_encoder,
                                     &tx,
                                     &client_protocol,
-                                    &format!("upstream error: {e}"),
+                                    &sanitized,
                                 ).await;
                                 stream_metrics.metrics.record_failure();
                             }
@@ -1083,7 +1115,6 @@ pub(crate) fn map_provider_error(e: llm_proxy_provider::error::ProviderError) ->
 /// `truncate_error_body()` in the error response encoder.
 const MAX_SANITIZE_LEN: usize = 512;
 const SANITIZE_SUFFIX: &str = "...[truncated]";
-const SANITIZE_SUFFIX_LEN: usize = SANITIZE_SUFFIX.len();
 
 /// Compiled regex for URL redaction, initialized once via `LazyLock`.
 static URL_REDACT_REGEX: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
@@ -1100,16 +1131,7 @@ fn sanitize_upstream_error_body(msg: &str) -> String {
     // Truncate to MAX_SANITIZE_LEN as a safety net. The suffix is included
     // within this budget. The actual error body in RouteError::Upstream is
     // further truncated by truncate_error_body() in the error response encoder.
-    let truncated = if msg.len() > MAX_SANITIZE_LEN {
-        let max_content = MAX_SANITIZE_LEN - SANITIZE_SUFFIX_LEN;
-        let mut end = max_content;
-        while !msg.is_char_boundary(end) && end > 0 {
-            end -= 1;
-        }
-        format!("{}{}", &msg[..end], SANITIZE_SUFFIX)
-    } else {
-        msg.to_owned()
-    };
+    let truncated = truncate_with_suffix(msg, MAX_SANITIZE_LEN, SANITIZE_SUFFIX);
 
     // Redact URL-like patterns that may contain hostnames/paths.
     // Matches http:// or https:// followed by any non-whitespace chars.

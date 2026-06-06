@@ -38,9 +38,10 @@
 //! ## Forward compatibility
 //!
 //! All public enums are annotated with `#[non_exhaustive]`, so adding new variants
-//! is not a semver-breaking change.  All structs with named fields use
-//! `#[serde(deny_unknown_fields)]` to ensure that unknown fields cause a
-//! deserialization error rather than being silently dropped.
+//! is not a semver-breaking change.  Core structs use `#[serde(deny_unknown_fields)]`
+//! to ensure that unknown fields cause a deserialization error rather than being
+//! silently dropped.  Wire-type structs in `openai.rs` may use `#[serde(flatten)]`
+//! with an extra `Map` for passthrough instead.
 
 use std::fmt;
 

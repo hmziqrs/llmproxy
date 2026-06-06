@@ -112,7 +112,16 @@ pub fn decode_request(req: ChatCompletionRequest) -> Result<CoreRequest, Protoco
                         })?;
                         let args: serde_json::Value = f
                             .arguments
-                            .and_then(|a| serde_json::from_str(&a).ok())
+                            .and_then(|a| {
+                                let parsed = serde_json::from_str::<serde_json::Value>(&a);
+                                if parsed.is_err() {
+                                    tracing::warn!(
+                                        arguments = %a,
+                                        "malformed tool_call.function.arguments; replacing with empty object"
+                                    );
+                                }
+                                parsed.ok()
+                            })
                             .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
                         (name, args)
                     } else {
@@ -139,7 +148,10 @@ pub fn decode_request(req: ChatCompletionRequest) -> Result<CoreRequest, Protoco
             }
             "tool" => {
                 // OpenAI tool messages lack an explicit is_error field; we default
-                // to false. Future OpenAI spec additions may add this field.
+                // to false. Some OpenAI-compatible providers support optional
+                // 'status' or 'is_error' fields on tool messages, but ChatMessage
+                // does not capture unknown fields (it lacks #[serde(flatten)]).
+                // Adding a flattened extra Map to ChatMessage would enable this.
                 let is_error = false;
                 let inner_content = if msg.content.is_empty() {
                     vec![]
@@ -290,7 +302,7 @@ pub fn encode_response(
     resp: CoreResponse,
 ) -> Result<ChatCompletionResponse, ProtocolError> {
     if !resp.provider_meta.is_empty() {
-        tracing::debug!(
+        tracing::warn!(
             meta_keys = resp.provider_meta.len(),
             "provider_meta is non-empty during OpenAI client encode; \
              this data is for provider adapters only and will not be forwarded to the client"

@@ -1,7 +1,7 @@
 use axum::{
     Router,
     extract::{DefaultBodyLimit, Request},
-    http::{HeaderValue, StatusCode, header},
+    http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
 };
@@ -85,39 +85,21 @@ pub fn router(state: AppState) -> Router {
 }
 
 async fn not_found(req: Request) -> impl IntoResponse {
-    // Protocol-aware 404: return OpenAI-shaped errors for /v1/chat/* paths,
-    // Anthropic-shaped errors for everything else.
+    // Protocol-aware 404: return OpenAI-shaped errors for /v1/chat/completions
+    // and related paths, Anthropic-shaped errors for everything else.
+    // Uses the typed error structs from error_response.rs for consistency.
     let path = req.uri().path();
+    let _ = req; // consumed for URI extraction
 
-    if path.starts_with("/v1/chat") {
-        // OpenAI-shaped error envelope.
-        let body = serde_json::json!({
-            "error": {
-                "message": "not found",
-                "type": "invalid_request_error",
-                "code": null
-            }
-        });
-        let mut response = (StatusCode::NOT_FOUND, axum::Json(body)).into_response();
-        response.headers_mut().insert(
-            header::CONTENT_TYPE,
-            HeaderValue::from_static("application/json"),
-        );
-        response
+    if path == "/v1/chat/completions" || path.starts_with("/v1/chat/") {
+        error_response::route_error_response(
+            error_response::ClientProtocol::OpenAiChat,
+            error_response::RouteError::NotFound,
+        )
     } else {
-        // Anthropic-shaped error envelope.
-        let body = serde_json::json!({
-            "type": "error",
-            "error": {
-                "type": "not_found_error",
-                "message": "not found"
-            }
-        });
-        let mut response = (StatusCode::NOT_FOUND, axum::Json(body)).into_response();
-        response.headers_mut().insert(
-            header::CONTENT_TYPE,
-            HeaderValue::from_static("application/json"),
-        );
-        response
+        error_response::route_error_response(
+            error_response::ClientProtocol::Anthropic,
+            error_response::RouteError::NotFound,
+        )
     }
 }

@@ -75,6 +75,11 @@ pub enum RouteError {
     #[error("provider decode error: {0}")]
     ProviderDecode(String),
     /// Internal server error (misconfiguration, missing state).
+    ///
+    /// **Security note:** The message is for server-side logging only. The error
+    /// response encoder discards it and sends a generic `INTERNAL_ERROR_CLIENT_MESSAGE`
+    /// to clients. Any future error handling path must NOT format this variant's
+    /// message directly into client responses.
     #[error("internal error: {0}")]
     Internal(String),
     /// Client has exceeded its rate limit.
@@ -83,6 +88,9 @@ pub enum RouteError {
     /// Duplicate request detected by the deduplicator.
     #[error("duplicate request")]
     Conflict,
+    /// The requested path does not match any mounted route.
+    #[error("not found")]
+    NotFound,
 }
 
 // ---------------------------------------------------------------------------
@@ -139,11 +147,11 @@ pub fn route_error_response(protocol: ClientProtocol, error: RouteError) -> Resp
 
 /// Generic message used for 500 Internal Server Error responses.
 /// The actual internal error details are logged server-side only.
-const INTERNAL_ERROR_CLIENT_MESSAGE: &str = "internal server error";
+pub(crate) const INTERNAL_ERROR_CLIENT_MESSAGE: &str = "internal server error";
 
 /// Generic message used for provider decode error responses.
 /// The actual decode error details are logged server-side only.
-const PROVIDER_DECODE_CLIENT_MESSAGE: &str = "provider response decode error";
+pub(crate) const PROVIDER_DECODE_CLIENT_MESSAGE: &str = "provider response decode error";
 
 /// Build an Anthropic-shaped error response.
 ///
@@ -185,6 +193,11 @@ fn anthropic_error_response(error: RouteError) -> Response<Body> {
             StatusCode::CONFLICT,
             "invalid_request_error",
             "duplicate request, please retry".to_owned(),
+        ),
+        RouteError::NotFound => (
+            StatusCode::NOT_FOUND,
+            "not_found_error",
+            "not found".to_owned(),
         ),
     };
 
@@ -238,6 +251,9 @@ fn openai_error_response(error: RouteError) -> Response<Body> {
         RouteError::Conflict => {
             (StatusCode::CONFLICT, "invalid_request_error", "duplicate request, please retry".to_owned())
         }
+        RouteError::NotFound => {
+            (StatusCode::NOT_FOUND, "invalid_request_error", "not found".to_owned())
+        }
     };
 
     let body = OpenAiErrorBody {
@@ -280,23 +296,31 @@ const MAX_ERROR_MESSAGE_LEN: usize = 512;
 
 /// Suffix appended when an error body is truncated.
 const TRUNCATED_SUFFIX: &str = "...[truncated]";
-const TRUNCATED_SUFFIX_LEN: usize = TRUNCATED_SUFFIX.len();
+
+/// Truncate an error body to a safe length for client responses.
+///
+/// The final string is at most `max_len` bytes (the suffix is included within
+/// this budget). Respects UTF-8 char boundaries to prevent panics on multi-byte
+/// characters.
+pub(crate) fn truncate_with_suffix(s: &str, max_len: usize, suffix: &str) -> String {
+    if s.len() <= max_len {
+        s.to_owned()
+    } else {
+        let max_content = max_len - suffix.len();
+        let mut end = max_content;
+        while !s.is_char_boundary(end) && end > 0 {
+            end -= 1;
+        }
+        format!("{}{}", &s[..end], suffix)
+    }
+}
 
 /// Truncate an error body to a safe length for client responses.
 ///
 /// The final string is at most `MAX_ERROR_MESSAGE_LEN` bytes (the suffix is
 /// included within this budget).
 fn truncate_error_body(body: &str) -> String {
-    if body.len() <= MAX_ERROR_MESSAGE_LEN {
-        body.to_owned()
-    } else {
-        let max_content = MAX_ERROR_MESSAGE_LEN - TRUNCATED_SUFFIX_LEN;
-        let mut end = max_content;
-        while !body.is_char_boundary(end) && end > 0 {
-            end -= 1;
-        }
-        format!("{}{}", &body[..end], TRUNCATED_SUFFIX)
-    }
+    truncate_with_suffix(body, MAX_ERROR_MESSAGE_LEN, TRUNCATED_SUFFIX)
 }
 
 // ===========================================================================

@@ -316,7 +316,7 @@ pub(crate) fn map_openai_finish_reason(reason: &str) -> StopReason {
         "stop" => StopReason::EndTurn,
         "length" => StopReason::MaxTokens,
         "tool_calls" | "tool_use" => StopReason::ToolUse,
-        "content_filter" => StopReason::EndTurn,
+        "content_filter" => StopReason::Refusal,
         _ => StopReason::Unknown,
     }
 }
@@ -582,7 +582,7 @@ mod tests {
         assert_eq!(map_openai_finish_reason("length"), StopReason::MaxTokens);
         assert_eq!(map_openai_finish_reason("tool_calls"), StopReason::ToolUse);
         assert_eq!(map_openai_finish_reason("tool_use"), StopReason::ToolUse);
-        assert_eq!(map_openai_finish_reason("content_filter"), StopReason::EndTurn);
+        assert_eq!(map_openai_finish_reason("content_filter"), StopReason::Refusal);
         assert_eq!(map_openai_finish_reason("unknown"), StopReason::Unknown);
     }
 

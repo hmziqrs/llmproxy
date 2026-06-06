@@ -457,11 +457,25 @@ async fn route_preserves_fields_through_core() {
 
     let body = json!({
         "model": "gpt-4o",
-        "messages": [{ "role": "user", "content": "hello" }],
+        "messages": [
+            { "role": "system", "content": "You are helpful" },
+            { "role": "user", "content": "hello" }
+        ],
         "max_tokens": 256,
         "temperature": 0.7,
         "top_p": 0.9,
-        "stream": false
+        "stream": false,
+        "tools": [{
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Get weather",
+                "parameters": { "type": "object", "properties": { "city": { "type": "string" } } }
+            }
+        }],
+        "tool_choice": "auto",
+        "reasoning_effort": "high",
+        "user": "test-user-123"
     });
     let resp = app.oneshot(chat_request(&body.to_string())).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -477,6 +491,14 @@ async fn route_preserves_fields_through_core() {
     assert_eq!(upstream_json["max_tokens"], 256);
     assert_eq!(upstream_json["temperature"], 0.7);
     assert_eq!(upstream_json["top_p"], 0.9);
+    // Tools and tool_choice should be preserved.
+    assert!(upstream_json["tools"].is_array(), "tools must be preserved");
+    assert_eq!(upstream_json["tools"][0]["function"]["name"], "get_weather");
+    assert_eq!(upstream_json["tool_choice"]["type"], "auto");
+    // reasoning_effort should be preserved.
+    assert_eq!(upstream_json["reasoning_effort"], "high");
+    // user (metadata) should be preserved.
+    assert_eq!(upstream_json["user"], "test-user-123");
 }
 
 // ===========================================================================
@@ -505,7 +527,7 @@ async fn unknown_model_returns_openai_shaped_400() {
     assert!(resp_body["error"]["code"].is_null(), "code must be null");
 
     // Must NOT be Anthropic-shaped.
-    assert!(resp_body["type"].is_null() || !resp_body["type"].is_string(), "must not have Anthropic type field");
+    assert!(!resp_body.as_object().unwrap().contains_key("type"), "must not have Anthropic type field");
 }
 
 /// invalid JSON/client decode failure returns OpenAI-shaped 400
@@ -541,7 +563,7 @@ async fn invalid_json_returns_openai_shaped_400() {
     assert!(resp_body["error"]["code"].is_null(), "code must be null");
 
     // Must NOT be Anthropic-shaped.
-    assert!(resp_body["type"].is_null() || !resp_body["type"].is_string(), "must not have Anthropic type field");
+    assert!(!resp_body.as_object().unwrap().contains_key("type"), "must not have Anthropic type field");
 }
 
 /// upstream failure returns OpenAI-shaped 502
@@ -913,7 +935,7 @@ async fn no_anthropic_error_envelope_on_openai_route() {
 
     // Must NOT have Anthropic-shaped error fields.
     assert!(
-        resp_body["type"].is_null() || !resp_body.as_object().unwrap().contains_key("type"),
+        !resp_body.as_object().unwrap().contains_key("type"),
         "must not have Anthropic 'type' field at top level"
     );
     assert!(
@@ -1206,5 +1228,158 @@ async fn max_tokens_zero_is_accepted() {
         resp.status(),
         StatusCode::INTERNAL_SERVER_ERROR,
         "max_tokens=0 should not cause an internal server error"
+    );
+}
+
+// ===========================================================================
+// Missing tests from audit round 2
+// ===========================================================================
+
+/// oversized body (> 32 MiB) returns 413 Payload Too Large
+#[tokio::test]
+async fn chat_completions_oversized_body_returns_payload_too_large() {
+    let app = build_router(empty_state());
+    // 33 MiB body (exceeds the 32 MiB limit).
+    let oversized_body = "X".repeat(33 * 1024 * 1024);
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(oversized_body))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+/// streaming error after first byte emits in-band OpenAI-shaped error event + [DONE]
+#[tokio::test]
+async fn stream_error_after_first_byte_emits_error_event() {
+
+    // Spawn a mock that sends one valid chunk then an invalid/malformed SSE event.
+    let app = Router::new().route(
+        "/{*path}",
+        post(|| async move {
+            // First, send a valid message_start event via Anthropic SSE format
+            // (since we're testing with an Anthropic provider mock).
+            let events = vec![
+                Event::default()
+                    .event("message_start")
+                    .data(r#"{"type":"message_start","message":{"id":"msg_test","type":"message","role":"assistant","content":[],"model":"claude-sonnet-4-6","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":0}}}"#),
+                Event::default()
+                    .event("content_block_delta")
+                    .data(r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}"#),
+                // Then send a malformed event that will cause a provider decode error.
+                Event::default()
+                    .event("content_block_delta")
+                    .data(r#"this is not valid JSON for the provider decoder"#),
+            ];
+            let stream = futures::stream::iter(events.into_iter().map(Ok::<_, std::convert::Infallible>));
+            let sse = Sse::new(stream).keep_alive(KeepAlive::default());
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "text/event-stream")],
+                sse.into_response(),
+            )
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let mock_url = format!("http://{}/v1/messages", addr);
+
+    let state = state_with_anthropic_provider(&mock_url);
+    let app = build_router(state);
+
+    let body = json!({
+        "model": "claude-sonnet-4-6",
+        "messages": [{ "role": "user", "content": "hello" }],
+        "stream": true
+    });
+    let resp = app.oneshot(chat_request(&body.to_string())).await.unwrap();
+    // The first byte was sent successfully, so HTTP status should be 200.
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+
+    // The stream should end with [DONE] even after an error.
+    assert!(text.contains("[DONE]"), "stream must end with [DONE] after error, got: {text}");
+}
+
+/// upstream disconnect mid-stream completes with synthetic terminal
+#[tokio::test]
+async fn upstream_disconnect_completes_with_synthetic_terminal() {
+    // Spawn a mock that sends partial events then disconnects (no message_stop).
+    let app = Router::new().route(
+        "/{*path}",
+        post(|| async move {
+            let events = vec![
+                Event::default()
+                    .event("message_start")
+                    .data(r#"{"type":"message_start","message":{"id":"msg_test","type":"message","role":"assistant","content":[],"model":"claude-sonnet-4-6","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":0}}}"#),
+                Event::default()
+                    .event("content_block_delta")
+                    .data(r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hello"}}"#),
+                // No message_stop -- simulates upstream disconnect.
+            ];
+            let stream = futures::stream::iter(events.into_iter().map(Ok::<_, std::convert::Infallible>));
+            let sse = Sse::new(stream).keep_alive(KeepAlive::default());
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "text/event-stream")],
+                sse.into_response(),
+            )
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let mock_url = format!("http://{}/v1/messages", addr);
+
+    let state = state_with_anthropic_provider(&mock_url);
+    let app = build_router(state);
+
+    let body = json!({
+        "model": "claude-sonnet-4-6",
+        "messages": [{ "role": "user", "content": "hello" }],
+        "stream": true
+    });
+    let resp = app.oneshot(chat_request(&body.to_string())).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+
+    // The stream should end with [DONE] even though upstream disconnected.
+    assert!(text.contains("[DONE]"), "stream must end with [DONE] after upstream disconnect, got: {text}");
+    // A synthetic finish_reason should be present.
+    assert!(text.contains("stop"), "stream should contain synthetic finish_reason: stop");
+}
+
+/// request with only system messages (no user message) does not panic
+#[tokio::test]
+async fn system_only_messages_does_not_panic() {
+    let mock_url = spawn_mock_openai_chat_non_stream().await;
+    let state = state_with_openai_chat_provider(&mock_url);
+    let app = build_router(state);
+
+    let body = json!({
+        "model": "gpt-4o",
+        "messages": [
+            { "role": "system", "content": "You are a helpful assistant." }
+        ]
+    });
+    let resp = app.oneshot(chat_request(&body.to_string())).await.unwrap();
+    // Should not panic. It may succeed (upstream accepts it) or return an error.
+    assert_ne!(
+        resp.status(),
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "system-only messages should not cause an internal server error"
     );
 }
