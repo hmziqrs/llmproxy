@@ -10,7 +10,6 @@ pub(crate) struct HealthBody {
     status: &'static str,
     service: String,
     metrics: HealthMetrics,
-    circuit_breakers: HashMap<String, String>,
     model_counts: HashMap<String, i64>,
 }
 
@@ -30,13 +29,6 @@ struct HealthMetrics {
 pub async fn health(State(state): State<AppState>) -> (StatusCode, Json<HealthBody>) {
     let snapshot = state.metrics.get_snapshot();
 
-    // When legacy state is present, use the legacy fallback handler's circuit
-    // states. When running in TOML new-runtime mode, return an empty map.
-    let circuit_breakers = state
-        .legacy()
-        .map(|ls| ls.fallback_handler.get_circuit_states())
-        .unwrap_or_default();
-
     (
         StatusCode::OK,
         Json(HealthBody {
@@ -51,7 +43,6 @@ pub async fn health(State(state): State<AppState>) -> (StatusCode, Json<HealthBo
                 rate_limited: snapshot.rate_limited,
                 deduplicated: snapshot.deduplicated,
             },
-            circuit_breakers,
             model_counts: snapshot.model_counts,
         }),
     )

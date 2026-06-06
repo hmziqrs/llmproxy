@@ -1,53 +1,33 @@
 //! Integration tests for ops endpoints, the `/v1/messages` proxy route, and
 //! TOML-mode integration scenarios.
 
-use std::sync::Arc;
+use std::collections::HashMap;
 use std::time::Duration;
 
 use axum::{
     body::Body,
     http::{Request, StatusCode},
 };
-use llm_proxy_core::{Config, FallbackHandler, ProviderRegistry};
-use llm_proxy_provider::{OpenCodeClient, ProviderAdapterRegistry, ProxyClient};
+use llm_proxy_core::{AppConfig, ProviderRegistry, ServerConfig};
+use llm_proxy_provider::{ProviderAdapterRegistry, ProxyClient};
 use llm_proxy_server::{AppState, BuildInfo, build_router};
 use serde_json::{Value, json};
 use tower::ServiceExt;
 
+/// Build AppState in TOML mode for integration testing.
 fn state() -> AppState {
-    let config = Config::default();
-    AppState::from_legacy(
-        config,
-        BuildInfo {
-            name: "test",
-            version: "0.0.0",
-            target: "test",
-            git_sha: "test",
-        },
-        OpenCodeClient::new(Arc::new(Config::default())),
-        FallbackHandler::new(3, Duration::from_secs(30)),
-        ProviderAdapterRegistry::builtin(),
-        ProxyClient::new(),
-    )
-}
-
-/// Build AppState in TOML new-runtime mode for integration testing.
-fn toml_state() -> AppState {
-    use llm_proxy_core::{AppConfig, ServerConfig};
-    use std::collections::HashMap;
-
     let app_config = AppConfig {
         server: ServerConfig {
             bind: "127.0.0.1:3456".parse().unwrap(),
             request_timeout: Duration::from_secs(300),
             log_level: "info".to_owned(),
             hot_reload: false,
-            server_name: "toml-test-proxy".to_owned(),
+            server_name: "test-proxy".to_owned(),
         },
         models: HashMap::new(),
     };
     let registry = ProviderRegistry::from_providers(vec![]).expect("empty registry");
-    AppState::from_toml(
+    AppState::new(
         app_config,
         registry,
         ProviderAdapterRegistry::builtin(),
@@ -112,7 +92,6 @@ async fn version_returns_build_info() {
             .unwrap(),
     )
     .unwrap();
-    // name comes from Config::default().server_name (env!("CARGO_PKG_NAME"))
     assert!(body["name"].is_string());
     assert_eq!(body["version"], "0.0.0");
     assert_eq!(body["target"], "test");
@@ -191,21 +170,21 @@ async fn messages_valid_json_parses_and_validates() {
     assert_ne!(status, StatusCode::NOT_FOUND, "route must be registered");
 
     // The request body is valid Anthropic JSON, so it must parse and route
-    // successfully. Valid downstream errors are: upstream failure (502),
-    // rate limit (429), duplicate (409), internal routing (500), or auth (401).
-    // A 400 with invalid_request_error would indicate the request body was
-    // malformed, which it is not.
-    let valid_error_statuses = [
-        StatusCode::BAD_GATEWAY,          // 502 - upstream failure
+    // successfully. With an empty routing table, the model is unknown so
+    // 400 is returned. With a real routing table, downstream errors are:
+    // 502 (upstream), 500 (routing), 401 (auth), 429 (rate limit), 409 (duplicate).
+    let valid_statuses = [
+        StatusCode::BAD_REQUEST, // 400 - unknown model (empty routing table)
+        StatusCode::BAD_GATEWAY, // 502 - upstream failure
         StatusCode::INTERNAL_SERVER_ERROR, // 500 - routing error
-        StatusCode::UNAUTHORIZED,          // 401 - auth failure
-        StatusCode::TOO_MANY_REQUESTS,     // 429 - rate limit
-        StatusCode::CONFLICT,              // 409 - duplicate
-        StatusCode::OK,                    // 200 - success (unlikely without real upstream)
+        StatusCode::UNAUTHORIZED, // 401 - auth failure
+        StatusCode::TOO_MANY_REQUESTS, // 429 - rate limit
+        StatusCode::CONFLICT,    // 409 - duplicate
+        StatusCode::OK,          // 200 - success (unlikely without real upstream)
     ];
     assert!(
-        valid_error_statuses.contains(&status),
-        "valid Anthropic JSON should produce a downstream error (502/500/401/429/409), got {status}"
+        valid_statuses.contains(&status),
+        "valid Anthropic JSON should produce a valid status, got {status}"
     );
 }
 
@@ -442,10 +421,10 @@ async fn messages_oversized_body_returns_payload_too_large() {
 
 // -- TOML mode integration tests -------------------------------------------
 
-/// TOML mode: /health returns ok with empty circuit_breakers map.
+/// TOML mode: /health returns ok with server name from AppConfig.
 #[tokio::test]
-async fn toml_health_returns_ok_with_empty_circuit_breakers() {
-    let app = build_router(toml_state());
+async fn toml_health_returns_ok() {
+    let app = build_router(state());
     let req = Request::builder()
         .uri("/health")
         .body(Body::empty())
@@ -459,20 +438,14 @@ async fn toml_health_returns_ok_with_empty_circuit_breakers() {
     )
     .unwrap();
     assert_eq!(body["status"], "ok");
-    // TOML mode has no legacy state, so circuit_breakers must be empty.
-    assert!(
-        body["circuit_breakers"].as_object().unwrap().is_empty(),
-        "circuit_breakers should be empty in TOML mode, got: {}",
-        body["circuit_breakers"]
-    );
     // server_name comes from AppConfig.
-    assert_eq!(body["service"], "toml-test-proxy");
+    assert_eq!(body["service"], "test-proxy");
 }
 
 /// TOML mode: /version returns build info with AppConfig server name.
 #[tokio::test]
 async fn toml_version_returns_app_config_server_name() {
-    let app = build_router(toml_state());
+    let app = build_router(state());
     let req = Request::builder()
         .uri("/version")
         .body(Body::empty())
@@ -485,8 +458,7 @@ async fn toml_version_returns_app_config_server_name() {
             .unwrap(),
     )
     .unwrap();
-    // name comes from AppConfig.server.server_name, not legacy Config.
-    assert_eq!(body["name"], "toml-test-proxy");
+    assert_eq!(body["name"], "test-proxy");
     assert_eq!(body["version"], "0.0.0");
     assert_eq!(body["target"], "test");
     assert_eq!(body["git_sha"], "test");
@@ -495,7 +467,7 @@ async fn toml_version_returns_app_config_server_name() {
 /// TOML mode: /ready returns ready.
 #[tokio::test]
 async fn toml_ready_returns_ready() {
-    let app = build_router(toml_state());
+    let app = build_router(state());
     let req = Request::builder()
         .uri("/ready")
         .body(Body::empty())
@@ -511,12 +483,10 @@ async fn toml_ready_returns_ready() {
     assert_eq!(body["status"], "ready");
 }
 
-/// TOML mode: POST /v1/messages works with `legacy = None`, `app_config = Some`,
-/// `providers = Some`. The route uses the core pipeline and returns a 400 error
-/// for unknown models (empty routing table) without panicking.
+/// TOML mode: POST /v1/messages returns 400 for unknown model (empty routing table).
 #[tokio::test]
-async fn toml_messages_returns_error_without_legacy_state() {
-    let app = build_router(toml_state());
+async fn toml_messages_returns_error_for_unknown_model() {
+    let app = build_router(state());
     let body = json!({
         "model": "claude-sonnet-4-6",
         "messages": [{ "role": "user", "content": "hello" }],
@@ -547,11 +517,9 @@ async fn toml_messages_returns_error_without_legacy_state() {
 }
 
 /// TOML mode: POST /v1/messages/count_tokens works without legacy state.
-/// The token count endpoint does not depend on legacy state; it only uses
-/// the token counter from AppState.
 #[tokio::test]
 async fn toml_count_tokens_returns_estimate() {
-    let app = build_router(toml_state());
+    let app = build_router(state());
     let body = json!({
         "model": "claude-sonnet-4-6",
         "messages": [{ "role": "user", "content": "hello world" }],

@@ -120,9 +120,7 @@ impl ProviderRegistry {
     /// Returns [`CoreError::ConfigLoad`], [`CoreError::ConfigParse`], or
     /// [`CoreError::ConfigValidation`] for I/O, parse, or validation failures
     /// in individual files.
-    pub fn load_from_dir(
-        path: impl AsRef<Path>,
-    ) -> Result<Self, CoreError> {
+    pub fn load_from_dir(path: impl AsRef<Path>) -> Result<Self, CoreError> {
         let path = path.as_ref();
         let entries = std::fs::read_dir(path).map_err(|source| CoreError::ConfigLoad {
             path: path.to_path_buf(),
@@ -136,12 +134,13 @@ impl ProviderRegistry {
 
         // Collect and sort entries by filename for deterministic ordering across
         // platforms (filesystem order is not guaranteed).
-        let mut sorted_entries: Vec<_> = entries
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|source| CoreError::ConfigLoad {
-                path: path.to_path_buf(),
-                source,
-            })?;
+        let mut sorted_entries: Vec<_> =
+            entries
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|source| CoreError::ConfigLoad {
+                    path: path.to_path_buf(),
+                    source,
+                })?;
         sorted_entries.sort_by_key(|e| e.file_name());
 
         for entry in sorted_entries {
@@ -299,15 +298,16 @@ impl ProviderRegistry {
         target: &ProviderTarget,
     ) -> Result<ProviderAdapterTargetConfig, CoreError> {
         // 1. Look up the provider.
-        let provider = self.providers.get(&target.provider).ok_or_else(|| {
-            CoreError::ProviderResolution {
-                message: format!(
-                    "unknown provider \"{}\": no provider config loaded with this name. \
+        let provider =
+            self.providers
+                .get(&target.provider)
+                .ok_or_else(|| CoreError::ProviderResolution {
+                    message: format!(
+                        "unknown provider \"{}\": no provider config loaded with this name. \
                      Check that the provider TOML file exists and the name matches the route table",
-                    target.provider
-                ),
-            }
-        })?;
+                        target.provider
+                    ),
+                })?;
 
         // 2. Look up the provider-local model to find the adapter name.
         let model_cfg = provider.models.get(&target.upstream_model).ok_or_else(|| {
@@ -330,21 +330,14 @@ impl ProviderRegistry {
                 if keys.len() <= 5 {
                     keys.join(", ")
                 } else {
-                    format!(
-                        "{} (+{} more)",
-                        keys[..5].join(", "),
-                        keys.len() - 5
-                    )
+                    format!("{} (+{} more)", keys[..5].join(", "), keys.len() - 5)
                 }
             };
             CoreError::ProviderResolution {
                 message: format!(
                     "provider \"{}\": model \"{}\" references adapter \"{}\" which does not exist \
                      in [provider.adapters]. Available adapters: {}",
-                    provider.name,
-                    model_key,
-                    model_cfg.adapter,
-                    available
+                    provider.name, model_key, model_cfg.adapter, available
                 ),
             }
         })?;
@@ -574,7 +567,10 @@ endpoint = "https://example.com/v1/chat/completions"
             "opencode-go",
             {
                 let mut m = HashMap::new();
-                m.insert("chat".to_owned(), make_adapter("openai_chat_completions", "https://go.example.com/v1"));
+                m.insert(
+                    "chat".to_owned(),
+                    make_adapter("openai_chat_completions", "https://go.example.com/v1"),
+                );
                 m
             },
             {
@@ -648,7 +644,10 @@ endpoint = "https://example.com/v1/chat/completions"
                 let mut m = HashMap::new();
                 m.insert(
                     "chat".to_owned(),
-                    make_adapter("openai_chat_completions", "https://go.example.com/v1/chat/completions"),
+                    make_adapter(
+                        "openai_chat_completions",
+                        "https://go.example.com/v1/chat/completions",
+                    ),
                 );
                 m
             },
@@ -909,11 +908,18 @@ endpoint = "https://example.com/v1/chat/completions"
         assert_eq!(r2.protocol, "anthropic_messages");
 
         let r3 = registry
-            .resolve_adapter_target(&make_target("multi-adapter", "gem-flash", "gemini-3.5-flash"))
+            .resolve_adapter_target(&make_target(
+                "multi-adapter",
+                "gem-flash",
+                "gemini-3.5-flash",
+            ))
             .expect("resolve gemini");
         assert_eq!(r3.adapter_name, "gemini");
         assert_eq!(r3.protocol, "gemini_generate_content");
-        assert_eq!(r3.endpoint, "https://multi.example.com/v1/models/{model}:generateContent");
+        assert_eq!(
+            r3.endpoint,
+            "https://multi.example.com/v1/models/{model}:generateContent"
+        );
     }
 
     // -- resolution errors carry actionable messages ---------------------------
@@ -975,7 +981,10 @@ endpoint = "https://example.com/v1/chat/completions"
             auth_style: AuthStyle::Bearer,
             adapters: {
                 let mut m = HashMap::new();
-                m.insert("real-adapter".to_owned(), make_adapter("openai_chat_completions", "https://example.com"));
+                m.insert(
+                    "real-adapter".to_owned(),
+                    make_adapter("openai_chat_completions", "https://example.com"),
+                );
                 m
             },
             models: {
@@ -1093,7 +1102,10 @@ endpoint = "https://example.com/v1/chat/completions"
             "gemini_generate_content",
         ];
         let result = registry.validate_protocols(known);
-        assert!(result.is_ok(), "expected validation to pass, got: {result:?}");
+        assert!(
+            result.is_ok(),
+            "expected validation to pass, got: {result:?}"
+        );
     }
 
     // -- validate_protocols passes when no protocols registered ----------------
@@ -1111,7 +1123,10 @@ endpoint = "https://example.com/v1/chat/completions"
 
         let known: Vec<&str> = vec!["openai_chat_completions"];
         let result = registry.validate_protocols(known);
-        assert!(result.is_ok(), "expected validation to pass, got: {result:?}");
+        assert!(
+            result.is_ok(),
+            "expected validation to pass, got: {result:?}"
+        );
     }
 
     // -- validate_protocols passes with empty known set if no adapters --------
@@ -1508,7 +1523,10 @@ endpoint = "https://a.example.com/v1/chat/completions"
         std::fs::create_dir(&toml_dir).expect("create dir");
 
         let registry = ProviderRegistry::load_from_dir(dir.path()).expect("load");
-        assert!(registry.is_empty(), "directory named .toml should be skipped");
+        assert!(
+            registry.is_empty(),
+            "directory named .toml should be skipped"
+        );
     }
 
     // -- Send+Sync static assertion for ProviderRegistry -------------------------
@@ -1666,7 +1684,10 @@ endpoint = "https://a.example.com/v1/chat/completions"
             },
             {
                 let mut m = HashMap::new();
-                m.insert("model.with.dots/and:colons".to_owned(), make_model("a.dapt/er"));
+                m.insert(
+                    "model.with.dots/and:colons".to_owned(),
+                    make_model("a.dapt/er"),
+                );
                 m
             },
         )])
@@ -1693,6 +1714,9 @@ endpoint = "https://a.example.com/v1/chat/completions"
             upstream_model: "gpt-4o".to_owned(),
         };
         let cloned = original.clone();
-        assert_eq!(cloned, original, "cloned ProviderAdapterTargetConfig should equal original");
+        assert_eq!(
+            cloned, original,
+            "cloned ProviderAdapterTargetConfig should equal original"
+        );
     }
 }

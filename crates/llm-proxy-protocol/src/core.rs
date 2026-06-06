@@ -77,7 +77,10 @@ fn redact_value(val: &serde_json::Value, f: &mut fmt::Formatter<'_>) -> fmt::Res
 }
 
 /// Formats a [`serde_json::Map`] for debug output without revealing content.
-fn redact_map(map: &serde_json::Map<String, serde_json::Value>, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+fn redact_map(
+    map: &serde_json::Map<String, serde_json::Value>,
+    f: &mut fmt::Formatter<'_>,
+) -> fmt::Result {
     write!(f, "Object({} keys)", map.len())
 }
 
@@ -286,18 +289,22 @@ impl fmt::Debug for CoreContent {
                 .field("text", &text)
                 .field("cache", &cache)
                 .finish(),
-            CoreContent::Image { source } => {
-                f.debug_struct("Image").field("source", &OpaqueJsonRef(source)).finish()
-            }
-            CoreContent::Document { source } => {
-                f.debug_struct("Document").field("source", &OpaqueJsonRef(source)).finish()
-            }
-            CoreContent::Audio { source } => {
-                f.debug_struct("Audio").field("source", &OpaqueJsonRef(source)).finish()
-            }
-            CoreContent::Video { source } => {
-                f.debug_struct("Video").field("source", &OpaqueJsonRef(source)).finish()
-            }
+            CoreContent::Image { source } => f
+                .debug_struct("Image")
+                .field("source", &OpaqueJsonRef(source))
+                .finish(),
+            CoreContent::Document { source } => f
+                .debug_struct("Document")
+                .field("source", &OpaqueJsonRef(source))
+                .finish(),
+            CoreContent::Audio { source } => f
+                .debug_struct("Audio")
+                .field("source", &OpaqueJsonRef(source))
+                .finish(),
+            CoreContent::Video { source } => f
+                .debug_struct("Video")
+                .field("source", &OpaqueJsonRef(source))
+                .finish(),
             CoreContent::ToolUse { id, name, input } => f
                 .debug_struct("ToolUse")
                 .field("id", &id)
@@ -464,9 +471,7 @@ impl fmt::Debug for CoreToolChoice {
             CoreToolChoice::Any => f.write_str("Any"),
             CoreToolChoice::None => f.write_str("None"),
             CoreToolChoice::Tool { name } => f.debug_struct("Tool").field("name", &name).finish(),
-            CoreToolChoice::Raw(v) => {
-                f.debug_tuple("Raw").field(&OpaqueJsonRef(v)).finish()
-            }
+            CoreToolChoice::Raw(v) => f.debug_tuple("Raw").field(&OpaqueJsonRef(v)).finish(),
         }
     }
 }
@@ -558,10 +563,7 @@ impl fmt::Debug for SamplingOptions {
             .field("max_tokens", &self.max_tokens)
             .field("stop", &self.stop)
             .field("reasoning_effort", &self.reasoning_effort)
-            .field(
-                "thinking",
-                &self.thinking.as_ref().map(OpaqueJsonRef),
-            )
+            .field("thinking", &self.thinking.as_ref().map(OpaqueJsonRef))
             .finish()
     }
 }
@@ -879,9 +881,10 @@ impl fmt::Debug for CoreEvent {
                 .field("index", &index)
                 .field("args_delta", &args_delta)
                 .finish(),
-            CoreEvent::ToolCallStop { index } => {
-                f.debug_struct("ToolCallStop").field("index", &index).finish()
-            }
+            CoreEvent::ToolCallStop { index } => f
+                .debug_struct("ToolCallStop")
+                .field("index", &index)
+                .finish(),
             CoreEvent::UsageDelta { usage } => {
                 f.debug_struct("UsageDelta").field("usage", &usage).finish()
             }
@@ -893,9 +896,7 @@ impl fmt::Debug for CoreEvent {
                 .field("stop_reason", &stop_reason)
                 .field("stop_sequence", &stop_sequence)
                 .finish(),
-            CoreEvent::Error { error } => {
-                f.debug_struct("Error").field("error", &error).finish()
-            }
+            CoreEvent::Error { error } => f.debug_struct("Error").field("error", &error).finish(),
             CoreEvent::Ping => f.write_str("Ping"),
         }
     }
@@ -1115,12 +1116,10 @@ mod tests {
     fn core_content_tool_result_can_nest_text() {
         let result = CoreContent::ToolResult {
             tool_use_id: "call_123".into(),
-            content: vec![
-                CoreContent::Text {
-                    text: "it worked".into(),
-                    cache: None,
-                },
-            ],
+            content: vec![CoreContent::Text {
+                text: "it worked".into(),
+                cache: None,
+            }],
             is_error: false,
         };
         match result {
@@ -1452,7 +1451,10 @@ mod tests {
                 (CoreEvent::Error { error: orig }, CoreEvent::Error { error: rt }) => {
                     assert_eq!(orig.kind, rt.kind, "kind mismatch at event {i}");
                     // message is skip_serializing, so it comes back empty.
-                    assert!(rt.message.is_empty(), "message should be empty after round-trip at event {i}");
+                    assert!(
+                        rt.message.is_empty(),
+                        "message should be empty after round-trip at event {i}"
+                    );
                 }
                 _ => assert_eq!(original, round_tripped, "mismatch at event {i}"),
             }
@@ -1465,7 +1467,8 @@ mod tests {
         let json = serde_json::to_string(&raw_val).unwrap();
         let choice = CoreToolChoice::Raw(raw_val);
         let serialized = serde_json::to_string(&choice).expect("serialize CoreToolChoice");
-        let back: CoreToolChoice = serde_json::from_str(&serialized).expect("deserialize CoreToolChoice");
+        let back: CoreToolChoice =
+            serde_json::from_str(&serialized).expect("deserialize CoreToolChoice");
         match back {
             CoreToolChoice::Raw(v) => {
                 let original: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -1522,7 +1525,10 @@ mod tests {
     #[test]
     fn cache_control_type_as_str() {
         assert_eq!(CacheControlType::Ephemeral.as_str(), "ephemeral");
-        assert_eq!(CacheControlType::Other("custom".to_owned()).as_str(), "custom");
+        assert_eq!(
+            CacheControlType::Other("custom".to_owned()).as_str(),
+            "custom"
+        );
     }
 
     #[test]
@@ -1614,11 +1620,7 @@ mod tests {
 
     #[test]
     fn core_event_rejects_malformed_json() {
-        let cases = vec![
-            "not json at all",
-            "[",
-            r#"{"TextDelta": "wrong"}"#,
-        ];
+        let cases = vec!["not json at all", "[", r#"{"TextDelta": "wrong"}"#];
         for bad in cases {
             assert!(
                 serde_json::from_str::<CoreEvent>(bad).is_err(),
@@ -1851,7 +1853,8 @@ mod tests {
         for kind in &variants {
             let err = CoreStreamError::new(*kind, format!("test error for {kind:?}"));
             let json = serde_json::to_string(&err).expect("serialize CoreStreamError");
-            let back: CoreStreamError = serde_json::from_str(&json).expect("deserialize CoreStreamError");
+            let back: CoreStreamError =
+                serde_json::from_str(&json).expect("deserialize CoreStreamError");
             // kind round-trips; message is #[serde(skip_serializing)] so it
             // comes back empty.
             assert_eq!(err.kind, back.kind);
@@ -2079,7 +2082,10 @@ mod tests {
             ..Default::default()
         };
         let json = serde_json::to_string(&opts).unwrap();
-        assert!(json.contains("null"), "NaN should serialize to null: {json}");
+        assert!(
+            json.contains("null"),
+            "NaN should serialize to null: {json}"
+        );
         let back: SamplingOptions = serde_json::from_str(&json).unwrap();
         // NaN is lost -- temperature becomes None after round-trip.
         assert_eq!(back.temperature, None);
@@ -2093,7 +2099,10 @@ mod tests {
             ..Default::default()
         };
         let json = serde_json::to_string(&opts).unwrap();
-        assert!(json.contains("null"), "Infinity should serialize to null: {json}");
+        assert!(
+            json.contains("null"),
+            "Infinity should serialize to null: {json}"
+        );
         let back: SamplingOptions = serde_json::from_str(&json).unwrap();
         assert_eq!(back.temperature, None);
     }
@@ -2182,14 +2191,17 @@ mod tests {
 
     #[test]
     fn core_stream_error_display_and_error_traits() {
-        let err = CoreStreamError::new(
-            CoreStreamErrorKind::RateLimit,
-            "too many requests".into(),
-        );
+        let err = CoreStreamError::new(CoreStreamErrorKind::RateLimit, "too many requests".into());
         // Display shows the kind, not the raw message (defense-in-depth).
         let display = format!("{err}");
-        assert!(display.contains("rate_limit"), "Display should show kind: {display}");
-        assert!(!display.contains("too many requests"), "Display should not leak message");
+        assert!(
+            display.contains("rate_limit"),
+            "Display should show kind: {display}"
+        );
+        assert!(
+            !display.contains("too many requests"),
+            "Display should not leak message"
+        );
 
         // Error trait
         let _: &dyn std::error::Error = &err;
@@ -2197,12 +2209,13 @@ mod tests {
 
     #[test]
     fn core_stream_error_debug_redacts_message() {
-        let err = CoreStreamError::new(
-            CoreStreamErrorKind::Internal,
-            "secret-api-key-12345".into(),
-        );
+        let err =
+            CoreStreamError::new(CoreStreamErrorKind::Internal, "secret-api-key-12345".into());
         let debug = format!("{err:?}");
-        assert!(!debug.contains("secret-api-key-12345"), "Debug should redact message content");
+        assert!(
+            !debug.contains("secret-api-key-12345"),
+            "Debug should redact message content"
+        );
         assert!(debug.contains("chars"), "Debug should show message length");
     }
 
@@ -2219,7 +2232,10 @@ mod tests {
     #[test]
     fn core_stream_error_kind_display() {
         assert_eq!(format!("{}", CoreStreamErrorKind::RateLimit), "rate_limit");
-        assert_eq!(format!("{}", CoreStreamErrorKind::InvalidRequest), "invalid_request");
+        assert_eq!(
+            format!("{}", CoreStreamErrorKind::InvalidRequest),
+            "invalid_request"
+        );
         assert_eq!(format!("{}", CoreStreamErrorKind::Internal), "internal");
     }
 
@@ -2240,7 +2256,10 @@ mod tests {
             signature: Some("super-secret-sig".into()),
         };
         let debug = format!("{content:?}");
-        assert!(!debug.contains("super-secret-sig"), "Debug should redact signature");
+        assert!(
+            !debug.contains("super-secret-sig"),
+            "Debug should redact signature"
+        );
         assert!(debug.contains("[REDACTED]"), "Debug should show [REDACTED]");
     }
 
@@ -2269,8 +2288,14 @@ mod tests {
             provider_meta: serde_json::from_str(r#"{"secret":"value","count":42}"#).unwrap(),
         };
         let debug = format!("{resp:?}");
-        assert!(!debug.contains("secret"), "Debug should redact provider_meta contents");
-        assert!(!debug.contains("value"), "Debug should redact provider_meta contents");
+        assert!(
+            !debug.contains("secret"),
+            "Debug should redact provider_meta contents"
+        );
+        assert!(
+            !debug.contains("value"),
+            "Debug should redact provider_meta contents"
+        );
     }
 
     #[test]
@@ -2280,7 +2305,10 @@ mod tests {
             raw: serde_json::from_str(r#"{"api_key":"sk-live-key-12345"}"#).unwrap(),
         };
         let debug = format!("{meta:?}");
-        assert!(!debug.contains("sk-live-key-12345"), "Debug should redact raw map");
+        assert!(
+            !debug.contains("sk-live-key-12345"),
+            "Debug should redact raw map"
+        );
     }
 
     #[test]
@@ -2289,7 +2317,10 @@ mod tests {
             raw: serde_json::from_str(r#"{"token":"bearer-abc123"}"#).unwrap(),
         };
         let debug = format!("{hints:?}");
-        assert!(!debug.contains("bearer-abc123"), "Debug should redact raw map");
+        assert!(
+            !debug.contains("bearer-abc123"),
+            "Debug should redact raw map"
+        );
     }
 
     #[test]
@@ -2299,7 +2330,10 @@ mod tests {
             ..Default::default()
         };
         let debug = format!("{opts:?}");
-        assert!(!debug.contains("budget_tokens"), "Debug should redact thinking");
+        assert!(
+            !debug.contains("budget_tokens"),
+            "Debug should redact thinking"
+        );
     }
 
     #[test]
@@ -2310,7 +2344,10 @@ mod tests {
             input_schema: serde_json::json!({"secret_field": "hidden"}),
         };
         let debug = format!("{tool:?}");
-        assert!(!debug.contains("secret_field"), "Debug should redact input_schema");
+        assert!(
+            !debug.contains("secret_field"),
+            "Debug should redact input_schema"
+        );
     }
 
     #[test]
@@ -2380,7 +2417,8 @@ mod tests {
             r#type: CacheControlType::Other("custom".into()),
         };
         let json = serde_json::to_string(&cc_other).expect("serialize CacheControl Other");
-        let back: CacheControl = serde_json::from_str(&json).expect("deserialize CacheControl Other");
+        let back: CacheControl =
+            serde_json::from_str(&json).expect("deserialize CacheControl Other");
         assert_eq!(cc_other, back);
     }
 
@@ -2449,7 +2487,10 @@ mod tests {
         let debug = format!("{content:?}");
         // The outer Object type is shown but Bool/Number values inside are
         // not printed verbatim -- redact_value hides inner details.
-        assert!(debug.contains("Object"), "should show Object type for source");
+        assert!(
+            debug.contains("Object"),
+            "should show Object type for source"
+        );
     }
 
     #[test]
@@ -2467,7 +2508,8 @@ mod tests {
             "CoreContent::ToolUse should reject unknown field"
         );
         // ToolResult variant with an extra field.
-        let json3 = r#"{"ToolResult": {"tool_use_id": "1", "content": [], "is_error": false, "extra": 1}}"#;
+        let json3 =
+            r#"{"ToolResult": {"tool_use_id": "1", "content": [], "is_error": false, "extra": 1}}"#;
         assert!(
             serde_json::from_str::<CoreContent>(json3).is_err(),
             "CoreContent::ToolResult should reject unknown field"
@@ -2489,7 +2531,8 @@ mod tests {
             "CoreEvent::MessageStart should reject unknown field"
         );
         // MessageStop with an extra field.
-        let json3 = r#"{"MessageStop": {"stop_reason": "EndTurn", "stop_sequence": null, "extra": true}}"#;
+        let json3 =
+            r#"{"MessageStop": {"stop_reason": "EndTurn", "stop_sequence": null, "extra": true}}"#;
         assert!(
             serde_json::from_str::<CoreEvent>(json3).is_err(),
             "CoreEvent::MessageStop should reject unknown field"

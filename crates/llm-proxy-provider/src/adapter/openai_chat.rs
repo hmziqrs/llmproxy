@@ -9,17 +9,17 @@
 //! ```
 
 use llm_proxy_protocol::core::{
-    ContentKind, CoreContent, CoreEvent, CoreRequest,
-    CoreResponse, CoreRole, CoreToolChoice, ModelRef, StopReason,
+    ContentKind, CoreContent, CoreEvent, CoreRequest, CoreResponse, CoreRole, CoreToolChoice,
+    ModelRef, StopReason,
 };
 use llm_proxy_protocol::openai::{
-    ChatCompletionChunk, ChatCompletionRequest, ChatMessage,
-    FunctionCall, FunctionDef, StreamOptions, ToolCall, ToolDef,
+    ChatCompletionChunk, ChatCompletionRequest, ChatMessage, FunctionCall, FunctionDef,
+    StreamOptions, ToolCall, ToolDef,
 };
 
 use super::{
-    build_proxy_request, build_usage_from_openai, expand_url_template, map_openai_finish_reason,
-    response_model_ref, ProviderAdapterTarget, ProviderStreamDecoder,
+    ProviderAdapterTarget, ProviderStreamDecoder, build_proxy_request, build_usage_from_openai,
+    expand_url_template, map_openai_finish_reason, response_model_ref,
 };
 use crate::error::ProviderError;
 use crate::sse::SseFrame;
@@ -76,10 +76,7 @@ impl ProviderStreamDecoder for OpenAiChatStreamDecoder {
             Ok(c) => c,
             Err(_) => {
                 let truncated = super::truncate_str_safe(data, 200);
-                tracing::warn!(
-                    data = truncated,
-                    "malformed OpenAI chunk, skipping"
-                );
+                tracing::warn!(data = truncated, "malformed OpenAI chunk, skipping");
                 return Ok(vec![]);
             }
         };
@@ -469,7 +466,9 @@ impl OpenAiChatAdapter {
                         .content
                         .iter()
                         .find_map(|c| match c {
-                            CoreContent::ToolResult { tool_use_id, .. } => Some(tool_use_id.clone()),
+                            CoreContent::ToolResult { tool_use_id, .. } => {
+                                Some(tool_use_id.clone())
+                            }
                             _ => None,
                         })
                         .unwrap_or_default();
@@ -924,10 +923,7 @@ mod tests {
         let body: ChatCompletionRequest = serde_json::from_slice(&proxy_req.body).unwrap();
         assert_eq!(body.stream, Some(true));
         assert!(body.stream_options.is_some());
-        assert_eq!(
-            body.stream_options.unwrap().include_usage,
-            Some(true)
-        );
+        assert_eq!(body.stream_options.unwrap().include_usage, Some(true));
         assert!(proxy_req.stream);
     }
 
@@ -949,10 +945,7 @@ mod tests {
         let body: ChatCompletionRequest = serde_json::from_slice(&proxy_req.body).unwrap();
         assert_eq!(body.stream, Some(true));
         assert!(body.stream_options.is_some());
-        assert_eq!(
-            body.stream_options.unwrap().include_usage,
-            Some(false)
-        );
+        assert_eq!(body.stream_options.unwrap().include_usage, Some(false));
     }
 
     #[test]
@@ -1153,10 +1146,18 @@ mod tests {
         let mut decoder = adapter.new_stream_decoder(&target);
 
         let frames = vec![
-            make_frame(r#"{"id":"c","object":"chat.completion.chunk","created":0,"model":"m","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}"#),
-            make_frame(r#"{"id":"c","object":"chat.completion.chunk","created":0,"model":"m","choices":[{"index":0,"delta":{"content":"Hello"},"finish_reason":null}]}"#),
-            make_frame(r#"{"id":"c","object":"chat.completion.chunk","created":0,"model":"m","choices":[{"index":0,"delta":{"content":" world"},"finish_reason":null}]}"#),
-            make_frame(r#"{"id":"c","object":"chat.completion.chunk","created":0,"model":"m","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#),
+            make_frame(
+                r#"{"id":"c","object":"chat.completion.chunk","created":0,"model":"m","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}"#,
+            ),
+            make_frame(
+                r#"{"id":"c","object":"chat.completion.chunk","created":0,"model":"m","choices":[{"index":0,"delta":{"content":"Hello"},"finish_reason":null}]}"#,
+            ),
+            make_frame(
+                r#"{"id":"c","object":"chat.completion.chunk","created":0,"model":"m","choices":[{"index":0,"delta":{"content":" world"},"finish_reason":null}]}"#,
+            ),
+            make_frame(
+                r#"{"id":"c","object":"chat.completion.chunk","created":0,"model":"m","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
+            ),
         ];
 
         let mut all_events = Vec::new();
@@ -1185,11 +1186,21 @@ mod tests {
         let mut decoder = adapter.new_stream_decoder(&target);
 
         let frames = vec![
-            make_frame(r#"{"id":"c","object":"chat.completion.chunk","created":0,"model":"m","choices":[{"index":0,"delta":{"content":"calling"},"finish_reason":null}]}"#),
-            make_frame(r#"{"id":"c","object":"chat.completion.chunk","created":0,"model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"get_weather","arguments":""}}]},"finish_reason":null}]}"#),
-            make_frame(r#"{"id":"c","object":"chat.completion.chunk","created":0,"model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"city\":"}}]},"finish_reason":null}]}"#),
-            make_frame(r#"{"id":"c","object":"chat.completion.chunk","created":0,"model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"SF\"}"}}]},"finish_reason":null}]}"#),
-            make_frame(r#"{"id":"c","object":"chat.completion.chunk","created":0,"model":"m","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#),
+            make_frame(
+                r#"{"id":"c","object":"chat.completion.chunk","created":0,"model":"m","choices":[{"index":0,"delta":{"content":"calling"},"finish_reason":null}]}"#,
+            ),
+            make_frame(
+                r#"{"id":"c","object":"chat.completion.chunk","created":0,"model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"get_weather","arguments":""}}]},"finish_reason":null}]}"#,
+            ),
+            make_frame(
+                r#"{"id":"c","object":"chat.completion.chunk","created":0,"model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"city\":"}}]},"finish_reason":null}]}"#,
+            ),
+            make_frame(
+                r#"{"id":"c","object":"chat.completion.chunk","created":0,"model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"SF\"}"}}]},"finish_reason":null}]}"#,
+            ),
+            make_frame(
+                r#"{"id":"c","object":"chat.completion.chunk","created":0,"model":"m","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
+            ),
         ];
 
         let mut all_events = Vec::new();
@@ -1201,13 +1212,19 @@ mod tests {
             e,
             CoreEvent::ToolCallStart { name, .. } if name == "get_weather"
         )));
-        assert!(all_events
-            .iter()
-            .any(|e| matches!(e, CoreEvent::ToolCallDelta { .. })));
+        assert!(
+            all_events
+                .iter()
+                .any(|e| matches!(e, CoreEvent::ToolCallDelta { .. }))
+        );
         assert_has_event(&all_events, "ToolCallStop");
-        assert!(all_events
-            .iter()
-            .any(|e| matches!(e, CoreEvent::MessageStop { stop_reason: StopReason::ToolUse, .. })));
+        assert!(all_events.iter().any(|e| matches!(
+            e,
+            CoreEvent::MessageStop {
+                stop_reason: StopReason::ToolUse,
+                ..
+            }
+        )));
     }
 
     #[test]
@@ -1280,7 +1297,10 @@ mod tests {
         let adapter = OpenAiChatAdapter;
         let core_resp = adapter.decode_response(&bytes, &target).unwrap();
 
-        let thinking = core_resp.content.iter().find(|c| matches!(c, CoreContent::Thinking { .. }));
+        let thinking = core_resp
+            .content
+            .iter()
+            .find(|c| matches!(c, CoreContent::Thinking { .. }));
         assert!(thinking.is_some(), "expected Thinking content");
     }
 
@@ -1327,7 +1347,10 @@ mod tests {
         let adapter = OpenAiChatAdapter;
         let core_resp = adapter.decode_response(&bytes, &target).unwrap();
 
-        let refusal = core_resp.content.iter().find(|c| matches!(c, CoreContent::Refusal { .. }));
+        let refusal = core_resp
+            .content
+            .iter()
+            .find(|c| matches!(c, CoreContent::Refusal { .. }));
         assert!(refusal.is_some(), "expected Refusal content");
     }
 
@@ -1364,17 +1387,22 @@ mod tests {
         let adapter = OpenAiChatAdapter;
         let mut decoder = adapter.new_stream_decoder(&target);
 
-        let frames = vec![
-            make_frame(r#"{"id":"c","object":"chat.completion.chunk","created":0,"model":"m","choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}"#),
-        ];
+        let frames = vec![make_frame(
+            r#"{"id":"c","object":"chat.completion.chunk","created":0,"model":"m","choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}"#,
+        )];
 
         let mut all_events = Vec::new();
         for frame in &frames {
             all_events.extend(decoder.decode_frame(frame).unwrap());
         }
 
-        assert!(all_events.iter().any(|e| matches!(e, CoreEvent::UsageDelta { .. })),
-            "usage-only chunk must emit UsageDelta, got: {:?}", all_events);
+        assert!(
+            all_events
+                .iter()
+                .any(|e| matches!(e, CoreEvent::UsageDelta { .. })),
+            "usage-only chunk must emit UsageDelta, got: {:?}",
+            all_events
+        );
     }
 
     #[test]
@@ -1385,11 +1413,15 @@ mod tests {
         let mut decoder = adapter.new_stream_decoder(&target);
 
         let frame = make_frame(
-            r#"{"id":"c","object":"chat.completion.chunk","created":0,"model":"m","choices":[{"index":0,"delta":{"reasoning":"thinking..."},"finish_reason":null}]}"#
+            r#"{"id":"c","object":"chat.completion.chunk","created":0,"model":"m","choices":[{"index":0,"delta":{"reasoning":"thinking..."},"finish_reason":null}]}"#,
         );
         let events = decoder.decode_frame(&frame).unwrap();
-        assert!(events.iter().any(|e| matches!(e, CoreEvent::ThinkingDelta { .. })),
-            "reasoning alias must produce ThinkingDelta");
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, CoreEvent::ThinkingDelta { .. })),
+            "reasoning alias must produce ThinkingDelta"
+        );
     }
 
     // -- Additional missing tests ----------------------------------------------
@@ -1457,7 +1489,8 @@ mod tests {
                 cache: None,
             }],
         }]);
-        core.sampling.thinking = Some(serde_json::json!({"type": "enabled", "budget_tokens": 5000}));
+        core.sampling.thinking =
+            Some(serde_json::json!({"type": "enabled", "budget_tokens": 5000}));
         let adapter = OpenAiChatAdapter;
         let target = make_target();
         let proxy_req = adapter.encode_request(&core, &target).unwrap();
@@ -1547,9 +1580,20 @@ mod tests {
         let core_resp = adapter.decode_response(&bytes, &target).unwrap();
 
         // Thinking must come before Text.
-        let thinking_idx = core_resp.content.iter().position(|c| matches!(c, CoreContent::Thinking { .. })).unwrap();
-        let text_idx = core_resp.content.iter().position(|c| matches!(c, CoreContent::Text { .. })).unwrap();
-        assert!(thinking_idx < text_idx, "Thinking must precede Text in content order");
+        let thinking_idx = core_resp
+            .content
+            .iter()
+            .position(|c| matches!(c, CoreContent::Thinking { .. }))
+            .unwrap();
+        let text_idx = core_resp
+            .content
+            .iter()
+            .position(|c| matches!(c, CoreContent::Text { .. }))
+            .unwrap();
+        assert!(
+            thinking_idx < text_idx,
+            "Thinking must precede Text in content order"
+        );
     }
 
     #[test]
@@ -1559,9 +1603,15 @@ mod tests {
         let mut decoder = adapter.new_stream_decoder(&target);
 
         let frames = vec![
-            make_frame(r#"{"id":"c","object":"chat.completion.chunk","created":0,"model":"m","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}"#),
-            make_frame(r#"{"id":"c","object":"chat.completion.chunk","created":0,"model":"m","choices":[{"index":0,"delta":{"content":"Hello"},"finish_reason":null}]}"#),
-            make_frame(r#"{"id":"c","object":"chat.completion.chunk","created":0,"model":"m","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#),
+            make_frame(
+                r#"{"id":"c","object":"chat.completion.chunk","created":0,"model":"m","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}"#,
+            ),
+            make_frame(
+                r#"{"id":"c","object":"chat.completion.chunk","created":0,"model":"m","choices":[{"index":0,"delta":{"content":"Hello"},"finish_reason":null}]}"#,
+            ),
+            make_frame(
+                r#"{"id":"c","object":"chat.completion.chunk","created":0,"model":"m","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
+            ),
         ];
 
         let mut all_events = Vec::new();
@@ -1569,14 +1619,35 @@ mod tests {
             all_events.extend(decoder.decode_frame(frame).unwrap());
         }
 
-        let start_idx = all_events.iter().position(|e| matches!(e, CoreEvent::MessageStart { .. })).unwrap();
-        let content_start_idx = all_events.iter().position(|e| matches!(e, CoreEvent::ContentStart { .. })).unwrap();
-        let text_delta_idx = all_events.iter().position(|e| matches!(e, CoreEvent::TextDelta { .. })).unwrap();
-        let stop_idx = all_events.iter().rposition(|e| matches!(e, CoreEvent::MessageStop { .. })).unwrap();
+        let start_idx = all_events
+            .iter()
+            .position(|e| matches!(e, CoreEvent::MessageStart { .. }))
+            .unwrap();
+        let content_start_idx = all_events
+            .iter()
+            .position(|e| matches!(e, CoreEvent::ContentStart { .. }))
+            .unwrap();
+        let text_delta_idx = all_events
+            .iter()
+            .position(|e| matches!(e, CoreEvent::TextDelta { .. }))
+            .unwrap();
+        let stop_idx = all_events
+            .iter()
+            .rposition(|e| matches!(e, CoreEvent::MessageStop { .. }))
+            .unwrap();
 
-        assert!(start_idx < content_start_idx, "MessageStart must precede ContentStart");
-        assert!(content_start_idx < text_delta_idx, "ContentStart must precede TextDelta");
-        assert!(text_delta_idx < stop_idx, "TextDelta must precede MessageStop");
+        assert!(
+            start_idx < content_start_idx,
+            "MessageStart must precede ContentStart"
+        );
+        assert!(
+            content_start_idx < text_delta_idx,
+            "ContentStart must precede TextDelta"
+        );
+        assert!(
+            text_delta_idx < stop_idx,
+            "TextDelta must precede MessageStop"
+        );
     }
 
     #[test]
@@ -1586,17 +1657,27 @@ mod tests {
         let adapter = OpenAiChatAdapter;
         let mut decoder = adapter.new_stream_decoder(&target);
 
-        let frames = vec![
-            make_frame(r#"{"id":"c","object":"chat.completion.chunk","created":0,"model":"m","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#),
-        ];
+        let frames = vec![make_frame(
+            r#"{"id":"c","object":"chat.completion.chunk","created":0,"model":"m","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
+        )];
 
         let mut all_events = Vec::new();
         for frame in &frames {
             all_events.extend(decoder.decode_frame(frame).unwrap());
         }
 
-        assert!(all_events.iter().any(|e| matches!(e, CoreEvent::MessageStart { .. })));
-        assert!(all_events.iter().any(|e| matches!(e, CoreEvent::MessageStop { stop_reason: StopReason::EndTurn, .. })));
+        assert!(
+            all_events
+                .iter()
+                .any(|e| matches!(e, CoreEvent::MessageStart { .. }))
+        );
+        assert!(all_events.iter().any(|e| matches!(
+            e,
+            CoreEvent::MessageStop {
+                stop_reason: StopReason::EndTurn,
+                ..
+            }
+        )));
     }
 
     // -- Source guard ---------------------------------------------------------
@@ -1630,10 +1711,18 @@ mod tests {
 
     fn assert_has_event(events: &[CoreEvent], name: &str) {
         let found = match name {
-            "MessageStart" => events.iter().any(|e| matches!(e, CoreEvent::MessageStart { .. })),
-            "ContentStart" => events.iter().any(|e| matches!(e, CoreEvent::ContentStart { .. })),
-            "MessageStop" => events.iter().any(|e| matches!(e, CoreEvent::MessageStop { .. })),
-            "ToolCallStop" => events.iter().any(|e| matches!(e, CoreEvent::ToolCallStop { .. })),
+            "MessageStart" => events
+                .iter()
+                .any(|e| matches!(e, CoreEvent::MessageStart { .. })),
+            "ContentStart" => events
+                .iter()
+                .any(|e| matches!(e, CoreEvent::ContentStart { .. })),
+            "MessageStop" => events
+                .iter()
+                .any(|e| matches!(e, CoreEvent::MessageStop { .. })),
+            "ToolCallStop" => events
+                .iter()
+                .any(|e| matches!(e, CoreEvent::ToolCallStop { .. })),
             _ => false,
         };
         assert!(found, "expected {} event, got: {:?}", name, events);

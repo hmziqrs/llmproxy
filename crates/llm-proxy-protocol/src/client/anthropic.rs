@@ -21,8 +21,8 @@ use crate::anthropic::{
 use crate::client::ProtocolError;
 use crate::core::{
     CacheControl, CacheControlType, ContentKind, CoreContent, CoreEvent, CoreMessage, CoreRequest,
-    CoreResponse, CoreRole, CoreStreamErrorKind, CoreTool, CoreToolChoice,
-    ModelRef, ProviderHints, RequestMetadata, SamplingOptions, StopReason, Usage,
+    CoreResponse, CoreRole, CoreStreamErrorKind, CoreTool, CoreToolChoice, ModelRef, ProviderHints,
+    RequestMetadata, SamplingOptions, StopReason, Usage,
 };
 
 // ---------------------------------------------------------------------------
@@ -80,7 +80,10 @@ pub fn decode_request(req: MessageRequest) -> Result<CoreRequest, ProtocolError>
         (None, serde_json::Map::new())
     };
 
-    let metadata = RequestMetadata { user_id, raw: raw_meta };
+    let metadata = RequestMetadata {
+        user_id,
+        raw: raw_meta,
+    };
 
     let provider_hints = ProviderHints {
         raw: serde_json::Map::new(),
@@ -115,20 +118,13 @@ fn decode_system(system: &Option<serde_json::Value>) -> Vec<CoreContent> {
             if let Some(arr) = value.as_array() {
                 let mut result = Vec::new();
                 for item in arr {
-                    if let Ok(block) =
-                        serde_json::from_value::<SystemContentBlock>(item.clone())
-                    {
+                    if let Ok(block) = serde_json::from_value::<SystemContentBlock>(item.clone()) {
                         if block.r#type == "text" {
                             if let Some(t) = block.text {
-                                let cache = block
-                                    .cache_control
-                                    .map(|cc| CacheControl {
-                                        r#type: CacheControlType::from(cc.r#type),
-                                    });
-                                result.push(CoreContent::Text {
-                                    text: t,
-                                    cache,
+                                let cache = block.cache_control.map(|cc| CacheControl {
+                                    r#type: CacheControlType::from(cc.r#type),
                                 });
+                                result.push(CoreContent::Text { text: t, cache });
                             }
                         } else {
                             // Non-text system blocks (e.g. future image blocks) are not
@@ -155,9 +151,7 @@ fn decode_message(msg: Message) -> Result<CoreMessage, ProtocolError> {
         "user" => CoreRole::User,
         "assistant" => CoreRole::Assistant,
         other => {
-            return Err(ProtocolError::Decode(format!(
-                "unknown role: {other}"
-            )));
+            return Err(ProtocolError::Decode(format!("unknown role: {other}")));
         }
     };
 
@@ -173,11 +167,9 @@ fn decode_message(msg: Message) -> Result<CoreMessage, ProtocolError> {
 fn decode_content_block(block: ContentBlock) -> Result<CoreContent, ProtocolError> {
     match block.r#type.as_str() {
         "text" => {
-            let cache = block
-                .cache_control
-                .map(|cc| CacheControl {
-                    r#type: CacheControlType::from(cc.r#type),
-                });
+            let cache = block.cache_control.map(|cc| CacheControl {
+                r#type: CacheControlType::from(cc.r#type),
+            });
             Ok(CoreContent::Text {
                 text: block.text.unwrap_or_default(),
                 cache,
@@ -193,7 +185,9 @@ fn decode_content_block(block: ContentBlock) -> Result<CoreContent, ProtocolErro
         "tool_use" => Ok(CoreContent::ToolUse {
             id: block.id.unwrap_or_default(),
             name: block.name.unwrap_or_default(),
-            input: block.input.unwrap_or(serde_json::Value::Object(serde_json::Map::new())),
+            input: block
+                .input
+                .unwrap_or(serde_json::Value::Object(serde_json::Map::new())),
         }),
         "tool_result" => {
             // TODO: The Anthropic API allows tool_result content to be an array of
@@ -285,7 +279,9 @@ pub fn encode_response(resp: CoreResponse) -> Result<MessageResponse, ProtocolEr
         );
     }
 
-    let id = resp.id.unwrap_or_else(|| format!("msg_{}", uuid::Uuid::new_v4()));
+    let id = resp
+        .id
+        .unwrap_or_else(|| format!("msg_{}", uuid::Uuid::new_v4()));
 
     let mut content = Vec::new();
     for block in resp.content {
@@ -329,13 +325,12 @@ fn encode_content_block(content: CoreContent) -> Result<ContentBlock, ProtocolEr
             Ok(block)
         }
         CoreContent::Image { source } => {
-            let img_source = serde_json::from_value(source).unwrap_or_else(|_| {
-                anthropic::ImageSource {
+            let img_source =
+                serde_json::from_value(source).unwrap_or_else(|_| anthropic::ImageSource {
                     r#type: String::new(),
                     media_type: String::new(),
                     data: String::new(),
-                }
-            });
+                });
             let mut block = ContentBlock::new_text(String::new());
             block.r#type = "image".to_owned();
             block.text = None;
@@ -951,7 +946,11 @@ mod tests {
         let core = decode_request(req).unwrap();
         assert_eq!(core.messages.len(), 2);
         match &core.messages[1].content[0] {
-            CoreContent::ToolResult { tool_use_id, is_error, .. } => {
+            CoreContent::ToolResult {
+                tool_use_id,
+                is_error,
+                ..
+            } => {
                 assert_eq!(tool_use_id, "tu_1");
                 assert!(!is_error);
             }
@@ -989,7 +988,11 @@ mod tests {
         });
         let core = decode_request(req).unwrap();
         match &core.messages[1].content[0] {
-            CoreContent::ToolResult { tool_use_id, is_error, .. } => {
+            CoreContent::ToolResult {
+                tool_use_id,
+                is_error,
+                ..
+            } => {
                 assert_eq!(tool_use_id, "tu_1");
                 assert!(is_error);
             }
@@ -1300,8 +1303,14 @@ mod tests {
             .unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].r#type, "content_block_delta");
-        assert_eq!(events[0].delta.as_ref().unwrap().r#type.as_deref(), Some("text_delta"));
-        assert_eq!(events[0].delta.as_ref().unwrap().text.as_deref(), Some("hello"));
+        assert_eq!(
+            events[0].delta.as_ref().unwrap().r#type.as_deref(),
+            Some("text_delta")
+        );
+        assert_eq!(
+            events[0].delta.as_ref().unwrap().text.as_deref(),
+            Some("hello")
+        );
     }
 
     #[test]
@@ -1315,8 +1324,14 @@ mod tests {
             .unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].r#type, "content_block_delta");
-        assert_eq!(events[0].delta.as_ref().unwrap().r#type.as_deref(), Some("thinking_delta"));
-        assert_eq!(events[0].delta.as_ref().unwrap().thinking.as_deref(), Some("hmm"));
+        assert_eq!(
+            events[0].delta.as_ref().unwrap().r#type.as_deref(),
+            Some("thinking_delta")
+        );
+        assert_eq!(
+            events[0].delta.as_ref().unwrap().thinking.as_deref(),
+            Some("hmm")
+        );
     }
 
     #[test]
@@ -1332,7 +1347,10 @@ mod tests {
             .unwrap();
         assert_eq!(start_events.len(), 1);
         assert_eq!(start_events[0].r#type, "content_block_start");
-        assert_eq!(start_events[0].content_block.as_ref().unwrap().r#type, "tool_use");
+        assert_eq!(
+            start_events[0].content_block.as_ref().unwrap().r#type,
+            "tool_use"
+        );
 
         let delta_events = enc
             .encode_event(CoreEvent::ToolCallDelta {
@@ -1385,7 +1403,12 @@ mod tests {
         assert_eq!(tool_start_events.len(), 1);
         assert_eq!(tool_start_events[0].r#type, "content_block_start");
         assert_eq!(
-            tool_start_events[0].content_block.as_ref().unwrap().id.as_deref(),
+            tool_start_events[0]
+                .content_block
+                .as_ref()
+                .unwrap()
+                .id
+                .as_deref(),
             Some("tu_1")
         );
     }
@@ -1413,7 +1436,10 @@ mod tests {
         assert_eq!(events[0].r#type, "message_delta");
         assert!(events[0].usage.is_some());
         assert_eq!(events[0].usage.as_ref().unwrap().input_tokens, 50);
-        assert_eq!(events[0].delta.as_ref().unwrap().stop_reason.as_deref(), Some("end_turn"));
+        assert_eq!(
+            events[0].delta.as_ref().unwrap().stop_reason.as_deref(),
+            Some("end_turn")
+        );
         assert_eq!(events[1].r#type, "message_stop");
     }
 
@@ -1586,10 +1612,7 @@ mod tests {
                 stop_sequence: None,
             },
             CoreEvent::Error {
-                error: CoreStreamError::new(
-                    CoreStreamErrorKind::Internal,
-                    "test".into(),
-                ),
+                error: CoreStreamError::new(CoreStreamErrorKind::Internal, "test".into()),
             },
             CoreEvent::Ping,
         ];
@@ -1849,10 +1872,18 @@ mod tests {
     fn encode_response_with_refusal_propagates_error() {
         let resp = CoreResponse {
             id: None,
-            model: ModelRef { requested: "m".into(), upstream: None },
+            model: ModelRef {
+                requested: "m".into(),
+                upstream: None,
+            },
             content: vec![
-                CoreContent::Text { text: "hello".into(), cache: None },
-                CoreContent::Refusal { text: "I cannot".into() },
+                CoreContent::Text {
+                    text: "hello".into(),
+                    cache: None,
+                },
+                CoreContent::Refusal {
+                    text: "I cannot".into(),
+                },
             ],
             stop_reason: StopReason::EndTurn,
             stop_sequence: None,
@@ -1868,11 +1899,22 @@ mod tests {
     fn encode_response_skips_safe_blocks_preserves_text() {
         let resp = CoreResponse {
             id: None,
-            model: ModelRef { requested: "m".into(), upstream: None },
+            model: ModelRef {
+                requested: "m".into(),
+                upstream: None,
+            },
             content: vec![
-                CoreContent::Text { text: "hello".into(), cache: None },
-                CoreContent::Document { source: serde_json::json!({"url": "x"}) },
-                CoreContent::Text { text: " world".into(), cache: None },
+                CoreContent::Text {
+                    text: "hello".into(),
+                    cache: None,
+                },
+                CoreContent::Document {
+                    source: serde_json::json!({"url": "x"}),
+                },
+                CoreContent::Text {
+                    text: " world".into(),
+                    cache: None,
+                },
             ],
             stop_reason: StopReason::EndTurn,
             stop_sequence: None,
@@ -1893,12 +1935,11 @@ mod tests {
         // event. Sanitization must happen at CoreStreamError::new() time.
         let mut enc = StreamEncoder::new("msg_1".into(), "m".into());
         let secret_msg = "api_key=sk-12345-secret";
-        let events = enc.encode_event(CoreEvent::Error {
-            error: CoreStreamError::new(
-                CoreStreamErrorKind::RateLimit,
-                secret_msg.into(),
-            ),
-        }).unwrap();
+        let events = enc
+            .encode_event(CoreEvent::Error {
+                error: CoreStreamError::new(CoreStreamErrorKind::RateLimit, secret_msg.into()),
+            })
+            .unwrap();
         assert_eq!(events[0].error.as_ref().unwrap().message, secret_msg);
         // The defense-in-depth contract requires that provider adapters
         // sanitize the message before constructing CoreStreamError.
@@ -1909,8 +1950,14 @@ mod tests {
         let large_text = "x".repeat(100_000);
         let resp = CoreResponse {
             id: None,
-            model: ModelRef { requested: "m".into(), upstream: None },
-            content: vec![CoreContent::Text { text: large_text.clone(), cache: None }],
+            model: ModelRef {
+                requested: "m".into(),
+                upstream: None,
+            },
+            content: vec![CoreContent::Text {
+                text: large_text.clone(),
+                cache: None,
+            }],
             stop_reason: StopReason::EndTurn,
             stop_sequence: None,
             usage: Usage::default(),

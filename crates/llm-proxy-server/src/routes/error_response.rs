@@ -256,9 +256,7 @@ pub fn openai_stream_error_json(message: &str) -> Option<String> {
 /// JSON envelope.
 fn extract_error_fields(error: RouteError) -> (StatusCode, &'static str, String) {
     match error {
-        RouteError::InvalidRequest(msg) => {
-            (StatusCode::BAD_REQUEST, "invalid_request_error", msg)
-        }
+        RouteError::InvalidRequest(msg) => (StatusCode::BAD_REQUEST, "invalid_request_error", msg),
         RouteError::UnknownModel(model) => (
             StatusCode::BAD_REQUEST,
             "invalid_request_error",
@@ -557,7 +555,12 @@ mod tests {
             .expect("body");
         let json: serde_json::Value = serde_json::from_slice(&body).expect("valid JSON");
         assert_eq!(json["error"]["type"], "invalid_request_error");
-        assert!(json["error"]["message"].as_str().unwrap().contains("gpt-99"));
+        assert!(
+            json["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("gpt-99")
+        );
         assert!(json["error"]["code"].is_null());
     }
 
@@ -629,7 +632,12 @@ mod tests {
             .expect("body");
         let json: serde_json::Value = serde_json::from_slice(&body).expect("valid JSON");
         assert_eq!(json["error"]["type"], "invalid_request_error");
-        assert!(json["error"]["message"].as_str().unwrap().contains("duplicate"));
+        assert!(
+            json["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("duplicate")
+        );
         assert!(json["error"]["code"].is_null());
     }
 
@@ -759,7 +767,12 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).expect("valid JSON");
         assert_eq!(json["type"], "error");
         assert_eq!(json["error"]["type"], "invalid_request_error");
-        assert!(json["error"]["message"].as_str().unwrap().contains("gpt-99"));
+        assert!(
+            json["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("gpt-99")
+        );
     }
 
     #[tokio::test]
@@ -814,7 +827,12 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).expect("valid JSON");
         assert_eq!(json["type"], "error");
         assert_eq!(json["error"]["type"], "invalid_request_error");
-        assert!(json["error"]["message"].as_str().unwrap().contains("duplicate"));
+        assert!(
+            json["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("duplicate")
+        );
     }
 
     // -- ClientProtocol equality -----------------------------------------------

@@ -6,8 +6,11 @@
 //! that are translated through the core pipeline into Anthropic-shaped responses.
 
 use std::collections::HashMap;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::Duration;
-use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 
 use axum::{
     Router,
@@ -114,7 +117,12 @@ fn gemini_success_response() -> Vec<u8> {
 
 /// Build AppState in TOML mode with a single provider of the given protocol
 /// routing to the given mock endpoint.
-fn state_with_provider(mock_endpoint: &str, protocol: &str, adapter_name: &str, model_name: &str) -> AppState {
+fn state_with_provider(
+    mock_endpoint: &str,
+    protocol: &str,
+    adapter_name: &str,
+    model_name: &str,
+) -> AppState {
     let provider = ProviderConfig {
         name: "mock-provider".to_owned(),
         api_key: "test-key".to_owned(),
@@ -164,7 +172,7 @@ fn state_with_provider(mock_endpoint: &str, protocol: &str, adapter_name: &str, 
         models: model_routes,
     };
 
-    AppState::from_toml(
+    AppState::new(
         app_config,
         registry,
         ProviderAdapterRegistry::builtin(),
@@ -180,7 +188,12 @@ fn state_with_provider(mock_endpoint: &str, protocol: &str, adapter_name: &str, 
 
 /// Convenience: AppState with an Anthropic provider.
 fn state_with_anthropic_provider(mock_endpoint: &str) -> AppState {
-    state_with_provider(mock_endpoint, "anthropic_messages", "messages", "claude-sonnet-4-6")
+    state_with_provider(
+        mock_endpoint,
+        "anthropic_messages",
+        "messages",
+        "claude-sonnet-4-6",
+    )
 }
 
 /// Convenience: AppState with an OpenAI Chat provider.
@@ -190,12 +203,22 @@ fn state_with_openai_chat_provider(mock_endpoint: &str) -> AppState {
 
 /// Convenience: AppState with an OpenAI Responses provider.
 fn state_with_openai_responses_provider(mock_endpoint: &str) -> AppState {
-    state_with_provider(mock_endpoint, "openai_responses", "responses", "gpt-4o-responses")
+    state_with_provider(
+        mock_endpoint,
+        "openai_responses",
+        "responses",
+        "gpt-4o-responses",
+    )
 }
 
 /// Convenience: AppState with a Gemini provider.
 fn state_with_gemini_provider(mock_endpoint: &str) -> AppState {
-    state_with_provider(mock_endpoint, "gemini_generate_content", "gemini", "gemini-2.5-pro")
+    state_with_provider(
+        mock_endpoint,
+        "gemini_generate_content",
+        "gemini",
+        "gemini-2.5-pro",
+    )
 }
 
 /// Spawn a local mock axum server returning a canned response body.
@@ -382,7 +405,9 @@ async fn spawn_mock_500() -> String {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 [(header::CONTENT_TYPE, "application/json")],
-                r#"{"type":"error","error":{"type":"internal_error","message":"upstream crash"}}"#.as_bytes().to_vec(),
+                r#"{"type":"error","error":{"type":"internal_error","message":"upstream crash"}}"#
+                    .as_bytes()
+                    .to_vec(),
             )
         }),
     );
@@ -484,8 +509,11 @@ async fn spawn_mock_with_request_tracker(response_body: Vec<u8>) -> (String, Arc
 
 /// Spawn a mock server that records the received request body.
 /// Returns (base_url, received_body_arc).
-async fn spawn_mock_with_body_capture(response_body: Vec<u8>) -> (String, Arc<tokio::sync::Mutex<Option<Vec<u8>>>>) {
-    let captured: Arc<tokio::sync::Mutex<Option<Vec<u8>>>> = Arc::new(tokio::sync::Mutex::new(None));
+async fn spawn_mock_with_body_capture(
+    response_body: Vec<u8>,
+) -> (String, Arc<tokio::sync::Mutex<Option<Vec<u8>>>>) {
+    let captured: Arc<tokio::sync::Mutex<Option<Vec<u8>>>> =
+        Arc::new(tokio::sync::Mutex::new(None));
     let captured_clone = captured.clone();
     let app = Router::new().route(
         "/{*path}",
@@ -553,7 +581,12 @@ async fn anthropic_provider_returns_anthropic_response() {
     .unwrap();
     assert_eq!(body["type"], "message");
     assert_eq!(body["role"], "assistant");
-    assert!(body["content"][0]["text"].as_str().unwrap().contains("Hello from mock!"));
+    assert!(
+        body["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Hello from mock!")
+    );
 }
 
 /// request ID header is present on success
@@ -650,7 +683,10 @@ async fn openai_chat_provider_returns_anthropic_response() {
     assert_eq!(resp_body["type"], "message");
     assert_eq!(resp_body["role"], "assistant");
     assert!(
-        resp_body["content"][0]["text"].as_str().unwrap().contains("Hello from OpenAI mock!"),
+        resp_body["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Hello from OpenAI mock!"),
         "response should contain translated OpenAI text"
     );
 }
@@ -680,7 +716,10 @@ async fn openai_responses_provider_returns_anthropic_response() {
     assert_eq!(resp_body["type"], "message");
     assert_eq!(resp_body["role"], "assistant");
     assert!(
-        resp_body["content"][0]["text"].as_str().unwrap().contains("Hello from Responses mock!"),
+        resp_body["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Hello from Responses mock!"),
         "response should contain translated Responses text"
     );
 }
@@ -710,7 +749,10 @@ async fn gemini_provider_returns_anthropic_response() {
     assert_eq!(resp_body["type"], "message");
     assert_eq!(resp_body["role"], "assistant");
     assert!(
-        resp_body["content"][0]["text"].as_str().unwrap().contains("Hello from Gemini mock!"),
+        resp_body["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Hello from Gemini mock!"),
         "response should contain translated Gemini text"
     );
 }
@@ -730,11 +772,22 @@ async fn stream_anthropic_provider_returns_sse_text_deltas() {
     let resp = app.oneshot(messages_request(&body)).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
-    let ct = resp.headers().get("content-type").unwrap().to_str().unwrap();
-    assert!(ct.contains("text/event-stream"), "expected SSE content-type, got: {ct}");
+    let ct = resp
+        .headers()
+        .get("content-type")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(
+        ct.contains("text/event-stream"),
+        "expected SSE content-type, got: {ct}"
+    );
 
     let request_id = resp.headers().get("x-request-id");
-    assert!(request_id.is_some(), "x-request-id must be present on stream response");
+    assert!(
+        request_id.is_some(),
+        "x-request-id must be present on stream response"
+    );
 
     // Collect the SSE body and parse events.
     let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
@@ -743,12 +796,24 @@ async fn stream_anthropic_provider_returns_sse_text_deltas() {
     let text = String::from_utf8(bytes.to_vec()).unwrap();
 
     // Verify key SSE events appear in the stream.
-    assert!(text.contains("event: message_start"), "missing message_start event");
-    assert!(text.contains("event: content_block_delta"), "missing content_block_delta");
-    assert!(text.contains("event: message_stop"), "missing message_stop event");
+    assert!(
+        text.contains("event: message_start"),
+        "missing message_start event"
+    );
+    assert!(
+        text.contains("event: content_block_delta"),
+        "missing content_block_delta"
+    );
+    assert!(
+        text.contains("event: message_stop"),
+        "missing message_stop event"
+    );
 
     // Verify text content came through.
-    assert!(text.contains("Hi!"), "expected text delta 'Hi!' in SSE output");
+    assert!(
+        text.contains("Hi!"),
+        "expected text delta 'Hi!' in SSE output"
+    );
 }
 
 // ===========================================================================
@@ -766,8 +831,16 @@ async fn stream_openai_chat_provider_returns_anthropic_sse_deltas() {
     let resp = app.oneshot(messages_request(&body)).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
-    let ct = resp.headers().get("content-type").unwrap().to_str().unwrap();
-    assert!(ct.contains("text/event-stream"), "expected SSE content-type, got: {ct}");
+    let ct = resp
+        .headers()
+        .get("content-type")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(
+        ct.contains("text/event-stream"),
+        "expected SSE content-type, got: {ct}"
+    );
 
     let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
         .await
@@ -775,8 +848,14 @@ async fn stream_openai_chat_provider_returns_anthropic_sse_deltas() {
     let text = String::from_utf8(bytes.to_vec()).unwrap();
 
     // The output must be Anthropic-shaped SSE events.
-    assert!(text.contains("event: message_start"), "missing message_start event");
-    assert!(text.contains("event: message_stop"), "missing message_stop event");
+    assert!(
+        text.contains("event: message_start"),
+        "missing message_start event"
+    );
+    assert!(
+        text.contains("event: message_stop"),
+        "missing message_stop event"
+    );
 
     // Verify text content was translated from OpenAI to Anthropic SSE format.
     assert!(
@@ -800,8 +879,16 @@ async fn stream_openai_responses_provider_returns_anthropic_sse_deltas() {
     let resp = app.oneshot(messages_request(&body)).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
-    let ct = resp.headers().get("content-type").unwrap().to_str().unwrap();
-    assert!(ct.contains("text/event-stream"), "expected SSE content-type, got: {ct}");
+    let ct = resp
+        .headers()
+        .get("content-type")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(
+        ct.contains("text/event-stream"),
+        "expected SSE content-type, got: {ct}"
+    );
 
     let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
         .await
@@ -809,8 +896,14 @@ async fn stream_openai_responses_provider_returns_anthropic_sse_deltas() {
     let text = String::from_utf8(bytes.to_vec()).unwrap();
 
     // The output must be Anthropic-shaped SSE events.
-    assert!(text.contains("event: message_start"), "missing message_start event");
-    assert!(text.contains("event: message_stop"), "missing message_stop event");
+    assert!(
+        text.contains("event: message_start"),
+        "missing message_start event"
+    );
+    assert!(
+        text.contains("event: message_stop"),
+        "missing message_stop event"
+    );
 
     // Verify text content was translated.
     assert!(
@@ -834,8 +927,16 @@ async fn stream_gemini_provider_returns_anthropic_sse_deltas() {
     let resp = app.oneshot(messages_request(&body)).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
-    let ct = resp.headers().get("content-type").unwrap().to_str().unwrap();
-    assert!(ct.contains("text/event-stream"), "expected SSE content-type, got: {ct}");
+    let ct = resp
+        .headers()
+        .get("content-type")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(
+        ct.contains("text/event-stream"),
+        "expected SSE content-type, got: {ct}"
+    );
 
     let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
         .await
@@ -843,8 +944,14 @@ async fn stream_gemini_provider_returns_anthropic_sse_deltas() {
     let text = String::from_utf8(bytes.to_vec()).unwrap();
 
     // The output must be Anthropic-shaped SSE events.
-    assert!(text.contains("event: message_start"), "missing message_start event");
-    assert!(text.contains("event: message_stop"), "missing message_stop event");
+    assert!(
+        text.contains("event: message_start"),
+        "missing message_start event"
+    );
+    assert!(
+        text.contains("event: message_stop"),
+        "missing message_stop event"
+    );
 
     // Verify text content was translated.
     assert!(
@@ -900,7 +1007,10 @@ async fn stream_error_after_first_byte_emits_error_event() {
     let text = String::from_utf8(bytes.to_vec()).unwrap();
 
     // Verify that the stream started with a message_start event.
-    assert!(text.contains("event: message_start"), "stream should start with message_start");
+    assert!(
+        text.contains("event: message_start"),
+        "stream should start with message_start"
+    );
 
     // The stream should complete with a message_stop (the malformed frame is
     // silently skipped by the Anthropic adapter, not treated as a fatal error).
@@ -930,7 +1040,10 @@ async fn upstream_disconnect_completes_with_synthetic_terminal() {
     let text = String::from_utf8(bytes.to_vec()).unwrap();
 
     // Stream should have started with message_start.
-    assert!(text.contains("event: message_start"), "stream should start with message_start");
+    assert!(
+        text.contains("event: message_start"),
+        "stream should start with message_start"
+    );
 
     // The stream should complete with a message_stop event generated by
     // the client encoder's finish() method, even though the upstream
@@ -962,9 +1075,15 @@ async fn malformed_stream_frame_is_handled_gracefully() {
     let text = String::from_utf8(bytes.to_vec()).unwrap();
 
     // Stream should have started with message_start.
-    assert!(text.contains("event: message_start"), "stream should start with message_start");
+    assert!(
+        text.contains("event: message_start"),
+        "stream should start with message_start"
+    );
     // Stream should complete normally (malformed frame silently skipped).
-    assert!(text.contains("event: message_stop"), "stream should end with message_stop");
+    assert!(
+        text.contains("event: message_stop"),
+        "stream should end with message_stop"
+    );
 }
 
 /// Stream terminal event is emitted after provider decoder finish().
@@ -987,8 +1106,14 @@ async fn stream_terminal_event_emitted_after_decoder_finish() {
 
     // Verify the finalization sequence:
     // 1. Real events from upstream arrive first (message_start, content_block_start).
-    assert!(text.contains("event: message_start"), "should have message_start from upstream");
-    assert!(text.contains("event: content_block_start"), "should have content_block_start from upstream");
+    assert!(
+        text.contains("event: message_start"),
+        "should have message_start from upstream"
+    );
+    assert!(
+        text.contains("event: content_block_start"),
+        "should have content_block_start from upstream"
+    );
 
     // 2. The synthetic terminal events (from finish()) appear after real events.
     // Find positions to verify ordering.
@@ -1063,11 +1188,7 @@ async fn duplicate_request_returns_409() {
     let body = make_messages_body("claude-sonnet-4-6", false);
 
     // First request should succeed or fail for non-dedup reasons.
-    let resp1 = app
-        .clone()
-        .oneshot(messages_request(&body))
-        .await
-        .unwrap();
+    let resp1 = app.clone().oneshot(messages_request(&body)).await.unwrap();
     assert_ne!(resp1.status(), StatusCode::CONFLICT);
 
     // Second request with the same body should be deduplicated.
@@ -1080,7 +1201,12 @@ async fn duplicate_request_returns_409() {
         )
         .unwrap();
         assert_eq!(resp_body["type"], "error");
-        assert!(resp_body["error"]["message"].as_str().unwrap().contains("duplicate"));
+        assert!(
+            resp_body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("duplicate")
+        );
     }
     // If dedup doesn't flag it (e.g. TTL expired), that's fine for the test.
     // The important thing is the variant exists and compiles correctly.
@@ -1213,7 +1339,7 @@ async fn token_count_with_tool_result_returns_positive_count() {
 async fn token_count_endpoint_works_without_legacy_state() {
     let mock_url = spawn_mock_anthropic_non_stream().await;
     let state = state_with_anthropic_provider(&mock_url);
-    // The state is constructed via AppState::from_toml which never sets legacy.
+    // The state is constructed via AppState::new which always sets TOML config.
     // We cannot call state.legacy() from integration tests (pub(crate)), so we
     // verify indirectly: the request should succeed with TOML-only state.
     let app = build_router(state);
@@ -1280,7 +1406,8 @@ async fn toml_messages_works_without_legacy_state() {
 /// and verifies the upstream mock receives them in the encoded request.
 #[tokio::test]
 async fn route_preserves_fields_through_core() {
-    let (mock_url, captured_body) = spawn_mock_with_body_capture(anthropic_success_response()).await;
+    let (mock_url, captured_body) =
+        spawn_mock_with_body_capture(anthropic_success_response()).await;
     let state = state_with_anthropic_provider(&mock_url);
     let app = build_router(state);
 
@@ -1293,19 +1420,27 @@ async fn route_preserves_fields_through_core() {
         "top_p": 0.9,
         "stream": false
     });
-    let resp = app.oneshot(messages_request(&body.to_string())).await.unwrap();
+    let resp = app
+        .oneshot(messages_request(&body.to_string()))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
     // Check the upstream received the correct fields.
     tokio::time::sleep(Duration::from_millis(100)).await;
     let guard = captured_body.lock().await;
-    let upstream_body = guard.as_ref().expect("upstream should have received a request body");
-    let upstream_json: Value = serde_json::from_slice(upstream_body).expect("upstream body should be valid JSON");
+    let upstream_body = guard
+        .as_ref()
+        .expect("upstream should have received a request body");
+    let upstream_json: Value =
+        serde_json::from_slice(upstream_body).expect("upstream body should be valid JSON");
 
     // The Anthropic adapter should have preserved these fields.
     assert_eq!(upstream_json["model"], "claude-sonnet-4-6");
-    assert!(upstream_json["system"].is_string() || upstream_json["system"].is_array(),
-        "system field should be preserved");
+    assert!(
+        upstream_json["system"].is_string() || upstream_json["system"].is_array(),
+        "system field should be preserved"
+    );
     assert_eq!(upstream_json["max_tokens"], 128);
     assert_eq!(upstream_json["temperature"], 0.7);
     assert_eq!(upstream_json["top_p"], 0.9);

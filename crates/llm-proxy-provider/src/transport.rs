@@ -210,10 +210,7 @@ impl ProxyClient {
 /// exists for compatibility with providers that accept either header (e.g.,
 /// Anthropic). Where possible, prefer `AuthStyle::Bearer` or
 /// `AuthStyle::XApiKey` to send the key in only one header.
-fn apply_auth(
-    mut builder: reqwest::RequestBuilder,
-    auth: &AuthHeaders,
-) -> reqwest::RequestBuilder {
+fn apply_auth(mut builder: reqwest::RequestBuilder, auth: &AuthHeaders) -> reqwest::RequestBuilder {
     if auth.style != AuthStyle::XApiKey {
         builder = builder.header("Authorization", format!("Bearer {}", auth.api_key));
     }
@@ -342,22 +339,34 @@ mod tests {
 
         // Echo Content-Type
         if let Some(ct) = headers.get("content-type") {
-            events.push(format!("data: {{\"content-type\": \"{}\"}}\n\n", ct.to_str().unwrap_or("?")));
+            events.push(format!(
+                "data: {{\"content-type\": \"{}\"}}\n\n",
+                ct.to_str().unwrap_or("?")
+            ));
         }
 
         // Echo Authorization
         if let Some(auth) = headers.get("authorization") {
-            events.push(format!("data: {{\"authorization\": \"{}\"}}\n\n", auth.to_str().unwrap_or("?")));
+            events.push(format!(
+                "data: {{\"authorization\": \"{}\"}}\n\n",
+                auth.to_str().unwrap_or("?")
+            ));
         }
 
         // Echo x-api-key
         if let Some(key) = headers.get("x-api-key") {
-            events.push(format!("data: {{\"x-api-key\": \"{}\"}}\n\n", key.to_str().unwrap_or("?")));
+            events.push(format!(
+                "data: {{\"x-api-key\": \"{}\"}}\n\n",
+                key.to_str().unwrap_or("?")
+            ));
         }
 
         // Echo Accept
         if let Some(accept) = headers.get("accept") {
-            events.push(format!("data: {{\"accept\": \"{}\"}}\n\n", accept.to_str().unwrap_or("?")));
+            events.push(format!(
+                "data: {{\"accept\": \"{}\"}}\n\n",
+                accept.to_str().unwrap_or("?")
+            ));
         }
 
         // Echo body
@@ -550,7 +559,9 @@ mod tests {
         // Verify the exact raw bytes were received by checking the first few.
         let body_prefix = b"body: \x00\x01\x02";
         assert!(
-            resp_bytes.windows(body_prefix.len()).any(|w| w == body_prefix),
+            resp_bytes
+                .windows(body_prefix.len())
+                .any(|w| w == body_prefix),
             "Response must contain exact raw bytes: {:?}",
             resp_bytes
         );
@@ -644,7 +655,10 @@ mod tests {
                 found_accept = true;
             }
         }
-        assert!(found_accept, "Stream response must show Accept: text/event-stream was set");
+        assert!(
+            found_accept,
+            "Stream response must show Accept: text/event-stream was set"
+        );
     }
 
     #[tokio::test]
@@ -701,8 +715,8 @@ mod tests {
 
     #[tokio::test]
     async fn dropping_stream_aborts_upstream() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
 
         let counter = Arc::new(AtomicUsize::new(0));
         let counter_clone = counter.clone();
@@ -720,7 +734,10 @@ mod tests {
                         counter.fetch_add(1, Ordering::SeqCst);
                         tokio::time::sleep(Duration::from_millis(10)).await;
                         let chunk = format!("data: chunk {}\n\n", i);
-                        Some((Ok::<_, std::convert::Infallible>(bytes::Bytes::from(chunk)), i + 1))
+                        Some((
+                            Ok::<_, std::convert::Infallible>(bytes::Bytes::from(chunk)),
+                            i + 1,
+                        ))
                     }
                 }
             });
@@ -779,7 +796,10 @@ mod tests {
                 None
             } else {
                 let chunk = format!("data: chunk {}\n\n", i);
-                Some((Ok::<_, std::convert::Infallible>(bytes::Bytes::from(chunk)), i + 1))
+                Some((
+                    Ok::<_, std::convert::Infallible>(bytes::Bytes::from(chunk)),
+                    i + 1,
+                ))
             }
         });
         (
@@ -889,7 +909,10 @@ mod tests {
         let err = client.send(req).await.unwrap_err();
         match err {
             ProviderError::Http(_) => {} // expected
-            other => panic!("expected ProviderError::Http for empty URL, got: {:?}", other),
+            other => panic!(
+                "expected ProviderError::Http for empty URL, got: {:?}",
+                other
+            ),
         }
     }
 
@@ -934,7 +957,10 @@ mod tests {
     fn prod_source() -> &'static str {
         let source = include_str!("transport.rs");
         // Split at the test module boundary.
-        source.split_once("#[cfg(test)]").map(|(prod, _)| prod).unwrap_or(source)
+        source
+            .split_once("#[cfg(test)]")
+            .map(|(prod, _)| prod)
+            .unwrap_or(source)
     }
 
     #[test]
@@ -1042,7 +1068,10 @@ mod tests {
         };
         match err {
             ProviderError::Http(_) => {} // expected
-            other => panic!("expected ProviderError::Http for unreachable URL, got: {:?}", other),
+            other => panic!(
+                "expected ProviderError::Http for unreachable URL, got: {:?}",
+                other
+            ),
         }
     }
 }

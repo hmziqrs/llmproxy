@@ -2059,7 +2059,6 @@ dependencies = [
 name = "llm-proxy-protocol"
 version = "0.1.0"
 dependencies = [
- "llm-proxy-core",
  "serde",
  "serde_json",
  "thiserror",

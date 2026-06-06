@@ -319,7 +319,15 @@ mod tests {
         // error response, the Bearer prefix + token must be redacted.
         let body = r#"error: invalid key Bearer sk-ant-api03-abc123def456ghi789jkl012"#.to_owned();
         let result = sanitize_api_error_body(body);
-        assert!(!result.contains("sk-ant-api03-abc123def456ghi789"), "Bearer token must be redacted: {}", result);
-        assert!(result.contains("***"), "Must contain redaction marker: {}", result);
+        assert!(
+            !result.contains("sk-ant-api03-abc123def456ghi789"),
+            "Bearer token must be redacted: {}",
+            result
+        );
+        assert!(
+            result.contains("***"),
+            "Must contain redaction marker: {}",
+            result
+        );
     }
 }

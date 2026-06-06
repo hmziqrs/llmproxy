@@ -8,9 +8,9 @@ use axum::body::Body;
 use axum::extract::State;
 use axum::http::{HeaderMap, Response};
 use axum::response::IntoResponse;
+use llm_proxy_core::MessageContent;
 use llm_proxy_protocol::anthropic::MessageRequest;
 use llm_proxy_protocol::client::anthropic;
-use llm_proxy_core::MessageContent;
 use serde::Serialize;
 
 use crate::state::AppState;
@@ -63,13 +63,11 @@ async fn count_tokens_inner(
     let req: MessageRequest = serde_json::from_slice(&body)
         .map_err(|e| RouteError::InvalidRequest(format!("invalid JSON: {e}")))?;
 
-    req.validate()
-        .map_err(RouteError::InvalidRequest)?;
+    req.validate().map_err(RouteError::InvalidRequest)?;
 
     // Decode through the Anthropic client adapter to get a CoreRequest.
     // This validates the request shape and normalises it.
-    let core = anthropic::decode_request(req)
-        .map_err(core_pipeline::protocol_error_to_route)?;
+    let core = anthropic::decode_request(req).map_err(core_pipeline::protocol_error_to_route)?;
 
     // Extract text content from core messages for token counting.
     //
@@ -87,11 +85,9 @@ async fn count_tokens_inner(
     let system_text: String = core
         .system
         .iter()
-        .filter_map(|block| {
-            match block {
-                llm_proxy_protocol::core::CoreContent::Text { text, .. } => Some(text.as_str()),
-                _ => None,
-            }
+        .filter_map(|block| match block {
+            llm_proxy_protocol::core::CoreContent::Text { text, .. } => Some(text.as_str()),
+            _ => None,
         })
         .fold(String::new(), |mut acc, s| {
             acc.push_str(s);
@@ -105,13 +101,9 @@ async fn count_tokens_inner(
             let text: String = msg
                 .content
                 .iter()
-                .filter_map(|block| {
-                    match block {
-                        llm_proxy_protocol::core::CoreContent::Text { text, .. } => {
-                            Some(text.as_str())
-                        }
-                        _ => None,
-                    }
+                .filter_map(|block| match block {
+                    llm_proxy_protocol::core::CoreContent::Text { text, .. } => Some(text.as_str()),
+                    _ => None,
                 })
                 .collect();
             let role_name = match msg.role {

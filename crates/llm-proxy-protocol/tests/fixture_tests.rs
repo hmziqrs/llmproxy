@@ -4,9 +4,7 @@
 //! then encodes a response from core and compares with output.json.
 
 use llm_proxy_protocol::anthropic::MessageRequest as AnthropicMessageRequest;
-use llm_proxy_protocol::client::{
-    anthropic as anthropic_adapter, openai_chat as openai_adapter,
-};
+use llm_proxy_protocol::client::{anthropic as anthropic_adapter, openai_chat as openai_adapter};
 use llm_proxy_protocol::core::{
     CoreContent, CoreEvent, CoreResponse, ModelRef, StopReason, Usage, UsageProvenance,
 };
@@ -33,8 +31,7 @@ fn read_fixture(dir: &Path, name: &str) -> serde_json::Value {
 /// Read a fixture file as raw string.
 fn read_fixture_raw(dir: &Path, name: &str) -> String {
     let path = dir.join(name);
-    fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()))
+    fs::read_to_string(&path).unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()))
 }
 
 /// Verify that decoding an input produces a core request that matches core.json.
@@ -57,8 +54,7 @@ fn assert_decode_matches_core(
         }
         _ => panic!("unknown adapter: {adapter}"),
     };
-    let serialized = serde_json::to_value(&core_request)
-        .expect("core request should serialize");
+    let serialized = serde_json::to_value(&core_request).expect("core request should serialize");
     assert_eq!(
         serialized, *core_json,
         "decoded core does not match core.json for adapter {adapter}"
@@ -99,19 +95,38 @@ fn build_core_response_from_output(adapter: &str, output_json: &serde_json::Valu
                             let t = block.get("type")?.as_str()?;
                             match t {
                                 "text" => Some(CoreContent::Text {
-                                    text: block.get("text").and_then(|v| v.as_str()).unwrap_or("").into(),
+                                    text: block
+                                        .get("text")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("")
+                                        .into(),
                                     cache: None,
                                 }),
                                 "tool_use" => Some(CoreContent::ToolUse {
-                                    id: block.get("id").and_then(|v| v.as_str()).unwrap_or("").into(),
-                                    name: block.get("name").and_then(|v| v.as_str()).unwrap_or("").into(),
-                                    input: block.get("input").cloned().unwrap_or(serde_json::Value::Object(
-                                        serde_json::Map::new(),
-                                    )),
+                                    id: block
+                                        .get("id")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("")
+                                        .into(),
+                                    name: block
+                                        .get("name")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("")
+                                        .into(),
+                                    input: block.get("input").cloned().unwrap_or(
+                                        serde_json::Value::Object(serde_json::Map::new()),
+                                    ),
                                 }),
                                 "thinking" => Some(CoreContent::Thinking {
-                                    text: block.get("thinking").and_then(|v| v.as_str()).unwrap_or("").into(),
-                                    signature: block.get("signature").and_then(|v| v.as_str()).map(String::from),
+                                    text: block
+                                        .get("thinking")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("")
+                                        .into(),
+                                    signature: block
+                                        .get("signature")
+                                        .and_then(|v| v.as_str())
+                                        .map(String::from),
                                 }),
                                 _ => None,
                             }
@@ -130,9 +145,15 @@ fn build_core_response_from_output(adapter: &str, output_json: &serde_json::Valu
                 "stop_sequence" => StopReason::StopSequence,
                 _ => StopReason::Unknown,
             };
-            let usage_json = output_json.get("usage").cloned().unwrap_or(serde_json::json!({}));
+            let usage_json = output_json
+                .get("usage")
+                .cloned()
+                .unwrap_or(serde_json::json!({}));
             CoreResponse {
-                id: output_json.get("id").and_then(|v| v.as_str()).map(String::from),
+                id: output_json
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .map(String::from),
                 model: ModelRef {
                     requested: output_json
                         .get("model")
@@ -178,10 +199,13 @@ fn build_core_response_from_output(adapter: &str, output_json: &serde_json::Valu
                     }
                 }
                 if let Some(reasoning) = msg.get("reasoning_content").and_then(|v| v.as_str()) {
-                    content.insert(0, CoreContent::Thinking {
-                        text: reasoning.into(),
-                        signature: None,
-                    });
+                    content.insert(
+                        0,
+                        CoreContent::Thinking {
+                            text: reasoning.into(),
+                            signature: None,
+                        },
+                    );
                 }
                 if let Some(tool_calls) = msg.get("tool_calls").and_then(|v| v.as_array()) {
                     for tc in tool_calls {
@@ -215,9 +239,15 @@ fn build_core_response_from_output(adapter: &str, output_json: &serde_json::Valu
                 "content_filter" => StopReason::Refusal,
                 _ => StopReason::Unknown,
             };
-            let usage_json = output_json.get("usage").cloned().unwrap_or(serde_json::json!({}));
+            let usage_json = output_json
+                .get("usage")
+                .cloned()
+                .unwrap_or(serde_json::json!({}));
             CoreResponse {
-                id: output_json.get("id").and_then(|v| v.as_str()).map(String::from),
+                id: output_json
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .map(String::from),
                 model: ModelRef {
                     requested: output_json
                         .get("model")
@@ -598,9 +628,9 @@ fn streaming_sse_fixtures_are_well_formed() {
             !input.is_empty(),
             "{adapter}/{case}/input.sse should not be empty"
         );
-        let input_has_sse = input.lines().any(|line| {
-            line.starts_with("data:") || line.starts_with("event:")
-        });
+        let input_has_sse = input
+            .lines()
+            .any(|line| line.starts_with("data:") || line.starts_with("event:"));
         assert!(
             input_has_sse,
             "{adapter}/{case}/input.sse should contain SSE-formatted lines"
@@ -611,9 +641,9 @@ fn streaming_sse_fixtures_are_well_formed() {
         let output = read_fixture_raw(&dir, "output.sse");
         let output_trimmed = output.trim();
         if !output_trimmed.is_empty() {
-            let output_has_sse = output_trimmed.lines().any(|line| {
-                line.starts_with("data:") || line.starts_with("event:")
-            });
+            let output_has_sse = output_trimmed
+                .lines()
+                .any(|line| line.starts_with("data:") || line.starts_with("event:"));
             assert!(
                 output_has_sse,
                 "{adapter}/{case}/output.sse should contain SSE-formatted lines (or be empty/whitespace-only)"

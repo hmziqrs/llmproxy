@@ -173,7 +173,10 @@ mod tests {
     fn model_route_error_display() {
         let err = ModelRouteError::UnknownModel("gpt-99".to_owned());
         let msg = err.to_string();
-        assert!(msg.contains("unknown model"), "expected 'unknown model', got: {msg}");
+        assert!(
+            msg.contains("unknown model"),
+            "expected 'unknown model', got: {msg}"
+        );
         assert!(msg.contains("gpt-99"), "expected 'gpt-99', got: {msg}");
     }
 

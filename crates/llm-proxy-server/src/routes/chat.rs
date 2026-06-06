@@ -58,8 +58,7 @@ async fn handle_chat_completions_inner(
     // Note: ChatCompletionRequest does not have a separate validate() method
     // (unlike the Anthropic handler). All validation is performed inside
     // decode_request: it checks for non-empty model and non-empty messages.
-    let core = openai_chat::decode_request(req)
-        .map_err(core_pipeline::protocol_error_to_route)?;
+    let core = openai_chat::decode_request(req).map_err(core_pipeline::protocol_error_to_route)?;
 
     let is_streaming = core.stream;
     info!(

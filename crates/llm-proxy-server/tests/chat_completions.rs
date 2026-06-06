@@ -86,7 +86,12 @@ fn openai_chat_tool_call_response() -> Vec<u8> {
 
 /// Build AppState in TOML mode with a single provider of the given protocol
 /// routing to the given mock endpoint.
-fn state_with_provider(mock_endpoint: &str, protocol: &str, adapter_name: &str, model_name: &str) -> AppState {
+fn state_with_provider(
+    mock_endpoint: &str,
+    protocol: &str,
+    adapter_name: &str,
+    model_name: &str,
+) -> AppState {
     let provider = ProviderConfig {
         name: "mock-provider".to_owned(),
         api_key: "test-key".to_owned(),
@@ -136,7 +141,7 @@ fn state_with_provider(mock_endpoint: &str, protocol: &str, adapter_name: &str, 
         models: model_routes,
     };
 
-    AppState::from_toml(
+    AppState::new(
         app_config,
         registry,
         ProviderAdapterRegistry::builtin(),
@@ -157,7 +162,12 @@ fn state_with_openai_chat_provider(mock_endpoint: &str) -> AppState {
 
 /// Convenience: AppState with an Anthropic provider (for cross-protocol tests).
 fn state_with_anthropic_provider(mock_endpoint: &str) -> AppState {
-    state_with_provider(mock_endpoint, "anthropic_messages", "messages", "claude-sonnet-4-6")
+    state_with_provider(
+        mock_endpoint,
+        "anthropic_messages",
+        "messages",
+        "claude-sonnet-4-6",
+    )
 }
 
 /// Spawn a local mock axum server returning a canned response body.
@@ -229,7 +239,9 @@ async fn spawn_mock_500() -> String {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 [(header::CONTENT_TYPE, "application/json")],
-                r#"{"error":{"message":"internal error","type":"server_error","code":null}}"#.as_bytes().to_vec(),
+                r#"{"error":{"message":"internal error","type":"server_error","code":null}}"#
+                    .as_bytes()
+                    .to_vec(),
             )
         }),
     );
@@ -241,8 +253,11 @@ async fn spawn_mock_500() -> String {
 }
 
 /// Spawn a mock server that records the received request body.
-async fn spawn_mock_with_body_capture(response_body: Vec<u8>) -> (String, std::sync::Arc<tokio::sync::Mutex<Option<Vec<u8>>>>) {
-    let captured: std::sync::Arc<tokio::sync::Mutex<Option<Vec<u8>>>> = std::sync::Arc::new(tokio::sync::Mutex::new(None));
+async fn spawn_mock_with_body_capture(
+    response_body: Vec<u8>,
+) -> (String, std::sync::Arc<tokio::sync::Mutex<Option<Vec<u8>>>>) {
+    let captured: std::sync::Arc<tokio::sync::Mutex<Option<Vec<u8>>>> =
+        std::sync::Arc::new(tokio::sync::Mutex::new(None));
     let captured_clone = captured.clone();
     let app = Router::new().route(
         "/{*path}",
@@ -280,7 +295,7 @@ fn empty_state() -> AppState {
         models: HashMap::new(),
     };
     let registry = ProviderRegistry::from_providers(vec![]).expect("empty registry");
-    AppState::from_toml(
+    AppState::new(
         app_config,
         registry,
         ProviderAdapterRegistry::builtin(),
@@ -356,13 +371,18 @@ async fn non_streaming_text_request_returns_openai_shaped_response() {
     .unwrap();
 
     // Assert the OpenAI response shape.
-    assert_eq!(resp_body["object"], "chat.completion", "object must be chat.completion");
+    assert_eq!(
+        resp_body["object"], "chat.completion",
+        "object must be chat.completion"
+    );
     assert!(resp_body["id"].is_string(), "id must be a string");
     assert!(resp_body["model"].is_string(), "model must be a string");
     assert!(resp_body["created"].is_number(), "created must be a number");
 
     // Assert choices.
-    let choices = resp_body["choices"].as_array().expect("choices must be array");
+    let choices = resp_body["choices"]
+        .as_array()
+        .expect("choices must be array");
     assert!(!choices.is_empty(), "must have at least one choice");
     assert_eq!(choices[0]["index"], 0);
     assert_eq!(choices[0]["finish_reason"], "stop");
@@ -371,7 +391,10 @@ async fn non_streaming_text_request_returns_openai_shaped_response() {
     let message = &choices[0]["message"];
     assert_eq!(message["role"], "assistant");
     assert!(
-        message["content"].as_str().unwrap().contains("Hello from OpenAI mock!"),
+        message["content"]
+            .as_str()
+            .unwrap()
+            .contains("Hello from OpenAI mock!"),
         "response should contain translated text"
     );
 
@@ -402,7 +425,10 @@ async fn non_streaming_response_shape_detailed() {
     .unwrap();
 
     assert_eq!(resp_body["object"], "chat.completion");
-    assert!(resp_body["id"].as_str().unwrap().starts_with("chatcmpl-"), "id must start with chatcmpl-");
+    assert!(
+        resp_body["id"].as_str().unwrap().starts_with("chatcmpl-"),
+        "id must start with chatcmpl-"
+    );
     assert_eq!(resp_body["model"], "gpt-4o");
     assert_eq!(resp_body["choices"][0]["finish_reason"], "stop");
     assert!(resp_body["choices"][0]["message"]["content"].is_string());
@@ -441,7 +467,9 @@ async fn tool_call_response_returns_tool_calls() {
     .unwrap();
 
     assert_eq!(resp_body["choices"][0]["finish_reason"], "tool_calls");
-    let tool_calls = resp_body["choices"][0]["message"]["tool_calls"].as_array().expect("tool_calls must be array");
+    let tool_calls = resp_body["choices"][0]["message"]["tool_calls"]
+        .as_array()
+        .expect("tool_calls must be array");
     assert!(!tool_calls.is_empty());
     assert_eq!(tool_calls[0]["id"], "call_abc123");
     assert_eq!(tool_calls[0]["function"]["name"], "get_weather");
@@ -451,7 +479,8 @@ async fn tool_call_response_returns_tool_calls() {
 /// stream, stream options/provider hints, reasoning/thinking, and cache markers
 #[tokio::test]
 async fn route_preserves_fields_through_core() {
-    let (mock_url, captured_body) = spawn_mock_with_body_capture(openai_chat_success_response()).await;
+    let (mock_url, captured_body) =
+        spawn_mock_with_body_capture(openai_chat_success_response()).await;
     let state = state_with_openai_chat_provider(&mock_url);
     let app = build_router(state);
 
@@ -489,8 +518,11 @@ async fn route_preserves_fields_through_core() {
     // Check the upstream received the correct fields.
     tokio::time::sleep(Duration::from_millis(100)).await;
     let guard = captured_body.lock().await;
-    let upstream_body = guard.as_ref().expect("upstream should have received a request body");
-    let upstream_json: Value = serde_json::from_slice(upstream_body).expect("upstream body should be valid JSON");
+    let upstream_body = guard
+        .as_ref()
+        .expect("upstream should have received a request body");
+    let upstream_json: Value =
+        serde_json::from_slice(upstream_body).expect("upstream body should be valid JSON");
 
     // The OpenAI adapter should have preserved these fields.
     assert_eq!(upstream_json["model"], "gpt-4o");
@@ -543,7 +575,10 @@ async fn unknown_model_returns_openai_shaped_400() {
     assert!(resp_body["error"]["code"].is_null(), "code must be null");
 
     // Must NOT be Anthropic-shaped.
-    assert!(!resp_body.as_object().unwrap().contains_key("type"), "must not have Anthropic type field");
+    assert!(
+        !resp_body.as_object().unwrap().contains_key("type"),
+        "must not have Anthropic type field"
+    );
 }
 
 /// invalid JSON/client decode failure returns OpenAI-shaped 400
@@ -573,13 +608,19 @@ async fn invalid_json_returns_openai_shaped_400() {
     assert!(resp_body["error"].is_object(), "must have error object");
     assert_eq!(resp_body["error"]["type"], "invalid_request_error");
     assert!(
-        resp_body["error"]["message"].as_str().unwrap().contains("invalid JSON"),
+        resp_body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("invalid JSON"),
         "error message should mention invalid JSON"
     );
     assert!(resp_body["error"]["code"].is_null(), "code must be null");
 
     // Must NOT be Anthropic-shaped.
-    assert!(!resp_body.as_object().unwrap().contains_key("type"), "must not have Anthropic type field");
+    assert!(
+        !resp_body.as_object().unwrap().contains_key("type"),
+        "must not have Anthropic type field"
+    );
 }
 
 /// upstream failure returns OpenAI-shaped 502
@@ -655,7 +696,10 @@ async fn streaming_response_emits_chat_completion_chunk() {
     let text = String::from_utf8(bytes.to_vec()).unwrap();
 
     // Must contain chat.completion.chunk objects.
-    assert!(text.contains("chat.completion.chunk"), "must emit chat.completion.chunk objects");
+    assert!(
+        text.contains("chat.completion.chunk"),
+        "must emit chat.completion.chunk objects"
+    );
 }
 
 /// streaming response sets SSE content type
@@ -669,8 +713,16 @@ async fn streaming_response_sets_sse_content_type() {
     let resp = app.oneshot(chat_request(&body)).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
-    let ct = resp.headers().get("content-type").unwrap().to_str().unwrap();
-    assert!(ct.contains("text/event-stream"), "expected SSE content-type, got: {ct}");
+    let ct = resp
+        .headers()
+        .get("content-type")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(
+        ct.contains("text/event-stream"),
+        "expected SSE content-type, got: {ct}"
+    );
 }
 
 /// stream: true uses shared streaming pipeline
@@ -686,7 +738,10 @@ async fn stream_true_uses_shared_streaming_pipeline() {
 
     // Verify the request ID header is present (set by shared pipeline).
     let request_id = resp.headers().get("x-request-id");
-    assert!(request_id.is_some(), "x-request-id must be present on stream response");
+    assert!(
+        request_id.is_some(),
+        "x-request-id must be present on stream response"
+    );
 
     let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
         .await
@@ -776,37 +831,52 @@ async fn streaming_tool_call_maps_to_delta_tool_calls() {
 
     // Find the tool_call start chunk: should have delta.tool_calls[0].id and
     // delta.tool_calls[0].function.name
-    let start_chunk = chunks.iter().find(|c| {
-        c.get("choices")
-            .and_then(|ch| ch.get(0))
-            .and_then(|ch| ch.get("delta"))
-            .and_then(|d| d.get("tool_calls"))
-            .and_then(|tc| tc.get(0))
-            .and_then(|tc| tc.get("id"))
-            .is_some()
-    }).expect("should have a tool_call start chunk with an id");
+    let start_chunk = chunks
+        .iter()
+        .find(|c| {
+            c.get("choices")
+                .and_then(|ch| ch.get(0))
+                .and_then(|ch| ch.get("delta"))
+                .and_then(|d| d.get("tool_calls"))
+                .and_then(|tc| tc.get(0))
+                .and_then(|tc| tc.get("id"))
+                .is_some()
+        })
+        .expect("should have a tool_call start chunk with an id");
 
     let tc_start = &start_chunk["choices"][0]["delta"]["tool_calls"][0];
-    assert_eq!(tc_start["id"].as_str(), Some("toolu_123"), "tool_call start id must be toolu_123");
     assert_eq!(
-        tc_start["function"]["name"].as_str(), Some("get_weather"),
+        tc_start["id"].as_str(),
+        Some("toolu_123"),
+        "tool_call start id must be toolu_123"
+    );
+    assert_eq!(
+        tc_start["function"]["name"].as_str(),
+        Some("get_weather"),
         "tool_call start function.name must be get_weather"
     );
-    assert_eq!(tc_start["index"].as_i64(), Some(0), "tool_call index must be 0");
+    assert_eq!(
+        tc_start["index"].as_i64(),
+        Some(0),
+        "tool_call index must be 0"
+    );
 
     // Find the tool_call delta chunk: should have delta.tool_calls[0].function.arguments
     // The provider decoder aggregates partial JSON deltas, so the delta chunk may
     // contain the full or partial arguments string.
-    let delta_chunk = chunks.iter().find(|c| {
-        c.get("choices")
-            .and_then(|ch| ch.get(0))
-            .and_then(|ch| ch.get("delta"))
-            .and_then(|d| d.get("tool_calls"))
-            .and_then(|tc| tc.get(0))
-            .and_then(|tc| tc.get("function"))
-            .and_then(|f| f.get("arguments"))
-            .is_some()
-    }).expect("should have a tool_call delta chunk with arguments");
+    let delta_chunk = chunks
+        .iter()
+        .find(|c| {
+            c.get("choices")
+                .and_then(|ch| ch.get(0))
+                .and_then(|ch| ch.get("delta"))
+                .and_then(|d| d.get("tool_calls"))
+                .and_then(|tc| tc.get(0))
+                .and_then(|tc| tc.get("function"))
+                .and_then(|f| f.get("arguments"))
+                .is_some()
+        })
+        .expect("should have a tool_call delta chunk with arguments");
 
     let tc_delta = &delta_chunk["choices"][0]["delta"]["tool_calls"][0];
     let args = tc_delta["function"]["arguments"].as_str().unwrap_or("");
@@ -888,7 +958,10 @@ async fn streaming_stop_reason_maps_to_finish_reason() {
     let text = String::from_utf8(bytes.to_vec()).unwrap();
 
     // The mock sends finish_reason: "stop", which should appear in the output.
-    assert!(text.contains("stop"), "stream must contain finish_reason: stop");
+    assert!(
+        text.contains("stop"),
+        "stream must contain finish_reason: stop"
+    );
 }
 
 /// stream errors become OpenAI-shaped stream errors or route errors
@@ -900,7 +973,11 @@ async fn stream_error_before_first_byte_returns_http_502() {
 
     let body = make_chat_body("gpt-4o", true);
     let resp = app.oneshot(chat_request(&body)).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY, "stream with upstream 500 should return 502");
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_GATEWAY,
+        "stream with upstream 500 should return 502"
+    );
 
     let resp_body: Value = serde_json::from_slice(
         &axum::body::to_bytes(resp.into_body(), 64 * 1024)
@@ -931,7 +1008,10 @@ async fn streaming_response_ends_with_done() {
     let text = String::from_utf8(bytes.to_vec()).unwrap();
 
     // Must end with data: [DONE].
-    assert!(text.contains("data: [DONE]"), "stream must end with data: [DONE], got: {text}");
+    assert!(
+        text.contains("data: [DONE]"),
+        "stream must end with data: [DONE], got: {text}"
+    );
 }
 
 /// no Anthropic error envelope appears on this route
@@ -955,7 +1035,10 @@ async fn no_anthropic_error_envelope_on_openai_route() {
         "must not have Anthropic 'type' field at top level"
     );
     assert!(
-        !resp_body["error"]["type"].as_str().unwrap_or("").contains("not_found_error"),
+        !resp_body["error"]["type"]
+            .as_str()
+            .unwrap_or("")
+            .contains("not_found_error"),
         "must not use Anthropic error types"
     );
     // Must have OpenAI error shape.
@@ -977,8 +1060,8 @@ fn source_guard_chat_rs_no_legacy_imports() {
         .join("src")
         .join("routes")
         .join("chat.rs");
-    let source = std::fs::read_to_string(&chat_path)
-        .expect("failed to read chat.rs for source guard");
+    let source =
+        std::fs::read_to_string(&chat_path).expect("failed to read chat.rs for source guard");
     let prod = source
         .split_once("#[cfg(test)]")
         .map(|(p, _)| p)
@@ -1270,7 +1353,6 @@ async fn chat_completions_oversized_body_returns_payload_too_large() {
 /// streaming error after first byte emits in-band OpenAI-shaped error event + [DONE]
 #[tokio::test]
 async fn stream_error_after_first_byte_emits_error_event() {
-
     // Spawn a mock that sends one valid chunk then an invalid/malformed SSE event.
     let app = Router::new().route(
         "/{*path}",
@@ -1322,7 +1404,10 @@ async fn stream_error_after_first_byte_emits_error_event() {
     let text = String::from_utf8(bytes.to_vec()).unwrap();
 
     // The stream should end with [DONE] even after an error.
-    assert!(text.contains("[DONE]"), "stream must end with [DONE] after error, got: {text}");
+    assert!(
+        text.contains("[DONE]"),
+        "stream must end with [DONE] after error, got: {text}"
+    );
 }
 
 /// upstream disconnect mid-stream completes with synthetic terminal
@@ -1373,9 +1458,15 @@ async fn upstream_disconnect_completes_with_synthetic_terminal() {
     let text = String::from_utf8(bytes.to_vec()).unwrap();
 
     // The stream should end with [DONE] even though upstream disconnected.
-    assert!(text.contains("[DONE]"), "stream must end with [DONE] after upstream disconnect, got: {text}");
+    assert!(
+        text.contains("[DONE]"),
+        "stream must end with [DONE] after upstream disconnect, got: {text}"
+    );
     // A synthetic finish_reason should be present.
-    assert!(text.contains("stop"), "stream should contain synthetic finish_reason: stop");
+    assert!(
+        text.contains("stop"),
+        "stream should contain synthetic finish_reason: stop"
+    );
 }
 
 /// request with only system messages (no user message) does not panic
@@ -1404,43 +1495,25 @@ async fn system_only_messages_does_not_panic() {
 // Missing tests from audit round 3
 // ===========================================================================
 
-/// Missing provider registry/config returns 500 Internal Server Error with
-/// OpenAI-shaped error envelope. This exercises the scenario where the server
-/// state has no TOML config (legacy mode), so the core pipeline cannot resolve
-/// a provider adapter.
+/// Unknown model with empty routing table returns 400 Bad Request with
+/// OpenAI-shaped error envelope (audit round 3 coverage). This exercises
+/// the core pipeline error path when the model routing table has no matching
+/// entry, confirming the OpenAI error shape for the chat completions route.
 #[tokio::test]
-async fn missing_provider_config_returns_openai_shaped_500() {
-    use llm_proxy_core::{Config, FallbackHandler};
-    use llm_proxy_provider::OpenCodeClient;
-    use std::sync::Arc;
-
-    // Build legacy state (no TOML config, no providers).
-    let state = AppState::from_legacy(
-        Config::default(),
-        BuildInfo {
-            name: "test",
-            version: "0.0.0",
-            target: "test",
-            git_sha: "test",
-        },
-        OpenCodeClient::new(Arc::new(Config::default())),
-        FallbackHandler::new(3, Duration::from_secs(30)),
-        ProviderAdapterRegistry::builtin(),
-        ProxyClient::new(),
-    );
-    let app = build_router(state);
+async fn unknown_model_empty_routing_table_openai_shaped_400() {
+    let app = build_router(empty_state());
 
     let body = json!({
-        "model": "gpt-4o",
+        "model": "nonexistent-model",
         "messages": [{ "role": "user", "content": "hello" }]
     });
     let resp = app.oneshot(chat_request(&body.to_string())).await.unwrap();
 
-    // Legacy state has no TOML config -> 500 Internal Server Error.
+    // Empty routing table -> unknown model -> 400 Bad Request.
     assert_eq!(
         resp.status(),
-        StatusCode::INTERNAL_SERVER_ERROR,
-        "legacy state should return 500 for missing TOML config"
+        StatusCode::BAD_REQUEST,
+        "unknown model should return 400"
     );
 
     let resp_body: Value = serde_json::from_slice(

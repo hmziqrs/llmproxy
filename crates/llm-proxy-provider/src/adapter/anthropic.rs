@@ -12,12 +12,14 @@ use std::sync::LazyLock;
 
 use llm_proxy_protocol::anthropic::{MessageEvent, MessageResponse};
 use llm_proxy_protocol::core::{
-    ContentKind, CoreContent, CoreEvent,
-    CoreRequest, CoreResponse, CoreRole, CoreToolChoice, ModelRef, StopReason,
-    UsageProvenance,
+    ContentKind, CoreContent, CoreEvent, CoreRequest, CoreResponse, CoreRole, CoreToolChoice,
+    ModelRef, StopReason, UsageProvenance,
 };
 
-use super::{build_proxy_request, expand_url_template, response_model_ref, ProviderAdapterTarget, ProviderStreamDecoder};
+use super::{
+    ProviderAdapterTarget, ProviderStreamDecoder, build_proxy_request, expand_url_template,
+    response_model_ref,
+};
 use crate::error::ProviderError;
 use crate::sse::SseFrame;
 
@@ -139,11 +141,7 @@ fn desanitize_tool_name(name: &str) -> std::borrow::Cow<'_, str> {
     while i < bytes.len() {
         // Pattern: _0xHH_ (6 bytes at offsets i..=i+5).
         // Need at least 6 bytes remaining: i + 5 must be a valid index.
-        if bytes[i] == b'_'
-            && i + 5 < bytes.len()
-            && bytes[i + 1] == b'0'
-            && bytes[i + 2] == b'x'
-        {
+        if bytes[i] == b'_' && i + 5 < bytes.len() && bytes[i + 1] == b'0' && bytes[i + 2] == b'x' {
             let hex_hi = i + 3;
             let hex_lo = i + 4;
             let closing = i + 5;
@@ -192,9 +190,7 @@ const fn hex_digit(b: u8) -> Option<u8> {
 ///
 /// Replaces disallowed characters with underscores, truncates to 256 chars.
 fn sanitize_tool_use_id(id: &str) -> String {
-    let sanitized: String = INVALID_TOOL_USE_ID_CHAR
-        .replace_all(id, "_")
-        .into_owned();
+    let sanitized: String = INVALID_TOOL_USE_ID_CHAR.replace_all(id, "_").into_owned();
     if sanitized.len() > 256 {
         let mut end = 256;
         while !sanitized.is_char_boundary(end) && end > 0 {
@@ -269,10 +265,7 @@ impl ProviderStreamDecoder for AnthropicStreamDecoder {
             Ok(e) => e,
             Err(_) => {
                 let truncated = super::truncate_str_safe(data, 200);
-                tracing::warn!(
-                    data = truncated,
-                    "malformed Anthropic event, skipping"
-                );
+                tracing::warn!(data = truncated, "malformed Anthropic event, skipping");
                 return Ok(vec![]);
             }
         };
@@ -283,16 +276,13 @@ impl ProviderStreamDecoder for AnthropicStreamDecoder {
             "message_start" => {
                 if !self.started {
                     self.started = true;
-                    let id = event
-                        .message
-                        .as_ref()
-                        .and_then(|m| {
-                            if m.id.is_empty() {
-                                None
-                            } else {
-                                Some(m.id.clone())
-                            }
-                        });
+                    let id = event.message.as_ref().and_then(|m| {
+                        if m.id.is_empty() {
+                            None
+                        } else {
+                            Some(m.id.clone())
+                        }
+                    });
                     events.push(CoreEvent::MessageStart {
                         id,
                         model: self.model_ref.clone(),
@@ -388,11 +378,7 @@ impl ProviderStreamDecoder for AnthropicStreamDecoder {
                 if self.current_block_kind == ContentKind::ToolUse {
                     events.push(CoreEvent::ToolCallStop { index: idx });
                     // Mark this tool block as closed so finish() won't re-emit.
-                    let tool_idx = self
-                        .tool_blocks
-                        .iter()
-                        .position(|&i| i == idx)
-                        .unwrap_or(0);
+                    let tool_idx = self.tool_blocks.iter().position(|&i| i == idx).unwrap_or(0);
                     if tool_idx < self.tool_blocks_closed.len() {
                         self.tool_blocks_closed[tool_idx] = true;
                     }
@@ -692,7 +678,10 @@ impl AnthropicAdapter {
             }
         }
         if let Some(ref user_id) = core.metadata.user_id {
-            obj.insert("metadata".to_owned(), serde_json::json!({"user_id": user_id}));
+            obj.insert(
+                "metadata".to_owned(),
+                serde_json::json!({"user_id": user_id}),
+            );
         }
         if let Some(ref thinking) = core.sampling.thinking {
             obj.insert("thinking".to_owned(), thinking.clone());
@@ -700,7 +689,10 @@ impl AnthropicAdapter {
         // Forward reasoning_effort if present (Anthropic supports this in
         // extended thinking mode).
         if let Some(ref effort) = core.sampling.reasoning_effort {
-            obj.insert("reasoning_effort".to_owned(), serde_json::Value::String(effort.clone()));
+            obj.insert(
+                "reasoning_effort".to_owned(),
+                serde_json::Value::String(effort.clone()),
+            );
         }
         if let Some(tc) = tool_choice {
             obj.insert("tool_choice".to_owned(), tc);
@@ -726,10 +718,7 @@ impl AnthropicAdapter {
             match block.r#type.as_str() {
                 "text" => {
                     let text = block.text.clone().unwrap_or_default();
-                    content.push(CoreContent::Text {
-                        text,
-                        cache: None,
-                    });
+                    content.push(CoreContent::Text { text, cache: None });
                 }
                 "thinking" => {
                     let thinking = block.thinking.clone().unwrap_or_default();
@@ -761,10 +750,7 @@ impl AnthropicAdapter {
                     // Unknown block type; store as text for safety.
                     let text = block.text.clone().unwrap_or_default();
                     if !text.is_empty() {
-                        content.push(CoreContent::Text {
-                            text,
-                            cache: None,
-                        });
+                        content.push(CoreContent::Text { text, cache: None });
                     }
                 }
             }
@@ -892,19 +878,14 @@ fn encode_content_blocks(content: &[CoreContent]) -> serde_json::Value {
                     block
                         .as_object_mut()
                         .expect("json! macro always produces an object")
-                        .insert(
-                            "is_error".to_owned(),
-                            serde_json::json!(true),
-                        );
+                        .insert("is_error".to_owned(), serde_json::json!(true));
                 }
                 Some(block)
             }
-            CoreContent::Image { source } => {
-                Some(serde_json::json!({
-                    "type": "image",
-                    "source": source,
-                }))
-            }
+            CoreContent::Image { source } => Some(serde_json::json!({
+                "type": "image",
+                "source": source,
+            })),
             other => {
                 tracing::warn!(
                     ?other,
@@ -1032,7 +1013,10 @@ mod tests {
         let (name2, changed2) = sanitize_tool_name("my_tool_name");
         assert!(changed1);
         assert!(!changed2);
-        assert_ne!(name1, name2, "collision-safe: different names must produce different sanitized names");
+        assert_ne!(
+            name1, name2,
+            "collision-safe: different names must produce different sanitized names"
+        );
         assert!(name1.contains("0x2e"), "dot should be encoded as _0x2e_");
     }
 
@@ -1214,7 +1198,8 @@ mod tests {
                 cache: None,
             }],
         }]);
-        core.sampling.thinking = Some(serde_json::json!({"type": "enabled", "budget_tokens": 5000}));
+        core.sampling.thinking =
+            Some(serde_json::json!({"type": "enabled", "budget_tokens": 5000}));
         let adapter = AnthropicAdapter::new();
         let target = make_target();
         let proxy_req = adapter.encode_request(&core, &target).unwrap();
@@ -1364,12 +1349,22 @@ mod tests {
         let mut decoder = adapter.new_stream_decoder(&target);
 
         let frames = vec![
-            make_frame(r#"{"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","content":[],"model":"claude","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":0}}}"#),
-            make_frame(r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#),
-            make_frame(r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello"}}"#),
-            make_frame(r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":" world"}}"#),
+            make_frame(
+                r#"{"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","content":[],"model":"claude","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":0}}}"#,
+            ),
+            make_frame(
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+            ),
+            make_frame(
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello"}}"#,
+            ),
+            make_frame(
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":" world"}}"#,
+            ),
             make_frame(r#"{"type":"content_block_stop","index":0}"#),
-            make_frame(r#"{"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"input_tokens":0,"output_tokens":10}}"#),
+            make_frame(
+                r#"{"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"input_tokens":0,"output_tokens":10}}"#,
+            ),
         ];
 
         let mut all_events = Vec::new();
@@ -1377,8 +1372,16 @@ mod tests {
             all_events.extend(decoder.decode_frame(frame).unwrap());
         }
 
-        assert!(all_events.iter().any(|e| matches!(e, CoreEvent::MessageStart { .. })));
-        assert!(all_events.iter().any(|e| matches!(e, CoreEvent::ContentStart { .. })));
+        assert!(
+            all_events
+                .iter()
+                .any(|e| matches!(e, CoreEvent::MessageStart { .. }))
+        );
+        assert!(
+            all_events
+                .iter()
+                .any(|e| matches!(e, CoreEvent::ContentStart { .. }))
+        );
         assert!(all_events.iter().any(|e| matches!(
             e,
             CoreEvent::TextDelta { text, .. } if text == "Hello"
@@ -1387,7 +1390,11 @@ mod tests {
             e,
             CoreEvent::TextDelta { text, .. } if text == " world"
         )));
-        assert!(all_events.iter().any(|e| matches!(e, CoreEvent::MessageStop { .. })));
+        assert!(
+            all_events
+                .iter()
+                .any(|e| matches!(e, CoreEvent::MessageStop { .. }))
+        );
     }
 
     #[test]
@@ -1397,12 +1404,22 @@ mod tests {
         let mut decoder = adapter.new_stream_decoder(&target);
 
         let frames = vec![
-            make_frame(r#"{"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","content":[],"model":"claude","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":0}}}"#),
-            make_frame(r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_1","name":"get_weather"}}"#),
-            make_frame(r#"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"city\":"}}"#),
-            make_frame(r#"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"\"SF\"}"}}"#),
+            make_frame(
+                r#"{"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","content":[],"model":"claude","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":0}}}"#,
+            ),
+            make_frame(
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_1","name":"get_weather"}}"#,
+            ),
+            make_frame(
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"city\":"}}"#,
+            ),
+            make_frame(
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"\"SF\"}"}}"#,
+            ),
             make_frame(r#"{"type":"content_block_stop","index":0}"#),
-            make_frame(r#"{"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null},"usage":{"input_tokens":0,"output_tokens":20}}"#),
+            make_frame(
+                r#"{"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null},"usage":{"input_tokens":0,"output_tokens":20}}"#,
+            ),
         ];
 
         let mut all_events = Vec::new();
@@ -1414,11 +1431,22 @@ mod tests {
             e,
             CoreEvent::ToolCallStart { name, .. } if name == "get_weather"
         )));
-        assert!(all_events.iter().any(|e| matches!(e, CoreEvent::ToolCallDelta { .. })));
-        assert!(all_events.iter().any(|e| matches!(e, CoreEvent::ToolCallStop { .. })));
+        assert!(
+            all_events
+                .iter()
+                .any(|e| matches!(e, CoreEvent::ToolCallDelta { .. }))
+        );
+        assert!(
+            all_events
+                .iter()
+                .any(|e| matches!(e, CoreEvent::ToolCallStop { .. }))
+        );
         assert!(all_events.iter().any(|e| matches!(
             e,
-            CoreEvent::MessageStop { stop_reason: StopReason::ToolUse, .. }
+            CoreEvent::MessageStop {
+                stop_reason: StopReason::ToolUse,
+                ..
+            }
         )));
     }
 
@@ -1439,7 +1467,9 @@ mod tests {
         let adapter = AnthropicAdapter::new();
         let mut decoder = adapter.new_stream_decoder(&target);
 
-        let frame = make_frame(r#"{"type":"error","error":{"type":"overloaded_error","message":"Too many requests"}}"#);
+        let frame = make_frame(
+            r#"{"type":"error","error":{"type":"overloaded_error","message":"Too many requests"}}"#,
+        );
         let events = decoder.decode_frame(&frame).unwrap();
         assert!(events.iter().any(|e| matches!(e, CoreEvent::Error { .. })));
     }
@@ -1451,8 +1481,16 @@ mod tests {
         let mut decoder = adapter.new_stream_decoder(&target);
 
         let events = decoder.finish().unwrap();
-        assert!(events.iter().any(|e| matches!(e, CoreEvent::MessageStart { .. })));
-        assert!(events.iter().any(|e| matches!(e, CoreEvent::MessageStop { .. })));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, CoreEvent::MessageStart { .. }))
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, CoreEvent::MessageStop { .. }))
+        );
     }
 
     #[test]
@@ -1462,14 +1500,26 @@ mod tests {
         let mut decoder = adapter.new_stream_decoder(&target);
 
         let frames = vec![
-            make_frame(r#"{"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","content":[],"model":"claude","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":0}}}"#),
-            make_frame(r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#),
-            make_frame(r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"Let me think..."}}"#),
+            make_frame(
+                r#"{"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","content":[],"model":"claude","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":0}}}"#,
+            ),
+            make_frame(
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#,
+            ),
+            make_frame(
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"Let me think..."}}"#,
+            ),
             make_frame(r#"{"type":"content_block_stop","index":0}"#),
-            make_frame(r#"{"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}"#),
-            make_frame(r#"{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"answer"}}"#),
+            make_frame(
+                r#"{"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}"#,
+            ),
+            make_frame(
+                r#"{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"answer"}}"#,
+            ),
             make_frame(r#"{"type":"content_block_stop","index":1}"#),
-            make_frame(r#"{"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"input_tokens":0,"output_tokens":20}}"#),
+            make_frame(
+                r#"{"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"input_tokens":0,"output_tokens":20}}"#,
+            ),
         ];
 
         let mut all_events = Vec::new();
@@ -1492,9 +1542,15 @@ mod tests {
     #[test]
     fn anthropic_stop_reason_mappings() {
         assert_eq!(map_anthropic_stop_reason("end_turn"), StopReason::EndTurn);
-        assert_eq!(map_anthropic_stop_reason("max_tokens"), StopReason::MaxTokens);
+        assert_eq!(
+            map_anthropic_stop_reason("max_tokens"),
+            StopReason::MaxTokens
+        );
         assert_eq!(map_anthropic_stop_reason("tool_use"), StopReason::ToolUse);
-        assert_eq!(map_anthropic_stop_reason("stop_sequence"), StopReason::StopSequence);
+        assert_eq!(
+            map_anthropic_stop_reason("stop_sequence"),
+            StopReason::StopSequence
+        );
         assert_eq!(map_anthropic_stop_reason("refusal"), StopReason::Refusal);
         assert_eq!(map_anthropic_stop_reason("unknown"), StopReason::Unknown);
     }
@@ -1516,10 +1572,7 @@ mod tests {
         let proxy_req = adapter.encode_request(&core, &target).unwrap();
 
         let body: serde_json::Value = serde_json::from_slice(&proxy_req.body).unwrap();
-        assert_eq!(
-            body["stop_sequences"],
-            serde_json::json!(["END", "STOP"])
-        );
+        assert_eq!(body["stop_sequences"], serde_json::json!(["END", "STOP"]));
     }
 
     #[test]
@@ -1645,8 +1698,12 @@ mod tests {
 
         // Send a message_delta with usage but no text content.
         let frames = vec![
-            make_frame(r#"{"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","content":[],"model":"claude","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":0}}}"#),
-            make_frame(r#"{"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"input_tokens":0,"output_tokens":20}}"#),
+            make_frame(
+                r#"{"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","content":[],"model":"claude","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":0}}}"#,
+            ),
+            make_frame(
+                r#"{"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"input_tokens":0,"output_tokens":20}}"#,
+            ),
         ];
 
         let mut all_events = Vec::new();
@@ -1655,8 +1712,16 @@ mod tests {
         }
 
         // Usage should NOT be dropped just because there was no text.
-        assert!(all_events.iter().any(|e| matches!(e, CoreEvent::UsageDelta { .. })));
-        assert!(all_events.iter().any(|e| matches!(e, CoreEvent::MessageStop { .. })));
+        assert!(
+            all_events
+                .iter()
+                .any(|e| matches!(e, CoreEvent::UsageDelta { .. }))
+        );
+        assert!(
+            all_events
+                .iter()
+                .any(|e| matches!(e, CoreEvent::MessageStop { .. }))
+        );
     }
 
     // -- Missing test: full lifecycle event ordering --------------------------
@@ -1668,11 +1733,19 @@ mod tests {
         let mut decoder = adapter.new_stream_decoder(&target);
 
         let frames = vec![
-            make_frame(r#"{"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","content":[],"model":"claude","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":0}}}"#),
-            make_frame(r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#),
-            make_frame(r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hi"}}"#),
+            make_frame(
+                r#"{"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","content":[],"model":"claude","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":0}}}"#,
+            ),
+            make_frame(
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+            ),
+            make_frame(
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hi"}}"#,
+            ),
             make_frame(r#"{"type":"content_block_stop","index":0}"#),
-            make_frame(r#"{"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"input_tokens":0,"output_tokens":5}}"#),
+            make_frame(
+                r#"{"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"input_tokens":0,"output_tokens":5}}"#,
+            ),
         ];
 
         let mut all_events = Vec::new();
@@ -1681,14 +1754,35 @@ mod tests {
         }
 
         // Verify ordering: MessageStart < ContentStart < TextDelta < MessageStop.
-        let msg_start_idx = all_events.iter().position(|e| matches!(e, CoreEvent::MessageStart { .. })).unwrap();
-        let content_start_idx = all_events.iter().position(|e| matches!(e, CoreEvent::ContentStart { .. })).unwrap();
-        let text_delta_idx = all_events.iter().position(|e| matches!(e, CoreEvent::TextDelta { .. })).unwrap();
-        let msg_stop_idx = all_events.iter().position(|e| matches!(e, CoreEvent::MessageStop { .. })).unwrap();
+        let msg_start_idx = all_events
+            .iter()
+            .position(|e| matches!(e, CoreEvent::MessageStart { .. }))
+            .unwrap();
+        let content_start_idx = all_events
+            .iter()
+            .position(|e| matches!(e, CoreEvent::ContentStart { .. }))
+            .unwrap();
+        let text_delta_idx = all_events
+            .iter()
+            .position(|e| matches!(e, CoreEvent::TextDelta { .. }))
+            .unwrap();
+        let msg_stop_idx = all_events
+            .iter()
+            .position(|e| matches!(e, CoreEvent::MessageStop { .. }))
+            .unwrap();
 
-        assert!(msg_start_idx < content_start_idx, "MessageStart must precede ContentStart");
-        assert!(content_start_idx < text_delta_idx, "ContentStart must precede TextDelta");
-        assert!(text_delta_idx < msg_stop_idx, "TextDelta must precede MessageStop");
+        assert!(
+            msg_start_idx < content_start_idx,
+            "MessageStart must precede ContentStart"
+        );
+        assert!(
+            content_start_idx < text_delta_idx,
+            "ContentStart must precede TextDelta"
+        );
+        assert!(
+            text_delta_idx < msg_stop_idx,
+            "TextDelta must precede MessageStop"
+        );
     }
 
     // -- Additional missing tests ----------------------------------------------
@@ -1738,7 +1832,9 @@ mod tests {
         let proxy_req = adapter.encode_request(&core, &target).unwrap();
 
         let body: serde_json::Value = serde_json::from_slice(&proxy_req.body).unwrap();
-        let content = &body["messages"].as_array().unwrap()[0]["content"].as_array().unwrap()[0];
+        let content = &body["messages"].as_array().unwrap()[0]["content"]
+            .as_array()
+            .unwrap()[0];
         assert_eq!(content["is_error"], true);
     }
 
@@ -1789,7 +1885,9 @@ mod tests {
         let proxy_req = adapter.encode_request(&core, &target).unwrap();
 
         let body: serde_json::Value = serde_json::from_slice(&proxy_req.body).unwrap();
-        let content = body["messages"].as_array().unwrap()[0]["content"].as_array().unwrap();
+        let content = body["messages"].as_array().unwrap()[0]["content"]
+            .as_array()
+            .unwrap();
         assert_eq!(content.len(), 2);
         assert_eq!(content[1]["type"], "image");
     }
@@ -1851,7 +1949,10 @@ mod tests {
 
         let body: serde_json::Value = serde_json::from_slice(&proxy_req.body).unwrap();
         let tc_name = body["tool_choice"]["name"].as_str().unwrap();
-        assert!(tc_name.contains("0x2e"), "tool name in tool_choice must be sanitized");
+        assert!(
+            tc_name.contains("0x2e"),
+            "tool name in tool_choice must be sanitized"
+        );
     }
 
     #[test]
@@ -1877,7 +1978,13 @@ mod tests {
         let core_resp = adapter.decode_response(&bytes, &target).unwrap();
 
         assert_eq!(core_resp.content.len(), 1);
-        assert_eq!(core_resp.content[0], CoreContent::Text { text: String::new(), cache: None });
+        assert_eq!(
+            core_resp.content[0],
+            CoreContent::Text {
+                text: String::new(),
+                cache: None
+            }
+        );
     }
 
     #[test]
@@ -1935,7 +2042,10 @@ mod tests {
         let original = "my.tool+name";
         let (sanitized, changed) = sanitize_tool_name(original);
         assert!(changed, "should have changed");
-        assert!(sanitized.starts_with("__llmp_"), "sanitized name should have sentinel");
+        assert!(
+            sanitized.starts_with("__llmp_"),
+            "sanitized name should have sentinel"
+        );
         let restored = desanitize_tool_name(&sanitized);
         assert_eq!(restored, original);
     }
@@ -1945,7 +2055,10 @@ mod tests {
         let original = "get_weather";
         let (sanitized, changed) = sanitize_tool_name(original);
         assert!(!changed, "should not have changed");
-        assert!(!sanitized.starts_with("__llmp_"), "unchanged name should not have sentinel");
+        assert!(
+            !sanitized.starts_with("__llmp_"),
+            "unchanged name should not have sentinel"
+        );
         assert_eq!(sanitized, original);
     }
 
@@ -2006,7 +2119,10 @@ mod tests {
         let error_event = events.iter().find(|e| matches!(e, CoreEvent::Error { .. }));
         assert!(error_event.is_some());
         if let CoreEvent::Error { error } = error_event.unwrap() {
-            assert_eq!(error.kind, llm_proxy_protocol::core::CoreStreamErrorKind::RateLimit);
+            assert_eq!(
+                error.kind,
+                llm_proxy_protocol::core::CoreStreamErrorKind::RateLimit
+            );
         }
     }
 
@@ -2023,7 +2139,10 @@ mod tests {
         let error_event = events.iter().find(|e| matches!(e, CoreEvent::Error { .. }));
         assert!(error_event.is_some());
         if let CoreEvent::Error { error } = error_event.unwrap() {
-            assert_eq!(error.kind, llm_proxy_protocol::core::CoreStreamErrorKind::Authentication);
+            assert_eq!(
+                error.kind,
+                llm_proxy_protocol::core::CoreStreamErrorKind::Authentication
+            );
         }
     }
 
@@ -2035,7 +2154,9 @@ mod tests {
 
         // A chunk that only has message_stop with no prior content.
         let frames = vec![
-            make_frame(r#"{"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","content":[],"model":"claude","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":0}}}"#),
+            make_frame(
+                r#"{"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","content":[],"model":"claude","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":0}}}"#,
+            ),
             make_frame(r#"{"type":"message_stop"}"#),
         ];
 
@@ -2044,9 +2165,17 @@ mod tests {
             all_events.extend(decoder.decode_frame(frame).unwrap());
         }
 
-        assert!(all_events.iter().any(|e| matches!(e, CoreEvent::MessageStart { .. })));
-        assert!(all_events.iter().any(|e| matches!(e, CoreEvent::MessageStop { .. })),
-            "message_stop event must not be silently dropped");
+        assert!(
+            all_events
+                .iter()
+                .any(|e| matches!(e, CoreEvent::MessageStart { .. }))
+        );
+        assert!(
+            all_events
+                .iter()
+                .any(|e| matches!(e, CoreEvent::MessageStop { .. })),
+            "message_stop event must not be silently dropped"
+        );
     }
 
     #[test]
@@ -2058,9 +2187,15 @@ mod tests {
         let mut decoder = adapter.new_stream_decoder(&target);
 
         let frames = vec![
-            make_frame(r#"{"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","content":[],"model":"claude","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":0}}}"#),
-            make_frame(r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_1","name":"get_weather"}}"#),
-            make_frame(r#"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{}"}}"#),
+            make_frame(
+                r#"{"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","content":[],"model":"claude","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":0}}}"#,
+            ),
+            make_frame(
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_1","name":"get_weather"}}"#,
+            ),
+            make_frame(
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{}"}}"#,
+            ),
             make_frame(r#"{"type":"content_block_stop","index":0}"#),
         ];
 
@@ -2075,7 +2210,10 @@ mod tests {
             .iter()
             .filter(|e| matches!(e, CoreEvent::ToolCallStop { .. }))
             .count();
-        assert_eq!(tool_call_stop_count, 1, "ToolCallStop should be emitted exactly once");
+        assert_eq!(
+            tool_call_stop_count, 1,
+            "ToolCallStop should be emitted exactly once"
+        );
     }
 
     // -- Source guard ---------------------------------------------------------

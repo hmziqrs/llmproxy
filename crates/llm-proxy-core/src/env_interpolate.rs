@@ -76,10 +76,14 @@ mod tests {
     #[test]
     fn interpolates_known_var() {
         let _g = crate::test_support::TestEnvLock::acquire();
-        unsafe { std::env::set_var("_LLM_PROXY_TEST_INTERPOLATE", "hello"); }
+        unsafe {
+            std::env::set_var("_LLM_PROXY_TEST_INTERPOLATE", "hello");
+        }
         let result = interpolate_env_vars("key = ${_LLM_PROXY_TEST_INTERPOLATE}");
         assert_eq!(result, "key = hello");
-        unsafe { std::env::remove_var("_LLM_PROXY_TEST_INTERPOLATE"); }
+        unsafe {
+            std::env::remove_var("_LLM_PROXY_TEST_INTERPOLATE");
+        }
     }
 
     #[test]
@@ -106,19 +110,28 @@ mod tests {
     #[test]
     fn empty_braces_not_interpolated() {
         let result = interpolate_env_vars("key = ${}");
-        assert_eq!(result, "key = ${}", "empty braces should not be interpolated");
+        assert_eq!(
+            result, "key = ${}",
+            "empty braces should not be interpolated"
+        );
     }
 
     #[test]
     fn hyphenated_var_not_interpolated() {
         let result = interpolate_env_vars("key = ${my-var}");
-        assert_eq!(result, "key = ${my-var}", "hyphenated var should not be interpolated");
+        assert_eq!(
+            result, "key = ${my-var}",
+            "hyphenated var should not be interpolated"
+        );
     }
 
     #[test]
     fn dotted_var_not_interpolated() {
         let result = interpolate_env_vars("key = ${my.var}");
-        assert_eq!(result, "key = ${my.var}", "dotted var should not be interpolated");
+        assert_eq!(
+            result, "key = ${my.var}",
+            "dotted var should not be interpolated"
+        );
     }
 
     #[test]

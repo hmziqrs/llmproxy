@@ -6,9 +6,9 @@
 //! `pub mod core;` is missing.
 
 use llm_proxy_protocol::core::{
-    CacheControl, CacheControlType, ContentKind, CoreEvent, CoreRequest, CoreResponse, CoreRole,
-    CoreMessage, CoreContent, CoreStreamError, CoreStreamErrorKind, CoreTool, CoreToolChoice,
-    ModelRef, RequestMetadata, SamplingOptions, ProviderHints, StopReason, Usage, UsageProvenance,
+    CacheControl, CacheControlType, ContentKind, CoreContent, CoreEvent, CoreMessage, CoreRequest,
+    CoreResponse, CoreRole, CoreStreamError, CoreStreamErrorKind, CoreTool, CoreToolChoice,
+    ModelRef, ProviderHints, RequestMetadata, SamplingOptions, StopReason, Usage, UsageProvenance,
 };
 
 /// Trivial compile-time check: the types exist and are constructible.
@@ -65,5 +65,8 @@ fn cache_control_type_is_exported() {
     let cc = CacheControl {
         r#type: CacheControlType::Ephemeral,
     };
-    assert_eq!(serde_json::to_string(&cc).unwrap(), r#"{"type":"ephemeral"}"#);
+    assert_eq!(
+        serde_json::to_string(&cc).unwrap(),
+        r#"{"type":"ephemeral"}"#
+    );
 }

@@ -9,15 +9,18 @@
 //! ```
 
 use llm_proxy_protocol::core::{
-    ContentKind, CoreContent, CoreEvent, CoreRequest, CoreResponse, CoreRole,
-    CoreToolChoice, ModelRef, StopReason, Usage, UsageProvenance,
+    ContentKind, CoreContent, CoreEvent, CoreRequest, CoreResponse, CoreRole, CoreToolChoice,
+    ModelRef, StopReason, Usage, UsageProvenance,
 };
 use llm_proxy_protocol::zen::{
-    ResponsesChunk, ResponsesInput, ResponsesReasoning,
-    ResponsesRequest, ResponsesResponse, ResponsesTool, ResponsesUsage,
+    ResponsesChunk, ResponsesInput, ResponsesReasoning, ResponsesRequest, ResponsesResponse,
+    ResponsesTool, ResponsesUsage,
 };
 
-use super::{build_proxy_request, expand_url_template, response_model_ref, ProviderAdapterTarget, ProviderStreamDecoder};
+use super::{
+    ProviderAdapterTarget, ProviderStreamDecoder, build_proxy_request, expand_url_template,
+    response_model_ref,
+};
 use crate::error::ProviderError;
 use crate::sse::SseFrame;
 
@@ -74,10 +77,7 @@ impl ProviderStreamDecoder for ResponsesStreamDecoder {
             Ok(c) => c,
             Err(_) => {
                 let truncated = super::truncate_str_safe(data, 200);
-                tracing::warn!(
-                    data = truncated,
-                    "malformed Responses chunk, skipping"
-                );
+                tracing::warn!(data = truncated, "malformed Responses chunk, skipping");
                 return Ok(vec![]);
             }
         };
@@ -281,10 +281,7 @@ impl ProviderStreamDecoder for ResponsesStreamDecoder {
                     })
                     .unwrap_or(llm_proxy_protocol::core::CoreStreamErrorKind::Upstream);
                 events.push(CoreEvent::Error {
-                    error: llm_proxy_protocol::core::CoreStreamError::new(
-                        kind,
-                        message,
-                    ),
+                    error: llm_proxy_protocol::core::CoreStreamError::new(kind, message),
                 });
             }
             _ => {
@@ -396,15 +393,19 @@ impl ResponsesAdapter {
                             text_parts.push(text.as_str());
                         }
                     }
-                    CoreContent::ToolUse { id, name, input: tool_input } => {
+                    CoreContent::ToolUse {
+                        id,
+                        name,
+                        input: tool_input,
+                    } => {
                         // Encode ToolUse as a function_call output item for the
                         // Responses API format (used when replaying prior turns).
                         // The Responses API represents prior tool calls as input
                         // items with type "function_call".
                         let call_id = id.clone();
                         let fn_name = name.clone();
-                        let arguments = serde_json::to_string(tool_input)
-                            .unwrap_or_else(|_| "{}".to_owned());
+                        let arguments =
+                            serde_json::to_string(tool_input).unwrap_or_else(|_| "{}".to_owned());
                         input.push(ResponsesInput {
                             role: role.to_owned(),
                             content: Some(serde_json::json!({
@@ -416,7 +417,11 @@ impl ResponsesAdapter {
                         });
                         has_function_call_output = true;
                     }
-                    CoreContent::ToolResult { tool_use_id, content: result_content, .. } => {
+                    CoreContent::ToolResult {
+                        tool_use_id,
+                        content: result_content,
+                        ..
+                    } => {
                         // Encode ToolResult as a function_call_output item.
                         let result_text: String = result_content
                             .iter()
@@ -609,7 +614,9 @@ impl ResponsesAdapter {
             });
         }
 
-        let has_tool_use = content.iter().any(|c| matches!(c, CoreContent::ToolUse { .. }));
+        let has_tool_use = content
+            .iter()
+            .any(|c| matches!(c, CoreContent::ToolUse { .. }));
         let stop_reason = match resp.status.as_deref() {
             Some("failed") | Some("expired") => StopReason::Error,
             Some("incomplete") => StopReason::MaxTokens,
@@ -930,7 +937,9 @@ mod tests {
             make_frame(r#"{"type":"response.created","id":"resp_1"}"#),
             make_frame(r#"{"type":"response.output_text.delta","delta":"Hello"}"#),
             make_frame(r#"{"type":"response.output_text.delta","delta":" world"}"#),
-            make_frame(r#"{"type":"response.completed","usage":{"input_tokens":10,"output_tokens":5}}"#),
+            make_frame(
+                r#"{"type":"response.completed","usage":{"input_tokens":10,"output_tokens":5}}"#,
+            ),
         ];
 
         let mut all_events = Vec::new();
@@ -938,13 +947,25 @@ mod tests {
             all_events.extend(decoder.decode_frame(frame).unwrap());
         }
 
-        assert!(all_events.iter().any(|e| matches!(e, CoreEvent::MessageStart { .. })));
-        assert!(all_events.iter().any(|e| matches!(e, CoreEvent::ContentStart { .. })));
+        assert!(
+            all_events
+                .iter()
+                .any(|e| matches!(e, CoreEvent::MessageStart { .. }))
+        );
+        assert!(
+            all_events
+                .iter()
+                .any(|e| matches!(e, CoreEvent::ContentStart { .. }))
+        );
         assert!(all_events.iter().any(|e| matches!(
             e,
             CoreEvent::TextDelta { text, .. } if text == "Hello"
         )));
-        assert!(all_events.iter().any(|e| matches!(e, CoreEvent::MessageStop { .. })));
+        assert!(
+            all_events
+                .iter()
+                .any(|e| matches!(e, CoreEvent::MessageStop { .. }))
+        );
     }
 
     #[test]
@@ -965,8 +986,16 @@ mod tests {
         let mut decoder = adapter.new_stream_decoder(&target);
 
         let events = decoder.finish().unwrap();
-        assert!(events.iter().any(|e| matches!(e, CoreEvent::MessageStart { .. })));
-        assert!(events.iter().any(|e| matches!(e, CoreEvent::MessageStop { .. })));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, CoreEvent::MessageStart { .. }))
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, CoreEvent::MessageStop { .. }))
+        );
     }
 
     // -- Stream tool call / malformed frame / response.failed tests -----------
@@ -979,11 +1008,15 @@ mod tests {
 
         let frames = vec![
             make_frame(r#"{"type":"response.created","id":"resp_1"}"#),
-            make_frame(r#"{"type":"response.output_item.added","output":[{"type":"function_call","call_id":"call_abc","name":"get_weather"}]}"#),
+            make_frame(
+                r#"{"type":"response.output_item.added","output":[{"type":"function_call","call_id":"call_abc","name":"get_weather"}]}"#,
+            ),
             make_frame(r#"{"type":"response.function_call_arguments.delta","delta":"{\"city\":"}"#),
             make_frame(r#"{"type":"response.function_call_arguments.delta","delta":"\"SF\"}"}"#),
             make_frame(r#"{"type":"response.function_call_arguments.done"}"#),
-            make_frame(r#"{"type":"response.completed","usage":{"input_tokens":20,"output_tokens":10}}"#),
+            make_frame(
+                r#"{"type":"response.completed","usage":{"input_tokens":20,"output_tokens":10}}"#,
+            ),
         ];
 
         let mut all_events = Vec::new();
@@ -991,14 +1024,30 @@ mod tests {
             all_events.extend(decoder.decode_frame(frame).unwrap());
         }
 
-        assert!(all_events.iter().any(|e| matches!(e, CoreEvent::ToolCallStart { .. })),
-            "expected ToolCallStart");
-        assert!(all_events.iter().any(|e| matches!(e, CoreEvent::ToolCallDelta { .. })),
-            "expected ToolCallDelta");
-        assert!(all_events.iter().any(|e| matches!(e, CoreEvent::ToolCallStop { .. })),
-            "expected ToolCallStop");
-        assert!(all_events.iter().any(|e| matches!(e, CoreEvent::MessageStop { .. })),
-            "expected MessageStop with ToolUse");
+        assert!(
+            all_events
+                .iter()
+                .any(|e| matches!(e, CoreEvent::ToolCallStart { .. })),
+            "expected ToolCallStart"
+        );
+        assert!(
+            all_events
+                .iter()
+                .any(|e| matches!(e, CoreEvent::ToolCallDelta { .. })),
+            "expected ToolCallDelta"
+        );
+        assert!(
+            all_events
+                .iter()
+                .any(|e| matches!(e, CoreEvent::ToolCallStop { .. })),
+            "expected ToolCallStop"
+        );
+        assert!(
+            all_events
+                .iter()
+                .any(|e| matches!(e, CoreEvent::MessageStop { .. })),
+            "expected MessageStop with ToolUse"
+        );
     }
 
     #[test]
@@ -1019,11 +1068,14 @@ mod tests {
         let adapter = ResponsesAdapter;
         let mut decoder = adapter.new_stream_decoder(&target);
 
-        let frame = make_frame(r#"{"type":"response.failed","error":{"message":"rate limit exceeded"}}"#);
+        let frame =
+            make_frame(r#"{"type":"response.failed","error":{"message":"rate limit exceeded"}}"#);
         let events = decoder.decode_frame(&frame).unwrap();
 
-        assert!(events.iter().any(|e| matches!(e, CoreEvent::Error { .. })),
-            "response.failed must emit CoreEvent::Error");
+        assert!(
+            events.iter().any(|e| matches!(e, CoreEvent::Error { .. })),
+            "response.failed must emit CoreEvent::Error"
+        );
     }
 
     // -- Encode: tool_choice forwarding test ----------------------------------
@@ -1127,7 +1179,9 @@ mod tests {
 
         let frames = vec![
             make_frame(r#"{"type":"response.created","id":"resp_1"}"#),
-            make_frame(r#"{"type":"response.output_item.added","output":[{"type":"function_call","call_id":"call_1","name":"test"}]}"#),
+            make_frame(
+                r#"{"type":"response.output_item.added","output":[{"type":"function_call","call_id":"call_1","name":"test"}]}"#,
+            ),
             make_frame(r#"{"type":"response.function_call_arguments.done"}"#),
             make_frame(r#"{"type":"response.done","usage":{"input_tokens":10,"output_tokens":5}}"#),
         ];
@@ -1138,7 +1192,9 @@ mod tests {
         }
 
         // Stop reason should be ToolUse since we saw a function_call.
-        let msg_stop = all_events.iter().find(|e| matches!(e, CoreEvent::MessageStop { .. }));
+        let msg_stop = all_events
+            .iter()
+            .find(|e| matches!(e, CoreEvent::MessageStop { .. }));
         assert!(msg_stop.is_some());
         match msg_stop.unwrap() {
             CoreEvent::MessageStop { stop_reason, .. } => {
@@ -1168,7 +1224,9 @@ mod tests {
         // Simulate receiving a tool call event but no explicit done/completed.
         let frames = vec![
             make_frame(r#"{"type":"response.created","id":"resp_1"}"#),
-            make_frame(r#"{"type":"response.output_item.added","output":[{"type":"function_call","call_id":"c1","name":"fn"}]}"#),
+            make_frame(
+                r#"{"type":"response.output_item.added","output":[{"type":"function_call","call_id":"c1","name":"fn"}]}"#,
+            ),
             make_frame(r#"{"type":"response.function_call_arguments.done"}"#),
         ];
 
@@ -1178,12 +1236,17 @@ mod tests {
         }
         all_events.extend(decoder.finish().unwrap());
 
-        let msg_stop = all_events.iter().find(|e| matches!(e, CoreEvent::MessageStop { .. }));
+        let msg_stop = all_events
+            .iter()
+            .find(|e| matches!(e, CoreEvent::MessageStop { .. }));
         assert!(msg_stop.is_some());
         match msg_stop.unwrap() {
             CoreEvent::MessageStop { stop_reason, .. } => {
-                assert_eq!(*stop_reason, StopReason::ToolUse,
-                    "finish() should infer ToolUse when saw_tool_call is true");
+                assert_eq!(
+                    *stop_reason,
+                    StopReason::ToolUse,
+                    "finish() should infer ToolUse when saw_tool_call is true"
+                );
             }
             _ => unreachable!(),
         }
@@ -1209,7 +1272,13 @@ mod tests {
         let core_resp = adapter.decode_response(&bytes, &target).unwrap();
 
         assert_eq!(core_resp.content.len(), 1);
-        assert_eq!(core_resp.content[0], CoreContent::Text { text: String::new(), cache: None });
+        assert_eq!(
+            core_resp.content[0],
+            CoreContent::Text {
+                text: String::new(),
+                cache: None
+            }
+        );
     }
 
     #[test]
@@ -1243,7 +1312,10 @@ mod tests {
         target.upstream_model = "gpt-4o-2024-08-06-alias".into();
         let core = make_core_request(vec![CoreMessage {
             role: CoreRole::User,
-            content: vec![CoreContent::Text { text: "hi".into(), cache: None }],
+            content: vec![CoreContent::Text {
+                text: "hi".into(),
+                cache: None,
+            }],
         }]);
         let adapter = ResponsesAdapter;
         let proxy_req = adapter.encode_request(&core, &target).unwrap();
@@ -1289,9 +1361,15 @@ mod tests {
         );
         let events = decoder.decode_frame(&frame).unwrap();
         let error_event = events.iter().find(|e| matches!(e, CoreEvent::Error { .. }));
-        assert!(error_event.is_some(), "response.failed should produce an Error event");
+        assert!(
+            error_event.is_some(),
+            "response.failed should produce an Error event"
+        );
         if let CoreEvent::Error { error } = error_event.unwrap() {
-            assert_eq!(error.kind, llm_proxy_protocol::core::CoreStreamErrorKind::RateLimit);
+            assert_eq!(
+                error.kind,
+                llm_proxy_protocol::core::CoreStreamErrorKind::RateLimit
+            );
         }
     }
 

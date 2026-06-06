@@ -223,9 +223,7 @@ mod tests {
     fn sse_framer_handles_crlf() {
         let mut framer = SseFramer::new();
 
-        let frames = framer
-            .push_chunk(b"data: hello\r\n\r\n")
-            .unwrap();
+        let frames = framer.push_chunk(b"data: hello\r\n\r\n").unwrap();
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].data, "hello");
     }
@@ -321,7 +319,10 @@ mod tests {
         // Invalid UTF-8 followed by a newline: drain_buffer will try to decode
         // the line and fail.
         let result = framer.push_chunk(&[0xFF, 0xFE, b'\n']);
-        assert!(result.is_err(), "Expected error for invalid UTF-8 at newline");
+        assert!(
+            result.is_err(),
+            "Expected error for invalid UTF-8 at newline"
+        );
         match result.unwrap_err() {
             ProviderError::Utf8(_) => {}
             other => panic!("Expected ProviderError::Utf8, got: {:?}", other),
@@ -348,9 +349,7 @@ mod tests {
     fn sse_framer_event_without_data() {
         let mut framer = SseFramer::new();
 
-        let frames = framer
-            .push_chunk(b"event: ping\n\n")
-            .unwrap();
+        let frames = framer.push_chunk(b"event: ping\n\n").unwrap();
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].event.as_deref(), Some("ping"));
         assert_eq!(frames[0].data, "");
@@ -469,9 +468,7 @@ mod tests {
     fn sse_framer_ignores_unknown_fields() {
         let mut framer = SseFramer::new();
 
-        let frames = framer
-            .push_chunk(b"retry: 5000\ndata: hello\n\n")
-            .unwrap();
+        let frames = framer.push_chunk(b"retry: 5000\ndata: hello\n\n").unwrap();
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].data, "hello");
         // The retry field is silently ignored per SSE spec.
@@ -522,7 +519,10 @@ mod tests {
         chunk2.extend_from_slice(b"\n\n");
         let frames = framer.push_chunk(&chunk2).unwrap();
         assert_eq!(frames.len(), 1);
-        assert_eq!(frames[0].data, "あ", "Multi-byte char must be preserved across chunk split");
+        assert_eq!(
+            frames[0].data, "あ",
+            "Multi-byte char must be preserved across chunk split"
+        );
     }
 
     #[test]

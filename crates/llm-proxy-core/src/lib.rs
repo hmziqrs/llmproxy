@@ -2,15 +2,12 @@
 //!
 //! Provides:
 //!
-//! - **Configuration**: the legacy JSON [`Config`] and the new TOML
-//!   [`AppConfig`]/[`ProviderConfig`] types with env-var interpolation and
-//!   validation.
+//! - **Configuration**: the TOML [`AppConfig`]/[`ProviderConfig`] types with
+//!   env-var interpolation and validation.
 //! - **Routing**: [`ProviderTarget`] and [`resolve_model_route`] for mapping
 //!   client-facing model names to upstream providers.
 //! - **Registry**: [`ProviderRegistry`] and [`ProviderAdapterTargetConfig`] for
 //!   resolving route targets to concrete adapter configurations.
-//! - **Scenario routing**: [`Scenario`], [`ScenarioConfig`], and related types
-//!   for request classification.
 //! - **Metrics**: the runtime [`Metrics`] collector with counters and latency
 //!   histograms.
 //! - **Token counting**: [`Counter`] and [`MessageContent`] for usage tracking.
@@ -20,12 +17,10 @@
 //! # Crate layout
 //!
 //! ```text
-//! config            - Legacy JSON config (oc-go-cc compatible)
-//! provider_config   - New TOML provider/app config types
+//! provider_config   - TOML provider/app config types
 //! provider_registry - Provider registry and adapter target resolution
 //! model_route       - Model routing resolution
 //! env_interpolate   - Shared ${ENV_VAR} interpolation
-//! router            - Scenario-based request routing
 //! token             - Token counting
 //! metrics           - Runtime metrics
 //! pid               - PID file management
@@ -34,12 +29,10 @@
 
 #![deny(missing_docs)]
 
-/// Configuration loading and types (legacy JSON system).
-pub mod config;
-/// Crate-level error type.
-pub mod error;
 /// Shared `${ENV_VAR}` interpolation for config files.
 pub mod env_interpolate;
+/// Crate-level error type.
+pub mod error;
 /// Runtime metrics (counters, latency ring-buffer, per-model counts).
 pub mod metrics;
 /// Model routing: resolve client-facing model names to provider targets.
@@ -50,8 +43,6 @@ pub mod pid;
 pub mod provider_config;
 /// Provider registry: load provider TOML files and resolve route targets.
 pub mod provider_registry;
-/// Scenario-based request routing for model selection.
-pub mod router;
 /// Token counting utilities.
 pub mod token;
 
@@ -59,19 +50,14 @@ pub mod token;
 #[cfg(test)]
 pub mod test_support;
 
-pub use config::{Config, LoggingConfig, ModelConfig, OpenCodeGoConfig, OpenCodeZenConfig};
 pub use error::CoreError;
 pub use metrics::{Metrics, Snapshot};
 pub use model_route::{ModelRouteError, ProviderTarget, resolve_model_route};
 pub use pid::PidManager;
 pub use provider_config::{
-    AppConfig, AuthStyle, ConfigValidationError, ModelRoute, ProviderAdapterConfig,
-    ProviderConfig, ProviderFile, ProviderModelConfig, ServerConfig, load_app_config,
-    load_provider_config, validate_model_routes, validate_provider_config,
+    AppConfig, AuthStyle, ConfigValidationError, ModelRoute, ProviderAdapterConfig, ProviderConfig,
+    ProviderFile, ProviderModelConfig, ServerConfig, load_app_config, load_provider_config,
+    validate_model_routes, validate_provider_config,
 };
 pub use provider_registry::{ProviderAdapterTargetConfig, ProviderRegistry};
-pub use router::{
-    CircuitBreaker, CircuitState, FallbackHandler, FallbackResult, Scenario, ScenarioConfig,
-    ScenarioResult, detect_scenario, get_fallback_chain, is_retryable_error, route_for_streaming,
-};
 pub use token::{Counter, MessageContent};

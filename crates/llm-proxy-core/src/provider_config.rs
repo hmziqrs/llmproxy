@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::env_interpolate::{find_unresolved_env_var, find_env_var_refs, interpolate_env_vars};
+use crate::env_interpolate::{find_env_var_refs, find_unresolved_env_var, interpolate_env_vars};
 use crate::error::CoreError;
 
 // ---------------------------------------------------------------------------
@@ -217,7 +217,9 @@ pub enum ConfigValidationError {
         adapter: String,
     },
     /// An environment variable referenced in `api_key` could not be resolved.
-    #[error("provider \"{provider}\": api_key contains unresolvable environment variable \"{var}\"")]
+    #[error(
+        "provider \"{provider}\": api_key contains unresolvable environment variable \"{var}\""
+    )]
     UnresolvedEnvVar {
         /// Provider name.
         provider: String,
@@ -225,7 +227,9 @@ pub enum ConfigValidationError {
         var: String,
     },
     /// An environment variable resolved to an empty value.
-    #[error("provider \"{provider}\": api_key environment variable \"{var}\" resolved to an empty value")]
+    #[error(
+        "provider \"{provider}\": api_key environment variable \"{var}\" resolved to an empty value"
+    )]
     EmptyEnvVar {
         /// Provider name.
         provider: String,
@@ -281,7 +285,9 @@ pub enum ConfigValidationError {
         protocol: String,
     },
     /// An adapter endpoint has a non-HTTP(S) URL scheme.
-    #[error("provider \"{provider}\": adapter \"{adapter}\" has invalid endpoint scheme (expected http:// or https://): \"{endpoint}\"")]
+    #[error(
+        "provider \"{provider}\": adapter \"{adapter}\" has invalid endpoint scheme (expected http:// or https://): \"{endpoint}\""
+    )]
     InvalidEndpointScheme {
         /// Provider name.
         provider: String,
@@ -367,8 +373,8 @@ pub fn validate_provider_config(
         // Valid schemes are "http://" and "https://". This prevents endpoints like
         // "file:///etc/passwd" or other arbitrary schemes.
         let endpoint_trimmed = adapter_cfg.endpoint.trim();
-        let has_valid_scheme = endpoint_trimmed.starts_with("http://")
-            || endpoint_trimmed.starts_with("https://");
+        let has_valid_scheme =
+            endpoint_trimmed.starts_with("http://") || endpoint_trimmed.starts_with("https://");
         if !has_valid_scheme {
             return Err(ConfigValidationError::InvalidEndpointScheme {
                 provider: name.clone(),
@@ -422,15 +428,15 @@ pub fn validate_provider_config(
 /// Returns a [`ConfigValidationError`] variant describing the first validation
 /// failure encountered: either an empty route key or an empty provider name
 /// within a route.
-pub fn validate_model_routes(models: &HashMap<String, ModelRoute>) -> Result<(), ConfigValidationError> {
+pub fn validate_model_routes(
+    models: &HashMap<String, ModelRoute>,
+) -> Result<(), ConfigValidationError> {
     for (key, route) in models {
         if key.trim().is_empty() {
             return Err(ConfigValidationError::EmptyRouteKey);
         }
         if route.provider.trim().is_empty() {
-            return Err(ConfigValidationError::EmptyRouteProvider {
-                key: key.clone(),
-            });
+            return Err(ConfigValidationError::EmptyRouteProvider { key: key.clone() });
         }
     }
     Ok(())
@@ -490,9 +496,7 @@ pub fn load_app_config(path: impl AsRef<Path>) -> Result<AppConfig, CoreError> {
     // passed through as a literal string.
     if let Some(var) = find_unresolved_env_var(&interpolated) {
         return Err(CoreError::ConfigValidation {
-            message: format!(
-                "app config contains unresolvable environment variable \"{var}\""
-            ),
+            message: format!("app config contains unresolvable environment variable \"{var}\""),
         });
     }
 
@@ -582,8 +586,10 @@ pub fn load_provider_config(
         });
     }
     let file: ProviderFile = toml::from_str(&interpolated).map_err(CoreError::ConfigParse)?;
-    validate_provider_config(&file.provider, known_protocols).map_err(|e| CoreError::ConfigValidation {
-        message: e.to_string(),
+    validate_provider_config(&file.provider, known_protocols).map_err(|e| {
+        CoreError::ConfigValidation {
+            message: e.to_string(),
+        }
     })?;
     Ok(file.provider)
 }
@@ -715,7 +721,10 @@ endpoint = "https://opencode.ai/zen/v1/models/{{model}}:generateContent"
         assert_eq!(cfg.adapters["responses"].protocol, "openai_responses");
         assert_eq!(cfg.adapters["anthropic"].protocol, "anthropic_messages");
         assert_eq!(cfg.adapters["gemini"].protocol, "gemini_generate_content");
-        assert_eq!(cfg.adapters["gemini"].endpoint, "https://opencode.ai/zen/v1/models/{model}:generateContent");
+        assert_eq!(
+            cfg.adapters["gemini"].endpoint,
+            "https://opencode.ai/zen/v1/models/{model}:generateContent"
+        );
         assert_eq!(cfg.models.len(), 3);
         assert_eq!(cfg.models["gpt-5.4"].adapter, "responses");
     }
@@ -972,7 +981,10 @@ protocol = "openai_chat_completions"
         };
         let known = vec!["openai_chat_completions", "anthropic_messages"];
         let result = validate_provider_config(&cfg, Some(&known));
-        assert!(result.is_ok(), "expected validation to pass, got: {result:?}");
+        assert!(
+            result.is_ok(),
+            "expected validation to pass, got: {result:?}"
+        );
     }
 
     // -- Unknown protocol fails validation when not supplied by caller ---------
@@ -1315,7 +1327,10 @@ server_name = "llm-proxy"
         assert_eq!(back.server.bind, original.server.bind);
         assert_eq!(back.server.request_timeout, original.server.request_timeout);
         assert_eq!(back.models.len(), 2);
-        assert_eq!(back.models["claude-4"].upstream_model.as_deref(), Some("claude-sonnet-4-20250514"));
+        assert_eq!(
+            back.models["claude-4"].upstream_model.as_deref(),
+            Some("claude-sonnet-4-20250514")
+        );
     }
 
     // -- Direct tests for validate_model_routes --------------------------------
@@ -1376,7 +1391,10 @@ server_name = "llm-proxy"
             },
         );
         let result = validate_model_routes(&models);
-        assert!(result.is_ok(), "expected validation to pass, got: {result:?}");
+        assert!(
+            result.is_ok(),
+            "expected validation to pass, got: {result:?}"
+        );
     }
 
     // -- Direct test for EmptyProviderModelKey ---------------------------------
@@ -1846,7 +1864,10 @@ endpoint = "https://example.com/v1/chat/completions"
             },
         };
         let result = validate_provider_config(&cfg, None);
-        assert!(result.is_ok(), "very long strings should pass validation, got: {result:?}");
+        assert!(
+            result.is_ok(),
+            "very long strings should pass validation, got: {result:?}"
+        );
     }
 
     // -- App config with unresolved env var in server field fails --------------
@@ -1872,7 +1893,10 @@ server_name = "${_LLM_PROXY_NEVER_EXISTS_FOR_APP_12345}"
         .expect("write");
 
         let result = load_app_config(&path);
-        assert!(result.is_err(), "expected error for unresolved env var in server field");
+        assert!(
+            result.is_err(),
+            "expected error for unresolved env var in server field"
+        );
         let err = result.unwrap_err().to_string();
         assert!(
             err.contains("unresolvable environment variable"),
@@ -1904,7 +1928,10 @@ server_name = "${_LLM_PROXY_APP_EMPTY_VAR}"
         .expect("write");
 
         let result = load_app_config(&path);
-        assert!(result.is_err(), "expected error for empty env var in server field");
+        assert!(
+            result.is_err(),
+            "expected error for empty env var in server field"
+        );
         let err = result.unwrap_err().to_string();
         assert!(
             err.contains("resolved to an empty value"),
@@ -2185,7 +2212,10 @@ server_name = "llm-proxy"
         .expect("write");
 
         let cfg = load_app_config(&path).expect("load");
-        assert!(cfg.models.is_empty(), "empty models map should parse successfully");
+        assert!(
+            cfg.models.is_empty(),
+            "empty models map should parse successfully"
+        );
     }
 
     // -- Minimal valid provider config (name + api_key + auth_style only) ----------
@@ -2235,7 +2265,10 @@ endpoint = "https://${{_LLM_PROXY_DUP_VAR}}/v1/chat/completions"
 
         let cfg = load_provider_config(&path, None).expect("load");
         assert_eq!(cfg.api_key, "shared-value");
-        assert_eq!(cfg.adapters["chat"].endpoint, "https://shared-value/v1/chat/completions");
+        assert_eq!(
+            cfg.adapters["chat"].endpoint,
+            "https://shared-value/v1/chat/completions"
+        );
     }
 
     // -- Env var interpolation in provider name ------------------------------------
@@ -2468,7 +2501,10 @@ endpoint = "https://example.com/v1/chat/completions"
         .expect("write");
 
         let result = load_provider_config(&path, None);
-        assert!(result.is_err(), "expected error for unknown auth_style variant");
+        assert!(
+            result.is_err(),
+            "expected error for unknown auth_style variant"
+        );
         let err = result.unwrap_err().to_string();
         // Serde enum deserialization reports unknown variants clearly.
         assert!(

@@ -289,7 +289,11 @@ fn providers_dir_for(config_path: &std::path::Path) -> PathBuf {
 #[cfg(target_os = "macos")]
 fn launchd_plist_path() -> PathBuf {
     home_env::home_dir()
-        .map(|h| h.join("Library").join("LaunchAgents").join("com.llm-proxy.plist"))
+        .map(|h| {
+            h.join("Library")
+                .join("LaunchAgents")
+                .join("com.llm-proxy.plist")
+        })
         .unwrap_or_else(|| PathBuf::from("com.llm-proxy.plist"))
 }
 
@@ -578,8 +582,10 @@ fn spawn_daemon(config_path: Option<PathBuf>, port_override: Option<u16>) -> Res
 
     #[cfg(not(unix))]
     {
-        println!("warning: daemon log redirection is not supported on this platform; \
-                   output will be lost");
+        println!(
+            "warning: daemon log redirection is not supported on this platform; \
+                   output will be lost"
+        );
     }
 
     let mut child = cmd.spawn().with_context(|| "spawning daemon process")?;
@@ -755,14 +761,17 @@ fn cmd_validate(config_path: Option<PathBuf>) -> Result<()> {
 
     println!("validating config: {}", path.display());
 
-    let app_config: AppConfig =
-        load_app_config(&path).with_context(|| format!("loading TOML config from {}", path.display()))?;
+    let app_config: AppConfig = load_app_config(&path)
+        .with_context(|| format!("loading TOML config from {}", path.display()))?;
 
     // Print settings summary.
     println!();
     println!("=== Server Configuration ===");
     println!("  bind:            {}", app_config.server.bind);
-    println!("  request_timeout: {}s", app_config.server.request_timeout.as_secs());
+    println!(
+        "  request_timeout: {}s",
+        app_config.server.request_timeout.as_secs()
+    );
     println!("  log_level:       {}", app_config.server.log_level);
     println!("  hot_reload:      {}", app_config.server.hot_reload);
     println!("  server_name:     {}", app_config.server.server_name);
@@ -790,7 +799,8 @@ fn cmd_validate(config_path: Option<PathBuf>) -> Result<()> {
         println!("  (none)");
     } else {
         for provider in registry.iter() {
-            println!("  {} ({} adapters, {} models)",
+            println!(
+                "  {} ({} adapters, {} models)",
                 provider.name,
                 provider.adapters.len(),
                 provider.models.len()
@@ -804,27 +814,24 @@ fn cmd_validate(config_path: Option<PathBuf>) -> Result<()> {
         println!("=== Model Route Table ===");
         let mut route_errors: Vec<String> = Vec::new();
         for client_model in app_config.models.keys() {
-
             match resolve_model_route(&app_config.models, client_model) {
-                Ok(target) => {
-                    match registry.resolve_adapter_target(&target) {
-                        Ok(resolved) => {
-                            println!(
-                                "  {} -> {}/{}/{}/{}",
-                                client_model,
-                                resolved.provider_name,
-                                resolved.upstream_model,
-                                resolved.adapter_name,
-                                resolved.protocol
-                            );
-                        }
-                        Err(e) => {
-                            let msg = format!("  {} -> ERROR: {}", client_model, e);
-                            println!("{}", msg);
-                            route_errors.push(msg);
-                        }
+                Ok(target) => match registry.resolve_adapter_target(&target) {
+                    Ok(resolved) => {
+                        println!(
+                            "  {} -> {}/{}/{}/{}",
+                            client_model,
+                            resolved.provider_name,
+                            resolved.upstream_model,
+                            resolved.adapter_name,
+                            resolved.protocol
+                        );
                     }
-                }
+                    Err(e) => {
+                        let msg = format!("  {} -> ERROR: {}", client_model, e);
+                        println!("{}", msg);
+                        route_errors.push(msg);
+                    }
+                },
                 Err(e) => {
                     let msg = format!("  {} -> ERROR: {}", client_model, e);
                     println!("{}", msg);
@@ -856,8 +863,8 @@ fn cmd_models(config_path: Option<PathBuf>) -> Result<()> {
     // Reject JSON config and non-TOML extensions.
     validate_toml_extension(&path)?;
 
-    let app_config =
-        load_app_config(&path).with_context(|| format!("loading TOML config from {}", path.display()))?;
+    let app_config = load_app_config(&path)
+        .with_context(|| format!("loading TOML config from {}", path.display()))?;
 
     if app_config.models.is_empty() {
         println!("No models configured.");
@@ -868,10 +875,7 @@ fn cmd_models(config_path: Option<PathBuf>) -> Result<()> {
     println!("Configured client models (from {}):", path.display());
     println!();
     for (name, route) in &app_config.models {
-        let upstream = route
-            .upstream_model
-            .as_deref()
-            .unwrap_or(name);
+        let upstream = route.upstream_model.as_deref().unwrap_or(name);
         if upstream == name {
             println!("  {}", name);
         } else {
@@ -909,7 +913,8 @@ fn cmd_autostart_enable(config_path: Option<PathBuf>, port: Option<u16>) -> Resu
         let plist_content = format_plist(&args.join(" "));
         let plist_path = launchd_plist_path();
 
-        let plist_dir = plist_path.parent()
+        let plist_dir = plist_path
+            .parent()
             .with_context(|| format!("invalid plist path: {}", plist_path.display()))?;
         std::fs::create_dir_all(plist_dir)
             .with_context(|| format!("creating {}", plist_dir.display()))?;
@@ -1110,18 +1115,18 @@ fn xml_escape(s: &str) -> String {
 /// the builtin adapter set after loading.
 ///
 /// Takes ownership of `adapter_registry` and `proxy_client` since they are
-/// consumed by [`AppState::from_toml`] and not reused after this call.
+/// consumed by [`AppState::new`] and not reused after this call.
 fn load_toml_state(
     path: &std::path::Path,
     adapter_registry: ProviderAdapterRegistry,
     proxy_client: ProxyClient,
     port_override: Option<u16>,
 ) -> Result<AppState> {
-    let mut app_config: AppConfig =
-        load_app_config(path).with_context(|| format!("loading TOML config from {}", path.display()))?;
+    let mut app_config: AppConfig = load_app_config(path)
+        .with_context(|| format!("loading TOML config from {}", path.display()))?;
 
     // Apply CLI port override.
-    // In-place mutation is safe here: the config is consumed by AppState::from_toml
+    // In-place mutation is safe here: the config is consumed by AppState::new
     // below and is not shared with any other caller.
     if let Some(p) = port_override {
         let mut bind = app_config.server.bind;
@@ -1151,7 +1156,7 @@ fn load_toml_state(
         "loaded TOML config"
     );
 
-    Ok(AppState::from_toml(
+    Ok(AppState::new(
         app_config,
         registry,
         adapter_registry,
@@ -1173,7 +1178,8 @@ fn init_tracing() {
     use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
     // Fallback to "info" level when RUST_LOG is not set. "info" is a known-valid
     // filter string so parse_lossy is safe here (it never panics).
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::builder().parse_lossy("info"));
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::builder().parse_lossy("info"));
     tracing_subscriber::registry()
         .with(filter)
         .with(fmt::layer())
@@ -1265,16 +1271,26 @@ mod tests {
             //    so no concurrent access to environment variables occurs.
             // 2. The original value is captured and restored on drop.
             // 3. This only runs in test code, not in production.
-            unsafe { std::env::set_var(key, value); }
-            Self { key: key.to_owned(), original }
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self {
+                key: key.to_owned(),
+                original,
+            }
         }
 
         fn remove(key: &str) -> Self {
             let original = std::env::var(key).ok();
             // SAFETY: Same justification as set() above -- serialised via
             // TEST_ENV_MUTEX and original value is restored on drop.
-            unsafe { std::env::remove_var(key); }
-            Self { key: key.to_owned(), original }
+            unsafe {
+                std::env::remove_var(key);
+            }
+            Self {
+                key: key.to_owned(),
+                original,
+            }
         }
     }
 
@@ -1283,8 +1299,12 @@ mod tests {
             // SAFETY: Same justification as set()/remove() above --
             // serialised via TEST_ENV_MUTEX.
             match &self.original {
-                Some(v) => unsafe { std::env::set_var(&self.key, v); },
-                None => unsafe { std::env::remove_var(&self.key); },
+                Some(v) => unsafe {
+                    std::env::set_var(&self.key, v);
+                },
+                None => unsafe {
+                    std::env::remove_var(&self.key);
+                },
             }
         }
     }
@@ -1333,7 +1353,10 @@ mod tests {
         let _g = EnvGuard::set("LLM_PROXY_CONFIG", "/tmp/from-env.toml");
         let (resolved, legacy) = resolve_serve_config(None);
         assert_eq!(resolved, PathBuf::from("/tmp/from-env.toml"));
-        assert!(!legacy, "LLM_PROXY_CONFIG should not trigger legacy detection");
+        assert!(
+            !legacy,
+            "LLM_PROXY_CONFIG should not trigger legacy detection"
+        );
     }
 
     // -- CLI path wins over $LLM_PROXY_CONFIG -----------------------------------
@@ -1354,7 +1377,10 @@ mod tests {
         let _env = clean_config_env();
         let _g = EnvGuard::set("OC_GO_CC_CONFIG", "/tmp/old-config.json");
         let (_, legacy) = resolve_serve_config(None);
-        assert!(legacy, "OC_GO_CC_CONFIG alone should trigger legacy detection");
+        assert!(
+            legacy,
+            "OC_GO_CC_CONFIG alone should trigger legacy detection"
+        );
     }
 
     // -- explicit TOML --config wins over $OC_GO_CC_CONFIG ----------------------
@@ -1387,7 +1413,10 @@ mod tests {
     fn provider_directory_path_is_next_to_config_file() {
         let config_path = PathBuf::from("/home/user/.config/llm-proxy/config.toml");
         let providers = providers_dir_for(&config_path);
-        assert_eq!(providers, PathBuf::from("/home/user/.config/llm-proxy/providers"));
+        assert_eq!(
+            providers,
+            PathBuf::from("/home/user/.config/llm-proxy/providers")
+        );
     }
 
     // -- provider directory path with no parent uses current dir ----------------
@@ -1410,7 +1439,10 @@ mod tests {
         let path = dir.path().join("config.toml");
         std::fs::write(&path, DEFAULT_CONFIG_TOML).expect("write");
         let cfg = load_app_config(&path).expect("generated TOML should parse as AppConfig");
-        assert!(!cfg.models.is_empty(), "generated config should have models");
+        assert!(
+            !cfg.models.is_empty(),
+            "generated config should have models"
+        );
     }
 
     // -- generated provider TOML parses as ProviderFile -------------------------
@@ -1439,7 +1471,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("opencode-zen.toml");
         std::fs::write(&path, DEFAULT_PROVIDER_OPENCODE_ZEN).expect("write");
-        let cfg = load_provider_config(&path, None).expect("generated zen provider TOML should parse");
+        let cfg =
+            load_provider_config(&path, None).expect("generated zen provider TOML should parse");
         assert_eq!(cfg.name, "opencode-zen");
         assert_eq!(cfg.adapters.len(), 4, "zen should have 4 adapters");
     }
@@ -1607,7 +1640,10 @@ mod tests {
         let _g = EnvGuard::set("OC_GO_CC_CONFIG", "/tmp/old.json");
         let (resolved, legacy) =
             resolve_serve_config(Some(std::path::Path::new("/tmp/config.toml")));
-        assert!(!legacy, "explicit --config should suppress legacy detection");
+        assert!(
+            !legacy,
+            "explicit --config should suppress legacy detection"
+        );
         assert!(is_toml_config(&resolved));
     }
 
@@ -1745,7 +1781,11 @@ server_name = "test"
             "generated config must not contain scenario"
         );
         // Also verify the config file extension is .toml, not .json.
-        assert!(default_config_path().extension().is_some_and(|e| e == "toml"));
+        assert!(
+            default_config_path()
+                .extension()
+                .is_some_and(|e| e == "toml")
+        );
     }
 
     // -- validate rejects legacy scenario config --------------------------------
@@ -1899,11 +1939,8 @@ server_name = "test"
         let cfg = load_app_config(&path).expect("load");
 
         // Collect all unique provider names referenced in models
-        let providers: std::collections::HashSet<&str> = cfg
-            .models
-            .values()
-            .map(|r| r.provider.as_str())
-            .collect();
+        let providers: std::collections::HashSet<&str> =
+            cfg.models.values().map(|r| r.provider.as_str()).collect();
 
         assert!(
             providers.contains("opencode-go"),
@@ -1913,11 +1950,7 @@ server_name = "test"
             providers.contains("opencode-zen"),
             "should reference opencode-zen provider"
         );
-        assert_eq!(
-            providers.len(),
-            2,
-            "should reference exactly 2 providers"
-        );
+        assert_eq!(providers.len(), 2, "should reference exactly 2 providers");
     }
 
     // =========================================================================
@@ -1992,7 +2025,10 @@ server_name = "test"
 
         // No providers/ subdirectory -- should still parse main config.
         let app_config = load_app_config(&config_path).expect("load");
-        assert!(!app_config.models.is_empty(), "main config should have models");
+        assert!(
+            !app_config.models.is_empty(),
+            "main config should have models"
+        );
     }
 
     // -- generated config contains no standalone stream key -----------------------
@@ -2034,13 +2070,13 @@ server_name = "test"
     #[test]
     fn example_config_file_is_valid_toml() {
         let _env = clean_config_env();
-        let example_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../config.toml.example");
+        let example_path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config.toml.example");
         if example_path.exists() {
             // If the example file has provider entries that require env vars, skip
             // validation and just verify it can be read.
-            let _content = std::fs::read_to_string(&example_path)
-                .expect("example config should be readable");
+            let _content =
+                std::fs::read_to_string(&example_path).expect("example config should be readable");
             // At minimum the file exists and is non-empty.
             assert!(!_content.is_empty(), "example config should not be empty");
         }
@@ -2063,14 +2099,26 @@ server_name = "test"
         std::fs::create_dir_all(&providers_dir).expect("mkdir providers");
 
         std::fs::write(&config_path, DEFAULT_CONFIG_TOML).expect("write config");
-        std::fs::write(providers_dir.join("opencode-go.toml"), DEFAULT_PROVIDER_OPENCODE_GO)
-            .expect("write go provider");
-        std::fs::write(providers_dir.join("opencode-zen.toml"), DEFAULT_PROVIDER_OPENCODE_ZEN)
-            .expect("write zen provider");
+        std::fs::write(
+            providers_dir.join("opencode-go.toml"),
+            DEFAULT_PROVIDER_OPENCODE_GO,
+        )
+        .expect("write go provider");
+        std::fs::write(
+            providers_dir.join("opencode-zen.toml"),
+            DEFAULT_PROVIDER_OPENCODE_ZEN,
+        )
+        .expect("write zen provider");
 
         assert!(config_path.exists(), "config.toml should exist");
-        assert!(providers_dir.join("opencode-go.toml").exists(), "go provider should exist");
-        assert!(providers_dir.join("opencode-zen.toml").exists(), "zen provider should exist");
+        assert!(
+            providers_dir.join("opencode-go.toml").exists(),
+            "go provider should exist"
+        );
+        assert!(
+            providers_dir.join("opencode-zen.toml").exists(),
+            "zen provider should exist"
+        );
 
         // Verify the files parse correctly.
         let _g1 = EnvGuard::set("LLM_PROXY_OPENCODE_GO_KEY", "test-key");
@@ -2096,7 +2144,10 @@ server_name = "test"
         assert_eq!(xml_escape("hello"), "hello");
         assert_eq!(xml_escape("<>&\"'"), "&lt;&gt;&amp;&quot;&apos;");
         assert_eq!(xml_escape("no-special"), "no-special");
-        assert_eq!(xml_escape("a<b>c&d\"e'f"), "a&lt;b&gt;c&amp;d&quot;e&apos;f");
+        assert_eq!(
+            xml_escape("a<b>c&d\"e'f"),
+            "a&lt;b&gt;c&amp;d&quot;e&apos;f"
+        );
     }
 
     // -- validate_toml_extension accepts valid TOML path -------------------------
@@ -2119,7 +2170,10 @@ server_name = "test"
         let _g = EnvGuard::set("LLM_PROXY_CONFIG", "");
         let (resolved, legacy) = resolve_serve_config(None);
         assert_eq!(resolved, default_config_path());
-        assert!(!legacy, "empty LLM_PROXY_CONFIG should fall through to default");
+        assert!(
+            !legacy,
+            "empty LLM_PROXY_CONFIG should fall through to default"
+        );
     }
 
     // -- resolve_serve_config ignores empty OC_GO_CC_CONFIG -----------------------
@@ -2130,7 +2184,10 @@ server_name = "test"
         let _g = EnvGuard::set("OC_GO_CC_CONFIG", "");
         let (resolved, legacy) = resolve_serve_config(None);
         assert_eq!(resolved, default_config_path());
-        assert!(!legacy, "empty OC_GO_CC_CONFIG should fall through to default");
+        assert!(
+            !legacy,
+            "empty OC_GO_CC_CONFIG should fall through to default"
+        );
     }
 
     // -- resolve_config ignores empty LLM_PROXY_CONFIG ---------------------------
@@ -2257,7 +2314,10 @@ model = "fallback-model"
 
         match cli.unwrap().command {
             Commands::Serve { daemonize, .. } => {
-                assert!(daemonize, "daemonize should be true when --daemonize is passed");
+                assert!(
+                    daemonize,
+                    "daemonize should be true when --daemonize is passed"
+                );
             }
             _ => panic!("expected Serve command"),
         }

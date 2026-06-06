@@ -301,7 +301,10 @@ pub(crate) fn expand_url_template(
             model
         )));
     }
-    if !model.chars().all(|c| c.is_alphanumeric() || c == '.' || c == '-' || c == '_') {
+    if !model
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == '.' || c == '-' || c == '_')
+    {
         return Err(ProviderError::InvalidConfig(format!(
             "upstream_model {:?} contains unsafe characters; refusing to interpolate into URL",
             model
@@ -509,19 +512,27 @@ mod tests {
     fn adapter_protocol_dispatch() {
         let reg = ProviderAdapterRegistry::builtin();
         assert_eq!(
-            reg.get(ProviderProtocol::OpenAiChatCompletions).unwrap().protocol(),
+            reg.get(ProviderProtocol::OpenAiChatCompletions)
+                .unwrap()
+                .protocol(),
             ProviderProtocol::OpenAiChatCompletions
         );
         assert_eq!(
-            reg.get(ProviderProtocol::AnthropicMessages).unwrap().protocol(),
+            reg.get(ProviderProtocol::AnthropicMessages)
+                .unwrap()
+                .protocol(),
             ProviderProtocol::AnthropicMessages
         );
         assert_eq!(
-            reg.get(ProviderProtocol::OpenAiResponses).unwrap().protocol(),
+            reg.get(ProviderProtocol::OpenAiResponses)
+                .unwrap()
+                .protocol(),
             ProviderProtocol::OpenAiResponses
         );
         assert_eq!(
-            reg.get(ProviderProtocol::GeminiGenerateContent).unwrap().protocol(),
+            reg.get(ProviderProtocol::GeminiGenerateContent)
+                .unwrap()
+                .protocol(),
             ProviderProtocol::GeminiGenerateContent
         );
     }
@@ -534,7 +545,8 @@ mod tests {
         let url = expand_url_template(
             "https://generativelanguage.googleapis.com/v1beta/models/{model}:streamGenerateContent",
             &target,
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(
             url,
             "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:streamGenerateContent"
@@ -544,7 +556,8 @@ mod tests {
     #[test]
     fn url_template_no_placeholder_unchanged() {
         let target = make_target(ProviderProtocol::OpenAiChatCompletions);
-        let url = expand_url_template("https://api.openai.com/v1/chat/completions", &target).unwrap();
+        let url =
+            expand_url_template("https://api.openai.com/v1/chat/completions", &target).unwrap();
         assert_eq!(url, "https://api.openai.com/v1/chat/completions");
     }
 
@@ -553,7 +566,10 @@ mod tests {
         let mut target = make_target(ProviderProtocol::OpenAiChatCompletions);
         target.upstream_model = "../../etc/passwd".into();
         let result = expand_url_template("https://api.openai.com/v1/{model}", &target);
-        assert!(result.is_err(), "should reject model name with path traversal");
+        assert!(
+            result.is_err(),
+            "should reject model name with path traversal"
+        );
     }
 
     #[test]
@@ -569,9 +585,14 @@ mod tests {
             upstream_model: "gpt-4o".into(),
         };
         let debug = format!("{:?}", target);
-        assert!(!debug.contains("sk-test-super-secret-key-1234567890"),
-            "Debug output must not contain the actual API key");
-        assert!(debug.contains("[REDACTED]"), "Debug output must show [REDACTED] for api_key");
+        assert!(
+            !debug.contains("sk-test-super-secret-key-1234567890"),
+            "Debug output must not contain the actual API key"
+        );
+        assert!(
+            debug.contains("[REDACTED]"),
+            "Debug output must show [REDACTED] for api_key"
+        );
     }
 
     // -- Finish reason mapping -----------------------------------------------
@@ -582,14 +603,20 @@ mod tests {
         assert_eq!(map_openai_finish_reason("length"), StopReason::MaxTokens);
         assert_eq!(map_openai_finish_reason("tool_calls"), StopReason::ToolUse);
         assert_eq!(map_openai_finish_reason("tool_use"), StopReason::ToolUse);
-        assert_eq!(map_openai_finish_reason("content_filter"), StopReason::Refusal);
+        assert_eq!(
+            map_openai_finish_reason("content_filter"),
+            StopReason::Refusal
+        );
         assert_eq!(map_openai_finish_reason("unknown"), StopReason::Unknown);
     }
 
     #[test]
     fn gemini_finish_reason_mappings() {
         assert_eq!(map_gemini_finish_reason("STOP"), StopReason::EndTurn);
-        assert_eq!(map_gemini_finish_reason("MAX_TOKENS"), StopReason::MaxTokens);
+        assert_eq!(
+            map_gemini_finish_reason("MAX_TOKENS"),
+            StopReason::MaxTokens
+        );
         assert_eq!(map_gemini_finish_reason("SAFETY"), StopReason::EndTurn);
         assert_eq!(map_gemini_finish_reason("RECITATION"), StopReason::EndTurn);
         assert_eq!(map_gemini_finish_reason("other"), StopReason::Unknown);
@@ -712,15 +739,18 @@ mod tests {
 
     fn make_target(protocol: ProviderProtocol) -> ProviderAdapterTarget {
         let (endpoint, auth_style) = match protocol {
-            ProviderProtocol::OpenAiChatCompletions => {
-                ("https://api.openai.com/v1/chat/completions".into(), AuthStyle::Bearer)
-            }
-            ProviderProtocol::AnthropicMessages => {
-                ("https://api.anthropic.com/v1/messages".into(), AuthStyle::XApiKey)
-            }
-            ProviderProtocol::OpenAiResponses => {
-                ("https://api.openai.com/v1/responses".into(), AuthStyle::Bearer)
-            }
+            ProviderProtocol::OpenAiChatCompletions => (
+                "https://api.openai.com/v1/chat/completions".into(),
+                AuthStyle::Bearer,
+            ),
+            ProviderProtocol::AnthropicMessages => (
+                "https://api.anthropic.com/v1/messages".into(),
+                AuthStyle::XApiKey,
+            ),
+            ProviderProtocol::OpenAiResponses => (
+                "https://api.openai.com/v1/responses".into(),
+                AuthStyle::Bearer,
+            ),
             ProviderProtocol::GeminiGenerateContent => (
                 "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
                     .into(),

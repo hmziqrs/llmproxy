@@ -9,18 +9,20 @@ use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::http::{HeaderMap, Response, StatusCode, header};
-use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::IntoResponse;
+use axum::response::sse::{Event, KeepAlive, Sse};
 use bytes::Bytes;
 use futures::stream::{BoxStream, StreamExt};
-use llm_proxy_core::model_route::{ModelRouteError, resolve_model_route};
 use llm_proxy_core::Metrics;
+use llm_proxy_core::model_route::{ModelRouteError, resolve_model_route};
 use llm_proxy_protocol::client::anthropic;
 use llm_proxy_protocol::client::anthropic::StreamEncoder as AnthropicStreamEncoder;
 use llm_proxy_protocol::client::openai_chat;
 use llm_proxy_protocol::client::openai_chat::StreamEncoder as OpenAiStreamEncoder;
 use llm_proxy_protocol::core::{CoreEvent, CoreRequest};
-use llm_proxy_provider::adapter::{ProviderAdapter, ProviderAdapterTarget, ProviderProtocol, ProviderStreamDecoder};
+use llm_proxy_provider::adapter::{
+    ProviderAdapter, ProviderAdapterTarget, ProviderProtocol, ProviderStreamDecoder,
+};
 use llm_proxy_provider::sse::SseFramer;
 use llm_proxy_provider::transport::ProxyRequest;
 use tracing::warn;
@@ -28,7 +30,10 @@ use tracing::warn;
 use crate::middleware::get_client_ip;
 use crate::state::AppState;
 
-use super::error_response::{ClientProtocol, RouteError, PROVIDER_DECODE_CLIENT_MESSAGE, truncate_with_suffix, openai_stream_error_json};
+use super::error_response::{
+    ClientProtocol, PROVIDER_DECODE_CLIENT_MESSAGE, RouteError, openai_stream_error_json,
+    truncate_with_suffix,
+};
 
 // ---------------------------------------------------------------------------
 // ClientStreamEncoder — protocol-agnostic stream encoder wrapper
@@ -79,13 +84,21 @@ impl ClientStreamEncoder {
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs() as i64;
-                Self::OpenAi(OpenAiStreamEncoder::new(msg_id, model, created, include_usage))
+                Self::OpenAi(OpenAiStreamEncoder::new(
+                    msg_id,
+                    model,
+                    created,
+                    include_usage,
+                ))
             }
         }
     }
 
     /// Encode a single [`CoreEvent`] into zero or more protocol-specific events.
-    fn encode_event(&mut self, event: CoreEvent) -> Result<Vec<ClientEncodedEvent>, llm_proxy_protocol::client::ProtocolError> {
+    fn encode_event(
+        &mut self,
+        event: CoreEvent,
+    ) -> Result<Vec<ClientEncodedEvent>, llm_proxy_protocol::client::ProtocolError> {
         match self {
             Self::Anthropic(enc) => {
                 let msg_events = enc.encode_event(event)?;
@@ -99,7 +112,9 @@ impl ClientStreamEncoder {
     }
 
     /// Flush any remaining buffered events (synthetic terminal if needed).
-    fn finish(&mut self) -> Result<Vec<ClientEncodedEvent>, llm_proxy_protocol::client::ProtocolError> {
+    fn finish(
+        &mut self,
+    ) -> Result<Vec<ClientEncodedEvent>, llm_proxy_protocol::client::ProtocolError> {
         match self {
             Self::Anthropic(enc) => {
                 let msg_events = enc.finish()?;
@@ -146,19 +161,14 @@ fn wrap_anthropic_events(
 /// Serialize OpenAI SSE chunks, dropping any that fail to serialize.
 ///
 /// `phase` is used in log messages (e.g. "encode" vs "finish") for context.
-fn wrap_openai_events<T: serde::Serialize>(
-    chunks: Vec<T>,
-    phase: &str,
-) -> Vec<ClientEncodedEvent> {
+fn wrap_openai_events<T: serde::Serialize>(chunks: Vec<T>, phase: &str) -> Vec<ClientEncodedEvent> {
     chunks
         .into_iter()
-        .filter_map(|chunk| {
-            match serde_json::to_string(&chunk) {
-                Ok(json) => Some(ClientEncodedEvent::OpenAi { json }),
-                Err(e) => {
-                    warn!(error = %e, phase, "failed to serialize OpenAI SSE chunk; dropping");
-                    None
-                }
+        .filter_map(|chunk| match serde_json::to_string(&chunk) {
+            Ok(json) => Some(ClientEncodedEvent::OpenAi { json }),
+            Err(e) => {
+                warn!(error = %e, phase, "failed to serialize OpenAI SSE chunk; dropping");
+                None
             }
         })
         .collect()
@@ -170,9 +180,7 @@ fn client_event_to_sse(encoded: ClientEncodedEvent) -> Event {
         ClientEncodedEvent::Anthropic { event_type, json } => {
             Event::default().event(&event_type).data(json)
         }
-        ClientEncodedEvent::OpenAi { json } => {
-            Event::default().data(json)
-        }
+        ClientEncodedEvent::OpenAi { json } => Event::default().data(json),
     }
 }
 
@@ -238,16 +246,11 @@ fn resolve_target(
     state: &AppState,
     core: &CoreRequest,
 ) -> Result<(ProviderAdapterTarget, ProviderAdapter), RouteError> {
-    let app_config = state
-        .app_config()
-        .ok_or_else(|| RouteError::Internal("TOML config required".to_owned()))?;
+    let app_config = state.app_config();
+    let providers = state.providers();
 
-    let providers = state
-        .providers()
-        .ok_or_else(|| RouteError::Internal("provider registry required".to_owned()))?;
-
-    let target = resolve_model_route(&app_config.models, &core.model.requested)
-        .map_err(|e| match e {
+    let target =
+        resolve_model_route(&app_config.models, &core.model.requested).map_err(|e| match e {
             ModelRouteError::UnknownModel(m) => RouteError::UnknownModel(m),
             _ => RouteError::Internal(e.to_string()),
         })?;
@@ -256,13 +259,12 @@ fn resolve_target(
         .resolve_adapter_target(&target)
         .map_err(|e| RouteError::Internal(e.to_string()))?;
 
-    let protocol = ProviderProtocol::parse(&adapter_target_config.protocol)
-        .ok_or_else(|| {
-            RouteError::Internal(format!(
-                "unknown protocol: {}",
-                adapter_target_config.protocol
-            ))
-        })?;
+    let protocol = ProviderProtocol::parse(&adapter_target_config.protocol).ok_or_else(|| {
+        RouteError::Internal(format!(
+            "unknown protocol: {}",
+            adapter_target_config.protocol
+        ))
+    })?;
 
     let adapter = state
         .provider_adapters
@@ -328,22 +330,16 @@ pub(crate) async fn handle_core_once(
     // All encode errors map to Internal per the plan's error behavior spec:
     // the core pipeline has already validated the request at this point, so
     // any encode failure is a proxy/adapter issue, not a client error.
-    let proxy_req: ProxyRequest = adapter
-        .encode_request(&core, &target)
-        .map_err(|e| {
-            state.metrics.record_failure();
-            RouteError::Internal(format!("encode error: {e}"))
-        })?;
+    let proxy_req: ProxyRequest = adapter.encode_request(&core, &target).map_err(|e| {
+        state.metrics.record_failure();
+        RouteError::Internal(format!("encode error: {e}"))
+    })?;
 
     // Send to upstream.
-    let response_bytes = state
-        .proxy_client
-        .send(proxy_req)
-        .await
-        .map_err(|e| {
-            state.metrics.record_failure();
-            map_provider_error(e)
-        })?;
+    let response_bytes = state.proxy_client.send(proxy_req).await.map_err(|e| {
+        state.metrics.record_failure();
+        map_provider_error(e)
+    })?;
 
     // Decode the provider response into a CoreResponse.
     let core_resp = adapter
@@ -470,12 +466,10 @@ pub(crate) async fn handle_core_stream(
     // Encode the core request into a provider-specific HTTP request.
     // All encode errors map to Internal per the plan's error behavior spec:
     // the core pipeline has already validated the request at this point.
-    let proxy_req: ProxyRequest = adapter
-        .encode_request(&core, &target)
-        .map_err(|e| {
-            state.metrics.record_failure();
-            RouteError::Internal(format!("encode error: {e}"))
-        })?;
+    let proxy_req: ProxyRequest = adapter.encode_request(&core, &target).map_err(|e| {
+        state.metrics.record_failure();
+        RouteError::Internal(format!("encode error: {e}"))
+    })?;
 
     // Open the streaming connection.
     let byte_stream = state
@@ -503,12 +497,8 @@ pub(crate) async fn handle_core_stream(
         ClientProtocol::OpenAiChat => format!("chatcmpl-{}", uuid::Uuid::new_v4()),
         ClientProtocol::Anthropic => format!("msg_{}", uuid::Uuid::new_v4()),
     };
-    let client_encoder = ClientStreamEncoder::new(
-        client_protocol,
-        msg_id,
-        core.model.requested.clone(),
-        &core,
-    );
+    let client_encoder =
+        ClientStreamEncoder::new(client_protocol, msg_id, core.model.requested.clone(), &core);
 
     // ctx is consumed after this point. request_id is cloned once for the
     // spawned task and once for the response header (both are needed).
@@ -550,11 +540,11 @@ pub(crate) async fn handle_core_stream(
         FirstByteResult::FirstEvent(event) => {
             // First event received. Commit HTTP 200 and start streaming.
             // Prepend the first event to the output stream.
-            let stream = futures::stream::once(async move { Ok::<_, std::convert::Infallible>(event) })
-                .chain(output_stream.map(Ok::<_, std::convert::Infallible>));
+            let stream =
+                futures::stream::once(async move { Ok::<_, std::convert::Infallible>(event) })
+                    .chain(output_stream.map(Ok::<_, std::convert::Infallible>));
 
-            let sse = Sse::new(stream)
-                .keep_alive(KeepAlive::new().interval(HEARTBEAT_INTERVAL));
+            let sse = Sse::new(stream).keep_alive(KeepAlive::new().interval(HEARTBEAT_INTERVAL));
 
             let response = sse.into_response();
             let (mut parts, body) = response.into_parts();
@@ -625,7 +615,13 @@ struct StreamMetrics {
 /// channel is dropped and all subsequent errors become in-band SSE events.
 #[allow(clippy::too_many_arguments)]
 fn build_sse_output_stream(
-    byte_stream: std::pin::Pin<Box<dyn futures::Stream<Item = Result<Bytes, llm_proxy_provider::error::ProviderError>> + Send + 'static>>,
+    byte_stream: std::pin::Pin<
+        Box<
+            dyn futures::Stream<Item = Result<Bytes, llm_proxy_provider::error::ProviderError>>
+                + Send
+                + 'static,
+        >,
+    >,
     mut provider_decoder: Box<dyn ProviderStreamDecoder + Send>,
     mut sse_framer: SseFramer,
     mut client_encoder: ClientStreamEncoder,
@@ -858,16 +854,10 @@ fn build_sse_output_stream(
                             }
                         };
                         for core_event in core_events {
-                            let client_events = encode_core_event(
-                                &mut client_encoder,
-                                core_event,
-                            );
+                            let client_events = encode_core_event(&mut client_encoder, core_event);
                             for event in client_events {
                                 if !first_byte_sent {
-                                    if send_first_event(
-                                        &mut first_byte_tx,
-                                        event,
-                                    ).await {
+                                    if send_first_event(&mut first_byte_tx, event).await {
                                         first_byte_sent = true;
                                     } else {
                                         stream_metrics.metrics.record_failure();
@@ -894,16 +884,10 @@ fn build_sse_output_stream(
             match provider_decoder.finish() {
                 Ok(final_events) => {
                     for core_event in final_events {
-                        let client_events = encode_core_event(
-                            &mut client_encoder,
-                            core_event,
-                        );
+                        let client_events = encode_core_event(&mut client_encoder, core_event);
                         for event in client_events {
                             if !first_byte_sent {
-                                if send_first_event(
-                                    &mut first_byte_tx,
-                                    event,
-                                ).await {
+                                if send_first_event(&mut first_byte_tx, event).await {
                                     first_byte_sent = true;
                                 } else {
                                     stream_metrics.metrics.record_failure();
@@ -931,10 +915,7 @@ fn build_sse_output_stream(
                     for encoded in final_encoded_events {
                         let event = client_event_to_sse(encoded);
                         if !first_byte_sent {
-                            if send_first_event(
-                                &mut first_byte_tx,
-                                event,
-                            ).await {
+                            if send_first_event(&mut first_byte_tx, event).await {
                                 first_byte_sent = true;
                             } else {
                                 stream_metrics.metrics.record_failure();
@@ -950,10 +931,7 @@ fn build_sse_output_stream(
                     if matches!(client_protocol, ClientProtocol::OpenAiChat) {
                         let done_event = openai_done_event();
                         if !first_byte_sent {
-                            if send_first_event(
-                                &mut first_byte_tx,
-                                done_event,
-                            ).await {
+                            if send_first_event(&mut first_byte_tx, done_event).await {
                                 first_byte_sent = true;
                             } else {
                                 stream_metrics.metrics.record_failure();
@@ -993,11 +971,9 @@ fn build_sse_output_stream(
         // a misleading "stream task panicked" error).
         if !first_byte_sent {
             if let Some(tx) = first_byte_tx.take() {
-                let _ = tx.send(FirstByteResult::PreStreamError(
-                    RouteError::ProviderDecode(
-                        "upstream returned an empty stream with no events".to_owned(),
-                    ),
-                ));
+                let _ = tx.send(FirstByteResult::PreStreamError(RouteError::ProviderDecode(
+                    "upstream returned an empty stream with no events".to_owned(),
+                )));
             }
         }
     });
@@ -1014,10 +990,7 @@ fn build_sse_output_stream(
 }
 
 /// Encode a single [`CoreEvent`] using the appropriate client stream encoder.
-fn encode_core_event(
-    client_encoder: &mut ClientStreamEncoder,
-    event: CoreEvent,
-) -> Vec<Event> {
+fn encode_core_event(client_encoder: &mut ClientStreamEncoder, event: CoreEvent) -> Vec<Event> {
     match client_encoder.encode_event(event) {
         Ok(encoded_events) => encoded_events
             .into_iter()
@@ -1070,7 +1043,9 @@ async fn emit_stream_error(
     }
 
     // For OpenAI Chat, emit the [DONE] terminator after an error event.
-    if matches!(client_protocol, ClientProtocol::OpenAiChat) && tx.send(openai_done_event()).await.is_err() {
+    if matches!(client_protocol, ClientProtocol::OpenAiChat)
+        && tx.send(openai_done_event()).await.is_err()
+    {
         return;
     }
 
@@ -1235,10 +1210,10 @@ mod tests {
 
     #[test]
     fn resolve_target_unknown_model_returns_unknown_model() {
-        use std::collections::HashMap;
         use llm_proxy_core::AppConfig;
         use llm_proxy_core::ServerConfig;
         use llm_proxy_provider::{ProviderAdapterRegistry, ProxyClient};
+        use std::collections::HashMap;
 
         let app_config = AppConfig {
             server: ServerConfig {
@@ -1251,10 +1226,10 @@ mod tests {
             models: HashMap::new(), // empty routing table
         };
 
-        let providers = llm_proxy_core::ProviderRegistry::from_providers(vec![])
-            .expect("empty registry");
+        let providers =
+            llm_proxy_core::ProviderRegistry::from_providers(vec![]).expect("empty registry");
 
-        let state = AppState::from_toml(
+        let state = AppState::new(
             app_config,
             providers,
             ProviderAdapterRegistry::builtin(),
@@ -1292,30 +1267,45 @@ mod tests {
 
     // -- resolve_target with missing app_config ---------------------------------
 
-    #[test]
-    fn resolve_target_missing_app_config_returns_internal() {
-        use llm_proxy_core::{Config, FallbackHandler};
-        use llm_proxy_provider::{OpenCodeClient, ProviderAdapterRegistry, ProxyClient};
-        use std::sync::Arc;
+    // -- resolve_target with empty routing table returns unknown model ----------
 
-        // Build legacy state (no app_config, no providers).
-        let state = AppState::from_legacy(
-            Config::default(),
+    #[test]
+    fn resolve_target_empty_routing_table_returns_unknown_model() {
+        use llm_proxy_core::AppConfig;
+        use llm_proxy_core::ServerConfig;
+        use llm_proxy_provider::{ProviderAdapterRegistry, ProxyClient};
+        use std::collections::HashMap;
+
+        let app_config = AppConfig {
+            server: ServerConfig {
+                bind: "127.0.0.1:3456".parse().unwrap(),
+                request_timeout: std::time::Duration::from_secs(60),
+                log_level: "info".to_owned(),
+                hot_reload: false,
+                server_name: "test".to_owned(),
+            },
+            models: HashMap::new(), // empty routing table
+        };
+
+        let providers =
+            llm_proxy_core::ProviderRegistry::from_providers(vec![]).expect("empty registry");
+
+        let state = AppState::new(
+            app_config,
+            providers,
+            ProviderAdapterRegistry::builtin(),
+            ProxyClient::new(),
             crate::state::BuildInfo {
                 name: "test",
                 version: "0.0.0",
                 target: "test",
                 git_sha: "test",
             },
-            OpenCodeClient::new(Arc::new(Config::default())),
-            FallbackHandler::new(3, std::time::Duration::from_secs(30)),
-            ProviderAdapterRegistry::builtin(),
-            ProxyClient::new(),
         );
 
         let core = CoreRequest {
             model: llm_proxy_protocol::core::ModelRef {
-                requested: "any-model".to_owned(),
+                requested: "nonexistent-model".to_owned(),
                 upstream: None,
             },
             system: vec![],
@@ -1331,8 +1321,8 @@ mod tests {
         let result = resolve_target(&state, &core);
         assert!(result.is_err());
         match result.unwrap_err() {
-            RouteError::Internal(msg) => assert!(msg.contains("TOML config required")),
-            other => panic!("expected Internal, got: {:?}", other),
+            RouteError::UnknownModel(m) => assert_eq!(m, "nonexistent-model"),
+            other => panic!("expected UnknownModel, got: {:?}", other),
         }
     }
 
@@ -1341,13 +1331,11 @@ mod tests {
     #[test]
     fn encode_core_event_ping_produces_event() {
         use llm_proxy_protocol::core::CoreEvent;
-        let mut encoder = ClientStreamEncoder::Anthropic(
-            AnthropicStreamEncoder::new("msg_test".to_owned(), "test-model".to_owned()),
-        );
-        let events = encode_core_event(
-            &mut encoder,
-            CoreEvent::Ping,
-        );
+        let mut encoder = ClientStreamEncoder::Anthropic(AnthropicStreamEncoder::new(
+            "msg_test".to_owned(),
+            "test-model".to_owned(),
+        ));
+        let events = encode_core_event(&mut encoder, CoreEvent::Ping);
         // Ping may or may not produce output depending on the encoder impl.
         // The important thing is it doesn't panic.
         let _ = events;
@@ -1357,10 +1345,17 @@ mod tests {
 
     #[test]
     fn sanitize_removes_urls() {
-        let msg = "request failed: connection refused to https://api.openai.com/v1/chat/completions";
+        let msg =
+            "request failed: connection refused to https://api.openai.com/v1/chat/completions";
         let sanitized = sanitize_upstream_error_body(msg);
-        assert!(!sanitized.contains("api.openai.com"), "URL should be redacted");
-        assert!(sanitized.contains("[url-redacted]"), "should contain redacted placeholder");
+        assert!(
+            !sanitized.contains("api.openai.com"),
+            "URL should be redacted"
+        );
+        assert!(
+            sanitized.contains("[url-redacted]"),
+            "should contain redacted placeholder"
+        );
     }
 
     #[test]

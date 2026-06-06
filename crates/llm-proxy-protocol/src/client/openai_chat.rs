@@ -17,18 +17,17 @@
 use crate::client::ProtocolError;
 use crate::core::{
     CacheControl, CacheControlType, ContentKind, CoreContent, CoreEvent, CoreMessage, CoreRequest,
-    CoreResponse, CoreRole, CoreTool, CoreToolChoice,
-    ModelRef, ProviderHints, RequestMetadata, SamplingOptions, StopReason, Usage,
+    CoreResponse, CoreRole, CoreTool, CoreToolChoice, ModelRef, ProviderHints, RequestMetadata,
+    SamplingOptions, StopReason, Usage,
 };
 #[cfg(test)]
 use crate::core::{CoreStreamError, CoreStreamErrorKind};
-use crate::openai::{
-    ChatCompletionChunk, ChatCompletionRequest,
-    ChatCompletionResponse, ChatMessage, Choice, FunctionCall,
-    ToolCall, UsageInfo,
-};
 #[cfg(test)]
 use crate::openai::{CacheControl as OpenAICacheControl, StreamOptions};
+use crate::openai::{
+    ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, ChatMessage, Choice,
+    FunctionCall, ToolCall, UsageInfo,
+};
 
 // ---------------------------------------------------------------------------
 // Shared helpers
@@ -74,11 +73,9 @@ pub fn decode_request(req: ChatCompletionRequest) -> Result<CoreRequest, Protoco
     for msg in req.messages {
         match msg.role.as_str() {
             "system" => {
-                let cache = msg
-                    .cache_control
-                    .map(|cc| CacheControl {
-                        r#type: CacheControlType::from(cc.r#type),
-                    });
+                let cache = msg.cache_control.map(|cc| CacheControl {
+                    r#type: CacheControlType::from(cc.r#type),
+                });
                 if !msg.content.is_empty() || cache.is_some() {
                     system.push(CoreContent::Text {
                         text: msg.content,
@@ -87,11 +84,9 @@ pub fn decode_request(req: ChatCompletionRequest) -> Result<CoreRequest, Protoco
                 }
             }
             "user" => {
-                let cache = msg
-                    .cache_control
-                    .map(|cc| CacheControl {
-                        r#type: CacheControlType::from(cc.r#type),
-                    });
+                let cache = msg.cache_control.map(|cc| CacheControl {
+                    r#type: CacheControlType::from(cc.r#type),
+                });
                 let mut content = Vec::new();
                 if !msg.content.is_empty() || cache.is_some() {
                     content.push(CoreContent::Text {
@@ -128,7 +123,9 @@ pub fn decode_request(req: ChatCompletionRequest) -> Result<CoreRequest, Protoco
                     let tc_function = tc.function;
                     let (tc_name, tc_args) = if let Some(f) = tc_function {
                         let name = f.name.ok_or_else(|| {
-                            ProtocolError::InvalidRequest("tool_call.function.name is required".into())
+                            ProtocolError::InvalidRequest(
+                                "tool_call.function.name is required".into(),
+                            )
                         })?;
                         let args: serde_json::Value = f
                             .arguments
@@ -174,7 +171,9 @@ pub fn decode_request(req: ChatCompletionRequest) -> Result<CoreRequest, Protoco
                 // Adding a flattened extra Map to ChatMessage would enable this.
                 let is_error = false;
                 let tool_use_id = msg.tool_call_id.ok_or_else(|| {
-                    ProtocolError::InvalidRequest("tool_call_id is required on tool messages".into())
+                    ProtocolError::InvalidRequest(
+                        "tool_call_id is required on tool messages".into(),
+                    )
                 })?;
                 let inner_content = if msg.content.is_empty() {
                     vec![]
@@ -194,9 +193,7 @@ pub fn decode_request(req: ChatCompletionRequest) -> Result<CoreRequest, Protoco
                 });
             }
             other => {
-                return Err(ProtocolError::Decode(format!(
-                    "unknown role: {other}"
-                )));
+                return Err(ProtocolError::Decode(format!("unknown role: {other}")));
             }
         }
     }
@@ -207,9 +204,10 @@ pub fn decode_request(req: ChatCompletionRequest) -> Result<CoreRequest, Protoco
         .map(|t| CoreTool {
             name: t.function.name,
             description: t.function.description,
-            input_schema: t.function.parameters.unwrap_or(serde_json::Value::Object(
-                serde_json::Map::new(),
-            )),
+            input_schema: t
+                .function
+                .parameters
+                .unwrap_or(serde_json::Value::Object(serde_json::Map::new())),
         })
         .collect();
 
@@ -321,9 +319,7 @@ fn decode_tool_choice(value: serde_json::Value) -> CoreToolChoice {
 ///   (overwritten). If this becomes common, consider concatenating them.
 /// - `stop_sequence` is silently dropped since OpenAI has no native field for it.
 /// - `provider_meta` is silently dropped (for provider adapters only).
-pub fn encode_response(
-    resp: CoreResponse,
-) -> Result<ChatCompletionResponse, ProtocolError> {
+pub fn encode_response(resp: CoreResponse) -> Result<ChatCompletionResponse, ProtocolError> {
     if !resp.provider_meta.is_empty() {
         tracing::warn!(
             meta_keys = resp.provider_meta.len(),
@@ -339,7 +335,9 @@ pub fn encode_response(
         );
     }
 
-    let id = resp.id.unwrap_or_else(|| format!("chatcmpl-{}", uuid::Uuid::new_v4()));
+    let id = resp
+        .id
+        .unwrap_or_else(|| format!("chatcmpl-{}", uuid::Uuid::new_v4()));
 
     let mut content_text = String::new();
     let mut reasoning = None;
@@ -363,8 +361,7 @@ pub fn encode_response(
                 reasoning = Some(text);
             }
             CoreContent::ToolUse { id, name, input } => {
-                let args_str = serde_json::to_string(&input)
-                    .unwrap_or_else(|_| "{}".to_owned());
+                let args_str = serde_json::to_string(&input).unwrap_or_else(|_| "{}".to_owned());
                 tool_calls.push(ToolCall {
                     index: Some(tool_calls.len() as i32),
                     id: Some(id),
@@ -471,9 +468,7 @@ fn encode_finish_reason(reason: StopReason) -> String {
         StopReason::MaxTokens => "length".to_owned(),
         StopReason::Refusal => "content_filter".to_owned(),
         StopReason::Error => {
-            tracing::warn!(
-                "StopReason::Error mapped to 'stop' in OpenAI finish_reason"
-            );
+            tracing::warn!("StopReason::Error mapped to 'stop' in OpenAI finish_reason");
             "stop".to_owned()
         }
         _ => "stop".to_owned(),
@@ -979,7 +974,11 @@ mod tests {
         let core = decode_request(req).unwrap();
         assert_eq!(core.messages[1].role, CoreRole::Tool);
         match &core.messages[1].content[0] {
-            CoreContent::ToolResult { tool_use_id, is_error, .. } => {
+            CoreContent::ToolResult {
+                tool_use_id,
+                is_error,
+                ..
+            } => {
                 assert_eq!(tool_use_id, "call_1");
                 assert!(!is_error);
             }
@@ -1018,7 +1017,8 @@ mod tests {
         assert_eq!(core.tool_choice, Some(CoreToolChoice::Auto));
 
         let mut req2 = make_openai_request();
-        req2.tool_choice = Some(serde_json::json!({"type": "function", "function": {"name": "get_weather"}}));
+        req2.tool_choice =
+            Some(serde_json::json!({"type": "function", "function": {"name": "get_weather"}}));
         let core2 = decode_request(req2).unwrap();
         match core2.tool_choice {
             Some(CoreToolChoice::Tool { name }) => assert_eq!(name, "get_weather"),
@@ -1155,11 +1155,18 @@ mod tests {
             r#type: "ephemeral".into(),
         });
         let core = decode_request(req).unwrap();
-        assert_eq!(core.messages[0].content.len(), 1, "empty user message with cache_control should still produce a content block");
+        assert_eq!(
+            core.messages[0].content.len(),
+            1,
+            "empty user message with cache_control should still produce a content block"
+        );
         match &core.messages[0].content[0] {
             CoreContent::Text { text, cache } => {
                 assert!(text.is_empty());
-                assert!(cache.is_some(), "cache_control must be preserved even with empty text");
+                assert!(
+                    cache.is_some(),
+                    "cache_control must be preserved even with empty text"
+                );
                 assert_eq!(cache.as_ref().unwrap().r#type, CacheControlType::Ephemeral);
             }
             _ => panic!("expected Text"),
@@ -1187,11 +1194,18 @@ mod tests {
             },
         );
         let core = decode_request(req).unwrap();
-        assert_eq!(core.system.len(), 1, "empty system message with cache_control should produce a system block");
+        assert_eq!(
+            core.system.len(),
+            1,
+            "empty system message with cache_control should produce a system block"
+        );
         match &core.system[0] {
             CoreContent::Text { text, cache } => {
                 assert!(text.is_empty());
-                assert!(cache.is_some(), "cache_control must be preserved even with empty text");
+                assert!(
+                    cache.is_some(),
+                    "cache_control must be preserved even with empty text"
+                );
                 assert_eq!(cache.as_ref().unwrap().r#type, CacheControlType::Ephemeral);
             }
             _ => panic!("expected Text"),
@@ -1272,7 +1286,10 @@ mod tests {
         let msg = out.choices[0].message.as_ref().unwrap();
         assert_eq!(msg.tool_calls.len(), 1);
         assert_eq!(msg.tool_calls[0].id.as_deref(), Some("call_1"));
-        assert_eq!(msg.tool_calls[0].function.as_ref().unwrap().name.as_deref(), Some("get_weather"));
+        assert_eq!(
+            msg.tool_calls[0].function.as_ref().unwrap().name.as_deref(),
+            Some("get_weather")
+        );
     }
 
     #[test]
@@ -1380,7 +1397,12 @@ mod tests {
         assert_eq!(delta.tool_calls.len(), 1);
         assert_eq!(delta.tool_calls[0].id.as_deref(), Some("call_1"));
         assert_eq!(
-            delta.tool_calls[0].function.as_ref().unwrap().name.as_deref(),
+            delta.tool_calls[0]
+                .function
+                .as_ref()
+                .unwrap()
+                .name
+                .as_deref(),
             Some("get_weather")
         );
 
@@ -1394,7 +1416,12 @@ mod tests {
         let delta = delta_chunks[0].choices[0].delta.as_ref().unwrap();
         assert_eq!(delta.tool_calls.len(), 1);
         assert_eq!(
-            delta.tool_calls[0].function.as_ref().unwrap().arguments.as_deref(),
+            delta.tool_calls[0]
+                .function
+                .as_ref()
+                .unwrap()
+                .arguments
+                .as_deref(),
             Some("{\"city\":")
         );
     }
@@ -1453,10 +1480,7 @@ mod tests {
     fn streaming_error_event_returns_encode_error() {
         let mut enc = StreamEncoder::new("chatcmpl-1".into(), "gpt-4o".into(), 1000, false);
         let result = enc.encode_event(CoreEvent::Error {
-            error: CoreStreamError::new(
-                CoreStreamErrorKind::RateLimit,
-                "too many requests".into(),
-            ),
+            error: CoreStreamError::new(CoreStreamErrorKind::RateLimit, "too many requests".into()),
         });
         // Error events now return Err so the route handler can emit a proper
         // error response, rather than leaking error text into content delta.
@@ -1506,7 +1530,10 @@ mod tests {
         // No events sent at all -- finish() should emit a synthetic terminal chunk.
         let remaining = enc.finish().unwrap();
         assert_eq!(remaining.len(), 1);
-        assert_eq!(remaining[0].choices[0].finish_reason.as_deref(), Some("stop"));
+        assert_eq!(
+            remaining[0].choices[0].finish_reason.as_deref(),
+            Some("stop")
+        );
     }
 
     // -- every CoreEvent variant handled ------------------------------------
@@ -1571,10 +1598,7 @@ mod tests {
                 stop_sequence: None,
             },
             CoreEvent::Error {
-                error: CoreStreamError::new(
-                    CoreStreamErrorKind::Internal,
-                    "test".into(),
-                ),
+                error: CoreStreamError::new(CoreStreamErrorKind::Internal, "test".into()),
             },
             CoreEvent::Ping,
         ];
@@ -1645,7 +1669,10 @@ mod tests {
     fn encode_document_drops_with_warning() {
         let resp = CoreResponse {
             id: None,
-            model: ModelRef { requested: "m".into(), upstream: None },
+            model: ModelRef {
+                requested: "m".into(),
+                upstream: None,
+            },
             content: vec![CoreContent::Document {
                 source: serde_json::json!({"url": "http://example.com/doc.pdf"}),
             }],
@@ -1663,7 +1690,10 @@ mod tests {
     fn encode_audio_drops_with_warning() {
         let resp = CoreResponse {
             id: None,
-            model: ModelRef { requested: "m".into(), upstream: None },
+            model: ModelRef {
+                requested: "m".into(),
+                upstream: None,
+            },
             content: vec![CoreContent::Audio {
                 source: serde_json::json!({"data": "base64..."}),
             }],
@@ -1681,7 +1711,10 @@ mod tests {
     fn encode_video_drops_with_warning() {
         let resp = CoreResponse {
             id: None,
-            model: ModelRef { requested: "m".into(), upstream: None },
+            model: ModelRef {
+                requested: "m".into(),
+                upstream: None,
+            },
             content: vec![CoreContent::Video {
                 source: serde_json::json!({"url": "http://example.com/vid.mp4"}),
             }],
@@ -1699,7 +1732,10 @@ mod tests {
     fn encode_tool_result_in_response_drops_with_warning() {
         let resp = CoreResponse {
             id: None,
-            model: ModelRef { requested: "m".into(), upstream: None },
+            model: ModelRef {
+                requested: "m".into(),
+                upstream: None,
+            },
             content: vec![CoreContent::ToolResult {
                 tool_use_id: "call_1".into(),
                 content: vec![],
@@ -1738,10 +1774,8 @@ mod tests {
     #[test]
     fn extra_fields_preserved_in_metadata_raw() {
         let mut req = make_openai_request();
-        req.extra.insert(
-            "custom_field".into(),
-            serde_json::json!("custom_value"),
-        );
+        req.extra
+            .insert("custom_field".into(), serde_json::json!("custom_value"));
         let core = decode_request(req).unwrap();
         assert_eq!(
             core.metadata.raw.get("custom_field").unwrap(),
@@ -1935,8 +1969,14 @@ mod tests {
     fn encode_response_with_stop_sequence_drops_with_warning() {
         let resp = CoreResponse {
             id: Some("chatcmpl-123".into()),
-            model: ModelRef { requested: "m".into(), upstream: None },
-            content: vec![CoreContent::Text { text: "hello".into(), cache: None }],
+            model: ModelRef {
+                requested: "m".into(),
+                upstream: None,
+            },
+            content: vec![CoreContent::Text {
+                text: "hello".into(),
+                cache: None,
+            }],
             stop_reason: StopReason::StopSequence,
             stop_sequence: Some("\n".into()),
             usage: Usage::default(),
@@ -1952,10 +1992,19 @@ mod tests {
     fn encode_multiple_thinking_blocks_keeps_last() {
         let resp = CoreResponse {
             id: Some("chatcmpl-123".into()),
-            model: ModelRef { requested: "m".into(), upstream: None },
+            model: ModelRef {
+                requested: "m".into(),
+                upstream: None,
+            },
             content: vec![
-                CoreContent::Thinking { text: "first".into(), signature: None },
-                CoreContent::Thinking { text: "second".into(), signature: None },
+                CoreContent::Thinking {
+                    text: "first".into(),
+                    signature: None,
+                },
+                CoreContent::Thinking {
+                    text: "second".into(),
+                    signature: None,
+                },
             ],
             stop_reason: StopReason::EndTurn,
             stop_sequence: None,
@@ -1973,8 +2022,14 @@ mod tests {
         let large_text = "x".repeat(100_000);
         let resp = CoreResponse {
             id: None,
-            model: ModelRef { requested: "m".into(), upstream: None },
-            content: vec![CoreContent::Text { text: large_text.clone(), cache: None }],
+            model: ModelRef {
+                requested: "m".into(),
+                upstream: None,
+            },
+            content: vec![CoreContent::Text {
+                text: large_text.clone(),
+                cache: None,
+            }],
             stop_reason: StopReason::EndTurn,
             stop_sequence: None,
             usage: Usage::default(),
@@ -1990,11 +2045,15 @@ mod tests {
         let mut enc = StreamEncoder::new("chatcmpl-1".into(), "gpt-4o".into(), 1000, true);
         enc.encode_event(CoreEvent::UsageDelta {
             usage: Usage::provider_reported(50, 100),
-        }).unwrap();
+        })
+        .unwrap();
         let remaining = enc.finish().unwrap();
         // Should produce finish chunk + usage chunk.
         assert_eq!(remaining.len(), 2);
-        assert_eq!(remaining[0].choices[0].finish_reason.as_deref(), Some("stop"));
+        assert_eq!(
+            remaining[0].choices[0].finish_reason.as_deref(),
+            Some("stop")
+        );
         assert!(remaining[1].usage.is_some());
         assert_eq!(remaining[1].usage.as_ref().unwrap().prompt_tokens, 50);
     }
@@ -2025,7 +2084,10 @@ mod tests {
         let err = decode_request(req).unwrap_err();
         match &err {
             ProtocolError::InvalidRequest(msg) => {
-                assert!(msg.contains("tool_call.id"), "expected tool_call.id error, got: {msg}");
+                assert!(
+                    msg.contains("tool_call.id"),
+                    "expected tool_call.id error, got: {msg}"
+                );
             }
             _ => panic!("expected InvalidRequest, got: {:?}", err),
         }
@@ -2052,7 +2114,10 @@ mod tests {
         let err = decode_request(req).unwrap_err();
         match &err {
             ProtocolError::InvalidRequest(msg) => {
-                assert!(msg.contains("tool_call.function"), "expected tool_call.function error, got: {msg}");
+                assert!(
+                    msg.contains("tool_call.function"),
+                    "expected tool_call.function error, got: {msg}"
+                );
             }
             _ => panic!("expected InvalidRequest, got: {:?}", err),
         }
@@ -2082,7 +2147,10 @@ mod tests {
         let err = decode_request(req).unwrap_err();
         match &err {
             ProtocolError::InvalidRequest(msg) => {
-                assert!(msg.contains("tool_call.function.name"), "expected tool_call.function.name error, got: {msg}");
+                assert!(
+                    msg.contains("tool_call.function.name"),
+                    "expected tool_call.function.name error, got: {msg}"
+                );
             }
             _ => panic!("expected InvalidRequest, got: {:?}", err),
         }
@@ -2104,7 +2172,10 @@ mod tests {
         let err = decode_request(req).unwrap_err();
         match &err {
             ProtocolError::InvalidRequest(msg) => {
-                assert!(msg.contains("tool_call_id"), "expected tool_call_id error, got: {msg}");
+                assert!(
+                    msg.contains("tool_call_id"),
+                    "expected tool_call_id error, got: {msg}"
+                );
             }
             _ => panic!("expected InvalidRequest, got: {:?}", err),
         }
@@ -2135,7 +2206,11 @@ mod tests {
         match &core.messages[1].content[0] {
             CoreContent::ToolUse { input, .. } => {
                 // Malformed arguments should be replaced with an empty object.
-                assert_eq!(input, &serde_json::json!({}), "malformed args should become empty object");
+                assert_eq!(
+                    input,
+                    &serde_json::json!({}),
+                    "malformed args should become empty object"
+                );
             }
             _ => panic!("expected ToolUse"),
         }
@@ -2165,6 +2240,9 @@ mod tests {
         req.stop = Some(serde_json::json!(["STOP", 123, "END"]));
         let core = decode_request(req).unwrap();
         // Non-string items should be filtered out with a warning.
-        assert_eq!(core.sampling.stop, Some(vec!["STOP".to_owned(), "END".to_owned()]));
+        assert_eq!(
+            core.sampling.stop,
+            Some(vec!["STOP".to_owned(), "END".to_owned()])
+        );
     }
 }
