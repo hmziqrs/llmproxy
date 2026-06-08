@@ -1,0 +1,565 @@
+# Provider-Based Routing Remodel
+
+## Goal
+
+Replace model-based routing with provider-based routing.
+
+Today the proxy decides the upstream provider by looking up the client model in
+top-level `[models]`, then looking up the provider-local model in
+`[provider.models]`. That makes config unnecessarily model-centric. If a user
+hits a Fireworks route, the provider choice is already explicit; the request
+model should be sent to Fireworks as requested, without needing a global model
+route entry.
+
+The remodel keeps the normalized core protocol and provider adapters, but
+changes target resolution from:
+
+```text
+client model -> top-level [models] -> provider -> [provider.models] -> adapter
+```
+
+to:
+
+```text
+URL provider -> provider config -> inbound route kind -> adapter
+request model -> upstream model
+```
+
+## Design Principles
+
+- Provider selection is static and explicit in the URL.
+- Model selection comes from the client request body by default.
+- Config describes providers and protocol endpoints, not every model a provider
+  might serve.
+- Model catalogs are discovery metadata, not routing rules.
+- Existing provider adapters keep receiving `requested_model` and
+  `upstream_model`; adapters continue to own request body encoding and URL
+  template expansion.
+- Transport remains protocol-neutral.
+- `/v1/*` compatibility routes should only work when a single
+  `default_provider` is explicitly configured.
+
+## Target Routes
+
+Canonical provider routes:
+
+```text
+POST /providers/{provider}/v1/chat/completions
+POST /providers/{provider}/v1/messages
+POST /providers/{provider}/v1/messages/count_tokens
+GET  /providers/{provider}/v1/models
+```
+
+Compatibility routes:
+
+```text
+POST /v1/chat/completions
+POST /v1/messages
+POST /v1/messages/count_tokens
+GET  /v1/models
+```
+
+Compatibility routes resolve to `server.default_provider` when configured. If
+`default_provider` is absent, they return a clear client error telling the user
+to call `/providers/{provider}/...`.
+
+Example OpenAI SDK base URL:
+
+```text
+http://127.0.0.1:3456/providers/fireworks/v1
+```
+
+Example Anthropic-style base URL:
+
+```text
+http://127.0.0.1:3456/providers/fireworks
+```
+
+## Model Source Rules
+
+For OpenAI Chat Completions, OpenAI Responses, Anthropic Messages, Fireworks
+OpenAI-compatible APIs, and similar providers, the model is in the JSON request
+body:
+
+```json
+{
+  "model": "accounts/fireworks/models/deepseek-v3p1",
+  "messages": []
+}
+```
+
+For Gemini GenerateContent, the selected model still comes from the decoded
+`CoreRequest.model.requested`, but the Gemini adapter expands it into the
+configured endpoint template:
+
+```toml
+endpoint = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+```
+
+Header or query-string model selection is not needed for the first
+implementation. If a provider later requires model selection outside the body,
+add it as adapter-specific config, not global routing logic.
+
+## New Config Shape
+
+Main config keeps server settings only:
+
+```toml
+[server]
+bind = "127.0.0.1:3456"
+request_timeout = "300s"
+log_level = "info"
+hot_reload = false
+server_name = "llm-proxy"
+
+# Optional compatibility default for old /v1/* routes.
+# default_provider = "fireworks"
+```
+
+Provider config owns provider details, adapters, inbound route mapping, and
+optional discovery:
+
+```toml
+[provider]
+name = "fireworks"
+api_key = "${FIREWORKS_API_KEY}"
+auth_style = "bearer"
+
+[provider.adapters.chat]
+protocol = "openai_chat_completions"
+endpoint = "https://api.fireworks.ai/inference/v1/chat/completions"
+
+[provider.adapters.responses]
+protocol = "openai_responses"
+endpoint = "https://api.fireworks.ai/inference/v1/responses"
+
+[provider.routes]
+chat_completions = "chat"
+messages = "chat"
+responses = "responses"
+
+[provider.discovery]
+kind = "fireworks_account_models"
+endpoint = "https://api.fireworks.ai/v1/accounts/fireworks/models"
+```
+
+For Anthropic:
+
+```toml
+[provider]
+name = "anthropic"
+api_key = "${ANTHROPIC_API_KEY}"
+auth_style = "x-api-key"
+
+[provider.adapters.messages]
+protocol = "anthropic_messages"
+endpoint = "https://api.anthropic.com/v1/messages"
+
+[provider.routes]
+messages = "messages"
+chat_completions = "messages"
+
+[provider.discovery]
+kind = "anthropic_models"
+endpoint = "https://api.anthropic.com/v1/models"
+```
+
+For Gemini:
+
+```toml
+[provider]
+name = "gemini"
+api_key = "${GEMINI_API_KEY}"
+auth_style = "x-api-key"
+
+[provider.adapters.generate_content]
+protocol = "gemini_generate_content"
+endpoint = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+
+[provider.routes]
+chat_completions = "generate_content"
+messages = "generate_content"
+
+[provider.discovery]
+kind = "gemini_models"
+endpoint = "https://generativelanguage.googleapis.com/v1beta/models"
+```
+
+## Core Type Changes
+
+Remove:
+
+- `AppConfig.models`
+- `ModelRoute`
+- `ProviderModelConfig`
+- `resolve_model_route`
+- model route validation
+- provider-local `[provider.models]` validation
+
+Add:
+
+```rust
+pub enum ProviderRouteKind {
+    ChatCompletions,
+    Messages,
+    CountTokens,
+    Responses,
+}
+
+pub struct ProviderRoutesConfig {
+    pub chat_completions: Option<String>,
+    pub messages: Option<String>,
+    pub count_tokens: Option<String>,
+    pub responses: Option<String>,
+}
+
+pub struct ProviderDiscoveryConfig {
+    pub kind: ProviderDiscoveryKind,
+    pub endpoint: String,
+}
+
+pub enum ProviderDiscoveryKind {
+    OpenAiModels,
+    AnthropicModels,
+    GeminiModels,
+    FireworksAccountModels,
+}
+```
+
+Change `ProviderConfig` to include:
+
+```rust
+pub routes: ProviderRoutesConfig,
+pub discovery: Option<ProviderDiscoveryConfig>,
+```
+
+Change `ServerConfig` to include:
+
+```rust
+pub default_provider: Option<String>,
+```
+
+## Registry Changes
+
+Current registry resolution:
+
+```text
+ProviderTarget.provider
+provider.models[target.upstream_model]
+provider.adapters[adapter_name]
+```
+
+New registry resolution:
+
+```text
+provider_name
+provider.routes[route_kind]
+provider.adapters[adapter_name]
+```
+
+New API:
+
+```rust
+pub fn resolve_provider_route(
+    &self,
+    provider_name: &str,
+    route_kind: ProviderRouteKind,
+    requested_model: &str,
+) -> Result<ProviderAdapterTargetConfig, CoreError>
+```
+
+The returned target keeps:
+
+```rust
+requested_model = requested_model
+upstream_model = requested_model
+```
+
+This preserves current provider adapter behavior:
+
+- OpenAI Chat and Responses put `target.upstream_model` into the request body.
+- Anthropic puts `target.upstream_model` into the request body.
+- Gemini expands `{model}` from `target.upstream_model`.
+- Client response encoders preserve `target.requested_model`.
+
+## Server Pipeline Changes
+
+`core_pipeline::resolve_target` currently reads `state.app_config().models` and
+calls `resolve_model_route`. Replace it with provider-route resolution:
+
+```rust
+fn resolve_target(
+    state: &AppState,
+    provider_name: &str,
+    route_kind: ProviderRouteKind,
+    core: &CoreRequest,
+) -> Result<(ProviderAdapterTarget, ProviderAdapter), RouteError>
+```
+
+Handlers extract `Path(provider)` for canonical routes and pass it into the
+pipeline.
+
+Compatibility handlers use:
+
+```rust
+state.app_config().server.default_provider
+```
+
+If absent, return a client-facing error:
+
+```text
+provider is required: use /providers/{provider}/v1/...
+```
+
+## CLI Changes
+
+`llm-proxy init`:
+
+- Generate `config.toml` without `[models]`.
+- Generate provider files with `[provider.routes]`.
+- Include commented discovery blocks.
+
+`llm-proxy validate`:
+
+- Load main config and provider files.
+- Validate every route adapter exists.
+- Validate every adapter protocol is registered.
+- Validate compatibility `default_provider`, if present, names a loaded
+  provider.
+- Print provider route table:
+
+```text
+=== Provider Routes ===
+fireworks:
+  chat_completions -> chat/openai_chat_completions
+  messages         -> chat/openai_chat_completions
+anthropic:
+  messages         -> messages/anthropic_messages
+```
+
+`llm-proxy models`:
+
+- No longer list top-level `[models]`.
+- New default behavior should list cached catalogs if present.
+- `--provider <name> --live` should fetch the provider model list using
+  `[provider.discovery]`.
+- `--write-catalog` should persist the discovered catalog next to the provider
+  config.
+
+Suggested commands:
+
+```text
+llm-proxy models --provider fireworks --live
+llm-proxy models --provider fireworks --live --write-catalog
+llm-proxy models --provider fireworks
+```
+
+## Model Discovery
+
+Discovery should be advisory. It helps users inspect models and lets
+`GET /providers/{provider}/v1/models` return useful data, but it should not
+block arbitrary model IDs unless a future `enforce_model_catalog = true` option
+is added.
+
+Supported discovery backends:
+
+```text
+openai_models
+anthropic_models
+gemini_models
+fireworks_account_models
+```
+
+Provider behavior from official docs:
+
+- OpenAI exposes `GET /v1/models`.
+- Anthropic exposes `GET /v1/models`.
+- Gemini exposes model listing through the Models API and uses
+  `models/{model}:generateContent` for GenerateContent.
+- Fireworks exposes OpenAI-compatible inference and model listing APIs.
+
+Catalog file shape:
+
+```toml
+[catalog]
+provider = "fireworks"
+source = "live"
+generated_at = "2026-06-08T00:00:00Z"
+
+[[models]]
+id = "accounts/fireworks/models/deepseek-v3p1"
+display_name = "DeepSeek V3.1"
+supports = ["chat_completions"]
+context_length = 131072
+```
+
+Catalog normalization rules:
+
+- Preserve the exact upstream model ID in `id`.
+- Add display fields when the provider returns them.
+- Keep unknown provider metadata in a raw JSON field only if needed later.
+- For Gemini, strip a leading `models/` prefix only for display; preserve the
+  exact value required by the adapter path.
+- Filter Gemini models to ones whose `supportedActions` include
+  `generateContent` for generation routes.
+
+## Implementation Phases
+
+### Phase 1: Config Types
+
+- Remove `AppConfig.models`.
+- Remove `ModelRoute` and `ProviderModelConfig`.
+- Add `ProviderRoutesConfig`, `ProviderRouteKind`, and discovery config types.
+- Update TOML parsing and validation.
+- Update config tests.
+
+### Phase 2: Provider Registry
+
+- Replace `resolve_adapter_target` with `resolve_provider_route`.
+- Keep `ProviderAdapterTargetConfig` fields unchanged.
+- Add errors for unknown provider, unsupported route kind, and route adapter
+  pointing to an unknown adapter.
+- Update registry tests.
+
+### Phase 3: Server Routes
+
+- Add canonical `/providers/{provider}/v1/...` routes.
+- Thread `provider_name` and `ProviderRouteKind` through handlers into
+  `core_pipeline`.
+- Preserve current non-streaming and streaming first-byte behavior.
+- Add compatibility handling for old `/v1/*` routes through
+  `server.default_provider`.
+
+### Phase 4: CLI and Examples
+
+- Rewrite default config constants.
+- Rewrite `init`, `validate`, and `models`.
+- Update `config.toml.example` and provider examples.
+- Update CLI tests that currently assert generated `[models]` routes resolve.
+
+### Phase 5: Model Catalogs
+
+- Add discovery client logic for configured providers.
+- Add catalog read/write helpers.
+- Implement `GET /providers/{provider}/v1/models`.
+- Implement `llm-proxy models --provider ... --live`.
+- Keep enforcement out of scope unless explicitly requested later.
+
+### Phase 6: Cleanup
+
+- Delete `model_route.rs` or repurpose it only if the name still makes sense.
+- Update `llm-proxy-core/src/lib.rs` exports and docs.
+- Update source guard tests to fail on `resolve_model_route` usage.
+- Update architecture docs from "model routing" to "provider routing".
+
+## Test Plan
+
+Core config tests:
+
+- App config parses without `[models]`.
+- Unknown top-level `[models]` fails because `deny_unknown_fields` should still
+  protect the schema.
+- Provider config parses with `[provider.routes]`.
+- Route adapter references must point to existing adapters.
+- Empty provider route adapter names fail.
+- Unknown protocols fail.
+- `default_provider`, if configured, must exist.
+
+Registry tests:
+
+- Provider route resolves to the correct adapter and protocol.
+- Unknown provider fails.
+- Unsupported route for a provider fails.
+- Resolved target uses request model as both requested and upstream.
+- API keys stay redacted in Debug.
+
+Server tests:
+
+- `/providers/fireworks/v1/chat/completions` routes to Fireworks.
+- Same request model can be sent to different providers by changing only the
+  URL.
+- Old `/v1/chat/completions` fails without `default_provider`.
+- Old `/v1/chat/completions` succeeds with `default_provider`.
+- Streaming first-byte behavior remains unchanged.
+
+CLI tests:
+
+- Generated config has no `[models]`.
+- Generated provider files have `[provider.routes]`.
+- `validate` prints provider routes.
+- `models --provider X --live` handles provider discovery responses.
+- Missing discovery config gives a clear error.
+
+## Migration
+
+Before:
+
+```toml
+[models]
+"kimi-k2.6" = { provider = "fireworks" }
+
+[provider.models]
+"kimi-k2.6" = { adapter = "chat" }
+```
+
+After:
+
+```toml
+[provider.routes]
+chat_completions = "chat"
+messages = "chat"
+```
+
+Client changes from:
+
+```text
+POST /v1/chat/completions
+```
+
+to:
+
+```text
+POST /providers/fireworks/v1/chat/completions
+```
+
+The request body keeps the model:
+
+```json
+{
+  "model": "kimi-k2.6",
+  "messages": []
+}
+```
+
+Temporary compatibility:
+
+```toml
+[server]
+default_provider = "fireworks"
+```
+
+## Open Questions
+
+1. Should compatibility `/v1/*` routes be kept permanently or treated as a
+   migration bridge?
+2. Should provider selection by `X-LLM-Provider` ever be supported, or should
+   URL routing stay the only provider-selection mechanism?
+3. Should catalogs remain advisory forever, or should we add optional
+   `enforce_model_catalog = true` after discovery is implemented?
+4. Should `messages = "chat"` be allowed when the provider only exposes an
+   OpenAI-compatible chat endpoint, or should a provider be required to declare
+   protocol-specific support explicitly?
+5. Should aliases be reintroduced as provider-local metadata only, for cases
+   where a user wants short local names like `kimi` while still staying inside a
+   chosen provider?
+
+## Research Sources
+
+- OpenAI API reference: https://developers.openai.com/api/reference/resources/models/methods/list
+- OpenAI Chat Completions API reference: https://developers.openai.com/api/reference/resources/chat
+- Anthropic Models API reference: https://anthropic.mintlify.app/en/api/models-list
+- Anthropic Messages API reference: https://docs.claude.com/en/api/messages
+- Gemini Models API reference: https://ai.google.dev/api/models
+- Gemini GenerateContent API reference: https://ai.google.dev/api/generate-content
+- Fireworks OpenAI compatibility docs: https://docs.fireworks.ai/tools-sdks/openai-compatibility
+- Fireworks list models API reference: https://docs.fireworks.ai/api-reference/list-models
