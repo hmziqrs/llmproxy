@@ -2,23 +2,14 @@
 
 ## Goal
 
-Replace model-based routing with provider-based routing.
+Build provider-based routing as the only routing surface.
 
-Today the proxy decides the upstream provider by looking up the client model in
-top-level `[models]`, then looking up the provider-local model in
-`[provider.models]`. That makes config unnecessarily model-centric. If a user
-hits a Fireworks route, the provider choice is already explicit; the request
-model should be sent to Fireworks as requested, without needing a global model
-route entry.
+Provider choice is explicit in the request path. If a user hits a Fireworks
+route, the provider choice is already known; the request model should be sent
+to Fireworks as requested, without any global model-to-provider lookup.
 
-The remodel keeps the normalized core protocol and provider adapters, but
-changes target resolution from:
-
-```text
-client model -> top-level [models] -> provider -> [provider.models] -> adapter
-```
-
-to:
+The remodel keeps the normalized core protocol and provider adapters, and uses
+this target resolution:
 
 ```text
 URL provider -> provider config -> inbound route kind -> adapter
@@ -36,30 +27,25 @@ request model -> upstream model
   `upstream_model`; adapters continue to own request body encoding and URL
   template expansion.
 - Transport remains protocol-neutral.
-- `/v1/*` compatibility routes should only work when a single
-  `default_provider` is explicitly configured.
+- This is greenfield. Every API request names a provider in the path.
 
 ## Locked Decisions
 
 These decisions are part of the implementation plan:
 
 1. Provider selection is URL-only. Do not add `X-LLM-Provider`.
-2. Compatibility `/v1/*` routes remain supported when
-   `server.default_provider` is configured. They are a compatibility surface,
-   not a second routing system.
-3. Compatibility `GET /v1/models` lists only the configured default provider.
-   If there is no default provider, it returns the same provider-required error
-   as the other compatibility routes.
-4. `GET /providers/{provider}/v1/models` is the canonical model-list route.
-5. Discovery does not run automatically during server startup.
-6. Normal `/models` reads use static plus cached catalog data. Live refresh is
+2. Bare `/v1/*` API routes are not registered. Provider choice must be present
+   in the path.
+3. `GET /providers/{provider}/v1/models` is the canonical model-list route.
+4. Discovery does not run automatically during server startup.
+5. Normal `/models` reads use static plus cached catalog data. Live refresh is
    explicit through CLI or a `refresh=live` query.
-7. Cross-protocol mappings such as `messages = "chat"` are allowed because the
+6. Cross-protocol mappings such as `messages = "chat"` are allowed because the
    normalized core protocol exists specifically to translate between client and
    provider protocols. The operator must declare the mapping explicitly.
-8. Provider-local aliases are supported, but global model-to-provider aliases
+7. Provider-local aliases are supported, but global model-to-provider aliases
    are removed.
-9. Catalog enforcement is disabled by default.
+8. Catalog enforcement is disabled by default.
 
 ## Target Routes
 
@@ -72,18 +58,7 @@ POST /providers/{provider}/v1/messages/count_tokens
 GET  /providers/{provider}/v1/models
 ```
 
-Compatibility routes:
-
-```text
-POST /v1/chat/completions
-POST /v1/messages
-POST /v1/messages/count_tokens
-GET  /v1/models
-```
-
-Compatibility routes resolve to `server.default_provider` when configured. If
-`default_provider` is absent, they return a clear client error telling the user
-to call `/providers/{provider}/...`.
+Bare `/v1/*` routes are intentionally not part of the API.
 
 Example OpenAI SDK base URL:
 
@@ -133,9 +108,6 @@ request_timeout = "300s"
 log_level = "info"
 hot_reload = false
 server_name = "llm-proxy"
-
-# Optional compatibility default for old /v1/* routes.
-# default_provider = "fireworks"
 ```
 
 Provider config owns provider details, adapters, inbound route mapping, and
@@ -231,14 +203,9 @@ endpoint = "https://generativelanguage.googleapis.com/v1beta/models"
 
 ## Core Type Changes
 
-Remove:
-
-- `AppConfig.models`
-- `ModelRoute`
-- `ProviderModelConfig`
-- `resolve_model_route`
-- model route validation
-- provider-local `[provider.models]` validation
+Do not include any global model-routing config in the new schema. The core
+schema should contain provider settings, provider route mappings, aliases, and
+catalog metadata only.
 
 Add:
 
@@ -331,23 +298,11 @@ pub discovery: Option<ProviderDiscoveryConfig>,
 pub catalog: Option<ProviderCatalogConfig>,
 ```
 
-Change `ServerConfig` to include:
-
-```rust
-pub default_provider: Option<String>,
-```
+`ServerConfig` contains server operational settings only.
 
 ## Registry Changes
 
-Current registry resolution:
-
-```text
-ProviderTarget.provider
-provider.models[target.upstream_model]
-provider.adapters[adapter_name]
-```
-
-New registry resolution:
+Registry resolution:
 
 ```text
 provider_name
@@ -385,8 +340,7 @@ This preserves current provider adapter behavior:
 
 ## Server Pipeline Changes
 
-`core_pipeline::resolve_target` currently reads `state.app_config().models` and
-calls `resolve_model_route`. Replace it with provider-route resolution:
+`core_pipeline::resolve_target` should resolve by provider route:
 
 ```rust
 fn resolve_target(
@@ -400,18 +354,6 @@ fn resolve_target(
 Handlers extract `Path(provider)` for canonical routes and pass it into the
 pipeline.
 
-Compatibility handlers use:
-
-```rust
-state.app_config().server.default_provider
-```
-
-If absent, return a client-facing error:
-
-```text
-provider is required: use /providers/{provider}/v1/...
-```
-
 Add explicit route errors instead of mapping provider resolution failures to a
 generic 500:
 
@@ -419,7 +361,6 @@ generic 500:
 UnknownProvider       -> 404
 UnsupportedRoute      -> 404 or 400 with actionable message
 ModelNotAllowed       -> 400
-MissingDefaultProvider -> 400
 InvalidProviderName   -> 400
 ```
 
@@ -427,12 +368,11 @@ The error envelope remains selected by inbound client protocol. Internal
 provider config errors remain generic 500 responses and must not expose API
 keys, endpoints containing secrets, or discovery response bodies.
 
-`/v1/messages/count_tokens` and
-`/providers/{provider}/v1/messages/count_tokens` are local token-estimation
-routes in the current codebase. They should not resolve an upstream adapter
-unless a future native provider token-count route is explicitly added.
-Provider-scoped count_tokens is still useful for SDK/base-URL consistency and
-future provider-specific tokenizers, but Phase 1 should keep current heuristic
+`/providers/{provider}/v1/messages/count_tokens` is a local token-estimation
+route in the initial remodel. It should not resolve an upstream adapter unless
+a future native provider token-count route is explicitly added.
+Provider-scoped count_tokens is useful for SDK/base-URL consistency and future
+provider-specific tokenizers, but Phase 1 should keep current heuristic
 counting behavior.
 
 Provider names used in paths should be validated as stable URL-safe slugs,
@@ -440,16 +380,14 @@ for example ASCII lowercase letters, digits, hyphens, and underscores. Provider
 TOML names and route path names must use the same canonical form; do not
 silently lowercase or normalize mismatches.
 
-The fallback/404 classifier must be updated for provider-prefixed paths. It
-currently recognizes `/v1/chat/*`; it also needs to classify
-`/providers/{provider}/v1/chat/*` as OpenAI-shaped and provider-scoped
-`/v1/messages*` paths as Anthropic-shaped.
+The 404 classifier should classify `/providers/{provider}/v1/chat/*` as
+OpenAI-shaped and `/providers/{provider}/v1/messages*` as Anthropic-shaped.
 
 ## CLI Changes
 
 `llm-proxy init`:
 
-- Generate `config.toml` without `[models]`.
+- Generate `config.toml` with server settings only.
 - Generate provider files with `[provider.routes]`.
 - Include commented discovery blocks.
 
@@ -458,8 +396,6 @@ currently recognizes `/v1/chat/*`; it also needs to classify
 - Load main config and provider files.
 - Validate every route adapter exists.
 - Validate every adapter protocol is registered.
-- Validate compatibility `default_provider`, if present, names a loaded
-  provider.
 - Print provider route table:
 
 ```text
@@ -473,7 +409,6 @@ anthropic:
 
 `llm-proxy models`:
 
-- No longer list top-level `[models]`.
 - New default behavior should list cached catalogs if present.
 - `--provider <name> --live` should fetch the provider model list using
   `[provider.discovery]`.
@@ -626,7 +561,7 @@ provider = "fireworks"
 source = "live"
 generated_at = "2026-06-08T00:00:00Z"
 
-[[models]]
+[[catalog.models]]
 id = "accounts/fireworks/models/deepseek-v3p1"
 display_name = "DeepSeek V3.1"
 supports = ["chat_completions"]
@@ -644,8 +579,6 @@ Catalog normalization rules:
   `generateContent` for generation routes.
 - Do not require provider prefixes inside provider-scoped routes. A request to
   `/providers/fireworks/...` can use `model = "accounts/fireworks/models/foo"`.
-- Compatibility `/v1/models` may expose provider-prefixed IDs such as
-  `fireworks/accounts/fireworks/models/foo` to disambiguate global listings.
 - Static model entries and provider-local aliases must be validated for empty
   IDs and unsafe Gemini URL-template characters when they are used as
   `upstream_model`.
@@ -663,8 +596,8 @@ Models endpoint response:
   applicable while retaining OpenAI-compatible root fields.
 - Never return provider credentials, raw discovery headers, or unfiltered raw
   provider metadata.
-- Decide compatibility `/v1/models` scope before implementation; provider-local
-  `/providers/{provider}/v1/models` has no ID collision problem.
+- Model IDs are provider-local because `/providers/{provider}/v1/models` has no
+  cross-provider ID collision problem.
 
 ## Reference Project Findings
 
@@ -688,7 +621,7 @@ llm-api-key-proxy:
 
 oc-go-cc:
 
-- Uses static model and fallback config.
+- Uses static model defaults and request-shape rules.
 - Has `respect_requested_model`, which can pass through a requested model, but
   provider choice still comes from config defaults rather than URL route.
 - It has no real model discovery.
@@ -697,7 +630,7 @@ Design decision from refs:
 
 - Keep LiteLLM's static/wildcard configurability.
 - Keep llm-api-key-proxy's optional live model discovery and allow/deny filters.
-- Avoid oc-go-cc's scenario model router for this proxy remodel.
+- Do not adopt oc-go-cc's request-shape model router.
 - Avoid making discovery a request-time routing dependency.
 
 ## Module Ownership
@@ -742,12 +675,12 @@ provider selection key.
 `crates/llm-proxy-core/src/provider_config.rs`:
 
 - Remove `AppConfig.models`, `ModelRoute`, `ProviderModelConfig`, and
-  `[provider.models]`.
+  provider-local model tables.
 - Add `[provider.routes]`, `[provider.model_aliases]`, `[provider.discovery]`,
   and `[provider.catalog]`.
 - Add adapter static headers and new auth styles.
-- Keep `deny_unknown_fields`, but add a targeted legacy-config detector so
-  users see a migration message for `[models]` and `[provider.models]`.
+- Keep `deny_unknown_fields`; removed model-routing fields should fail as
+  unknown configuration.
 
 `crates/llm-proxy-core/src/provider_registry.rs`:
 
@@ -759,22 +692,20 @@ provider selection key.
 `crates/llm-proxy-core/src/error.rs` and server route errors:
 
 - Replace `UnknownModel` routing semantics with provider-route errors:
-  unknown provider, unsupported route, missing default provider, invalid
-  provider name, and optional model-not-allowed.
+  unknown provider, unsupported route, invalid provider name, and optional
+  model-not-allowed.
 
 `crates/llm-proxy-server/src/routes/mod.rs`:
 
 - Add provider-prefixed Axum routes.
-- Keep compatibility `/v1/*` routes wired to handlers that require
-  `server.default_provider`.
-- Update fallback classification for provider-prefixed OpenAI and Anthropic
+- Update 404 classification for provider-prefixed OpenAI and Anthropic
   paths.
 
 `crates/llm-proxy-server/src/routes/chat.rs` and `messages.rs`:
 
-- Accept a provider name from canonical routes or compatibility default.
+- Accept the provider name from the canonical route path.
 - Pass `ProviderRouteKind` into the core pipeline.
-- Stop hardcoding `/v1/...` as the only route label in request preparation.
+- Use the provider-prefixed request path in request preparation and tracing.
 
 `crates/llm-proxy-server/src/routes/core_pipeline.rs`:
 
@@ -812,7 +743,7 @@ provider selection key.
 - Rewrite default TOML constants.
 - Update `init`, `validate`, and `models`.
 - Convert live model discovery command paths to async orchestration.
-- Remove tests that expect generated `[models]` routes to resolve.
+- Remove tests that expect global model routes to resolve.
 
 Examples and docs:
 
@@ -824,8 +755,6 @@ Examples and docs:
 
 ### Phase 1: Config Types
 
-- Remove `AppConfig.models`.
-- Remove `ModelRoute` and `ProviderModelConfig`.
 - Add `ProviderRoutesConfig`, `ProviderRouteKind`, provider-local aliases,
   catalog config, and discovery config types.
 - Add serde defaults so `[provider.catalog]`, `[provider.discovery]`, and
@@ -849,11 +778,9 @@ Examples and docs:
 - Thread `provider_name` and `ProviderRouteKind` through handlers into
   `core_pipeline`.
 - Preserve current non-streaming and streaming first-byte behavior.
-- Add compatibility handling for old `/v1/*` routes through
-  `server.default_provider`.
 - Keep count_tokens local and avoid requiring a provider adapter for it in the
   first implementation.
-- Add provider-specific route errors and update protocol-aware fallback
+- Add provider-specific route errors and update protocol-aware 404
   classification.
 - Record provider and upstream model in structured tracing fields.
 
@@ -862,9 +789,7 @@ Examples and docs:
 - Rewrite default config constants.
 - Rewrite `init`, `validate`, and `models`.
 - Update `config.toml.example` and provider examples.
-- Update CLI tests that currently assert generated `[models]` routes resolve.
-- Detect legacy `[models]` and `[provider.models]` config with an actionable
-  migration error instead of exposing a raw serde unknown-field failure.
+- Update CLI tests for provider route generation and validation.
 - Make the `models` command async so it can reuse the provider discovery client.
 
 ### Phase 5: Model Catalogs
@@ -875,8 +800,6 @@ Examples and docs:
 - Add catalog read/write helpers.
 - Add `ModelCatalogService` with per-provider single-flight refreshes.
 - Implement `GET /providers/{provider}/v1/models`.
-- Implement compatibility `GET /v1/models` through `server.default_provider`,
-  or through all providers only if a global listing policy is explicitly added.
 - Implement `llm-proxy models --provider ... --live`.
 - Implement static, discovered, and hybrid catalog modes.
 - Add allow/deny glob filtering.
@@ -894,13 +817,8 @@ Examples and docs:
 - Review `/health` exposure because provider/model counters are currently
   returned without inbound authentication.
 
-### Phase 7: Migration and Final Verification
+### Phase 7: Final Verification
 
-- Add a migration guide showing old model routes, new provider routes, aliases,
-  and default-provider compatibility.
-- Preserve old config files; never rewrite them automatically.
-- `serve` and `validate` should identify legacy model tables and print the exact
-  replacement sections.
 - Run formatting, full workspace tests, Clippy with warnings denied, and source
   guard scans.
 
@@ -908,14 +826,13 @@ Examples and docs:
 
 Core config tests:
 
-- App config parses without `[models]`.
-- Unknown top-level `[models]` fails because `deny_unknown_fields` should still
-  protect the schema.
+- App config parses with server settings only.
+- Unknown top-level routing tables fail because `deny_unknown_fields` protects
+  the schema.
 - Provider config parses with `[provider.routes]`.
 - Route adapter references must point to existing adapters.
 - Empty provider route adapter names fail.
 - Unknown protocols fail.
-- `default_provider`, if configured, must exist.
 - Provider config parses when discovery, catalog, and model aliases are omitted.
 - Empty alias names or empty alias targets fail.
 - Catalog entries with empty IDs fail.
@@ -938,8 +855,7 @@ Server tests:
 - `/providers/fireworks/v1/chat/completions` routes to Fireworks.
 - Same request model can be sent to different providers by changing only the
   URL.
-- Old `/v1/chat/completions` fails without `default_provider`.
-- Old `/v1/chat/completions` succeeds with `default_provider`.
+- Bare `/v1/chat/completions` is not registered and returns 404.
 - Provider-scoped count_tokens works without an upstream adapter.
 - Streaming first-byte behavior remains unchanged.
 - Unknown provider and unsupported provider route return client errors, not
@@ -950,15 +866,13 @@ Server tests:
 
 CLI tests:
 
-- Generated config has no `[models]`.
+- Generated config has server settings only.
 - Generated provider files have `[provider.routes]`.
 - `validate` prints provider routes.
 - `models --provider X --live` handles provider discovery responses.
 - Missing discovery config gives a clear error.
 - `models --provider X` reads static and cached catalogs without network.
 - Discovery failure does not start the server failure path.
-- Legacy `[models]` and `[provider.models]` produce the targeted migration
-  message.
 
 Catalog tests:
 
@@ -991,57 +905,6 @@ cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 rg "resolve_model_route|ModelRoute|ProviderModelConfig|provider\\.models" crates apps
 ```
 
-## Migration
-
-Before:
-
-```toml
-[models]
-"kimi-k2.6" = { provider = "fireworks" }
-
-[provider.models]
-"kimi-k2.6" = { adapter = "chat" }
-```
-
-After:
-
-```toml
-[provider.routes]
-chat_completions = "chat"
-messages = "chat"
-
-[provider.model_aliases]
-"kimi-k2.6" = "accounts/fireworks/models/kimi-k2.6"
-```
-
-Client changes from:
-
-```text
-POST /v1/chat/completions
-```
-
-to:
-
-```text
-POST /providers/fireworks/v1/chat/completions
-```
-
-The request body keeps the model:
-
-```json
-{
-  "model": "kimi-k2.6",
-  "messages": []
-}
-```
-
-Temporary compatibility:
-
-```toml
-[server]
-default_provider = "fireworks"
-```
-
 ## Deferred Features
 
 These are intentionally outside the initial implementation:
@@ -1051,7 +914,6 @@ These are intentionally outside the initial implementation:
 - Automatic discovery during server startup.
 - Background scheduled catalog refresh.
 - Native upstream token-count APIs.
-- Multi-provider merged `/v1/models`.
 - Database-backed catalogs.
 - Per-client model access control, since the proxy currently has no inbound
   authentication.
