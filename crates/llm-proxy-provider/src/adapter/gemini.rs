@@ -615,6 +615,7 @@ mod tests {
             api_key: "test-key".into(),
             requested_model: "gemini-2.5-pro".into(),
             upstream_model: "gemini-2.5-pro".into(),
+            headers: std::collections::HashMap::new(),
         }
     }
 

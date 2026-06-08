@@ -92,6 +92,20 @@ fn state_with_provider(
     adapter_name: &str,
     model_name: &str,
 ) -> AppState {
+    // Build routes based on protocol so the provider-based routing can resolve.
+    // Anthropic providers also support chat_completions for cross-protocol tests.
+    let routes = if protocol == "anthropic_messages" {
+        llm_proxy_core::ProviderRoutesConfig {
+            messages: Some(adapter_name.to_owned()),
+            chat_completions: Some(adapter_name.to_owned()),
+        }
+    } else {
+        llm_proxy_core::ProviderRoutesConfig {
+            chat_completions: Some(adapter_name.to_owned()),
+            messages: None,
+        }
+    };
+
     let provider = ProviderConfig {
         name: "mock-provider".to_owned(),
         api_key: "test-key".to_owned(),
@@ -103,6 +117,7 @@ fn state_with_provider(
                 ProviderAdapterConfig {
                     protocol: protocol.to_owned(),
                     endpoint: mock_endpoint.to_owned(),
+                    headers: HashMap::new(),
                 },
             );
             m
@@ -117,18 +132,13 @@ fn state_with_provider(
             );
             m
         },
+        routes,
+        model_aliases: HashMap::new(),
+        discovery: None,
+        catalog: None,
     };
 
     let registry = ProviderRegistry::from_providers(vec![provider]).expect("registry");
-
-    let mut model_routes = HashMap::new();
-    model_routes.insert(
-        model_name.to_owned(),
-        llm_proxy_core::ModelRoute {
-            provider: "mock-provider".to_owned(),
-            upstream_model: None,
-        },
-    );
 
     let app_config = AppConfig {
         server: ServerConfig {
@@ -138,7 +148,7 @@ fn state_with_provider(
             hot_reload: false,
             server_name: "test-proxy".to_owned(),
         },
-        models: model_routes,
+        models: HashMap::new(),
     };
 
     AppState::new(
@@ -187,7 +197,7 @@ async fn spawn_mock_server(response_body: Vec<u8>, content_type: &str) -> String
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     tokio::time::sleep(Duration::from_millis(50)).await;
-    format!("http://{}/v1/chat/completions", addr)
+    format!("http://{}/v1/mock-provider/chat/completions", addr)
 }
 
 /// Spawn a local mock axum server returning OpenAI Chat non-streaming response.
@@ -228,7 +238,7 @@ async fn spawn_mock_openai_chat_stream() -> String {
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     tokio::time::sleep(Duration::from_millis(50)).await;
-    format!("http://{}/v1/chat/completions", addr)
+    format!("http://{}/v1/mock-provider/chat/completions", addr)
 }
 
 /// Spawn a mock server that returns HTTP 500.
@@ -249,7 +259,7 @@ async fn spawn_mock_500() -> String {
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     tokio::time::sleep(Duration::from_millis(50)).await;
-    format!("http://{}/v1/chat/completions", addr)
+    format!("http://{}/v1/mock-provider/chat/completions", addr)
 }
 
 /// Spawn a mock server that records the received request body.
@@ -279,7 +289,10 @@ async fn spawn_mock_with_body_capture(
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     tokio::time::sleep(Duration::from_millis(50)).await;
-    (format!("http://{}/v1/chat/completions", addr), captured)
+    (
+        format!("http://{}/v1/mock-provider/chat/completions", addr),
+        captured,
+    )
 }
 
 /// Build an AppState with empty routing table (for error tests).
@@ -313,7 +326,7 @@ fn empty_state() -> AppState {
 fn chat_request(body: &str) -> Request<Body> {
     Request::builder()
         .method("POST")
-        .uri("/v1/chat/completions")
+        .uri("/v1/mock-provider/chat/completions")
         .header("content-type", "application/json")
         .body(Body::from(body.to_owned()))
         .unwrap()
@@ -336,11 +349,13 @@ fn make_chat_body(model: &str, stream: bool) -> String {
 /// route is mounted, no longer 404
 #[tokio::test]
 async fn route_is_mounted_no_longer_404() {
-    let app = build_router(empty_state());
+    let mock_url = spawn_mock_openai_chat_non_stream().await;
+    let app = build_router(state_with_openai_chat_provider(&mock_url));
     let body = make_chat_body("gpt-4o", false);
     let resp = app.oneshot(chat_request(&body)).await.unwrap();
     // The route is now mounted -- should not return 404.
-    // With an empty routing table, the model is unknown so we expect 400.
+    // With a valid provider, the request should succeed (200) or fail with
+    // a non-404 error.
     assert_ne!(
         resp.status(),
         StatusCode::NOT_FOUND,
@@ -553,13 +568,14 @@ async fn route_preserves_fields_through_core() {
 // Error tests
 // ===========================================================================
 
-/// unknown model returns OpenAI-shaped 400
+/// unknown provider returns OpenAI-shaped 404
 #[tokio::test]
 async fn unknown_model_returns_openai_shaped_400() {
     let app = build_router(empty_state());
     let body = make_chat_body("nonexistent-model", false);
     let resp = app.oneshot(chat_request(&body)).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    // With provider-based routing, empty state means the provider is unknown -> 404.
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
     let resp_body: Value = serde_json::from_slice(
         &axum::body::to_bytes(resp.into_body(), 64 * 1024)
@@ -590,7 +606,7 @@ async fn invalid_json_returns_openai_shaped_400() {
 
     let req = Request::builder()
         .method("POST")
-        .uri("/v1/chat/completions")
+        .uri("/v1/mock-provider/chat/completions")
         .header("content-type", "application/json")
         .body(Body::from("this is not json"))
         .unwrap();
@@ -802,7 +818,7 @@ async fn streaming_tool_call_maps_to_delta_tool_calls() {
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     tokio::time::sleep(Duration::from_millis(50)).await;
-    let mock_url = format!("http://{}/v1/messages", addr);
+    let mock_url = format!("http://{}/v1/mock-provider/messages", addr);
 
     // Use Anthropic provider (which supports tool call events in SSE),
     // but call the OpenAI chat/completions endpoint.
@@ -1020,7 +1036,8 @@ async fn no_anthropic_error_envelope_on_openai_route() {
     let app = build_router(empty_state());
     let body = make_chat_body("nonexistent-model", false);
     let resp = app.oneshot(chat_request(&body)).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    // With provider-based routing, empty state -> UnknownProvider -> 404.
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
     let resp_body: Value = serde_json::from_slice(
         &axum::body::to_bytes(resp.into_body(), 64 * 1024)
@@ -1139,7 +1156,7 @@ async fn not_found_anthropic_path_returns_anthropic_shaped_error() {
     // Use a path under /v1/messages that does NOT match any mounted route.
     let req = Request::builder()
         .method("POST")
-        .uri("/v1/messages/typo")
+        .uri("/v1/mock-provider/messages/typo")
         .header("content-type", "application/json")
         .body(Body::empty())
         .unwrap();
@@ -1168,7 +1185,7 @@ async fn empty_body_returns_openai_shaped_400() {
     let app = build_router(empty_state());
     let req = Request::builder()
         .method("POST")
-        .uri("/v1/chat/completions")
+        .uri("/v1/mock-provider/chat/completions")
         .header("content-type", "application/json")
         .body(Body::empty())
         .unwrap();
@@ -1194,7 +1211,7 @@ async fn wrong_field_types_returns_openai_shaped_400() {
     let app = build_router(empty_state());
     let req = Request::builder()
         .method("POST")
-        .uri("/v1/chat/completions")
+        .uri("/v1/mock-provider/chat/completions")
         .header("content-type", "application/json")
         .body(Body::from(
             r#"{"model": 123, "messages": "hello", "stream": "yes"}"#.to_owned(),
@@ -1222,7 +1239,7 @@ async fn missing_model_returns_openai_shaped_400() {
     let app = build_router(empty_state());
     let req = Request::builder()
         .method("POST")
-        .uri("/v1/chat/completions")
+        .uri("/v1/mock-provider/chat/completions")
         .header("content-type", "application/json")
         .body(Body::from(
             r#"{"messages": [{"role": "user", "content": "hello"}]}"#.to_owned(),
@@ -1256,7 +1273,7 @@ async fn missing_messages_returns_openai_shaped_400() {
     let app = build_router(empty_state());
     let req = Request::builder()
         .method("POST")
-        .uri("/v1/chat/completions")
+        .uri("/v1/mock-provider/chat/completions")
         .header("content-type", "application/json")
         .body(Body::from(r#"{"model": "gpt-4o"}"#.to_owned()))
         .unwrap();
@@ -1288,7 +1305,7 @@ async fn invalid_utf8_body_returns_openai_shaped_400() {
     let app = build_router(empty_state());
     let req = Request::builder()
         .method("POST")
-        .uri("/v1/chat/completions")
+        .uri("/v1/mock-provider/chat/completions")
         .header("content-type", "application/json")
         .body(Body::from(vec![0xff, 0xfe, 0x00, 0x01]))
         .unwrap();
@@ -1342,7 +1359,7 @@ async fn chat_completions_oversized_body_returns_payload_too_large() {
     let oversized_body = "X".repeat(33 * 1024 * 1024);
     let req = Request::builder()
         .method("POST")
-        .uri("/v1/chat/completions")
+        .uri("/v1/mock-provider/chat/completions")
         .header("content-type", "application/json")
         .body(Body::from(oversized_body))
         .unwrap();
@@ -1384,7 +1401,7 @@ async fn stream_error_after_first_byte_emits_error_event() {
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     tokio::time::sleep(Duration::from_millis(50)).await;
-    let mock_url = format!("http://{}/v1/messages", addr);
+    let mock_url = format!("http://{}/v1/mock-provider/messages", addr);
 
     let state = state_with_anthropic_provider(&mock_url);
     let app = build_router(state);
@@ -1439,7 +1456,7 @@ async fn upstream_disconnect_completes_with_synthetic_terminal() {
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     tokio::time::sleep(Duration::from_millis(50)).await;
-    let mock_url = format!("http://{}/v1/messages", addr);
+    let mock_url = format!("http://{}/v1/mock-provider/messages", addr);
 
     let state = state_with_anthropic_provider(&mock_url);
     let app = build_router(state);
@@ -1509,11 +1526,11 @@ async fn unknown_model_empty_routing_table_openai_shaped_400() {
     });
     let resp = app.oneshot(chat_request(&body.to_string())).await.unwrap();
 
-    // Empty routing table -> unknown model -> 400 Bad Request.
+    // Empty routing table -> unknown provider -> 404 Not Found.
     assert_eq!(
         resp.status(),
-        StatusCode::BAD_REQUEST,
-        "unknown model should return 400"
+        StatusCode::NOT_FOUND,
+        "unknown provider should return 404"
     );
 
     let resp_body: Value = serde_json::from_slice(

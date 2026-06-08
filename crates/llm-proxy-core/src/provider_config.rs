@@ -28,7 +28,13 @@ use crate::error::CoreError;
 pub struct AppConfig {
     /// Server bind and operational settings.
     pub server: ServerConfig,
-    /// Model routing table. Keys are client-facing model names.
+    /// Legacy model routing table (ignored under provider-based routing).
+    ///
+    /// Keys are client-facing model names. This field is kept for backward
+    /// compatibility with existing `config.toml` files that contain a
+    /// `[models]` section. Under provider-based routing (`/v1/{provider}/...`),
+    /// this table is not consulted.
+    #[serde(default)]
     pub models: HashMap<String, ModelRoute>,
 }
 
@@ -101,7 +107,20 @@ pub struct ProviderConfig {
     /// Named adapter configurations (protocol + endpoint pairs).
     pub adapters: HashMap<String, ProviderAdapterConfig>,
     /// Provider-local model-to-adapter mapping.
+    #[serde(default)]
     pub models: HashMap<String, ProviderModelConfig>,
+    /// Route kind to adapter name mapping (e.g. chat_completions -> openai_adapter).
+    #[serde(default)]
+    pub routes: ProviderRoutesConfig,
+    /// Model alias mapping (requested model -> upstream model name).
+    #[serde(default)]
+    pub model_aliases: HashMap<String, String>,
+    /// Live model discovery configuration (optional).
+    #[serde(default)]
+    pub discovery: Option<ProviderDiscoveryConfig>,
+    /// Model catalog configuration (optional, defaults to advisory hybrid).
+    #[serde(default)]
+    pub catalog: Option<ProviderCatalogConfig>,
 }
 
 impl std::fmt::Debug for ProviderConfig {
@@ -112,6 +131,10 @@ impl std::fmt::Debug for ProviderConfig {
             .field("auth_style", &self.auth_style)
             .field("adapters", &self.adapters)
             .field("models", &self.models)
+            .field("routes", &self.routes)
+            .field("model_aliases", &self.model_aliases)
+            .field("discovery", &self.discovery)
+            .field("catalog", &self.catalog)
             .finish()
     }
 }
@@ -146,6 +169,53 @@ pub struct ProviderAdapterConfig {
     pub protocol: String,
     /// Upstream endpoint URL.
     pub endpoint: String,
+    /// Static headers to include in upstream requests (e.g. anthropic-version).
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
+}
+
+// ---------------------------------------------------------------------------
+// ProviderRouteKind & ProviderRoutesConfig
+// ---------------------------------------------------------------------------
+
+/// The kind of client-facing route being requested.
+///
+/// Each variant corresponds to an inbound endpoint that the proxy exposes.
+/// Providers map these route kinds to adapter names via [`ProviderRoutesConfig`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderRouteKind {
+    /// OpenAI-compatible `/chat/completions` endpoint.
+    ChatCompletions,
+    /// Anthropic-compatible `/messages` endpoint.
+    Messages,
+}
+
+/// Maps [`ProviderRouteKind`] to adapter names within a provider.
+///
+/// Defined in TOML as:
+///
+/// ```toml
+/// [provider.routes]
+/// chat_completions = "openai_adapter"
+/// messages = "anthropic_adapter"
+/// ```
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ProviderRoutesConfig {
+    /// Route kind: adapter name for the `chat_completions` endpoint.
+    pub chat_completions: Option<String>,
+    /// Route kind: adapter name for the `messages` endpoint.
+    pub messages: Option<String>,
+}
+
+impl ProviderRoutesConfig {
+    /// Look up the adapter name for the given route kind.
+    pub fn get(&self, kind: ProviderRouteKind) -> Option<&str> {
+        match kind {
+            ProviderRouteKind::ChatCompletions => self.chat_completions.as_deref(),
+            ProviderRouteKind::Messages => self.messages.as_deref(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -158,6 +228,158 @@ pub struct ProviderAdapterConfig {
 pub struct ProviderModelConfig {
     /// Adapter name (must match a key in `ProviderConfig::adapters`).
     pub adapter: String,
+}
+
+// ---------------------------------------------------------------------------
+// ProviderDiscoveryKind & ProviderDiscoveryConfig
+// ---------------------------------------------------------------------------
+
+/// Supported discovery backends for fetching upstream model lists.
+///
+/// Provider-specific discovery kinds are only justified when authentication,
+/// pagination, or response shape differs materially from the OpenAI-compatible
+/// default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderDiscoveryKind {
+    /// Generic OpenAI-style `GET /v1/models` returning `{ "data": [{ "id": ... }] }`.
+    OpenAiCompatibleModels,
+    /// OpenAI's own model-list endpoint (uses org-level auth).
+    OpenAiModels,
+    /// Anthropic model-list endpoint (`GET /v1/models` with `x-api-key`).
+    AnthropicModels,
+    /// Google Gemini model-list endpoint.
+    GeminiModels,
+    /// Fireworks account-level model-list endpoint.
+    FireworksAccountModels,
+}
+
+/// Configuration for live model discovery from an upstream provider.
+///
+/// Discovery does **not** run automatically during server startup. Live refresh
+/// is triggered explicitly via CLI or a `refresh=live` query parameter on the
+/// models endpoint.
+///
+/// ```toml
+/// [provider.discovery]
+/// kind = "openai_compatible_models"
+/// endpoint = "https://api.example.com/v1/models"
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderDiscoveryConfig {
+    /// Which discovery backend protocol to use.
+    pub kind: ProviderDiscoveryKind,
+    /// Upstream URL to fetch the model list from.
+    pub endpoint: String,
+}
+
+// ---------------------------------------------------------------------------
+// ProviderCatalogMode & StaticModelCatalogEntry & ProviderCatalogConfig
+// ---------------------------------------------------------------------------
+
+/// How the model catalog is assembled for a provider.
+///
+/// - `Static`: only use operator-defined `[[provider.catalog.models]]` entries.
+/// - `Discovered`: only use live/cached discovery results.
+/// - `Hybrid`: merge both sources; static metadata wins on ID conflicts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderCatalogMode {
+    /// Only use `[[provider.catalog.models]]` entries.
+    Static,
+    /// Only use live/cached discovery results.
+    Discovered,
+    /// Merge static and discovered models; static metadata wins on ID conflicts.
+    #[serde(rename = "hybrid")]
+    #[default]
+    Hybrid,
+}
+
+/// A single static model entry in the provider catalog.
+///
+/// Defined in TOML as:
+///
+/// ```toml
+/// [[provider.catalog.models]]
+/// id = "accounts/fireworks/models/deepseek-v3p1"
+/// display_name = "DeepSeek V3.1"
+/// supports = ["chat_completions"]
+/// context_length = 131_072
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StaticModelCatalogEntry {
+    /// Model ID (must be non-empty, matches the upstream model name).
+    pub id: String,
+    /// Human-readable display name.
+    #[serde(default)]
+    pub display_name: Option<String>,
+    /// Which route kinds this model supports.
+    #[serde(default)]
+    pub supports: Vec<ProviderRouteKind>,
+    /// Maximum context length in tokens, if known.
+    #[serde(default)]
+    pub context_length: Option<u32>,
+}
+
+/// Provider catalog configuration.
+///
+/// Controls how the `/providers/{provider}/v1/models` endpoint assembles its
+/// response and whether catalog enforcement blocks unknown model IDs.
+///
+/// ```toml
+/// [provider.catalog]
+/// mode = "hybrid"
+/// enforce = false
+/// cache_ttl = "24h"
+/// allow = ["*"]
+/// deny = ["*-preview"]
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderCatalogConfig {
+    /// How to assemble the catalog: static, discovered, or hybrid merge.
+    #[serde(default)]
+    pub mode: ProviderCatalogMode,
+    /// When `true`, requests using a model ID not in the filtered catalog are
+    /// rejected. When `false` (default), the catalog is advisory only.
+    #[serde(default)]
+    pub enforce: bool,
+    /// How long to cache discovered models before allowing a refresh.
+    #[serde(default = "default_cache_ttl")]
+    #[serde(with = "humantime_serde")]
+    pub cache_ttl: Duration,
+    /// Glob patterns for model IDs that are allowed. `["*"]` allows all.
+    #[serde(default = "default_allow_all")]
+    pub allow: Vec<String>,
+    /// Glob patterns for model IDs that are denied (takes precedence after allow).
+    #[serde(default)]
+    pub deny: Vec<String>,
+    /// Operator-defined static model entries.
+    #[serde(default)]
+    pub models: Vec<StaticModelCatalogEntry>,
+}
+
+fn default_cache_ttl() -> Duration {
+    Duration::from_secs(24 * 60 * 60) // 24 hours
+}
+
+fn default_allow_all() -> Vec<String> {
+    vec!["*".to_owned()]
+}
+
+impl Default for ProviderCatalogConfig {
+    fn default() -> Self {
+        Self {
+            mode: ProviderCatalogMode::Hybrid,
+            enforce: false,
+            cache_ttl: default_cache_ttl(),
+            allow: default_allow_all(),
+            deny: Vec::new(),
+            models: Vec::new(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -245,14 +467,11 @@ pub enum ConfigValidationError {
     /// A provider name is empty.
     #[error("provider name is empty")]
     EmptyProviderName,
-    /// A route key (client-facing model name) is empty.
-    #[error("model route key is empty")]
-    EmptyRouteKey,
-    /// A provider name in a route is empty.
-    #[error("model route \"{key}\" has an empty provider")]
-    EmptyRouteProvider {
-        /// Route key.
-        key: String,
+    /// A catalog model entry has an empty ID.
+    #[error("provider \"{provider}\": catalog entry has an empty id")]
+    EmptyCatalogEntryId {
+        /// Provider name.
+        provider: String,
     },
     /// An adapter name is empty.
     #[error("provider \"{provider}\": adapter name is empty")]
@@ -415,30 +634,17 @@ pub fn validate_provider_config(
         }
     }
 
-    Ok(())
-}
-
-/// Validate the model routing table in [`AppConfig`].
-///
-/// Checks that route keys and provider names are non-empty (whitespace-only
-/// values are rejected).
-///
-/// # Errors
-///
-/// Returns a [`ConfigValidationError`] variant describing the first validation
-/// failure encountered: either an empty route key or an empty provider name
-/// within a route.
-pub fn validate_model_routes(
-    models: &HashMap<String, ModelRoute>,
-) -> Result<(), ConfigValidationError> {
-    for (key, route) in models {
-        if key.trim().is_empty() {
-            return Err(ConfigValidationError::EmptyRouteKey);
-        }
-        if route.provider.trim().is_empty() {
-            return Err(ConfigValidationError::EmptyRouteProvider { key: key.clone() });
+    // Catalog model entry validation.
+    if let Some(catalog) = &provider.catalog {
+        for entry in &catalog.models {
+            if entry.id.trim().is_empty() {
+                return Err(ConfigValidationError::EmptyCatalogEntryId {
+                    provider: name.clone(),
+                });
+            }
         }
     }
+
     Ok(())
 }
 
@@ -501,9 +707,6 @@ pub fn load_app_config(path: impl AsRef<Path>) -> Result<AppConfig, CoreError> {
     }
 
     let cfg: AppConfig = toml::from_str(&interpolated).map_err(CoreError::ConfigParse)?;
-    validate_model_routes(&cfg.models).map_err(|e| CoreError::ConfigValidation {
-        message: e.to_string(),
-    })?;
     Ok(cfg)
 }
 
@@ -844,6 +1047,10 @@ endpoint = "https://example.com/v1/chat/completions"
             auth_style: AuthStyle::Bearer,
             adapters: HashMap::new(),
             models: HashMap::new(),
+            routes: ProviderRoutesConfig::default(),
+            model_aliases: HashMap::new(),
+            discovery: None,
+            catalog: None,
         };
         let result = validate_provider_config(&cfg, None);
         assert!(result.is_err());
@@ -934,6 +1141,7 @@ protocol = "openai_chat_completions"
                     ProviderAdapterConfig {
                         protocol: "openai_chat_completions".to_owned(),
                         endpoint: "https://example.com/v1".to_owned(),
+                        headers: HashMap::new(),
                     },
                 );
                 m
@@ -948,6 +1156,10 @@ protocol = "openai_chat_completions"
                 );
                 m
             },
+            routes: ProviderRoutesConfig::default(),
+            model_aliases: HashMap::new(),
+            discovery: None,
+            catalog: None,
         };
         let result = validate_provider_config(&cfg, None);
         assert!(result.is_err());
@@ -973,11 +1185,16 @@ protocol = "openai_chat_completions"
                     ProviderAdapterConfig {
                         protocol: "openai_chat_completions".to_owned(),
                         endpoint: "https://example.com".to_owned(),
+                        headers: HashMap::new(),
                     },
                 );
                 m
             },
             models: HashMap::new(),
+            routes: ProviderRoutesConfig::default(),
+            model_aliases: HashMap::new(),
+            discovery: None,
+            catalog: None,
         };
         let known = vec!["openai_chat_completions", "anthropic_messages"];
         let result = validate_provider_config(&cfg, Some(&known));
@@ -1002,11 +1219,16 @@ protocol = "openai_chat_completions"
                     ProviderAdapterConfig {
                         protocol: "totally_fake_protocol".to_owned(),
                         endpoint: "https://example.com".to_owned(),
+                        headers: HashMap::new(),
                     },
                 );
                 m
             },
             models: HashMap::new(),
+            routes: ProviderRoutesConfig::default(),
+            model_aliases: HashMap::new(),
+            discovery: None,
+            catalog: None,
         };
         let known = vec!["openai_chat_completions", "anthropic_messages"];
         let result = validate_provider_config(&cfg, Some(&known));
@@ -1028,6 +1250,10 @@ protocol = "openai_chat_completions"
             auth_style: AuthStyle::Bearer,
             adapters: HashMap::new(),
             models: HashMap::new(),
+            routes: ProviderRoutesConfig::default(),
+            model_aliases: HashMap::new(),
+            discovery: None,
+            catalog: None,
         };
         let debug_output = format!("{:?}", cfg);
         assert!(
@@ -1050,6 +1276,10 @@ protocol = "openai_chat_completions"
             auth_style: AuthStyle::Bearer,
             adapters: HashMap::new(),
             models: HashMap::new(),
+            routes: ProviderRoutesConfig::default(),
+            model_aliases: HashMap::new(),
+            discovery: None,
+            catalog: None,
         };
         let toml_str = toml::to_string(&cfg).expect("serialize");
         assert!(
@@ -1169,11 +1399,16 @@ server_name = "llm-proxy"
                     ProviderAdapterConfig {
                         protocol: "openai_chat_completions".to_owned(),
                         endpoint: String::new(),
+                        headers: HashMap::new(),
                     },
                 );
                 m
             },
             models: HashMap::new(),
+            routes: ProviderRoutesConfig::default(),
+            model_aliases: HashMap::new(),
+            discovery: None,
+            catalog: None,
         };
         let result = validate_provider_config(&cfg, None);
         assert!(result.is_err());
@@ -1194,6 +1429,10 @@ server_name = "llm-proxy"
             auth_style: AuthStyle::Bearer,
             adapters: HashMap::new(),
             models: HashMap::new(),
+            routes: ProviderRoutesConfig::default(),
+            model_aliases: HashMap::new(),
+            discovery: None,
+            catalog: None,
         };
         let result = validate_provider_config(&cfg, None);
         assert!(result.is_err());
@@ -1219,11 +1458,16 @@ server_name = "llm-proxy"
                     ProviderAdapterConfig {
                         protocol: String::new(),
                         endpoint: "https://example.com".to_owned(),
+                        headers: HashMap::new(),
                     },
                 );
                 m
             },
             models: HashMap::new(),
+            routes: ProviderRoutesConfig::default(),
+            model_aliases: HashMap::new(),
+            discovery: None,
+            catalog: None,
         };
         let result = validate_provider_config(&cfg, None);
         assert!(result.is_err());
@@ -1249,11 +1493,16 @@ server_name = "llm-proxy"
                     ProviderAdapterConfig {
                         protocol: "openai_chat_completions".to_owned(),
                         endpoint: "https://example.com".to_owned(),
+                        headers: HashMap::new(),
                     },
                 );
                 m
             },
             models: HashMap::new(),
+            routes: ProviderRoutesConfig::default(),
+            model_aliases: HashMap::new(),
+            discovery: None,
+            catalog: None,
         };
         let result = validate_provider_config(&cfg, None);
         assert!(result.is_err());
@@ -1333,70 +1582,6 @@ server_name = "llm-proxy"
         );
     }
 
-    // -- Direct tests for validate_model_routes --------------------------------
-
-    #[test]
-    fn validate_model_routes_empty_route_key_fails() {
-        let mut models = HashMap::new();
-        models.insert(
-            String::new(),
-            ModelRoute {
-                provider: "opencode-go".to_owned(),
-                upstream_model: None,
-            },
-        );
-        let result = validate_model_routes(&models);
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("route key is empty"),
-            "expected empty route key error, got: {err}"
-        );
-    }
-
-    #[test]
-    fn validate_model_routes_empty_provider_fails() {
-        let mut models = HashMap::new();
-        models.insert(
-            "my-model".to_owned(),
-            ModelRoute {
-                provider: String::new(),
-                upstream_model: None,
-            },
-        );
-        let result = validate_model_routes(&models);
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("empty provider") && err.contains("my-model"),
-            "expected empty route provider error, got: {err}"
-        );
-    }
-
-    #[test]
-    fn validate_model_routes_valid_passes() {
-        let mut models = HashMap::new();
-        models.insert(
-            "kimi-k2.6".to_owned(),
-            ModelRoute {
-                provider: "opencode-go".to_owned(),
-                upstream_model: None,
-            },
-        );
-        models.insert(
-            "claude-4".to_owned(),
-            ModelRoute {
-                provider: "opencode-zen".to_owned(),
-                upstream_model: Some("claude-sonnet-4".to_owned()),
-            },
-        );
-        let result = validate_model_routes(&models);
-        assert!(
-            result.is_ok(),
-            "expected validation to pass, got: {result:?}"
-        );
-    }
-
     // -- Direct test for EmptyProviderModelKey ---------------------------------
 
     #[test]
@@ -1412,6 +1597,7 @@ server_name = "llm-proxy"
                     ProviderAdapterConfig {
                         protocol: "openai_chat_completions".to_owned(),
                         endpoint: "https://example.com".to_owned(),
+                        headers: HashMap::new(),
                     },
                 );
                 m
@@ -1426,6 +1612,10 @@ server_name = "llm-proxy"
                 );
                 m
             },
+            routes: ProviderRoutesConfig::default(),
+            model_aliases: HashMap::new(),
+            discovery: None,
+            catalog: None,
         };
         let result = validate_provider_config(&cfg, None);
         assert!(result.is_err());
@@ -1451,6 +1641,7 @@ server_name = "llm-proxy"
                     ProviderAdapterConfig {
                         protocol: "openai_chat_completions".to_owned(),
                         endpoint: "https://example.com".to_owned(),
+                        headers: HashMap::new(),
                     },
                 );
                 m
@@ -1465,6 +1656,10 @@ server_name = "llm-proxy"
                 );
                 m
             },
+            routes: ProviderRoutesConfig::default(),
+            model_aliases: HashMap::new(),
+            discovery: None,
+            catalog: None,
         };
         let result = validate_provider_config(&cfg, None);
         assert!(result.is_err());
@@ -1727,11 +1922,16 @@ endpoint = "https://example.com/v1/chat/completions"
                     ProviderAdapterConfig {
                         protocol: "totally_fake_protocol".to_owned(),
                         endpoint: "https://example.com".to_owned(),
+                        headers: HashMap::new(),
                     },
                 );
                 m
             },
             models: HashMap::new(),
+            routes: ProviderRoutesConfig::default(),
+            model_aliases: HashMap::new(),
+            discovery: None,
+            catalog: None,
         };
         // When known_protocols is None, protocol validation is skipped entirely.
         let result = validate_provider_config(&cfg, None);
@@ -1785,6 +1985,10 @@ endpoint = "https://example.com/v1/chat/completions"
             auth_style: AuthStyle::Bearer,
             adapters: HashMap::new(),
             models: HashMap::new(),
+            routes: ProviderRoutesConfig::default(),
+            model_aliases: HashMap::new(),
+            discovery: None,
+            catalog: None,
         };
         let result = validate_provider_config(&cfg, None);
         assert!(
@@ -1813,11 +2017,16 @@ endpoint = "https://example.com/v1/chat/completions"
                     ProviderAdapterConfig {
                         protocol: "openai_chat_completions".to_owned(),
                         endpoint: "https://example.com".to_owned(),
+                        headers: HashMap::new(),
                     },
                 );
                 m
             },
             models: HashMap::new(),
+            routes: ProviderRoutesConfig::default(),
+            model_aliases: HashMap::new(),
+            discovery: None,
+            catalog: None,
         };
         let result = validate_provider_config(&cfg, None);
         assert!(
@@ -1848,6 +2057,7 @@ endpoint = "https://example.com/v1/chat/completions"
                     ProviderAdapterConfig {
                         protocol: "openai_chat_completions".to_owned(),
                         endpoint: long_url.clone(),
+                        headers: HashMap::new(),
                     },
                 );
                 m
@@ -1862,6 +2072,10 @@ endpoint = "https://example.com/v1/chat/completions"
                 );
                 m
             },
+            routes: ProviderRoutesConfig::default(),
+            model_aliases: HashMap::new(),
+            discovery: None,
+            catalog: None,
         };
         let result = validate_provider_config(&cfg, None);
         assert!(
@@ -1954,11 +2168,16 @@ server_name = "${_LLM_PROXY_APP_EMPTY_VAR}"
                     ProviderAdapterConfig {
                         protocol: "openai_chat_completions".to_owned(),
                         endpoint: "   ".to_owned(),
+                        headers: HashMap::new(),
                     },
                 );
                 m
             },
             models: HashMap::new(),
+            routes: ProviderRoutesConfig::default(),
+            model_aliases: HashMap::new(),
+            discovery: None,
+            catalog: None,
         };
         let result = validate_provider_config(&cfg, None);
         assert!(
@@ -1987,11 +2206,16 @@ server_name = "${_LLM_PROXY_APP_EMPTY_VAR}"
                     ProviderAdapterConfig {
                         protocol: "   ".to_owned(),
                         endpoint: "https://example.com".to_owned(),
+                        headers: HashMap::new(),
                     },
                 );
                 m
             },
             models: HashMap::new(),
+            routes: ProviderRoutesConfig::default(),
+            model_aliases: HashMap::new(),
+            discovery: None,
+            catalog: None,
         };
         let result = validate_provider_config(&cfg, None);
         assert!(
@@ -2002,54 +2226,6 @@ server_name = "${_LLM_PROXY_APP_EMPTY_VAR}"
         assert!(
             err.contains("empty protocol"),
             "expected empty protocol error, got: {err}"
-        );
-    }
-
-    // -- Whitespace-only route key fails validation --------------------------------
-
-    #[test]
-    fn whitespace_only_route_key_fails_validation() {
-        let mut models = HashMap::new();
-        models.insert(
-            "   ".to_owned(),
-            ModelRoute {
-                provider: "opencode-go".to_owned(),
-                upstream_model: None,
-            },
-        );
-        let result = validate_model_routes(&models);
-        assert!(
-            result.is_err(),
-            "whitespace-only route key should fail validation, got: {result:?}"
-        );
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("route key is empty"),
-            "expected empty route key error, got: {err}"
-        );
-    }
-
-    // -- Whitespace-only route provider fails validation ---------------------------
-
-    #[test]
-    fn whitespace_only_route_provider_fails_validation() {
-        let mut models = HashMap::new();
-        models.insert(
-            "my-model".to_owned(),
-            ModelRoute {
-                provider: "   ".to_owned(),
-                upstream_model: None,
-            },
-        );
-        let result = validate_model_routes(&models);
-        assert!(
-            result.is_err(),
-            "whitespace-only route provider should fail validation, got: {result:?}"
-        );
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("empty provider"),
-            "expected empty route provider error, got: {err}"
         );
     }
 
@@ -2068,6 +2244,7 @@ server_name = "${_LLM_PROXY_APP_EMPTY_VAR}"
                     ProviderAdapterConfig {
                         protocol: "openai_chat_completions".to_owned(),
                         endpoint: "https://example.com".to_owned(),
+                        headers: HashMap::new(),
                     },
                 );
                 m
@@ -2082,6 +2259,10 @@ server_name = "${_LLM_PROXY_APP_EMPTY_VAR}"
                 );
                 m
             },
+            routes: ProviderRoutesConfig::default(),
+            model_aliases: HashMap::new(),
+            discovery: None,
+            catalog: None,
         };
         let result = validate_provider_config(&cfg, None);
         assert!(
@@ -2108,6 +2289,10 @@ server_name = "${_LLM_PROXY_APP_EMPTY_VAR}"
             auth_style: AuthStyle::Bearer,
             adapters: HashMap::new(),
             models: HashMap::new(),
+            routes: ProviderRoutesConfig::default(),
+            model_aliases: HashMap::new(),
+            discovery: None,
+            catalog: None,
         };
         let result = validate_provider_config(&cfg, None);
         assert!(
@@ -2228,6 +2413,10 @@ server_name = "llm-proxy"
             auth_style: AuthStyle::Bearer,
             adapters: HashMap::new(),
             models: HashMap::new(),
+            routes: ProviderRoutesConfig::default(),
+            model_aliases: HashMap::new(),
+            discovery: None,
+            catalog: None,
         };
         let result = validate_provider_config(&cfg, None);
         assert!(
@@ -2349,6 +2538,7 @@ adapter = "${{_LLM_PROXY_ADAPTER_NAME_VAR}}"
                     ProviderAdapterConfig {
                         protocol: "openai_chat_completions".to_owned(),
                         endpoint: "https://example.com".to_owned(),
+                        headers: HashMap::new(),
                     },
                 );
                 m
@@ -2363,6 +2553,10 @@ adapter = "${{_LLM_PROXY_ADAPTER_NAME_VAR}}"
                 );
                 m
             },
+            routes: ProviderRoutesConfig::default(),
+            model_aliases: HashMap::new(),
+            discovery: None,
+            catalog: None,
         };
         let result = validate_provider_config(&cfg, None);
         assert!(

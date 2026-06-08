@@ -2,7 +2,7 @@
 //!
 //! All counters are lock-free ([`std::sync::atomic::AtomicI64`]). The only
 //! mutex-guarded state is the latency ring-buffer (last 1 000 samples) and
-//! the per-model request counter map.
+//! the per-provider-model request counter map.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
@@ -12,6 +12,9 @@ use std::time::Duration;
 /// Maximum number of latency samples retained in the ring-buffer.
 const LATENCY_CAP: usize = 1000;
 
+/// Separator used in the composite metrics key: `"{provider}/{model}"`.
+const KEY_SEPARATOR: &str = "/";
+
 // ---------------------------------------------------------------------------
 // Metrics
 // ---------------------------------------------------------------------------
@@ -19,7 +22,7 @@ const LATENCY_CAP: usize = 1000;
 /// Thread-safe metrics collector.
 ///
 /// Internally uses [`AtomicI64`] counters for hot-path increments and
-/// [`Mutex`] only for the latency ring-buffer and model map.
+/// [`Mutex`] only for the latency ring-buffer and provider-model map.
 #[derive(Debug)]
 pub struct Metrics {
     requests_received: AtomicI64,
@@ -31,7 +34,7 @@ pub struct Metrics {
     deduplicated: AtomicI64,
     /// Ring-buffer holding the last [`LATENCY_CAP`] latency samples.
     latencies: Mutex<VecDeque<Duration>>,
-    /// Per-model request counts.
+    /// Per-provider-model request counts. Key format: `"{provider}/{model}"`.
     model_counts: Mutex<HashMap<String, AtomicI64>>,
 }
 
@@ -66,8 +69,8 @@ impl Metrics {
     /// Record a successful upstream response.
     ///
     /// Increments `requests_success` and `upstream_calls`, stores the
-    /// `latency` sample, and bumps the per-`model` counter.
-    pub fn record_success(&self, model: &str, latency: Duration) {
+    /// `latency` sample, and bumps the per-`provider`/`model` counter.
+    pub fn record_success(&self, provider: &str, model: &str, latency: Duration) {
         self.requests_success.fetch_add(1, Ordering::Relaxed);
         self.upstream_calls.fetch_add(1, Ordering::Relaxed);
 
@@ -79,13 +82,14 @@ impl Metrics {
             buf.push_back(latency);
         }
 
-        // Bump per-model counter.
+        // Bump per-provider-model counter.
+        let key = format!("{provider}{KEY_SEPARATOR}{model}");
         if let Ok(mut map) = self.model_counts.lock() {
-            if let Some(counter) = map.get(model) {
+            if let Some(counter) = map.get(&key) {
                 counter.fetch_add(1, Ordering::Relaxed);
             } else {
                 let counter = AtomicI64::new(1);
-                map.insert(model.to_owned(), counter);
+                map.insert(key, counter);
             }
         }
     }
@@ -177,7 +181,7 @@ pub struct Snapshot {
     pub deduplicated: i64,
     /// Collected latency samples (up to 1 000 entries).
     pub latencies: Vec<Duration>,
-    /// Per-model request counts.
+    /// Per-provider-model request counts. Key format: `"{provider}/{model}"`.
     pub model_counts: HashMap<String, i64>,
 }
 
@@ -265,18 +269,30 @@ mod tests {
     }
 
     #[test]
-    fn record_success_tracks_latency_and_model() {
+    fn record_success_tracks_latency_and_provider_model() {
         let m = Metrics::new();
-        m.record_success("gpt-4o", Duration::from_millis(120));
-        m.record_success("gpt-4o", Duration::from_millis(80));
-        m.record_success("claude-3", Duration::from_millis(200));
+        m.record_success("openai", "gpt-4o", Duration::from_millis(120));
+        m.record_success("openai", "gpt-4o", Duration::from_millis(80));
+        m.record_success("anthropic", "claude-3", Duration::from_millis(200));
 
         let snap = m.get_snapshot();
         assert_eq!(snap.requests_success, 3);
         assert_eq!(snap.upstream_calls, 3);
         assert_eq!(snap.latencies.len(), 3);
-        assert_eq!(snap.model_counts.get("gpt-4o"), Some(&2));
-        assert_eq!(snap.model_counts.get("claude-3"), Some(&1));
+        assert_eq!(snap.model_counts.get("openai/gpt-4o"), Some(&2));
+        assert_eq!(snap.model_counts.get("anthropic/claude-3"), Some(&1));
+    }
+
+    #[test]
+    fn record_success_same_model_different_providers_are_distinct() {
+        let m = Metrics::new();
+        m.record_success("provider-a", "gpt-4o", Duration::from_millis(100));
+        m.record_success("provider-b", "gpt-4o", Duration::from_millis(200));
+
+        let snap = m.get_snapshot();
+        assert_eq!(snap.model_counts.get("provider-a/gpt-4o"), Some(&1));
+        assert_eq!(snap.model_counts.get("provider-b/gpt-4o"), Some(&1));
+        assert_eq!(snap.model_counts.len(), 2);
     }
 
     #[test]
@@ -306,7 +322,7 @@ mod tests {
     fn latency_ring_buffer_capped_at_1000() {
         let m = Metrics::new();
         for i in 0..1050 {
-            m.record_success("model", Duration::from_millis(i));
+            m.record_success("p", "model", Duration::from_millis(i));
         }
 
         let snap = m.get_snapshot();
@@ -360,7 +376,7 @@ mod tests {
     #[test]
     fn snapshot_is_clone_and_debug() {
         let m = Metrics::new();
-        m.record_success("test", Duration::from_millis(10));
+        m.record_success("p", "test", Duration::from_millis(10));
         let snap = m.get_snapshot();
 
         let cloned = snap.clone();
@@ -383,7 +399,7 @@ mod tests {
                 for i in 0..500 {
                     m.record_request(i % 2 == 0);
                     if i % 3 == 0 {
-                        m.record_success("model-a", Duration::from_micros(i));
+                        m.record_success("p", "model-a", Duration::from_micros(i));
                     } else {
                         m.record_failure();
                     }

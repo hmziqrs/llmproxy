@@ -4,10 +4,10 @@
 //!
 //! - **Configuration**: the TOML [`AppConfig`]/[`ProviderConfig`] types with
 //!   env-var interpolation and validation.
-//! - **Routing**: [`ProviderTarget`] and [`resolve_model_route`] for mapping
-//!   client-facing model names to upstream providers.
+//! - **Routing**: [`ProviderRouteKind`] and [`ProviderRoutesConfig`] for
+//!   provider-based route resolution.
 //! - **Registry**: [`ProviderRegistry`] and [`ProviderAdapterTargetConfig`] for
-//!   resolving route targets to concrete adapter configurations.
+//!   resolving provider routes to concrete adapter configurations.
 //! - **Metrics**: the runtime [`Metrics`] collector with counters and latency
 //!   histograms.
 //! - **Token counting**: [`Counter`] and [`MessageContent`] for usage tracking.
@@ -19,7 +19,6 @@
 //! ```text
 //! provider_config   - TOML provider/app config types
 //! provider_registry - Provider registry and adapter target resolution
-//! model_route       - Model routing resolution
 //! env_interpolate   - Shared ${ENV_VAR} interpolation
 //! token             - Token counting
 //! metrics           - Runtime metrics
@@ -33,10 +32,8 @@
 pub mod env_interpolate;
 /// Crate-level error type.
 pub mod error;
-/// Runtime metrics (counters, latency ring-buffer, per-model counts).
+/// Runtime metrics (counters, latency ring-buffer, per-provider-model counts).
 pub mod metrics;
-/// Model routing: resolve client-facing model names to provider targets.
-pub mod model_route;
 /// PID file management for daemon mode.
 pub mod pid;
 /// TOML provider configuration types, parsing, and validation.
@@ -52,12 +49,13 @@ pub mod test_support;
 
 pub use error::CoreError;
 pub use metrics::{Metrics, Snapshot};
-pub use model_route::{ModelRouteError, ProviderTarget, resolve_model_route};
 pub use pid::PidManager;
 pub use provider_config::{
-    AppConfig, AuthStyle, ConfigValidationError, ModelRoute, ProviderAdapterConfig, ProviderConfig,
-    ProviderFile, ProviderModelConfig, ServerConfig, load_app_config, load_provider_config,
-    validate_model_routes, validate_provider_config,
+    AppConfig, AuthStyle, ConfigValidationError, ModelRoute, ProviderAdapterConfig,
+    ProviderCatalogConfig, ProviderCatalogMode, ProviderConfig, ProviderDiscoveryConfig,
+    ProviderDiscoveryKind, ProviderFile, ProviderModelConfig, ProviderRouteKind,
+    ProviderRoutesConfig, ServerConfig, StaticModelCatalogEntry, load_app_config,
+    load_provider_config, validate_provider_config,
 };
 pub use provider_registry::{ProviderAdapterTargetConfig, ProviderRegistry};
 pub use token::{Counter, MessageContent};

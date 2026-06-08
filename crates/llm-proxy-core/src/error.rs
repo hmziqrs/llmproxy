@@ -29,9 +29,9 @@ pub enum CoreError {
     },
     /// Provider registry resolution failed.
     ///
-    /// Produced when the registry cannot resolve a [`ProviderTarget`](crate::ProviderTarget)
-    /// to a concrete adapter configuration because a provider, model, adapter, or
-    /// protocol is missing from the loaded registry.
+    /// Produced when [`ProviderRegistry::resolve_provider_route`] cannot resolve
+    /// a provider + route kind to a concrete adapter configuration because a
+    /// provider, adapter, or protocol is missing from the loaded registry.
     #[error("provider resolution error: {message}")]
     ProviderResolution {
         /// Human-readable description of the resolution failure.

@@ -9,8 +9,9 @@
 //! fallback chains, legacy HTTP client, or provider-specific stream handlers.
 
 use axum::body::Body;
-use axum::extract::State;
+use axum::extract::{Path, State};
 use axum::http::{HeaderMap, Response};
+use llm_proxy_core::ProviderRouteKind;
 use llm_proxy_protocol::anthropic::MessageRequest;
 use llm_proxy_protocol::client::anthropic;
 use tracing::info;
@@ -26,10 +27,11 @@ use super::error_response::{ClientProtocol, RouteError, route_error_response};
 /// core pipeline, and returns an Anthropic-shaped response.
 pub async fn handle_messages(
     State(state): State<AppState>,
+    Path(provider): Path<String>,
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response<Body> {
-    match handle_messages_inner(state, headers, body).await {
+    match handle_messages_inner(state, provider, headers, body).await {
         Ok(response) => response,
         Err(error) => {
             info!(error = %error, "request failed");
@@ -41,6 +43,7 @@ pub async fn handle_messages(
 /// Inner handler that returns `Result` so errors can be mapped uniformly.
 async fn handle_messages_inner(
     state: AppState,
+    provider: String,
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<Response<Body>, RouteError> {
@@ -63,6 +66,7 @@ async fn handle_messages_inner(
     let is_streaming = core.stream;
     info!(
         request_id = %ctx.request_id,
+        provider = %provider,
         model = %core.model.requested,
         streaming = is_streaming,
         "decoded Anthropic request into CoreRequest"
@@ -70,9 +74,25 @@ async fn handle_messages_inner(
 
     // Dispatch to streaming or non-streaming pipeline.
     if is_streaming {
-        core_pipeline::handle_core_stream(state, ctx, core, ClientProtocol::Anthropic).await
+        core_pipeline::handle_core_stream(
+            state,
+            ctx,
+            &provider,
+            ProviderRouteKind::Messages,
+            core,
+            ClientProtocol::Anthropic,
+        )
+        .await
     } else {
-        core_pipeline::handle_core_once(state, ctx, core, ClientProtocol::Anthropic).await
+        core_pipeline::handle_core_once(
+            state,
+            ctx,
+            &provider,
+            ProviderRouteKind::Messages,
+            core,
+            ClientProtocol::Anthropic,
+        )
+        .await
     }
 }
 

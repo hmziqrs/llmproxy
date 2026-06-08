@@ -62,8 +62,20 @@ pub enum RouteError {
     #[error("invalid request: {0}")]
     InvalidRequest(String),
     /// The requested model is not in the routing table.
+    ///
+    /// Retained for forward compatibility with catalog enforcement (Phase 5).
+    #[allow(dead_code)]
     #[error("unknown model: {0}")]
     UnknownModel(String),
+    /// The requested provider name is not registered.
+    #[error("unknown provider: {0}")]
+    UnknownProvider(String),
+    /// The route kind is not supported by the named provider.
+    #[error("unsupported route: {0}")]
+    UnsupportedRoute(String),
+    /// The provider name in the URL path contains invalid characters.
+    #[error("invalid provider name: {0}")]
+    InvalidProviderName(String),
     /// Upstream provider returned an error status.
     #[error("upstream error: {status}")]
     Upstream {
@@ -281,6 +293,19 @@ fn extract_error_fields(error: RouteError) -> (StatusCode, &'static str, String)
             StatusCode::BAD_REQUEST,
             "invalid_request_error",
             format!("unknown model: {model}"),
+        ),
+        RouteError::UnknownProvider(provider) => (
+            StatusCode::NOT_FOUND,
+            "not_found_error",
+            format!("unknown provider: {provider}"),
+        ),
+        RouteError::UnsupportedRoute(msg) => {
+            (StatusCode::BAD_REQUEST, "invalid_request_error", msg)
+        }
+        RouteError::InvalidProviderName(msg) => (
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            format!("invalid provider name: {msg}"),
         ),
         RouteError::Upstream { status, body } => (
             map_upstream_status(status),

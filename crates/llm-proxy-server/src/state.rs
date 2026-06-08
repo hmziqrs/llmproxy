@@ -230,13 +230,17 @@ mod tests {
 
     #[test]
     fn app_state_debug_does_not_leak_api_key() {
-        use llm_proxy_core::{AuthStyle, ProviderConfig};
+        use llm_proxy_core::{AuthStyle, ProviderConfig, ProviderRoutesConfig};
         let provider = ProviderConfig {
             name: "test".to_owned(),
             api_key: "sk-secret-key-99999".to_owned(),
             auth_style: AuthStyle::Bearer,
             adapters: HashMap::new(),
             models: HashMap::new(),
+            routes: ProviderRoutesConfig::default(),
+            model_aliases: HashMap::new(),
+            discovery: None,
+            catalog: None,
         };
         let registry = ProviderRegistry::from_providers(vec![provider]).expect("registry");
         let state = AppState::new(
@@ -326,6 +330,7 @@ mod tests {
     fn toml_provider_protocol_validation_against_builtin() {
         use llm_proxy_core::{
             AuthStyle, ProviderAdapterConfig, ProviderConfig, ProviderModelConfig,
+            ProviderRoutesConfig,
         };
         let provider = ProviderConfig {
             name: "test".to_owned(),
@@ -338,6 +343,7 @@ mod tests {
                     ProviderAdapterConfig {
                         protocol: "openai_chat_completions".to_owned(),
                         endpoint: "https://example.com/v1".to_owned(),
+                        headers: HashMap::new(),
                     },
                 );
                 m.insert(
@@ -345,6 +351,7 @@ mod tests {
                     ProviderAdapterConfig {
                         protocol: "anthropic_messages".to_owned(),
                         endpoint: "https://example.com/v1/messages".to_owned(),
+                        headers: HashMap::new(),
                     },
                 );
                 m
@@ -359,6 +366,10 @@ mod tests {
                 );
                 m
             },
+            routes: ProviderRoutesConfig::default(),
+            model_aliases: HashMap::new(),
+            discovery: None,
+            catalog: None,
         };
         let registry = ProviderRegistry::from_providers(vec![provider]).expect("registry");
         let adapter_reg = ProviderAdapterRegistry::builtin();
@@ -371,7 +382,9 @@ mod tests {
 
     #[test]
     fn toml_unknown_protocol_fails_validation_against_builtin() {
-        use llm_proxy_core::{AuthStyle, ProviderAdapterConfig, ProviderConfig};
+        use llm_proxy_core::{
+            AuthStyle, ProviderAdapterConfig, ProviderConfig, ProviderRoutesConfig,
+        };
         let provider = ProviderConfig {
             name: "bad".to_owned(),
             api_key: "key".to_owned(),
@@ -383,11 +396,16 @@ mod tests {
                     ProviderAdapterConfig {
                         protocol: "not_a_real_protocol".to_owned(),
                         endpoint: "https://example.com".to_owned(),
+                        headers: HashMap::new(),
                     },
                 );
                 m
             },
             models: HashMap::new(),
+            routes: ProviderRoutesConfig::default(),
+            model_aliases: HashMap::new(),
+            discovery: None,
+            catalog: None,
         };
         let registry = ProviderRegistry::from_providers(vec![provider]).expect("registry");
         let adapter_reg = ProviderAdapterRegistry::builtin();
@@ -479,7 +497,9 @@ mod tests {
 
     #[test]
     fn multi_provider_toml_mixed_protocols() {
-        use llm_proxy_core::{AuthStyle, ProviderAdapterConfig, ProviderConfig};
+        use llm_proxy_core::{
+            AuthStyle, ProviderAdapterConfig, ProviderConfig, ProviderRoutesConfig,
+        };
 
         // Provider with valid protocols
         let good = ProviderConfig {
@@ -493,11 +513,16 @@ mod tests {
                     ProviderAdapterConfig {
                         protocol: "openai_chat_completions".to_owned(),
                         endpoint: "https://example.com/v1".to_owned(),
+                        headers: HashMap::new(),
                     },
                 );
                 m
             },
             models: HashMap::new(),
+            routes: ProviderRoutesConfig::default(),
+            model_aliases: HashMap::new(),
+            discovery: None,
+            catalog: None,
         };
 
         // Provider with invalid protocol
@@ -512,11 +537,16 @@ mod tests {
                     ProviderAdapterConfig {
                         protocol: "not_real".to_owned(),
                         endpoint: "https://example.com".to_owned(),
+                        headers: HashMap::new(),
                     },
                 );
                 m
             },
             models: HashMap::new(),
+            routes: ProviderRoutesConfig::default(),
+            model_aliases: HashMap::new(),
+            discovery: None,
+            catalog: None,
         };
 
         let registry = ProviderRegistry::from_providers(vec![good, bad]).expect("registry");

@@ -108,6 +108,8 @@ pub struct ProviderAdapterTarget {
     pub requested_model: String,
     /// The model to send upstream (may differ due to aliasing).
     pub upstream_model: String,
+    /// Optional static headers from the adapter config (e.g. `anthropic-version`).
+    pub headers: std::collections::HashMap<String, String>,
 }
 
 impl fmt::Debug for ProviderAdapterTarget {
@@ -121,6 +123,7 @@ impl fmt::Debug for ProviderAdapterTarget {
             .field("api_key", &"[REDACTED]")
             .field("requested_model", &self.requested_model)
             .field("upstream_model", &self.upstream_model)
+            .field("headers", &self.headers)
             .finish()
     }
 }
@@ -599,6 +602,7 @@ mod tests {
             api_key: "sk-test-super-secret-key-1234567890".into(),
             requested_model: "gpt-4o".into(),
             upstream_model: "gpt-4o".into(),
+            headers: std::collections::HashMap::new(),
         };
         let debug = format!("{:?}", target);
         assert!(
@@ -676,6 +680,7 @@ mod tests {
             api_key: "key".into(),
             requested_model: "gpt-4o".into(),
             upstream_model: "gpt-4o".into(),
+            headers: std::collections::HashMap::new(),
         };
         let mr = response_model_ref(&target);
         assert_eq!(mr.requested, "gpt-4o");
@@ -693,6 +698,7 @@ mod tests {
             api_key: "key".into(),
             requested_model: "my-alias".into(),
             upstream_model: "gpt-4o-2024-08-06".into(),
+            headers: std::collections::HashMap::new(),
         };
         let mr = response_model_ref(&target);
         assert_eq!(mr.requested, "my-alias");
@@ -782,6 +788,7 @@ mod tests {
             api_key: "test-key".into(),
             requested_model: "gpt-4o".into(),
             upstream_model: "gemini-2.5-pro".into(),
+            headers: std::collections::HashMap::new(),
         }
     }
 }

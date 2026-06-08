@@ -123,6 +123,22 @@ fn state_with_provider(
     adapter_name: &str,
     model_name: &str,
 ) -> AppState {
+    // Build routes based on protocol so the provider-based routing can resolve.
+    let routes = match protocol {
+        "anthropic_messages" => llm_proxy_core::ProviderRoutesConfig {
+            messages: Some(adapter_name.to_owned()),
+            chat_completions: None,
+        },
+        "openai_chat_completions" => llm_proxy_core::ProviderRoutesConfig {
+            chat_completions: Some(adapter_name.to_owned()),
+            messages: Some(adapter_name.to_owned()),
+        },
+        _ => llm_proxy_core::ProviderRoutesConfig {
+            messages: Some(adapter_name.to_owned()),
+            chat_completions: None,
+        },
+    };
+
     let provider = ProviderConfig {
         name: "mock-provider".to_owned(),
         api_key: "test-key".to_owned(),
@@ -134,6 +150,7 @@ fn state_with_provider(
                 ProviderAdapterConfig {
                     protocol: protocol.to_owned(),
                     endpoint: mock_endpoint.to_owned(),
+                    headers: HashMap::new(),
                 },
             );
             m
@@ -148,18 +165,13 @@ fn state_with_provider(
             );
             m
         },
+        routes,
+        model_aliases: HashMap::new(),
+        discovery: None,
+        catalog: None,
     };
 
     let registry = ProviderRegistry::from_providers(vec![provider]).expect("registry");
-
-    let mut model_routes = HashMap::new();
-    model_routes.insert(
-        model_name.to_owned(),
-        llm_proxy_core::ModelRoute {
-            provider: "mock-provider".to_owned(),
-            upstream_model: None,
-        },
-    );
 
     let app_config = AppConfig {
         server: ServerConfig {
@@ -169,7 +181,7 @@ fn state_with_provider(
             hot_reload: false,
             server_name: "test-proxy".to_owned(),
         },
-        models: model_routes,
+        models: HashMap::new(),
     };
 
     AppState::new(
@@ -240,7 +252,7 @@ async fn spawn_mock_server(response_body: Vec<u8>, content_type: &str) -> String
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     tokio::time::sleep(Duration::from_millis(50)).await;
-    format!("http://{}/v1/messages", addr)
+    format!("http://{}/v1/mock-provider/messages", addr)
 }
 
 /// Spawn a local mock axum server returning canned Anthropic non-streaming
@@ -303,7 +315,7 @@ async fn spawn_mock_anthropic_stream() -> String {
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     tokio::time::sleep(Duration::from_millis(50)).await;
-    format!("http://{}/v1/messages", addr)
+    format!("http://{}/v1/mock-provider/messages", addr)
 }
 
 /// Spawn a mock server returning OpenAI Chat streaming SSE events.
@@ -334,7 +346,7 @@ async fn spawn_mock_openai_chat_stream() -> String {
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     tokio::time::sleep(Duration::from_millis(50)).await;
-    format!("http://{}/v1/messages", addr)
+    format!("http://{}/v1/mock-provider/messages", addr)
 }
 
 /// Spawn a mock server returning OpenAI Responses streaming SSE events.
@@ -369,7 +381,7 @@ async fn spawn_mock_openai_responses_stream() -> String {
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     tokio::time::sleep(Duration::from_millis(50)).await;
-    format!("http://{}/v1/messages", addr)
+    format!("http://{}/v1/mock-provider/messages", addr)
 }
 
 /// Spawn a mock server returning Gemini streaming SSE events.
@@ -394,7 +406,7 @@ async fn spawn_mock_gemini_stream() -> String {
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     tokio::time::sleep(Duration::from_millis(50)).await;
-    format!("http://{}/v1/messages", addr)
+    format!("http://{}/v1/mock-provider/messages", addr)
 }
 
 /// Spawn a mock server that returns HTTP 500.
@@ -415,7 +427,7 @@ async fn spawn_mock_500() -> String {
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     tokio::time::sleep(Duration::from_millis(50)).await;
-    format!("http://{}/v1/messages", addr)
+    format!("http://{}/v1/mock-provider/messages", addr)
 }
 
 /// Spawn a mock server that returns a malformed SSE stream (invalid JSON in
@@ -446,7 +458,7 @@ async fn spawn_mock_malformed_stream() -> String {
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     tokio::time::sleep(Duration::from_millis(50)).await;
-    format!("http://{}/v1/messages", addr)
+    format!("http://{}/v1/mock-provider/messages", addr)
 }
 
 /// Spawn a mock server that accepts a request, sends a few events, then
@@ -478,7 +490,7 @@ async fn spawn_mock_disconnect_stream() -> String {
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     tokio::time::sleep(Duration::from_millis(50)).await;
-    format!("http://{}/v1/messages", addr)
+    format!("http://{}/v1/mock-provider/messages", addr)
 }
 
 /// Spawn a mock server that captures whether it received a request.
@@ -504,7 +516,10 @@ async fn spawn_mock_with_request_tracker(response_body: Vec<u8>) -> (String, Arc
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     tokio::time::sleep(Duration::from_millis(50)).await;
-    (format!("http://{}/v1/messages", addr), received)
+    (
+        format!("http://{}/v1/mock-provider/messages", addr),
+        received,
+    )
 }
 
 /// Spawn a mock server that records the received request body.
@@ -535,7 +550,10 @@ async fn spawn_mock_with_body_capture(
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     tokio::time::sleep(Duration::from_millis(50)).await;
-    (format!("http://{}/v1/messages", addr), captured)
+    (
+        format!("http://{}/v1/mock-provider/messages", addr),
+        captured,
+    )
 }
 
 fn make_messages_body(model: &str, stream: bool) -> String {
@@ -548,11 +566,11 @@ fn make_messages_body(model: &str, stream: bool) -> String {
     .to_string()
 }
 
-/// Build a request to /v1/messages.
+/// Build a request to /v1/mock-provider/messages.
 fn messages_request(body: &str) -> Request<Body> {
     Request::builder()
         .method("POST")
-        .uri("/v1/messages")
+        .uri("/v1/mock-provider/messages")
         .header("content-type", "application/json")
         .body(Body::from(body.to_owned()))
         .unwrap()
@@ -632,29 +650,22 @@ async fn upstream_500_returns_502() {
 
 /// unknown model returns 400 and does not call upstream
 #[tokio::test]
-async fn unknown_model_returns_400() {
+async fn unknown_model_passes_through_to_upstream() {
     let (mock_url, received) = spawn_mock_with_request_tracker(anthropic_success_response()).await;
     let state = state_with_anthropic_provider(&mock_url);
     let app = build_router(state);
 
     let body = make_messages_body("nonexistent-model", false);
     let resp = app.oneshot(messages_request(&body)).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    // With provider-based routing, the model name is passed through to the
+    // upstream provider. The mock returns 200, so we get a successful response.
+    assert_eq!(resp.status(), StatusCode::OK);
 
-    let resp_body: Value = serde_json::from_slice(
-        &axum::body::to_bytes(resp.into_body(), 64 * 1024)
-            .await
-            .unwrap(),
-    )
-    .unwrap();
-    assert_eq!(resp_body["type"], "error");
-    assert_eq!(resp_body["error"]["type"], "invalid_request_error");
-
-    // Verify upstream was NOT called.
+    // Verify upstream WAS called (model name is passed through).
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert!(
-        !received.load(Ordering::SeqCst),
-        "upstream should not be called for unknown model"
+        received.load(Ordering::SeqCst),
+        "upstream should be called -- model name is passed through"
     );
 }
 
@@ -1240,7 +1251,7 @@ async fn token_count_with_tools_returns_positive_count() {
     });
     let req = Request::builder()
         .method("POST")
-        .uri("/v1/messages/count_tokens")
+        .uri("/v1/mock-provider/messages/count_tokens")
         .header("content-type", "application/json")
         .body(Body::from(body.to_string()))
         .unwrap();
@@ -1280,7 +1291,7 @@ async fn token_count_with_non_text_content_returns_positive_count() {
     });
     let req = Request::builder()
         .method("POST")
-        .uri("/v1/messages/count_tokens")
+        .uri("/v1/mock-provider/messages/count_tokens")
         .header("content-type", "application/json")
         .body(Body::from(body.to_string()))
         .unwrap();
@@ -1316,7 +1327,7 @@ async fn token_count_with_tool_result_returns_positive_count() {
     });
     let req = Request::builder()
         .method("POST")
-        .uri("/v1/messages/count_tokens")
+        .uri("/v1/mock-provider/messages/count_tokens")
         .header("content-type", "application/json")
         .body(Body::from(body.to_string()))
         .unwrap();
@@ -1351,7 +1362,7 @@ async fn token_count_endpoint_works_without_legacy_state() {
     });
     let req = Request::builder()
         .method("POST")
-        .uri("/v1/messages/count_tokens")
+        .uri("/v1/mock-provider/messages/count_tokens")
         .header("content-type", "application/json")
         .body(Body::from(body.to_string()))
         .unwrap();
@@ -1372,7 +1383,7 @@ async fn invalid_json_returns_400_anthropic_shape() {
 
     let req = Request::builder()
         .method("POST")
-        .uri("/v1/messages")
+        .uri("/v1/mock-provider/messages")
         .header("content-type", "application/json")
         .body(Body::from("not json"))
         .unwrap();

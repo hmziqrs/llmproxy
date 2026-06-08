@@ -737,6 +737,7 @@ mod tests {
             api_key: "test-key".into(),
             requested_model: "gpt-4o".into(),
             upstream_model: "gpt-4o-2024-08-06".into(),
+            headers: std::collections::HashMap::new(),
         }
     }
 

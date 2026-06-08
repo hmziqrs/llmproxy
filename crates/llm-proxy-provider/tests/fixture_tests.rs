@@ -91,6 +91,7 @@ fn make_target(protocol: ProviderProtocol) -> ProviderAdapterTarget {
         api_key: "test-key".into(),
         requested_model: model.clone(),
         upstream_model: model,
+        headers: std::collections::HashMap::new(),
     }
 }
 

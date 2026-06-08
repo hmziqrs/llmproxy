@@ -5,7 +5,7 @@
 //! representation. No legacy state is required.
 
 use axum::body::Body;
-use axum::extract::State;
+use axum::extract::{Path, State};
 use axum::http::{HeaderMap, Response};
 use axum::response::IntoResponse;
 use llm_proxy_core::MessageContent;
@@ -43,6 +43,7 @@ pub(crate) struct TokenCountResponse {
 /// without legacy state.
 pub async fn count_tokens(
     State(state): State<AppState>,
+    Path(_provider): Path<String>,
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response<Body> {

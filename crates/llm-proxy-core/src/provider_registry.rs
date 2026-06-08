@@ -1,16 +1,12 @@
 //! Provider registry: load provider TOML files and resolve route targets to
 //! adapter configurations.
 //!
-//! The registry sits between the model router ([`resolve_model_route`](crate::resolve_model_route))
-//! and the provider adapter layer. The router selects *which* provider and model
-//! to use; the registry resolves that selection into concrete adapter config
-//! (protocol, endpoint, auth style, API key).
-//!
-//! # Separation of concerns
+//! # Provider-based routing
 //!
 //! ```text
-//! resolve_model_route(...)  ->  ProviderTarget
-//! ProviderRegistry::resolve_adapter_target(ProviderTarget)  ->  ProviderAdapterTargetConfig
+//! provider_name + route_kind  -> provider config + route -> adapter name
+//! adapter_name                -> protocol + endpoint + headers
+//! requested_model             -> model_aliases -> upstream_model
 //! ```
 //!
 //! The registry does **not**:
@@ -26,8 +22,9 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use crate::error::CoreError;
-use crate::model_route::ProviderTarget;
-use crate::provider_config::{AuthStyle, ProviderConfig, load_provider_config};
+use crate::provider_config::{
+    AuthStyle, ProviderConfig, ProviderRouteKind, StaticModelCatalogEntry, load_provider_config,
+};
 
 // ---------------------------------------------------------------------------
 // ProviderAdapterTargetConfig
@@ -37,8 +34,8 @@ use crate::provider_config::{AuthStyle, ProviderConfig, load_provider_config};
 ///
 /// Contains everything the provider adapter layer needs to build an upstream
 /// request: which provider, which adapter, which protocol, the raw endpoint
-/// URL, authentication style, API key, and both the client-requested and
-/// upstream model names.
+/// URL, authentication style, API key, optional static headers, and both the
+/// client-requested and upstream model names.
 ///
 /// `endpoint` is the raw endpoint or URL template from provider TOML. It is
 /// **not** a route-built final URL. Provider adapters own endpoint URL shape,
@@ -62,6 +59,8 @@ pub struct ProviderAdapterTargetConfig {
     pub requested_model: String,
     /// The model name to send to the upstream provider.
     pub upstream_model: String,
+    /// Optional static headers from the adapter config (e.g. `anthropic-version`).
+    pub headers: HashMap<String, String>,
 }
 
 impl std::fmt::Debug for ProviderAdapterTargetConfig {
@@ -75,6 +74,7 @@ impl std::fmt::Debug for ProviderAdapterTargetConfig {
             .field("api_key", &"[REDACTED]")
             .field("requested_model", &self.requested_model)
             .field("upstream_model", &self.upstream_model)
+            .field("headers", &self.headers)
             .finish()
     }
 }
@@ -83,16 +83,17 @@ impl std::fmt::Debug for ProviderAdapterTargetConfig {
 // ProviderRegistry
 // ---------------------------------------------------------------------------
 
-/// Loads provider TOML files and resolves [`ProviderTarget`]s to
+/// Loads provider TOML files and resolves provider routes to
 /// [`ProviderAdapterTargetConfig`]s.
 ///
 /// The registry owns a map of provider configs keyed by provider name.
 /// Resolution follows a strict lookup chain:
 ///
 /// ```text
-/// ProviderTarget.provider          -> provider config
-/// provider.models[upstream_model]  -> adapter name
-/// provider.adapters[adapter_name]  -> protocol + endpoint
+/// provider_name                    -> provider config
+/// provider.routes[route_kind]     -> adapter name
+/// provider.adapters[adapter_name] -> protocol + endpoint + headers
+/// provider.model_aliases[model]   -> upstream_model (if present)
 /// ```
 #[derive(Debug, Clone)]
 #[non_exhaustive]
@@ -276,14 +277,15 @@ impl ProviderRegistry {
         Ok(())
     }
 
-    /// Resolve a [`ProviderTarget`] to a [`ProviderAdapterTargetConfig`].
+    /// Resolve a provider route by provider name, route kind, and requested model.
     ///
     /// Lookup chain:
     ///
     /// ```text
-    /// target.provider              -> provider config
-    /// provider.models[target.upstream_model] -> adapter name
-    /// provider.adapters[adapter_name]        -> protocol + endpoint
+    /// provider_name                         -> provider config
+    /// provider.routes[route_kind]           -> adapter name
+    /// provider.adapters[adapter_name]       -> protocol + endpoint + headers
+    /// provider.model_aliases[requested_model] -> upstream_model (if present)
     /// ```
     ///
     /// # Errors
@@ -291,38 +293,40 @@ impl ProviderRegistry {
     /// Returns [`CoreError::ProviderResolution`] with an actionable message if:
     ///
     /// - the provider is not in the registry,
-    /// - the upstream model is not in the provider's model table,
-    /// - the adapter referenced by the model is not in the provider's adapter table.
-    pub fn resolve_adapter_target(
+    /// - the route kind is not configured for this provider,
+    /// - the adapter referenced by the route is not in the provider's adapter table.
+    pub fn resolve_provider_route(
         &self,
-        target: &ProviderTarget,
+        provider_name: &str,
+        route_kind: ProviderRouteKind,
+        requested_model: &str,
     ) -> Result<ProviderAdapterTargetConfig, CoreError> {
         // 1. Look up the provider.
-        let provider =
-            self.providers
-                .get(&target.provider)
-                .ok_or_else(|| CoreError::ProviderResolution {
-                    message: format!(
-                        "unknown provider \"{}\": no provider config loaded with this name. \
-                     Check that the provider TOML file exists and the name matches the route table",
-                        target.provider
-                    ),
-                })?;
-
-        // 2. Look up the provider-local model to find the adapter name.
-        let model_cfg = provider.models.get(&target.upstream_model).ok_or_else(|| {
+        let provider = self.providers.get(provider_name).ok_or_else(|| {
             CoreError::ProviderResolution {
                 message: format!(
-                    "provider \"{}\" has no model mapping for \"{}\". \
-                     Add an entry in [provider.models] for this upstream model name",
-                    provider.name, target.upstream_model
+                    "unknown provider \"{provider_name}\": no provider config loaded with this name"
                 ),
             }
         })?;
 
-        // 3. Look up the adapter to get protocol and endpoint.
-        let adapter_cfg = provider.adapters.get(&model_cfg.adapter).ok_or_else(|| {
-            let model_key = &target.upstream_model;
+        // 2. Look up the route to find the adapter name.
+        let adapter_name = provider.routes.get(route_kind).ok_or_else(|| {
+            let route_name = match route_kind {
+                ProviderRouteKind::ChatCompletions => "chat_completions",
+                ProviderRouteKind::Messages => "messages",
+            };
+            CoreError::ProviderResolution {
+                message: format!(
+                    "provider \"{}\" does not support route \"{}\". \
+                     Add a [provider.routes.{}] entry mapping to an adapter name",
+                    provider.name, route_name, route_name
+                ),
+            }
+        })?;
+
+        // 3. Look up the adapter to get protocol, endpoint, and headers.
+        let adapter_cfg = provider.adapters.get(adapter_name).ok_or_else(|| {
             let available = if provider.adapters.is_empty() {
                 "(none)".to_owned()
             } else {
@@ -335,22 +339,30 @@ impl ProviderRegistry {
             };
             CoreError::ProviderResolution {
                 message: format!(
-                    "provider \"{}\": model \"{}\" references adapter \"{}\" which does not exist \
+                    "provider \"{}\": route references adapter \"{}\" which does not exist \
                      in [provider.adapters]. Available adapters: {}",
-                    provider.name, model_key, model_cfg.adapter, available
+                    provider.name, adapter_name, available
                 ),
             }
         })?;
 
+        // 4. Apply provider-local model alias if present.
+        let upstream_model = provider
+            .model_aliases
+            .get(requested_model)
+            .map(|s| s.as_str())
+            .unwrap_or(requested_model);
+
         Ok(ProviderAdapterTargetConfig {
             provider_name: provider.name.clone(),
-            adapter_name: model_cfg.adapter.clone(),
+            adapter_name: adapter_name.to_owned(),
             protocol: adapter_cfg.protocol.clone(),
             endpoint: adapter_cfg.endpoint.clone(),
             auth_style: provider.auth_style,
             api_key: provider.api_key.clone(),
-            requested_model: target.requested_model.clone(),
-            upstream_model: target.upstream_model.clone(),
+            requested_model: requested_model.to_owned(),
+            upstream_model: upstream_model.to_owned(),
+            headers: adapter_cfg.headers.clone(),
         })
     }
 
@@ -376,6 +388,18 @@ impl ProviderRegistry {
     pub fn iter(&self) -> impl Iterator<Item = &ProviderConfig> {
         self.providers.values()
     }
+
+    /// Returns the static catalog entries for a provider, if a catalog is configured.
+    ///
+    /// Returns `None` if the provider is not found. Returns `Some(&[])` if the
+    /// provider exists but has no catalog configured (or an empty static list).
+    #[must_use]
+    pub fn catalog_models(&self, provider_name: &str) -> Option<&[StaticModelCatalogEntry]> {
+        self.providers.get(provider_name).map(|p| match &p.catalog {
+            Some(catalog) => catalog.models.as_slice(),
+            None => &[],
+        })
+    }
 }
 
 // ===========================================================================
@@ -385,7 +409,9 @@ impl ProviderRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider_config::{ProviderAdapterConfig, ProviderModelConfig};
+    use crate::provider_config::{
+        ProviderAdapterConfig, ProviderModelConfig, ProviderRoutesConfig,
+    };
     use crate::test_support::{EnvVarGuard, TestEnvLock};
     use std::io::Write as IoWrite;
 
@@ -422,6 +448,30 @@ mod tests {
             auth_style: AuthStyle::Bearer,
             adapters,
             models,
+            routes: ProviderRoutesConfig::default(),
+            model_aliases: HashMap::new(),
+            discovery: None,
+            catalog: None,
+        }
+    }
+
+    /// Helper: build a provider config with routes configured for provider-based routing.
+    fn make_routed_provider(
+        name: &str,
+        adapters: HashMap<String, ProviderAdapterConfig>,
+        routes: ProviderRoutesConfig,
+        model_aliases: HashMap<String, String>,
+    ) -> ProviderConfig {
+        ProviderConfig {
+            name: name.to_owned(),
+            api_key: "test-key".to_owned(),
+            auth_style: AuthStyle::Bearer,
+            adapters,
+            models: HashMap::new(),
+            routes,
+            model_aliases,
+            discovery: None,
+            catalog: None,
         }
     }
 
@@ -430,22 +480,7 @@ mod tests {
         ProviderAdapterConfig {
             protocol: protocol.to_owned(),
             endpoint: endpoint.to_owned(),
-        }
-    }
-
-    /// Helper: build a provider model config.
-    fn make_model(adapter: &str) -> ProviderModelConfig {
-        ProviderModelConfig {
-            adapter: adapter.to_owned(),
-        }
-    }
-
-    /// Helper: build a `ProviderTarget`.
-    fn make_target(provider: &str, requested: &str, upstream: &str) -> ProviderTarget {
-        ProviderTarget {
-            provider: provider.to_owned(),
-            requested_model: requested.to_owned(),
-            upstream_model: upstream.to_owned(),
+            headers: HashMap::new(),
         }
     }
 
@@ -557,13 +592,18 @@ endpoint = "https://example.com/v1/chat/completions"
         );
     }
 
-    // -- missing provider fails ------------------------------------------------
+    // -- resolve_provider_route: missing provider fails -------------------------
 
     #[test]
-    fn missing_provider_fails() {
+    fn resolve_provider_route_missing_provider_fails() {
         let _env = clean_env();
 
-        let registry = ProviderRegistry::from_providers(vec![make_provider(
+        let routes = ProviderRoutesConfig {
+            chat_completions: Some("chat".to_owned()),
+            messages: None,
+        };
+
+        let registry = ProviderRegistry::from_providers(vec![make_routed_provider(
             "opencode-go",
             {
                 let mut m = HashMap::new();
@@ -573,16 +613,16 @@ endpoint = "https://example.com/v1/chat/completions"
                 );
                 m
             },
-            {
-                let mut m = HashMap::new();
-                m.insert("kimi-k2.6".to_owned(), make_model("chat"));
-                m
-            },
+            routes,
+            HashMap::new(),
         )])
         .expect("registry");
 
-        let target = make_target("nonexistent-provider", "kimi-k2.6", "kimi-k2.6");
-        let result = registry.resolve_adapter_target(&target);
+        let result = registry.resolve_provider_route(
+            "nonexistent-provider",
+            ProviderRouteKind::ChatCompletions,
+            "kimi-k2.6",
+        );
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
@@ -591,15 +631,21 @@ endpoint = "https://example.com/v1/chat/completions"
         );
     }
 
-    // -- requested model alias resolves through upstream model -----------------
+    // -- resolve_provider_route: model alias rewrites upstream model -----------
 
     #[test]
-    fn requested_model_alias_resolves_through_upstream_model() {
+    fn resolve_provider_route_model_alias_rewrites_upstream() {
         let _env = clean_env();
 
-        // Route: "claude-4" -> provider "opencode-zen", upstream "claude-sonnet-4-20250514"
-        // Provider "opencode-zen": model "claude-sonnet-4-20250514" -> adapter "anthropic"
-        let registry = ProviderRegistry::from_providers(vec![make_provider(
+        let routes = ProviderRoutesConfig {
+            chat_completions: None,
+            messages: Some("anthropic".to_owned()),
+        };
+
+        let mut aliases = HashMap::new();
+        aliases.insert("claude-4".to_owned(), "claude-sonnet-4-20250514".to_owned());
+
+        let registry = ProviderRegistry::from_providers(vec![make_routed_provider(
             "opencode-zen",
             {
                 let mut m = HashMap::new();
@@ -609,36 +655,33 @@ endpoint = "https://example.com/v1/chat/completions"
                 );
                 m
             },
-            {
-                let mut m = HashMap::new();
-                m.insert(
-                    "claude-sonnet-4-20250514".to_owned(),
-                    make_model("anthropic"),
-                );
-                m
-            },
+            routes,
+            aliases,
         )])
         .expect("registry");
 
-        let target = make_target("opencode-zen", "claude-4", "claude-sonnet-4-20250514");
-        let resolved = registry.resolve_adapter_target(&target).expect("resolve");
+        let resolved = registry
+            .resolve_provider_route("opencode-zen", ProviderRouteKind::Messages, "claude-4")
+            .expect("resolve");
         assert_eq!(resolved.provider_name, "opencode-zen");
         assert_eq!(resolved.adapter_name, "anthropic");
         assert_eq!(resolved.protocol, "anthropic_messages");
-        assert_eq!(resolved.endpoint, "https://zen.example.com/v1/messages");
         assert_eq!(resolved.requested_model, "claude-4");
         assert_eq!(resolved.upstream_model, "claude-sonnet-4-20250514");
     }
 
-    // -- upstream_model defaults to requested_model ----------------------------
+    // -- resolve_provider_route: no alias means requested == upstream ----------
 
     #[test]
-    fn upstream_model_defaults_to_requested_model() {
+    fn resolve_provider_route_no_alias_passes_model_through() {
         let _env = clean_env();
 
-        // When the route has no upstream_model, the router sets upstream_model = requested_model.
-        // The registry should then look up the model using the requested name.
-        let registry = ProviderRegistry::from_providers(vec![make_provider(
+        let routes = ProviderRoutesConfig {
+            chat_completions: Some("chat".to_owned()),
+            messages: None,
+        };
+
+        let registry = ProviderRegistry::from_providers(vec![make_routed_provider(
             "opencode-go",
             {
                 let mut m = HashMap::new();
@@ -651,59 +694,31 @@ endpoint = "https://example.com/v1/chat/completions"
                 );
                 m
             },
-            {
-                let mut m = HashMap::new();
-                m.insert("kimi-k2.6".to_owned(), make_model("chat"));
-                m
-            },
+            routes,
+            HashMap::new(),
         )])
         .expect("registry");
 
-        // Simulates: resolve_model_route returns upstream_model == requested_model
-        let target = make_target("opencode-go", "kimi-k2.6", "kimi-k2.6");
-        let resolved = registry.resolve_adapter_target(&target).expect("resolve");
-        assert_eq!(resolved.upstream_model, "kimi-k2.6");
+        let resolved = registry
+            .resolve_provider_route(
+                "opencode-go",
+                ProviderRouteKind::ChatCompletions,
+                "kimi-k2.6",
+            )
+            .expect("resolve");
         assert_eq!(resolved.requested_model, "kimi-k2.6");
+        assert_eq!(resolved.upstream_model, "kimi-k2.6");
     }
 
-    // -- resolved target preserves both requested and upstream model names -----
+    // -- resolve_provider_route: unsupported route kind fails -------------------
 
     #[test]
-    fn resolved_target_preserves_both_requested_and_upstream_model_names() {
+    fn resolve_provider_route_unsupported_route_kind_fails() {
         let _env = clean_env();
 
-        let registry = ProviderRegistry::from_providers(vec![make_provider(
-            "multi",
-            {
-                let mut m = HashMap::new();
-                m.insert(
-                    "chat".to_owned(),
-                    make_adapter("openai_chat_completions", "https://multi.example.com/v1"),
-                );
-                m
-            },
-            {
-                let mut m = HashMap::new();
-                m.insert("upstream-model-x".to_owned(), make_model("chat"));
-                m
-            },
-        )])
-        .expect("registry");
+        let routes = ProviderRoutesConfig::default(); // no routes configured
 
-        let target = make_target("multi", "my-alias", "upstream-model-x");
-        let resolved = registry.resolve_adapter_target(&target).expect("resolve");
-        assert_eq!(resolved.requested_model, "my-alias");
-        assert_eq!(resolved.upstream_model, "upstream-model-x");
-        assert_ne!(resolved.requested_model, resolved.upstream_model);
-    }
-
-    // -- provider-local missing model fails ------------------------------------
-
-    #[test]
-    fn provider_local_missing_model_fails() {
-        let _env = clean_env();
-
-        let registry = ProviderRegistry::from_providers(vec![make_provider(
+        let registry = ProviderRegistry::from_providers(vec![make_routed_provider(
             "opencode-zen",
             {
                 let mut m = HashMap::new();
@@ -713,67 +728,349 @@ endpoint = "https://example.com/v1/chat/completions"
                 );
                 m
             },
-            {
-                let mut m = HashMap::new();
-                m.insert("claude-sonnet-4".to_owned(), make_model("chat"));
-                m
-            },
+            routes,
+            HashMap::new(),
         )])
         .expect("registry");
 
-        // Request a model that is NOT in the provider's model table
-        let target = make_target("opencode-zen", "unknown-model", "unknown-model");
-        let result = registry.resolve_adapter_target(&target);
+        let result = registry.resolve_provider_route(
+            "opencode-zen",
+            ProviderRouteKind::ChatCompletions,
+            "some-model",
+        );
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
-            err.contains("no model mapping") && err.contains("unknown-model"),
-            "expected missing model error, got: {err}"
-        );
-        assert!(
-            err.contains("opencode-zen"),
-            "error should name the provider, got: {err}"
+            err.contains("does not support route") && err.contains("opencode-zen"),
+            "expected unsupported route error, got: {err}"
         );
     }
 
-    // -- provider-local missing adapter fails ----------------------------------
+    // -- resolve_provider_route: missing adapter in route fails ----------------
 
     #[test]
-    fn provider_local_missing_adapter_fails() {
+    fn resolve_provider_route_missing_adapter_fails() {
         let _env = clean_env();
 
-        // Create a provider whose model references a non-existent adapter.
-        // We bypass `validate_provider_config` by building the struct directly.
+        // Bypass validation by building a ProviderConfig whose route references
+        // a non-existent adapter.
+        let routes = ProviderRoutesConfig {
+            chat_completions: Some("nonexistent-adapter".to_owned()),
+            messages: None,
+        };
+
         let registry = ProviderRegistry::from_providers(vec![ProviderConfig {
             name: "broken".to_owned(),
             api_key: "key".to_owned(),
             auth_style: AuthStyle::Bearer,
-            adapters: HashMap::new(), // no adapters
-            models: {
-                let mut m = HashMap::new();
-                m.insert(
-                    "some-model".to_owned(),
-                    ProviderModelConfig {
-                        adapter: "nonexistent-adapter".to_owned(),
-                    },
-                );
-                m
-            },
+            adapters: HashMap::new(),
+            models: HashMap::new(),
+            routes,
+            model_aliases: HashMap::new(),
+            discovery: None,
+            catalog: None,
         }])
         .expect("registry");
 
-        let target = make_target("broken", "some-model", "some-model");
-        let result = registry.resolve_adapter_target(&target);
+        let result = registry.resolve_provider_route(
+            "broken",
+            ProviderRouteKind::ChatCompletions,
+            "some-model",
+        );
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
             err.contains("nonexistent-adapter") && err.contains("does not exist"),
             "expected missing adapter error, got: {err}"
         );
+    }
+
+    // -- resolve_provider_route: multi-adapter provider resolves per route -----
+
+    #[test]
+    fn resolve_provider_route_multi_adapter_resolves_per_route() {
+        let _env = clean_env();
+
+        let routes = ProviderRoutesConfig {
+            chat_completions: Some("chat".to_owned()),
+            messages: Some("messages".to_owned()),
+        };
+
+        let registry = ProviderRegistry::from_providers(vec![make_routed_provider(
+            "multi-adapter",
+            {
+                let mut m = HashMap::new();
+                m.insert(
+                    "chat".to_owned(),
+                    make_adapter(
+                        "openai_chat_completions",
+                        "https://multi.example.com/v1/chat/completions",
+                    ),
+                );
+                m.insert(
+                    "messages".to_owned(),
+                    make_adapter(
+                        "anthropic_messages",
+                        "https://multi.example.com/v1/messages",
+                    ),
+                );
+                m
+            },
+            routes,
+            HashMap::new(),
+        )])
+        .expect("registry");
+
+        let r1 = registry
+            .resolve_provider_route(
+                "multi-adapter",
+                ProviderRouteKind::ChatCompletions,
+                "gpt-5.4",
+            )
+            .expect("resolve chat");
+        assert_eq!(r1.adapter_name, "chat");
+        assert_eq!(r1.protocol, "openai_chat_completions");
+        assert_eq!(r1.upstream_model, "gpt-5.4");
+
+        let r2 = registry
+            .resolve_provider_route(
+                "multi-adapter",
+                ProviderRouteKind::Messages,
+                "claude-sonnet-4",
+            )
+            .expect("resolve messages");
+        assert_eq!(r2.adapter_name, "messages");
+        assert_eq!(r2.protocol, "anthropic_messages");
+        assert_eq!(r2.upstream_model, "claude-sonnet-4");
+    }
+
+    // -- resolve_provider_route: preserves auth_style and api_key --------------
+
+    #[test]
+    fn resolve_provider_route_preserves_auth_style_and_api_key() {
+        let _env = clean_env();
+
+        let routes = ProviderRoutesConfig {
+            chat_completions: None,
+            messages: Some("messages".to_owned()),
+        };
+
+        let registry = ProviderRegistry::from_providers(vec![ProviderConfig {
+            name: "test".to_owned(),
+            api_key: "sk-secret-key".to_owned(),
+            auth_style: AuthStyle::XApiKey,
+            adapters: {
+                let mut m = HashMap::new();
+                m.insert(
+                    "messages".to_owned(),
+                    make_adapter("anthropic_messages", "https://api.example.com/v1/messages"),
+                );
+                m
+            },
+            models: HashMap::new(),
+            routes,
+            model_aliases: HashMap::new(),
+            discovery: None,
+            catalog: None,
+        }])
+        .expect("registry");
+
+        let resolved = registry
+            .resolve_provider_route("test", ProviderRouteKind::Messages, "claude-4")
+            .expect("resolve");
+        assert_eq!(resolved.auth_style, AuthStyle::XApiKey);
+        assert_eq!(resolved.api_key, "sk-secret-key");
+    }
+
+    // -- resolve_provider_route: resolution errors carry actionable messages ---
+
+    #[test]
+    fn resolve_provider_route_errors_are_actionable() {
+        let _env = clean_env();
+
+        let routes = ProviderRoutesConfig {
+            chat_completions: Some("chat".to_owned()),
+            messages: None,
+        };
+
+        let registry = ProviderRegistry::from_providers(vec![make_routed_provider(
+            "provider-x",
+            {
+                let mut m = HashMap::new();
+                m.insert(
+                    "chat".to_owned(),
+                    make_adapter("openai_chat_completions", "https://x.example.com/v1"),
+                );
+                m
+            },
+            routes,
+            HashMap::new(),
+        )])
+        .expect("registry");
+
+        // Missing provider: names the missing provider
+        let err1 = registry
+            .resolve_provider_route("no-such-provider", ProviderRouteKind::ChatCompletions, "m")
+            .unwrap_err()
+            .to_string();
         assert!(
-            err.contains("broken"),
-            "error should name the provider, got: {err}"
+            err1.contains("no-such-provider"),
+            "missing provider error should name it, got: {err1}"
         );
+
+        // Unsupported route: names the provider and suggests adding route config
+        let err2 = registry
+            .resolve_provider_route("provider-x", ProviderRouteKind::Messages, "m")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err2.contains("provider-x") && err2.contains("does not support route"),
+            "unsupported route error should be actionable, got: {err2}"
+        );
+    }
+
+    // -- resolve_provider_route: empty provider name yields unknown provider ---
+
+    #[test]
+    fn resolve_provider_route_empty_provider_name_yields_unknown_provider_error() {
+        let _env = clean_env();
+
+        let routes = ProviderRoutesConfig {
+            chat_completions: Some("chat".to_owned()),
+            messages: None,
+        };
+
+        let registry = ProviderRegistry::from_providers(vec![make_routed_provider(
+            "real-provider",
+            {
+                let mut m = HashMap::new();
+                m.insert(
+                    "chat".to_owned(),
+                    make_adapter("openai_chat_completions", "https://example.com"),
+                );
+                m
+            },
+            routes,
+            HashMap::new(),
+        )])
+        .expect("registry");
+
+        let result =
+            registry.resolve_provider_route("", ProviderRouteKind::ChatCompletions, "model-a");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("unknown provider"),
+            "expected unknown provider error for empty string, got: {err}"
+        );
+    }
+
+    // -- resolve_provider_route: unicode names resolve correctly ----------------
+
+    #[test]
+    fn resolve_provider_route_unicode_names_resolve() {
+        let _env = clean_env();
+
+        let routes = ProviderRoutesConfig {
+            chat_completions: Some("chat".to_owned()),
+            messages: None,
+        };
+
+        let registry = ProviderRegistry::from_providers(vec![make_routed_provider(
+            "プロバイダー",
+            {
+                let mut m = HashMap::new();
+                m.insert(
+                    "chat".to_owned(),
+                    make_adapter("openai_chat_completions", "https://example.com/v1"),
+                );
+                m
+            },
+            routes,
+            HashMap::new(),
+        )])
+        .expect("registry");
+
+        let resolved = registry
+            .resolve_provider_route(
+                "プロバイダー",
+                ProviderRouteKind::ChatCompletions,
+                "モデル-🤖",
+            )
+            .expect("resolve");
+        assert_eq!(resolved.provider_name, "プロバイダー");
+        assert_eq!(resolved.upstream_model, "モデル-🤖");
+    }
+
+    // -- resolve_provider_route: very long model name passes through ------------
+
+    #[test]
+    fn resolve_provider_route_very_long_model_name() {
+        let _env = clean_env();
+
+        let long_name = "a".repeat(10_000);
+
+        let routes = ProviderRoutesConfig {
+            chat_completions: Some("chat".to_owned()),
+            messages: None,
+        };
+
+        let registry = ProviderRegistry::from_providers(vec![make_routed_provider(
+            "test",
+            {
+                let mut m = HashMap::new();
+                m.insert(
+                    "chat".to_owned(),
+                    make_adapter("openai_chat_completions", "https://example.com"),
+                );
+                m
+            },
+            routes,
+            HashMap::new(),
+        )])
+        .expect("registry");
+
+        let resolved = registry
+            .resolve_provider_route("test", ProviderRouteKind::ChatCompletions, &long_name)
+            .expect("resolve");
+        assert_eq!(resolved.upstream_model, long_name);
+    }
+
+    // -- resolve_provider_route: special characters in adapter name work -------
+
+    #[test]
+    fn resolve_provider_route_special_characters_in_adapter_name() {
+        let _env = clean_env();
+
+        let routes = ProviderRoutesConfig {
+            chat_completions: Some("a.dapt/er".to_owned()),
+            messages: None,
+        };
+
+        let registry = ProviderRegistry::from_providers(vec![make_routed_provider(
+            "test",
+            {
+                let mut m = HashMap::new();
+                m.insert(
+                    "a.dapt/er".to_owned(),
+                    make_adapter("openai_chat_completions", "https://example.com"),
+                );
+                m
+            },
+            routes,
+            HashMap::new(),
+        )])
+        .expect("registry");
+
+        let resolved = registry
+            .resolve_provider_route(
+                "test",
+                ProviderRouteKind::ChatCompletions,
+                "model.with.dots/and:colons",
+            )
+            .expect("resolve");
+        assert_eq!(resolved.adapter_name, "a.dapt/er");
+        assert_eq!(resolved.upstream_model, "model.with.dots/and:colons");
     }
 
     // -- protocol validation fails for unknown protocol ------------------------
@@ -810,202 +1107,6 @@ endpoint = "https://example.com/v1/chat/completions"
         assert!(
             err.contains("test") && err.contains("chat"),
             "error should name provider and adapter, got: {err}"
-        );
-    }
-
-    // -- model names do not imply protocols ------------------------------------
-
-    #[test]
-    fn model_names_do_not_imply_protocols() {
-        let _env = clean_env();
-
-        // A Claude-looking model name resolves to an OpenAI adapter when TOML says so.
-        let registry = ProviderRegistry::from_providers(vec![make_provider(
-            "cross-protocol",
-            {
-                let mut m = HashMap::new();
-                m.insert(
-                    "openai_adapter".to_owned(),
-                    make_adapter(
-                        "openai_chat_completions",
-                        "https://cross.example.com/v1/chat/completions",
-                    ),
-                );
-                m
-            },
-            {
-                let mut m = HashMap::new();
-                m.insert(
-                    "claude-sonnet-4-20250514".to_owned(),
-                    make_model("openai_adapter"),
-                );
-                m
-            },
-        )])
-        .expect("registry");
-
-        let target = make_target("cross-protocol", "claude-4", "claude-sonnet-4-20250514");
-        let resolved = registry.resolve_adapter_target(&target).expect("resolve");
-        assert_eq!(resolved.protocol, "openai_chat_completions");
-        assert_eq!(resolved.adapter_name, "openai_adapter");
-        assert_eq!(resolved.upstream_model, "claude-sonnet-4-20250514");
-    }
-
-    // -- one provider with multiple adapters resolves only by provider-local model table --
-
-    #[test]
-    fn one_provider_with_multiple_adapters_resolves_only_by_provider_local_model_table() {
-        let _env = clean_env();
-
-        let registry = ProviderRegistry::from_providers(vec![make_provider(
-            "multi-adapter",
-            {
-                let mut m = HashMap::new();
-                m.insert(
-                    "chat".to_owned(),
-                    make_adapter(
-                        "openai_chat_completions",
-                        "https://multi.example.com/v1/chat/completions",
-                    ),
-                );
-                m.insert(
-                    "messages".to_owned(),
-                    make_adapter(
-                        "anthropic_messages",
-                        "https://multi.example.com/v1/messages",
-                    ),
-                );
-                m.insert(
-                    "gemini".to_owned(),
-                    make_adapter(
-                        "gemini_generate_content",
-                        "https://multi.example.com/v1/models/{model}:generateContent",
-                    ),
-                );
-                m
-            },
-            {
-                let mut m = HashMap::new();
-                m.insert("gpt-5.4".to_owned(), make_model("chat"));
-                m.insert("claude-sonnet-4".to_owned(), make_model("messages"));
-                m.insert("gemini-3.5-flash".to_owned(), make_model("gemini"));
-                m
-            },
-        )])
-        .expect("registry");
-
-        // Each model resolves to its own adapter
-        let r1 = registry
-            .resolve_adapter_target(&make_target("multi-adapter", "gpt-5.4", "gpt-5.4"))
-            .expect("resolve gpt");
-        assert_eq!(r1.adapter_name, "chat");
-        assert_eq!(r1.protocol, "openai_chat_completions");
-
-        let r2 = registry
-            .resolve_adapter_target(&make_target("multi-adapter", "claude-4", "claude-sonnet-4"))
-            .expect("resolve claude");
-        assert_eq!(r2.adapter_name, "messages");
-        assert_eq!(r2.protocol, "anthropic_messages");
-
-        let r3 = registry
-            .resolve_adapter_target(&make_target(
-                "multi-adapter",
-                "gem-flash",
-                "gemini-3.5-flash",
-            ))
-            .expect("resolve gemini");
-        assert_eq!(r3.adapter_name, "gemini");
-        assert_eq!(r3.protocol, "gemini_generate_content");
-        assert_eq!(
-            r3.endpoint,
-            "https://multi.example.com/v1/models/{model}:generateContent"
-        );
-    }
-
-    // -- resolution errors carry actionable messages ---------------------------
-
-    #[test]
-    fn resolution_errors_carry_actionable_messages() {
-        let _env = clean_env();
-
-        let registry = ProviderRegistry::from_providers(vec![make_provider(
-            "provider-x",
-            {
-                let mut m = HashMap::new();
-                m.insert(
-                    "anthropic".to_owned(),
-                    make_adapter("anthropic_messages", "https://x.example.com/v1/messages"),
-                );
-                m
-            },
-            {
-                let mut m = HashMap::new();
-                m.insert("claude-sonnet-4".to_owned(), make_model("anthropic"));
-                m
-            },
-        )])
-        .expect("registry");
-
-        // Missing provider: names the missing provider and suggests checking files
-        let err1 = registry
-            .resolve_adapter_target(&make_target("no-such-provider", "m", "m"))
-            .unwrap_err()
-            .to_string();
-        assert!(
-            err1.contains("no-such-provider"),
-            "missing provider error should name it, got: {err1}"
-        );
-        assert!(
-            err1.contains("provider config"),
-            "missing provider error should be actionable, got: {err1}"
-        );
-
-        // Missing model: names the provider and model, suggests adding to [provider.models]
-        let err2 = registry
-            .resolve_adapter_target(&make_target("provider-x", "bad-model", "bad-model"))
-            .unwrap_err()
-            .to_string();
-        assert!(
-            err2.contains("provider-x") && err2.contains("bad-model"),
-            "missing model error should name provider and model, got: {err2}"
-        );
-        assert!(
-            err2.contains("[provider.models]"),
-            "missing model error should suggest fix, got: {err2}"
-        );
-
-        // Missing adapter: names provider, model, adapter, and lists available adapters
-        let bad_registry = ProviderRegistry::from_providers(vec![ProviderConfig {
-            name: "broken".to_owned(),
-            api_key: "key".to_owned(),
-            auth_style: AuthStyle::Bearer,
-            adapters: {
-                let mut m = HashMap::new();
-                m.insert(
-                    "real-adapter".to_owned(),
-                    make_adapter("openai_chat_completions", "https://example.com"),
-                );
-                m
-            },
-            models: {
-                let mut m = HashMap::new();
-                m.insert("my-model".to_owned(), make_model("ghost-adapter"));
-                m
-            },
-        }])
-        .expect("registry");
-
-        let err3 = bad_registry
-            .resolve_adapter_target(&make_target("broken", "my-model", "my-model"))
-            .unwrap_err()
-            .to_string();
-        assert!(
-            err3.contains("ghost-adapter") && err3.contains("does not exist"),
-            "missing adapter error should name the adapter, got: {err3}"
-        );
-        assert!(
-            err3.contains("real-adapter"),
-            "missing adapter error should list available adapters, got: {err3}"
         );
     }
 
@@ -1212,38 +1313,6 @@ endpoint = "https://example.com/v1/chat/completions"
         );
     }
 
-    // -- resolved config preserves auth_style and api_key ----------------------
-
-    #[test]
-    fn resolved_config_preserves_auth_style_and_api_key() {
-        let _env = clean_env();
-
-        let registry = ProviderRegistry::from_providers(vec![ProviderConfig {
-            name: "test".to_owned(),
-            api_key: "sk-secret-key".to_owned(),
-            auth_style: AuthStyle::XApiKey,
-            adapters: {
-                let mut m = HashMap::new();
-                m.insert(
-                    "messages".to_owned(),
-                    make_adapter("anthropic_messages", "https://api.example.com/v1/messages"),
-                );
-                m
-            },
-            models: {
-                let mut m = HashMap::new();
-                m.insert("claude-4".to_owned(), make_model("messages"));
-                m
-            },
-        }])
-        .expect("registry");
-
-        let target = make_target("test", "claude-4", "claude-4");
-        let resolved = registry.resolve_adapter_target(&target).expect("resolve");
-        assert_eq!(resolved.auth_style, AuthStyle::XApiKey);
-        assert_eq!(resolved.api_key, "sk-secret-key");
-    }
-
     // -- ProviderAdapterTargetConfig Debug redacts api_key ---------------------
 
     #[test]
@@ -1257,6 +1326,7 @@ endpoint = "https://example.com/v1/chat/completions"
             api_key: "sk-super-secret-key-do-not-leak".to_owned(),
             requested_model: "gpt-4o".to_owned(),
             upstream_model: "gpt-4o".to_owned(),
+            headers: HashMap::new(),
         };
         let debug = format!("{:?}", config);
         assert!(
@@ -1291,74 +1361,6 @@ endpoint = "https://example.com/v1/chat/completions"
         assert!(
             err.contains("duplicate provider name") && err.contains("dup"),
             "expected duplicate error, got: {err}"
-        );
-    }
-
-    // -- resolve_adapter_target with empty provider name yields unknown provider error --
-
-    #[test]
-    fn resolve_adapter_target_empty_provider_name_yields_unknown_provider_error() {
-        let _env = clean_env();
-
-        let registry = ProviderRegistry::from_providers(vec![make_provider(
-            "real-provider",
-            {
-                let mut m = HashMap::new();
-                m.insert(
-                    "chat".to_owned(),
-                    make_adapter("openai_chat_completions", "https://example.com"),
-                );
-                m
-            },
-            {
-                let mut m = HashMap::new();
-                m.insert("model-a".to_owned(), make_model("chat"));
-                m
-            },
-        )])
-        .expect("registry");
-
-        let target = make_target("", "model-a", "model-a");
-        let result = registry.resolve_adapter_target(&target);
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("unknown provider") && err.contains("no provider config"),
-            "expected unknown provider error for empty string, got: {err}"
-        );
-    }
-
-    // -- resolve_adapter_target with empty upstream_model yields missing model error --
-
-    #[test]
-    fn resolve_adapter_target_empty_upstream_model_yields_missing_model_error() {
-        let _env = clean_env();
-
-        let registry = ProviderRegistry::from_providers(vec![make_provider(
-            "test",
-            {
-                let mut m = HashMap::new();
-                m.insert(
-                    "chat".to_owned(),
-                    make_adapter("openai_chat_completions", "https://example.com"),
-                );
-                m
-            },
-            {
-                let mut m = HashMap::new();
-                m.insert("real-model".to_owned(), make_model("chat"));
-                m
-            },
-        )])
-        .expect("registry");
-
-        let target = make_target("test", "whatever", "");
-        let result = registry.resolve_adapter_target(&target);
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("no model mapping"),
-            "expected missing model error for empty upstream_model, got: {err}"
         );
     }
 
@@ -1424,36 +1426,6 @@ auth_style = "bearer"
         );
     }
 
-    // -- resolve_adapter_target with provider that has no models fails ---------
-
-    #[test]
-    fn resolve_adapter_target_provider_with_no_models_fails() {
-        let _env = clean_env();
-
-        let registry = ProviderRegistry::from_providers(vec![make_provider(
-            "empty-models",
-            {
-                let mut m = HashMap::new();
-                m.insert(
-                    "chat".to_owned(),
-                    make_adapter("openai_chat_completions", "https://example.com"),
-                );
-                m
-            },
-            HashMap::new(), // no models
-        )])
-        .expect("registry");
-
-        let target = make_target("empty-models", "any-model", "any-model");
-        let result = registry.resolve_adapter_target(&target);
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("no model mapping") && err.contains("any-model"),
-            "expected no model mapping error, got: {err}"
-        );
-    }
-
     // -- load_from_dir sorts entries deterministically -------------------------
 
     #[test]
@@ -1463,8 +1435,6 @@ auth_style = "bearer"
 
         let dir = tempfile::tempdir().expect("tempdir");
 
-        // Write two providers in reverse alphabetical filename order.
-        // The registry should still load both successfully (sorted order is stable).
         let path_b = dir.path().join("z-provider.toml");
         let mut f = std::fs::File::create(&path_b).expect("create");
         write!(
@@ -1518,7 +1488,6 @@ endpoint = "https://a.example.com/v1/chat/completions"
         let _env = clean_env();
         let dir = tempfile::tempdir().expect("tempdir");
 
-        // Create a directory with .toml extension -- should be skipped.
         let toml_dir = dir.path().join("subdir.toml");
         std::fs::create_dir(&toml_dir).expect("create dir");
 
@@ -1538,167 +1507,6 @@ endpoint = "https://a.example.com/v1/chat/completions"
         check::<ProviderAdapterTargetConfig>();
     }
 
-    // -- Whitespace-only provider name in resolve_adapter_target -----------------
-
-    #[test]
-    fn resolve_adapter_target_whitespace_only_provider_name_yields_unknown_provider_error() {
-        let _env = clean_env();
-
-        let registry = ProviderRegistry::from_providers(vec![make_provider(
-            "real-provider",
-            {
-                let mut m = HashMap::new();
-                m.insert(
-                    "chat".to_owned(),
-                    make_adapter("openai_chat_completions", "https://example.com"),
-                );
-                m
-            },
-            {
-                let mut m = HashMap::new();
-                m.insert("model-a".to_owned(), make_model("chat"));
-                m
-            },
-        )])
-        .expect("registry");
-
-        let target = make_target("   ", "model-a", "model-a");
-        let result = registry.resolve_adapter_target(&target);
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("unknown provider"),
-            "expected unknown provider error for whitespace-only name, got: {err}"
-        );
-    }
-
-    // -- Whitespace-only upstream_model in resolve_adapter_target ----------------
-
-    #[test]
-    fn resolve_adapter_target_whitespace_only_upstream_model_yields_missing_model_error() {
-        let _env = clean_env();
-
-        let registry = ProviderRegistry::from_providers(vec![make_provider(
-            "test",
-            {
-                let mut m = HashMap::new();
-                m.insert(
-                    "chat".to_owned(),
-                    make_adapter("openai_chat_completions", "https://example.com"),
-                );
-                m
-            },
-            {
-                let mut m = HashMap::new();
-                m.insert("real-model".to_owned(), make_model("chat"));
-                m
-            },
-        )])
-        .expect("registry");
-
-        let target = make_target("test", "whatever", "   ");
-        let result = registry.resolve_adapter_target(&target);
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("no model mapping"),
-            "expected missing model error for whitespace-only upstream_model, got: {err}"
-        );
-    }
-
-    // -- Unicode model/provider names resolve correctly --------------------------
-
-    #[test]
-    fn unicode_provider_and_model_names_resolve() {
-        let _env = clean_env();
-
-        let registry = ProviderRegistry::from_providers(vec![make_provider(
-            "プロバイダー",
-            {
-                let mut m = HashMap::new();
-                m.insert(
-                    "chat".to_owned(),
-                    make_adapter("openai_chat_completions", "https://example.com/v1"),
-                );
-                m
-            },
-            {
-                let mut m = HashMap::new();
-                m.insert("モデル-🤖".to_owned(), make_model("chat"));
-                m
-            },
-        )])
-        .expect("registry");
-
-        let target = make_target("プロバイダー", "モデル-🤖", "モデル-🤖");
-        let resolved = registry.resolve_adapter_target(&target).expect("resolve");
-        assert_eq!(resolved.provider_name, "プロバイダー");
-        assert_eq!(resolved.upstream_model, "モデル-🤖");
-    }
-
-    // -- Very long model name as registry key -----------------------------------
-
-    #[test]
-    fn very_long_model_name_resolves_in_registry() {
-        let _env = clean_env();
-
-        let long_name = "a".repeat(10_000);
-        let registry = ProviderRegistry::from_providers(vec![make_provider(
-            "test",
-            {
-                let mut m = HashMap::new();
-                m.insert(
-                    "chat".to_owned(),
-                    make_adapter("openai_chat_completions", "https://example.com"),
-                );
-                m
-            },
-            {
-                let mut m = HashMap::new();
-                m.insert(long_name.clone(), make_model("chat"));
-                m
-            },
-        )])
-        .expect("registry");
-
-        let target = make_target("test", &long_name, &long_name);
-        let resolved = registry.resolve_adapter_target(&target).expect("resolve");
-        assert_eq!(resolved.upstream_model, long_name);
-    }
-
-    // -- Special characters in model/adapter names work as HashMap keys ----------
-
-    #[test]
-    fn special_characters_in_names_resolve() {
-        let _env = clean_env();
-
-        let registry = ProviderRegistry::from_providers(vec![make_provider(
-            "test",
-            {
-                let mut m = HashMap::new();
-                m.insert(
-                    "a.dapt/er".to_owned(),
-                    make_adapter("openai_chat_completions", "https://example.com"),
-                );
-                m
-            },
-            {
-                let mut m = HashMap::new();
-                m.insert(
-                    "model.with.dots/and:colons".to_owned(),
-                    make_model("a.dapt/er"),
-                );
-                m
-            },
-        )])
-        .expect("registry");
-
-        let target = make_target("test", "alias", "model.with.dots/and:colons");
-        let resolved = registry.resolve_adapter_target(&target).expect("resolve");
-        assert_eq!(resolved.adapter_name, "a.dapt/er");
-        assert_eq!(resolved.upstream_model, "model.with.dots/and:colons");
-    }
-
     // -- ProviderAdapterTargetConfig Clone round-trip ----------------------------
 
     #[test]
@@ -1712,6 +1520,7 @@ endpoint = "https://a.example.com/v1/chat/completions"
             api_key: "sk-secret".to_owned(),
             requested_model: "gpt-4o".to_owned(),
             upstream_model: "gpt-4o".to_owned(),
+            headers: HashMap::new(),
         };
         let cloned = original.clone();
         assert_eq!(

@@ -2,7 +2,8 @@
 //!
 //! Provides [`prepare_request`] (rate-limit, dedup, request-ID generation),
 //! [`handle_core_once`] (non-streaming), and [`handle_core_stream`] (streaming)
-//! used by `/v1/messages` and `/v1/chat/completions`.
+//! used by `/providers/{provider}/v1/messages` and
+//! `/providers/{provider}/v1/chat/completions`.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -14,7 +15,7 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use bytes::Bytes;
 use futures::stream::{BoxStream, StreamExt};
 use llm_proxy_core::Metrics;
-use llm_proxy_core::model_route::{ModelRouteError, resolve_model_route};
+use llm_proxy_core::ProviderRouteKind;
 use llm_proxy_protocol::client::anthropic;
 use llm_proxy_protocol::client::anthropic::StreamEncoder as AnthropicStreamEncoder;
 use llm_proxy_protocol::client::openai_chat;
@@ -245,24 +246,68 @@ pub(crate) fn prepare_request(
 // resolve target helper
 // ---------------------------------------------------------------------------
 
-/// Resolve a `CoreRequest` through the model router and provider registry into
-/// a tuple of (`ProviderAdapterTarget`, `ProviderAdapter`) ready for encoding.
+/// Regex for validating provider names in URL paths.
+///
+/// Provider names must be ASCII lowercase letters, digits, hyphens, and
+/// underscores. This ensures URL-safe slugs that cannot be confused with path
+/// traversal or encoding attacks.
+static PROVIDER_NAME_REGEX: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r"^[a-z0-9_-]+$").expect("valid provider name regex")
+});
+
+/// Validate that a provider name from a URL path contains only safe characters.
+fn validate_provider_name(name: &str) -> Result<(), RouteError> {
+    if name.is_empty() {
+        return Err(RouteError::InvalidProviderName(
+            "provider name is empty".to_owned(),
+        ));
+    }
+    if !PROVIDER_NAME_REGEX.is_match(name) {
+        return Err(RouteError::InvalidProviderName(format!(
+            "provider name \"{name}\" contains invalid characters; \
+             only lowercase ASCII letters, digits, hyphens, and underscores are allowed"
+        )));
+    }
+    Ok(())
+}
+
+/// Map provider name from URL path, validating it first.
+fn validate_and_clean_provider_name(provider_name: &str) -> Result<&str, RouteError> {
+    validate_provider_name(provider_name)?;
+    Ok(provider_name)
+}
+
+/// Resolve a provider route through the provider registry into a tuple of
+/// (`ProviderAdapterTarget`, `ProviderAdapter`) ready for encoding.
+///
+/// Lookup chain:
+///
+/// ```text
+/// provider_name + route_kind  -> provider config + route -> adapter name
+/// adapter_name                -> protocol + endpoint + headers
+/// requested_model             -> model_aliases -> upstream_model
+/// ```
 fn resolve_target(
     state: &AppState,
+    provider_name: &str,
+    route_kind: ProviderRouteKind,
     core: &CoreRequest,
 ) -> Result<(ProviderAdapterTarget, ProviderAdapter), RouteError> {
-    let app_config = state.app_config();
     let providers = state.providers();
 
-    let target =
-        resolve_model_route(&app_config.models, &core.model.requested).map_err(|e| match e {
-            ModelRouteError::UnknownModel(m) => RouteError::UnknownModel(m),
-            _ => RouteError::Internal(e.to_string()),
-        })?;
-
     let adapter_target_config = providers
-        .resolve_adapter_target(&target)
-        .map_err(|e| RouteError::Internal(e.to_string()))?;
+        .resolve_provider_route(provider_name, route_kind, &core.model.requested)
+        .map_err(|e| {
+            // Map CoreError to specific RouteError variants for proper HTTP status codes.
+            let msg = e.to_string();
+            if msg.contains("unknown provider") {
+                RouteError::UnknownProvider(provider_name.to_owned())
+            } else if msg.contains("does not support route") || msg.contains("unsupported") {
+                RouteError::UnsupportedRoute(msg)
+            } else {
+                RouteError::Internal(msg)
+            }
+        })?;
 
     let protocol = ProviderProtocol::parse(&adapter_target_config.protocol).ok_or_else(|| {
         RouteError::Internal(format!(
@@ -291,6 +336,7 @@ fn resolve_target(
         api_key: adapter_target_config.api_key,
         requested_model: adapter_target_config.requested_model,
         upstream_model: adapter_target_config.upstream_model,
+        headers: adapter_target_config.headers,
     };
 
     Ok((provider_target, adapter))
@@ -308,26 +354,32 @@ fn resolve_target(
 pub(crate) async fn handle_core_once(
     state: AppState,
     ctx: RequestContext,
+    provider_name: &str,
+    route_kind: ProviderRouteKind,
     core: CoreRequest,
     client_protocol: ClientProtocol,
 ) -> Result<Response<Body>, RouteError> {
+    validate_and_clean_provider_name(provider_name)?;
+
     state.metrics.record_request(false);
 
     tracing::debug!(
         request_id = %ctx.request_id,
+        provider = %provider_name,
         model = %core.model.requested,
         streaming = false,
         "processing request"
     );
 
-    let (target, adapter) = resolve_target(&state, &core).inspect_err(|_| {
-        state.metrics.record_failure();
-    })?;
+    let (target, adapter) =
+        resolve_target(&state, provider_name, route_kind, &core).inspect_err(|_| {
+            state.metrics.record_failure();
+        })?;
 
     tracing::debug!(
         request_id = %ctx.request_id,
         provider = %target.provider_name,
-        model = %target.upstream_model,
+        upstream_model = %target.upstream_model,
         "routed to provider"
     );
 
@@ -358,7 +410,7 @@ pub(crate) async fn handle_core_once(
     let latency = ctx.start.elapsed();
     state
         .metrics
-        .record_success(&target.upstream_model, latency);
+        .record_success(&target.provider_name, &target.upstream_model, latency);
 
     let response_body = match client_protocol {
         ClientProtocol::Anthropic => {
@@ -445,26 +497,32 @@ enum FirstByteResult {
 pub(crate) async fn handle_core_stream(
     state: AppState,
     ctx: RequestContext,
+    provider_name: &str,
+    route_kind: ProviderRouteKind,
     core: CoreRequest,
     client_protocol: ClientProtocol,
 ) -> Result<Response<Body>, RouteError> {
+    validate_and_clean_provider_name(provider_name)?;
+
     state.metrics.record_request(true);
 
     tracing::debug!(
         request_id = %ctx.request_id,
+        provider = %provider_name,
         model = %core.model.requested,
         streaming = true,
         "processing streaming request"
     );
 
-    let (target, adapter) = resolve_target(&state, &core).inspect_err(|_| {
-        state.metrics.record_failure();
-    })?;
+    let (target, adapter) =
+        resolve_target(&state, provider_name, route_kind, &core).inspect_err(|_| {
+            state.metrics.record_failure();
+        })?;
 
     tracing::debug!(
         request_id = %ctx.request_id,
         provider = %target.provider_name,
-        model = %target.upstream_model,
+        upstream_model = %target.upstream_model,
         "routed to provider (streaming)"
     );
 
@@ -529,6 +587,7 @@ pub(crate) async fn handle_core_stream(
             request_id: request_id.clone(),
             stream_metrics: StreamMetrics {
                 metrics: Arc::clone(&state.metrics),
+                provider_name: target.provider_name.clone(),
                 upstream_model: upstream_model.clone(),
                 start: ctx.start,
             },
@@ -615,7 +674,9 @@ pub(crate) async fn handle_core_stream(
 struct StreamMetrics {
     /// Shared metrics recorder for success/failure/latency tracking.
     metrics: Arc<Metrics>,
-    /// Upstream model name used as the metrics label.
+    /// Provider name used as part of the composite metrics key.
+    provider_name: String,
+    /// Upstream model name used as part of the composite metrics key.
     upstream_model: String,
     /// Instant when the handler was entered (for latency measurement).
     start: Instant,
@@ -928,6 +989,7 @@ fn build_sse_output_stream(
         // Record metrics after stream completes.
         if stream_succeeded {
             ctx.stream_metrics.metrics.record_success(
+                &ctx.stream_metrics.provider_name,
                 &ctx.stream_metrics.upstream_model,
                 ctx.stream_metrics.start.elapsed(),
             );
@@ -1214,10 +1276,10 @@ mod tests {
         }
     }
 
-    // -- resolve_target with unknown model --------------------------------------
+    // -- resolve_target with unknown provider -----------------------------------
 
     #[test]
-    fn resolve_target_unknown_model_returns_unknown_model() {
+    fn resolve_target_unknown_provider_returns_unknown_provider() {
         use llm_proxy_core::AppConfig;
         use llm_proxy_core::ServerConfig;
         use llm_proxy_provider::{ProviderAdapterRegistry, ProxyClient};
@@ -1231,7 +1293,7 @@ mod tests {
                 hot_reload: false,
                 server_name: "test".to_owned(),
             },
-            models: HashMap::new(), // empty routing table
+            models: HashMap::new(),
         };
 
         let providers =
@@ -1252,7 +1314,7 @@ mod tests {
 
         let core = CoreRequest {
             model: llm_proxy_protocol::core::ModelRef {
-                requested: "nonexistent".to_owned(),
+                requested: "gpt-4o".to_owned(),
                 upstream: None,
             },
             system: vec![],
@@ -1265,20 +1327,23 @@ mod tests {
             provider_hints: Default::default(),
         };
 
-        let result = resolve_target(&state, &core);
+        let result = resolve_target(
+            &state,
+            "nonexistent",
+            ProviderRouteKind::ChatCompletions,
+            &core,
+        );
         assert!(result.is_err());
         match result.unwrap_err() {
-            RouteError::UnknownModel(m) => assert_eq!(m, "nonexistent"),
-            other => panic!("expected UnknownModel, got: {:?}", other),
+            RouteError::UnknownProvider(name) => assert_eq!(name, "nonexistent"),
+            other => panic!("expected UnknownProvider, got: {:?}", other),
         }
     }
 
-    // -- resolve_target with missing app_config ---------------------------------
-
-    // -- resolve_target with empty routing table returns unknown model ----------
+    // -- resolve_target with empty registry returns unknown provider ------------
 
     #[test]
-    fn resolve_target_empty_routing_table_returns_unknown_model() {
+    fn resolve_target_empty_registry_returns_unknown_provider() {
         use llm_proxy_core::AppConfig;
         use llm_proxy_core::ServerConfig;
         use llm_proxy_provider::{ProviderAdapterRegistry, ProxyClient};
@@ -1292,7 +1357,7 @@ mod tests {
                 hot_reload: false,
                 server_name: "test".to_owned(),
             },
-            models: HashMap::new(), // empty routing table
+            models: HashMap::new(),
         };
 
         let providers =
@@ -1313,7 +1378,7 @@ mod tests {
 
         let core = CoreRequest {
             model: llm_proxy_protocol::core::ModelRef {
-                requested: "nonexistent-model".to_owned(),
+                requested: "some-model".to_owned(),
                 upstream: None,
             },
             system: vec![],
@@ -1326,11 +1391,16 @@ mod tests {
             provider_hints: Default::default(),
         };
 
-        let result = resolve_target(&state, &core);
+        let result = resolve_target(
+            &state,
+            "no-such-provider",
+            ProviderRouteKind::Messages,
+            &core,
+        );
         assert!(result.is_err());
         match result.unwrap_err() {
-            RouteError::UnknownModel(m) => assert_eq!(m, "nonexistent-model"),
-            other => panic!("expected UnknownModel, got: {:?}", other),
+            RouteError::UnknownProvider(name) => assert_eq!(name, "no-such-provider"),
+            other => panic!("expected UnknownProvider, got: {:?}", other),
         }
     }
 

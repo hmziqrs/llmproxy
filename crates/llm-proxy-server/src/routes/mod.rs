@@ -15,11 +15,13 @@ mod core_pipeline;
 mod error_response;
 mod health;
 mod messages;
+mod models;
 mod token_count;
 
 use chat::handle_chat_completions;
 use health::{health, ready, version};
 use messages::handle_messages;
+use models::handle_models;
 use token_count::count_tokens;
 
 const MAX_BODY_BYTES: usize = 32 * 1024 * 1024; // 32 MiB
@@ -87,9 +89,13 @@ pub fn router(state: AppState) -> Router {
         ));
 
     let api = Router::new()
-        .route("/v1/messages", post(handle_messages))
-        .route("/v1/messages/count_tokens", post(count_tokens))
-        .route("/v1/chat/completions", post(handle_chat_completions))
+        .route("/v1/{provider}/messages", post(handle_messages))
+        .route("/v1/{provider}/messages/count_tokens", post(count_tokens))
+        .route(
+            "/v1/{provider}/chat/completions",
+            post(handle_chat_completions),
+        )
+        .route("/v1/{provider}/models", get(handle_models))
         .layer(api_middleware);
 
     Router::new()

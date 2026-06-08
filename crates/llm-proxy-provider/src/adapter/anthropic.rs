@@ -1018,6 +1018,7 @@ mod tests {
             api_key: "test-key".into(),
             requested_model: "claude-sonnet-4-20250514".into(),
             upstream_model: "claude-sonnet-4-20250514".into(),
+            headers: std::collections::HashMap::new(),
         }
     }
 

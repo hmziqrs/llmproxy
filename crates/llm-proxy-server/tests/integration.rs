@@ -8,7 +8,10 @@ use axum::{
     body::Body,
     http::{Request, StatusCode},
 };
-use llm_proxy_core::{AppConfig, ProviderRegistry, ServerConfig};
+use llm_proxy_core::{
+    AppConfig, AuthStyle, ProviderAdapterConfig, ProviderConfig, ProviderRegistry,
+    ProviderRoutesConfig, ServerConfig,
+};
 use llm_proxy_provider::{ProviderAdapterRegistry, ProxyClient};
 use llm_proxy_server::{AppState, BuildInfo, build_router};
 use serde_json::{Value, json};
@@ -29,6 +32,60 @@ fn state() -> AppState {
     let registry = ProviderRegistry::from_providers(vec![]).expect("empty registry");
     AppState::new(
         app_config,
+        registry,
+        ProviderAdapterRegistry::builtin(),
+        ProxyClient::new(),
+        BuildInfo {
+            name: "test",
+            version: "0.0.0",
+            target: "test",
+            git_sha: "test",
+        },
+    )
+}
+
+/// Build AppState with a single "mock-provider" registered so that provider-based
+/// routing can resolve. The provider has an `anthropic_messages` adapter with a
+/// dummy endpoint. This is used by tests that send valid JSON past the parsing
+/// layer and need the request to reach the core pipeline.
+fn state_with_provider() -> AppState {
+    let provider = ProviderConfig {
+        name: "mock-provider".to_owned(),
+        api_key: "test-key".to_owned(),
+        auth_style: AuthStyle::Bearer,
+        adapters: {
+            let mut m = HashMap::new();
+            m.insert(
+                "messages".to_owned(),
+                ProviderAdapterConfig {
+                    protocol: "anthropic_messages".to_owned(),
+                    endpoint: "https://127.0.0.1:0/v1/messages".to_owned(),
+                    headers: HashMap::new(),
+                },
+            );
+            m
+        },
+        models: HashMap::new(),
+        routes: ProviderRoutesConfig {
+            messages: Some("messages".to_owned()),
+            chat_completions: Some("messages".to_owned()),
+        },
+        model_aliases: HashMap::new(),
+        discovery: None,
+        catalog: None,
+    };
+    let registry = ProviderRegistry::from_providers(vec![provider]).expect("registry");
+    AppState::new(
+        AppConfig {
+            server: ServerConfig {
+                bind: "127.0.0.1:3456".parse().unwrap(),
+                request_timeout: Duration::from_secs(300),
+                log_level: "info".to_owned(),
+                hot_reload: false,
+                server_name: "test-proxy".to_owned(),
+            },
+            models: HashMap::new(),
+        },
         registry,
         ProviderAdapterRegistry::builtin(),
         ProxyClient::new(),
@@ -100,7 +157,7 @@ async fn version_returns_build_info() {
 
 #[tokio::test]
 async fn messages_requires_auth_header() {
-    let app = build_router(state());
+    let app = build_router(state_with_provider());
     // Minimal Anthropic-shaped request without x-api-key.
     let body = json!({
         "model": "claude-sonnet-4-6",
@@ -109,7 +166,7 @@ async fn messages_requires_auth_header() {
     });
     let req = Request::builder()
         .method("POST")
-        .uri("/v1/messages")
+        .uri("/v1/mock-provider/messages")
         .header("content-type", "application/json")
         .body(Body::from(body.to_string()))
         .unwrap();
@@ -144,7 +201,7 @@ async fn unknown_route_returns_not_found() {
 /// JSON/shape error, not that no 400 can ever occur.
 #[tokio::test]
 async fn messages_valid_json_parses_and_validates() {
-    let app = build_router(state());
+    let app = build_router(state_with_provider());
     let body = json!({
         "model": "claude-sonnet-4-6",
         "messages": [{ "role": "user", "content": "hello" }],
@@ -152,7 +209,7 @@ async fn messages_valid_json_parses_and_validates() {
     });
     let req = Request::builder()
         .method("POST")
-        .uri("/v1/messages")
+        .uri("/v1/mock-provider/messages")
         .header("content-type", "application/json")
         .body(Body::from(body.to_string()))
         .unwrap();
@@ -195,7 +252,7 @@ async fn messages_invalid_json_returns_bad_request() {
     let app = build_router(state());
     let req = Request::builder()
         .method("POST")
-        .uri("/v1/messages")
+        .uri("/v1/mock-provider/messages")
         .header("content-type", "application/json")
         .body(Body::from("this is not json"))
         .unwrap();
@@ -228,7 +285,7 @@ async fn messages_valid_json_missing_fields_returns_validation_error() {
     });
     let req = Request::builder()
         .method("POST")
-        .uri("/v1/messages")
+        .uri("/v1/mock-provider/messages")
         .header("content-type", "application/json")
         .body(Body::from(body.to_string()))
         .unwrap();
@@ -267,7 +324,7 @@ async fn count_tokens_returns_estimate() {
     });
     let req = Request::builder()
         .method("POST")
-        .uri("/v1/messages/count_tokens")
+        .uri("/v1/mock-provider/messages/count_tokens")
         .header("content-type", "application/json")
         .body(Body::from(body.to_string()))
         .unwrap();
@@ -318,7 +375,7 @@ async fn messages_wrong_field_type_returns_bad_request() {
     });
     let req = Request::builder()
         .method("POST")
-        .uri("/v1/messages")
+        .uri("/v1/mock-provider/messages")
         .header("content-type", "application/json")
         .body(Body::from(body.to_string()))
         .unwrap();
@@ -346,7 +403,7 @@ async fn messages_unknown_fields_returns_bad_request() {
     });
     let req = Request::builder()
         .method("POST")
-        .uri("/v1/messages")
+        .uri("/v1/mock-provider/messages")
         .header("content-type", "application/json")
         .body(Body::from(body.to_string()))
         .unwrap();
@@ -369,7 +426,7 @@ async fn messages_invalid_utf8_returns_bad_request() {
     // Raw non-UTF-8 bytes.
     let req = Request::builder()
         .method("POST")
-        .uri("/v1/messages")
+        .uri("/v1/mock-provider/messages")
         .header("content-type", "application/json")
         .body(Body::from(vec![0x80, 0x81, 0x82]))
         .unwrap();
@@ -388,7 +445,7 @@ async fn messages_empty_body_returns_bad_request() {
     let app = build_router(state());
     let req = Request::builder()
         .method("POST")
-        .uri("/v1/messages")
+        .uri("/v1/mock-provider/messages")
         .header("content-type", "application/json")
         .body(Body::empty())
         .unwrap();
@@ -411,7 +468,7 @@ async fn messages_oversized_body_returns_payload_too_large() {
     let oversized_body = "X".repeat(33 * 1024 * 1024);
     let req = Request::builder()
         .method("POST")
-        .uri("/v1/messages")
+        .uri("/v1/mock-provider/messages")
         .header("content-type", "application/json")
         .body(Body::from(oversized_body))
         .unwrap();
@@ -483,10 +540,13 @@ async fn toml_ready_returns_ready() {
     assert_eq!(body["status"], "ready");
 }
 
-/// TOML mode: POST /v1/messages returns 400 for unknown model (empty routing table).
+/// TOML mode: POST /v1/{provider}/messages with a registered provider passes the
+/// request through to the upstream adapter. The model name is forwarded as-is, so
+/// an unknown model results in a downstream error (502) rather than a 400, because
+/// the proxy no longer validates model names locally.
 #[tokio::test]
-async fn toml_messages_returns_error_for_unknown_model() {
-    let app = build_router(state());
+async fn toml_messages_passes_through_to_upstream() {
+    let app = build_router(state_with_provider());
     let body = json!({
         "model": "claude-sonnet-4-6",
         "messages": [{ "role": "user", "content": "hello" }],
@@ -494,26 +554,29 @@ async fn toml_messages_returns_error_for_unknown_model() {
     });
     let req = Request::builder()
         .method("POST")
-        .uri("/v1/messages")
+        .uri("/v1/mock-provider/messages")
         .header("content-type", "application/json")
         .body(Body::from(body.to_string()))
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
-    // The core pipeline resolves the model route. With an empty routing table,
-    // the model is unknown, so it returns 400 Bad Request.
-    assert_eq!(
-        resp.status(),
-        StatusCode::BAD_REQUEST,
-        "TOML mode /v1/messages should return 400 for unknown model"
+    // With provider-based routing, the model is passed through to the upstream
+    // adapter. The dummy endpoint refuses connections, so we get a 502 Bad Gateway
+    // (or 500 internal error), not a 400 for unknown model.
+    let status = resp.status();
+    assert_ne!(
+        status,
+        StatusCode::NOT_FOUND,
+        "provider is registered, route must resolve"
     );
-    let resp_body: Value = serde_json::from_slice(
-        &axum::body::to_bytes(resp.into_body(), 64 * 1024)
-            .await
-            .unwrap(),
-    )
-    .unwrap();
-    assert_eq!(resp_body["type"], "error");
-    assert_eq!(resp_body["error"]["type"], "invalid_request_error");
+    // The upstream is unreachable so downstream error is expected.
+    let valid_statuses = [
+        StatusCode::BAD_GATEWAY,           // 502 - upstream failure
+        StatusCode::INTERNAL_SERVER_ERROR, // 500 - routing error
+    ];
+    assert!(
+        valid_statuses.contains(&status),
+        "expected downstream error for unreachable upstream, got {status}"
+    );
 }
 
 /// TOML mode: POST /v1/messages/count_tokens works without legacy state.
@@ -527,7 +590,7 @@ async fn toml_count_tokens_returns_estimate() {
     });
     let req = Request::builder()
         .method("POST")
-        .uri("/v1/messages/count_tokens")
+        .uri("/v1/mock-provider/messages/count_tokens")
         .header("content-type", "application/json")
         .body(Body::from(body.to_string()))
         .unwrap();
