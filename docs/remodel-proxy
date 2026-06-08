@@ -141,6 +141,22 @@ responses = "responses"
 [provider.discovery]
 kind = "fireworks_account_models"
 endpoint = "https://api.fireworks.ai/v1/accounts/fireworks/models"
+
+[provider.catalog]
+# Optional static model metadata. These entries are useful when a provider does
+# not expose a model-list endpoint, when the operator wants stable display
+# names/capabilities, or when a provider endpoint is too noisy.
+mode = "hybrid" # static | discovered | hybrid
+enforce = false
+cache_ttl = "24h"
+allow = ["*"]
+deny = ["*-preview"]
+
+[[provider.catalog.models]]
+id = "accounts/fireworks/models/deepseek-v3p1"
+display_name = "DeepSeek V3.1"
+supports = ["chat_completions"]
+context_length = 131072
 ```
 
 For Anthropic:
@@ -218,6 +234,28 @@ pub struct ProviderDiscoveryConfig {
     pub endpoint: String,
 }
 
+pub struct ProviderCatalogConfig {
+    pub mode: ProviderCatalogMode,
+    pub enforce: bool,
+    pub cache_ttl: Duration,
+    pub allow: Vec<String>,
+    pub deny: Vec<String>,
+    pub models: Vec<StaticModelCatalogEntry>,
+}
+
+pub enum ProviderCatalogMode {
+    Static,
+    Discovered,
+    Hybrid,
+}
+
+pub struct StaticModelCatalogEntry {
+    pub id: String,
+    pub display_name: Option<String>,
+    pub supports: Vec<ProviderRouteKind>,
+    pub context_length: Option<u32>,
+}
+
 pub enum ProviderDiscoveryKind {
     OpenAiModels,
     AnthropicModels,
@@ -231,6 +269,7 @@ Change `ProviderConfig` to include:
 ```rust
 pub routes: ProviderRoutesConfig,
 pub discovery: Option<ProviderDiscoveryConfig>,
+pub catalog: ProviderCatalogConfig,
 ```
 
 Change `ServerConfig` to include:
@@ -356,10 +395,19 @@ llm-proxy models --provider fireworks
 
 ## Model Discovery
 
-Discovery should be advisory. It helps users inspect models and lets
-`GET /providers/{provider}/v1/models` return useful data, but it should not
-block arbitrary model IDs unless a future `enforce_model_catalog = true` option
-is added.
+Discovery should feed a provider model catalog. It helps users inspect models
+and lets `GET /providers/{provider}/v1/models` return useful data, but it
+should not block arbitrary model IDs unless `provider.catalog.enforce = true`.
+
+This is the "best of both worlds" policy:
+
+- Static config is always allowed.
+- Live discovery is used only when configured and supported by the provider.
+- Hybrid catalogs merge static entries and discovered entries.
+- Request routing does not depend on live discovery.
+- Operators can allow/deny models with glob patterns.
+- Enforcement is opt-in because many providers accept model IDs before their
+  model-list endpoint catches up.
 
 Supported discovery backends:
 
@@ -369,6 +417,40 @@ anthropic_models
 gemini_models
 fireworks_account_models
 ```
+
+Catalog modes:
+
+```text
+static      Only use [[provider.catalog.models]].
+discovered  Only use live/cached discovery results.
+hybrid      Merge static and discovered models; static metadata wins on ID conflicts.
+```
+
+Runtime behavior:
+
+```text
+/providers/{provider}/... request:
+  provider comes from URL
+  model comes from request body/path
+  if catalog.enforce = false:
+    do not check catalog; send model upstream
+  if catalog.enforce = true:
+    require model to match merged catalog after allow/deny filtering
+
+/providers/{provider}/v1/models:
+  return merged catalog if available
+  refresh from discovery when cache is stale and live refresh is requested
+  otherwise return cached/static data
+```
+
+Model filter rules:
+
+- `allow` and `deny` support glob patterns.
+- `allow` wins over `deny`.
+- With no `allow`, all models are allowed except denied models.
+- With `allow = ["*"]`, all models are allowed except denied models.
+- With a narrow allow list, only matching models are shown and, if enforcement
+  is enabled, accepted.
 
 Provider behavior from official docs:
 
@@ -402,6 +484,44 @@ Catalog normalization rules:
   exact value required by the adapter path.
 - Filter Gemini models to ones whose `supportedActions` include
   `generateContent` for generation routes.
+- Do not require provider prefixes inside provider-scoped routes. A request to
+  `/providers/fireworks/...` can use `model = "accounts/fireworks/models/foo"`.
+- Compatibility `/v1/models` may expose provider-prefixed IDs such as
+  `fireworks/accounts/fireworks/models/foo` to disambiguate global listings.
+
+## Reference Project Findings
+
+LiteLLM:
+
+- Uses static `model_list` entries as the main routing surface.
+- Supports wildcard model routes like `anthropic/*`.
+- `/v1/models` lists models available through config and access rules.
+- It does not rely on live upstream discovery for normal routing.
+
+llm-api-key-proxy:
+
+- Implements real provider discovery through provider plugins with
+  `get_models`.
+- OpenAI, Groq, Mistral, OpenRouter, Gemini, and OpenAI-compatible providers
+  fetch upstream model-list endpoints.
+- Dynamic OpenAI-compatible providers can be discovered from environment
+  variables like `<NAME>_API_BASE`.
+- It applies allow/deny filtering and caches fetched model lists.
+- `/v1/models` returns OpenAI-style model cards built from available models.
+
+oc-go-cc:
+
+- Uses static model and fallback config.
+- Has `respect_requested_model`, which can pass through a requested model, but
+  provider choice still comes from config defaults rather than URL route.
+- It has no real model discovery.
+
+Design decision from refs:
+
+- Keep LiteLLM's static/wildcard configurability.
+- Keep llm-api-key-proxy's optional live model discovery and allow/deny filters.
+- Avoid oc-go-cc's scenario model router for this proxy remodel.
+- Avoid making discovery a request-time routing dependency.
 
 ## Implementation Phases
 
@@ -443,7 +563,10 @@ Catalog normalization rules:
 - Add catalog read/write helpers.
 - Implement `GET /providers/{provider}/v1/models`.
 - Implement `llm-proxy models --provider ... --live`.
-- Keep enforcement out of scope unless explicitly requested later.
+- Implement static, discovered, and hybrid catalog modes.
+- Add allow/deny glob filtering.
+- Add opt-in catalog enforcement with `provider.catalog.enforce`.
+- Keep enforcement disabled by default.
 
 ### Phase 6: Cleanup
 
