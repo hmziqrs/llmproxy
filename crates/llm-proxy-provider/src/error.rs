@@ -9,8 +9,7 @@
 
 /// Errors produced by provider transport and adapter operations.
 ///
-/// This enum may grow new variants in future phases; match exhaustively at your
-/// own risk. Prefer `match` with a catch-all `_ =>` arm in downstream code.
+/// This enum is non-exhaustive; downstream code should include a catch-all arm.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum ProviderError {
@@ -19,8 +18,16 @@ pub enum ProviderError {
     Serialize(#[from] serde_json::Error),
 
     /// The HTTP request failed at the transport level.
-    #[error("request failed: {0}")]
-    Http(#[from] reqwest::Error),
+    ///
+    /// The message is stored without the request URL so query credentials
+    /// cannot leak through logs, CLI output, or downstream responses.
+    #[error("request failed: {message}")]
+    Http {
+        /// URL-free transport error text.
+        message: String,
+        /// Whether reqwest classified the failure as a timeout.
+        timeout: bool,
+    },
 
     /// The upstream API returned an error status code.
     ///
@@ -54,6 +61,16 @@ pub enum ProviderError {
     /// Invalid configuration or input (e.g. unsafe model name for URL interpolation).
     #[error("invalid configuration: {0}")]
     InvalidConfig(String),
+}
+
+impl From<reqwest::Error> for ProviderError {
+    fn from(error: reqwest::Error) -> Self {
+        let timeout = error.is_timeout();
+        Self::Http {
+            message: error.without_url().to_string(),
+            timeout,
+        }
+    }
 }
 
 /// Maximum length for upstream API error bodies stored in [`ProviderError::Api`].
@@ -150,8 +167,7 @@ pub(crate) fn sanitize_api_error_body(mut body: String) -> String {
     // Truncate if the sanitized body exceeds the limit.
     // Uses the same truncate-with-suffix logic as
     // `llm_proxy_server::routes::error_response::truncate_with_suffix`.
-    // Both implementations must stay in sync. If a shared utility crate is
-    // introduced in a future phase, both should call into it.
+    // Both implementations must stay in sync.
     if body.len() > MAX_API_ERROR_BODY_LEN {
         body = truncate_with_suffix(&body, MAX_API_ERROR_BODY_LEN, TRUNCATED_SUFFIX);
     }
@@ -163,6 +179,12 @@ pub(crate) fn sanitize_api_error_body(mut body: String) -> String {
 // ---------------------------------------------------------------------------
 
 impl ProviderError {
+    /// Return whether this is an HTTP timeout.
+    #[must_use]
+    pub fn is_timeout(&self) -> bool {
+        matches!(self, Self::Http { timeout: true, .. })
+    }
+
     /// Construct a [`ProviderError::Api`] with automatic body sanitization.
     ///
     /// Encapsulates the sanitization call so callers never need to remember
@@ -401,5 +423,19 @@ mod tests {
         // the LazyLock would panic at first use in production. This test
         // exercises the initialization path explicitly.
         let _ = &*REDACTION_PATTERNS;
+    }
+
+    #[tokio::test]
+    async fn http_error_does_not_expose_request_url_or_query_secret() {
+        let secret = "query-secret-that-must-not-leak";
+        let error = reqwest::Client::new()
+            .get(format!("http://127.0.0.1:0/models?key={secret}"))
+            .send()
+            .await
+            .expect_err("port zero must fail");
+        let rendered = ProviderError::from(error).to_string();
+        assert!(!rendered.contains(secret));
+        assert!(!rendered.contains("127.0.0.1"));
+        assert!(!rendered.contains("models?key="));
     }
 }

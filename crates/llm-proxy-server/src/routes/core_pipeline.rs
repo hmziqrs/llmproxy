@@ -1157,8 +1157,8 @@ pub(crate) fn map_provider_error(e: llm_proxy_provider::error::ProviderError) ->
         _ => {
             // Check for reqwest timeout specifically so we can return 504
             // instead of the generic 502 Bad Gateway.
-            if let Some(reqwest_err) = is_reqwest_timeout(&e) {
-                let sanitized = sanitize_upstream_error_body(&reqwest_err.to_string());
+            if e.is_timeout() {
+                let sanitized = sanitize_upstream_error_body(&e.to_string());
                 return RouteError::UpstreamTimeout(sanitized);
             }
             // Sanitize non-Api error messages to prevent leaking upstream
@@ -1169,23 +1169,6 @@ pub(crate) fn map_provider_error(e: llm_proxy_provider::error::ProviderError) ->
                 body: sanitized,
             }
         }
-    }
-}
-
-/// Check whether a `ProviderError` wraps a reqwest timeout error.
-///
-/// Returns the inner `reqwest::Error` reference if the error chain contains
-/// a timeout, so the caller can extract a sanitized message.
-fn is_reqwest_timeout(e: &llm_proxy_provider::error::ProviderError) -> Option<&reqwest::Error> {
-    match e {
-        llm_proxy_provider::error::ProviderError::Http(http_err) => {
-            // reqwest::Error implements std::error::Error; check is_timeout().
-            if http_err.is_timeout() {
-                return Some(http_err);
-            }
-            None
-        }
-        _ => None,
     }
 }
 

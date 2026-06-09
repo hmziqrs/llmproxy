@@ -18,9 +18,6 @@ pub enum CoreError {
     /// Failed to parse a TOML config file.
     #[error("failed to parse config: {0}")]
     ConfigParse(#[from] toml::de::Error),
-    /// Failed to parse a JSON config file.
-    #[error("failed to parse config: {0}")]
-    ConfigParseJson(#[from] serde_json::Error),
     /// Config validation failed.
     #[error("config validation error: {message}")]
     ConfigValidation {

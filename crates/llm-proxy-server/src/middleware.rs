@@ -253,8 +253,7 @@ impl Default for RequestIdGenerator {
 ///
 /// # `trust_forwarded_headers` config option
 ///
-/// A `trust_forwarded_headers` boolean config option (default: `true` for
-/// backward compatibility) should be added in a future phase.  When set to
+/// A `trust_forwarded_headers` boolean config option should be added. When set to
 /// `false`, this function will skip `X-Forwarded-For` and `X-Real-IP` and
 /// rely solely on connection info.  This is needed for deployments where
 /// the proxy is directly exposed to the internet without a trusted reverse

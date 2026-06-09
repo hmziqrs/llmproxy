@@ -307,7 +307,7 @@ async fn messages_valid_json_missing_fields_returns_validation_error() {
 }
 
 /// Phase 9 guardrail: POST /v1/chat/completions route is mounted and tested
-/// comprehensively in tests/chat_completions.rs. The legacy chat_echo test that
+/// comprehensively in tests/chat_completions.rs. The removed chat_echo test that
 /// was here has been removed since its single assertion (not-404) is a subset
 /// of the `route_is_mounted_no_longer_404` test in that file.
 
@@ -576,7 +576,7 @@ async fn toml_messages_passes_through_to_upstream() {
     );
 }
 
-/// TOML mode: POST /v1/messages/count_tokens works without legacy state.
+/// POST /providers/{provider}/v1/messages/count_tokens works with provider state.
 #[tokio::test]
 async fn toml_count_tokens_returns_estimate() {
     let app = build_router(state_with_provider());

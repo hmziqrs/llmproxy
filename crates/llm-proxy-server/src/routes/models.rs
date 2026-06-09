@@ -99,6 +99,7 @@ async fn handle_models_inner(
     provider_name: &str,
     refresh_live: bool,
 ) -> Result<Response<Body>, RouteError> {
+    super::core_pipeline::validate_provider_name(provider_name)?;
     // Look up the provider. Returns 404 if not found.
     let provider = state
         .providers()
@@ -353,17 +354,14 @@ mod tests {
     }
 
     #[test]
-    fn source_guard_models_no_legacy_imports() {
+    fn source_guard_models_uses_current_architecture() {
         let source = include_str!("models.rs");
         let prod = source
             .split_once("#[cfg(test)]")
             .map(|(p, _)| p)
             .unwrap_or(source);
 
-        assert!(
-            !prod.contains("ApiError"),
-            "models.rs must not use legacy ApiError"
-        );
+        assert!(!prod.contains("ApiError"), "models.rs must use RouteError");
         assert!(
             !prod.contains("crate::error::"),
             "models.rs must not import from crate::error"

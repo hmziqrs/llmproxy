@@ -1067,10 +1067,10 @@ async fn no_anthropic_error_envelope_on_openai_route() {
 // Source guard test (integration level)
 // ===========================================================================
 
-/// source guard confirms routes/chat.rs has no legacy transformer,
+/// source guard confirms routes/chat.rs respects architecture boundaries,
 /// endpoint-classifier, fallback, or direct-provider execution path
 #[test]
-fn source_guard_chat_rs_no_legacy_imports() {
+fn source_guard_chat_rs_architecture_boundaries() {
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
     let chat_path = std::path::Path::new(&manifest_dir)
         .join("src")

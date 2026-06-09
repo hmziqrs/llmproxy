@@ -14,7 +14,7 @@ use crate::state::AppState;
 ///
 /// The `model_counts` field exposes internal routing information using
 /// composite keys of the form `"{provider}/{model}"` (provider name + model
-/// → request count). In a future phase, this should be gated behind
+/// → request count). This should be gated behind
 /// authentication or redacted for unauthenticated access, as it reveals
 /// which providers and models are configured and their relative usage.
 #[derive(Serialize)]

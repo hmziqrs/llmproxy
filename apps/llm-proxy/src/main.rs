@@ -446,7 +446,7 @@ async fn main() -> Result<()> {
 
 /// Run the `serve` command.
 ///
-/// Requires TOML config. JSON config is rejected with a migration error.
+/// Requires TOML configuration.
 async fn cmd_serve(
     config_path: Option<PathBuf>,
     port_override: Option<u16>,
@@ -1321,4 +1321,90 @@ fn set_private_permissions(path: &std::path::Path) -> Result<()> {
 // ===========================================================================
 
 #[cfg(test)]
-mod tests {}
+mod tests {
+    use axum::{Router, routing::get};
+
+    use super::*;
+
+    #[test]
+    fn models_flags_parse_together() {
+        let cli = Cli::try_parse_from([
+            "llm-proxy",
+            "models",
+            "--provider",
+            "fireworks",
+            "--live",
+            "--write-catalog",
+            "--require-success",
+        ])
+        .unwrap();
+        let Commands::Models {
+            provider,
+            live,
+            write_catalog,
+            require_success,
+            ..
+        } = cli.command
+        else {
+            panic!("expected models command");
+        };
+        assert_eq!(provider.as_deref(), Some("fireworks"));
+        assert!(live);
+        assert!(write_catalog);
+        assert!(require_success);
+    }
+
+    #[tokio::test]
+    async fn models_live_writes_discovered_catalog() {
+        let app = Router::new().route(
+            "/models",
+            get(|| async {
+                (
+                    [("content-type", "application/json")],
+                    r#"{"data":[{"id":"discovered-model"}]}"#,
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let directory = tempfile::tempdir().unwrap();
+        let config = directory.path().join("config.toml");
+        std::fs::write(&config, DEFAULT_CONFIG_TOML).unwrap();
+        let providers = directory.path().join("providers");
+        std::fs::create_dir(&providers).unwrap();
+        std::fs::write(
+            providers.join("test-provider.toml"),
+            format!(
+                r#"[provider]
+name = "test-provider"
+api_key = "test-key"
+auth_style = "bearer"
+
+[provider.discovery]
+kind = "openai_compatible_models"
+endpoint = "http://{address}/models"
+"#
+            ),
+        )
+        .unwrap();
+
+        cmd_models(
+            Some(config),
+            Some("test-provider".to_owned()),
+            true,
+            true,
+            true,
+        )
+        .await
+        .unwrap();
+
+        let raw =
+            std::fs::read_to_string(providers.join(".catalog").join("test-provider.toml")).unwrap();
+        let catalog: CatalogFile = toml::from_str(&raw).unwrap();
+        assert_eq!(catalog.catalog.models[0].id, "discovered-model");
+    }
+}

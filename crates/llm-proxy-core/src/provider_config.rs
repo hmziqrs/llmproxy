@@ -360,7 +360,8 @@ pub struct ProviderCatalogConfig {
     /// Glob patterns for model IDs that are allowed. `["*"]` allows all.
     #[serde(default = "default_allow_all")]
     pub allow: Vec<String>,
-    /// Glob patterns for model IDs that are denied (takes precedence after allow).
+    /// Glob patterns for model IDs that are denied unless a non-wildcard allow
+    /// pattern explicitly includes the model.
     #[serde(default)]
     pub deny: Vec<String>,
     /// Operator-defined static model entries.
@@ -395,9 +396,8 @@ impl Default for ProviderCatalogConfig {
 
 /// Errors produced during config validation.
 ///
-/// This enum is `#[non_exhaustive]` to allow adding new validation variants in
-/// future phases (e.g. Phase 6 cross-file validation) without breaking changes
-/// for downstream `match` expressions.
+/// This enum is `#[non_exhaustive]` so validation can evolve without breaking
+/// downstream `match` expressions.
 #[derive(Debug, Clone, thiserror::Error)]
 #[non_exhaustive]
 pub enum ConfigValidationError {

@@ -52,10 +52,10 @@ const NOT_FOUND_BODY_DRAIN_LIMIT: usize = 1024;
 /// which would confuse orchestrators (Kubernetes, load balancers).
 ///
 /// Note: `TimeoutLayer` still applies to streaming SSE responses within the
-/// `/v1/*` group. The configured `request_timeout` must be set high enough
+/// provider API route group. The configured `request_timeout` must be set high enough
 /// for long-running LLM streaming responses. Exempting streaming routes
 /// specifically (e.g. via per-route middleware or a streaming-aware timeout
-/// that only covers the request-body phase) is deferred to a future phase.
+/// that only covers the request-body phase) is not currently implemented.
 pub fn router(state: AppState) -> Router {
     let timeout = state.request_timeout();
 

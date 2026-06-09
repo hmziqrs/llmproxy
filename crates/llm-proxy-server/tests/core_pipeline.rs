@@ -1,7 +1,7 @@
 //! Integration tests for the core pipeline (Phase 8).
 //!
 //! These tests exercise the full request path through the axum router with a
-//! local mock upstream server. Each test configures AppState with a model route
+//! local mock upstream server. Each test configures AppState with a provider route
 //! pointing at the mock server, which returns canned provider-specific responses
 //! that are translated through the core pipeline into Anthropic-shaped responses.
 
@@ -1333,14 +1333,11 @@ async fn token_count_with_tool_result_returns_positive_count() {
     );
 }
 
-/// Token count endpoint does not require legacy state (works with TOML mode only).
+/// Token count endpoint works with the provider-configured application state.
 #[tokio::test]
-async fn token_count_endpoint_works_without_legacy_state() {
+async fn token_count_endpoint_works_with_provider_state() {
     let mock_url = spawn_mock_anthropic_non_stream().await;
     let state = state_with_anthropic_provider(&mock_url);
-    // The state is constructed via AppState::new which always sets TOML config.
-    // We cannot call state.legacy() from integration tests (pub(crate)), so we
-    // verify indirectly: the request should succeed with TOML-only state.
     let app = build_router(state);
 
     let body = json!({
@@ -1387,9 +1384,9 @@ async fn invalid_json_returns_400_anthropic_shape() {
     assert_eq!(body["error"]["type"], "invalid_request_error");
 }
 
-/// TOML mode /v1/messages works with legacy = None, app_config = Some.
+/// Provider-scoped messages routing works with the configured application state.
 #[tokio::test]
-async fn toml_messages_works_without_legacy_state() {
+async fn provider_messages_route_works() {
     let mock_url = spawn_mock_anthropic_non_stream().await;
     let state = state_with_anthropic_provider(&mock_url);
     let app = build_router(state);

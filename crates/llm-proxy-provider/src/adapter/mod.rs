@@ -68,15 +68,14 @@ impl ProviderProtocol {
 
     /// Parse a protocol name string (case-insensitive).
     ///
-    /// Accepts both the canonical snake_case names and the legacy kebab-case
-    /// names for backward compatibility.
+    /// Accepts canonical snake_case protocol names.
     #[must_use]
     pub fn parse(name: &str) -> Option<Self> {
         match name.to_ascii_lowercase().as_str() {
-            "openai_chat_completions" | "openai-chat" => Some(Self::OpenAiChatCompletions),
-            "anthropic_messages" | "anthropic" => Some(Self::AnthropicMessages),
-            "openai_responses" | "openai-responses" => Some(Self::OpenAiResponses),
-            "gemini_generate_content" | "gemini" => Some(Self::GeminiGenerateContent),
+            "openai_chat_completions" => Some(Self::OpenAiChatCompletions),
+            "anthropic_messages" => Some(Self::AnthropicMessages),
+            "openai_responses" => Some(Self::OpenAiResponses),
+            "gemini_generate_content" => Some(Self::GeminiGenerateContent),
             _ => None,
         }
     }
@@ -289,10 +288,9 @@ impl ProviderAdapterRegistry {
 ///
 /// Currently supports `{model}` -> `upstream_model`.
 ///
-/// Validates that the model name contains only safe characters (alphanumeric,
-/// dots, hyphens, underscores) to prevent path traversal injection.  Returns
-/// an error if the model name contains characters that could enable SSRF or
-/// path-traversal attacks (e.g. `/`, `..`, control characters).
+/// Validates that the model name contains only safe characters. Gemini resource
+/// names may contain one leading `models/` segment; all other slashes are
+/// rejected.
 ///
 /// # Path canonicalization
 ///
@@ -306,7 +304,14 @@ pub(crate) fn expand_url_template(
     template: &str,
     target: &ProviderAdapterTarget,
 ) -> Result<String, ProviderError> {
-    let model = &target.upstream_model;
+    if !template.contains("{model}") {
+        return Ok(template.to_owned());
+    }
+    let configured_model = &target.upstream_model;
+    let model = configured_model
+        .strip_prefix("models/")
+        .filter(|_| template.contains("models/{model}"))
+        .unwrap_or(configured_model);
     // Reject model names containing path traversal or other unsafe characters.
     // Additionally reject `.` and `..` exactly (path traversal patterns).
     if model == ".." || model == "." {
@@ -315,16 +320,25 @@ pub(crate) fn expand_url_template(
             model
         )));
     }
-    if !model
-        .chars()
-        .all(|c| c.is_alphanumeric() || c == '.' || c == '-' || c == '_')
-    {
+    let valid_resource_name = model
+        .strip_prefix("models/")
+        .is_some_and(is_safe_model_component);
+    if !is_safe_model_component(model) && !valid_resource_name {
         return Err(ProviderError::InvalidConfig(format!(
             "upstream_model {:?} contains unsafe characters; refusing to interpolate into URL",
             model
         )));
     }
     Ok(template.replace("{model}", model))
+}
+
+fn is_safe_model_component(model: &str) -> bool {
+    !model.is_empty()
+        && model != "."
+        && model != ".."
+        && model
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
 }
 
 /// Map a finish reason string from OpenAI-compatible providers to a core StopReason.
@@ -464,27 +478,6 @@ mod tests {
     }
 
     #[test]
-    fn protocol_parse_legacy_kebab_case() {
-        // Legacy kebab-case names are still accepted for backward compatibility.
-        assert_eq!(
-            ProviderProtocol::parse("openai-chat"),
-            Some(ProviderProtocol::OpenAiChatCompletions)
-        );
-        assert_eq!(
-            ProviderProtocol::parse("anthropic"),
-            Some(ProviderProtocol::AnthropicMessages)
-        );
-        assert_eq!(
-            ProviderProtocol::parse("openai-responses"),
-            Some(ProviderProtocol::OpenAiResponses)
-        );
-        assert_eq!(
-            ProviderProtocol::parse("gemini"),
-            Some(ProviderProtocol::GeminiGenerateContent)
-        );
-    }
-
-    #[test]
     fn protocol_parse_unknown_returns_none() {
         assert_eq!(ProviderProtocol::parse("unknown"), None);
         assert_eq!(ProviderProtocol::parse(""), None);
@@ -521,9 +514,8 @@ mod tests {
         assert!(reg.has_protocol_name("openai_responses"));
         assert!(reg.has_protocol_name("gemini_generate_content"));
         assert!(!reg.has_protocol_name("unknown"));
-        // Legacy kebab-case names are also accepted.
-        assert!(reg.has_protocol_name("openai-chat"));
-        assert!(reg.has_protocol_name("anthropic"));
+        assert!(!reg.has_protocol_name("openai-chat"));
+        assert!(!reg.has_protocol_name("anthropic"));
     }
 
     // -- Adapter protocol method ---------------------------------------------
@@ -582,6 +574,21 @@ mod tests {
     }
 
     #[test]
+    fn url_without_placeholder_accepts_body_only_resource_model() {
+        let mut target = make_target(ProviderProtocol::OpenAiChatCompletions);
+        target.upstream_model = "accounts/example/models/deepseek-v3".into();
+        let url = expand_url_template(
+            "https://api.fireworks.ai/inference/v1/chat/completions",
+            &target,
+        )
+        .unwrap();
+        assert_eq!(
+            url,
+            "https://api.fireworks.ai/inference/v1/chat/completions"
+        );
+    }
+
+    #[test]
     fn url_template_rejects_unsafe_model_name() {
         let mut target = make_target(ProviderProtocol::OpenAiChatCompletions);
         target.upstream_model = "../../etc/passwd".into();
@@ -589,6 +596,46 @@ mod tests {
         assert!(
             result.is_err(),
             "should reject model name with path traversal"
+        );
+    }
+
+    #[test]
+    fn url_template_accepts_discovered_gemini_resource_name() {
+        let mut target = make_target(ProviderProtocol::GeminiGenerateContent);
+        target.upstream_model = "models/gemini-2.5-pro".into();
+        let url = expand_url_template(
+            "https://generativelanguage.googleapis.com/v1beta/{model}:generateContent",
+            &target,
+        )
+        .unwrap();
+        assert_eq!(
+            url,
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent"
+        );
+    }
+
+    #[test]
+    fn url_template_does_not_duplicate_gemini_models_segment() {
+        let mut target = make_target(ProviderProtocol::GeminiGenerateContent);
+        target.upstream_model = "models/gemini-2.5-pro".into();
+        let url = expand_url_template(
+            "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+            &target,
+        )
+        .unwrap();
+        assert_eq!(
+            url,
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent"
+        );
+    }
+
+    #[test]
+    fn url_template_rejects_nested_model_resource_name() {
+        let mut target = make_target(ProviderProtocol::GeminiGenerateContent);
+        target.upstream_model = "models/group/gemini-2.5-pro".into();
+        assert!(
+            expand_url_template("https://example.com/{model}", &target).is_err(),
+            "only the provider-defined models/ prefix may contain a slash"
         );
     }
 

@@ -1,12 +1,12 @@
-//! `/v1/messages` handler using the core pipeline.
+//! `/providers/{provider}/v1/messages` handler using the core pipeline.
 //!
-//! This is the Phase 8 rewrite: the handler parses the incoming Anthropic
-//! `MessageRequest`, decodes it into a `CoreRequest` via the Anthropic client
+//! The handler parses the incoming Anthropic `MessageRequest`, decodes it into
+//! a `CoreRequest` via the Anthropic client
 //! adapter, and then dispatches through the shared core pipeline
 //! ([`handle_core_once`] or [`handle_core_stream`]).
 //!
-//! **No legacy imports**: no scenario detection, endpoint classification,
-//! fallback chains, legacy HTTP client, or provider-specific stream handlers.
+//! Architecture boundary: route handlers do not perform scenario detection,
+//! endpoint classification, fallback routing, or provider-specific streaming.
 
 use axum::body::Body;
 use axum::extract::{Path, State};
@@ -21,7 +21,7 @@ use crate::state::AppState;
 use super::core_pipeline;
 use super::error_response::{ClientProtocol, RouteError, route_error_response};
 
-/// POST `/v1/messages`
+/// POST `/providers/{provider}/v1/messages`
 ///
 /// Accepts an Anthropic-format [`MessageRequest`], decodes it through the
 /// core pipeline, and returns an Anthropic-shaped response.
@@ -103,10 +103,10 @@ async fn handle_messages_inner(
 
 #[cfg(test)]
 mod tests {
-    // -- Source guard: no legacy imports ---------------------------------------
+    // -- Architecture source guard ---------------------------------------------
 
     #[test]
-    fn source_guard_no_legacy_imports() {
+    fn source_guard_enforces_route_boundaries() {
         let source = include_str!("messages.rs");
         let prod = source
             .split_once("#[cfg(test)]")
@@ -115,7 +115,7 @@ mod tests {
 
         assert!(
             !prod.contains("llm_proxy_core::router"),
-            "messages.rs must not import legacy router (scenario/fallback)"
+            "messages.rs must not import scenario/fallback routing"
         );
         assert!(
             !prod.contains("detect_scenario"),
@@ -139,7 +139,7 @@ mod tests {
         );
         assert!(
             !prod.contains("transformer"),
-            "messages.rs must not use legacy transformer module"
+            "messages.rs must not use the removed transformer module"
         );
         assert!(
             !prod.contains("StreamProxy"),
@@ -167,7 +167,7 @@ mod tests {
         );
         assert!(
             !prod.contains("ApiError"),
-            "messages.rs must not use legacy ApiError"
+            "messages.rs must use RouteError"
         );
         assert!(
             !prod.contains("ScenarioConfig"),

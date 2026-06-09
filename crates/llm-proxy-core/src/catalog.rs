@@ -66,7 +66,10 @@ pub fn merge_catalog(
 pub fn model_allowed(model: &str, allow: &[String], deny: &[String]) -> bool {
     let allowed = allow.is_empty() || allow.iter().any(|pattern| glob_matches(pattern, model));
     let denied = deny.iter().any(|pattern| glob_matches(pattern, model));
-    allowed && !denied
+    let explicitly_allowed = allow
+        .iter()
+        .any(|pattern| pattern != "*" && glob_matches(pattern, model));
+    allowed && (!denied || explicitly_allowed)
 }
 
 fn glob_matches(pattern: &str, value: &str) -> bool {
@@ -123,6 +126,15 @@ mod tests {
         assert!(!model_allowed(
             "model-preview",
             &["*".to_owned()],
+            &["*-preview".to_owned()]
+        ));
+    }
+
+    #[test]
+    fn explicit_allow_overrides_deny() {
+        assert!(model_allowed(
+            "model-preview",
+            &["*".to_owned(), "model-preview".to_owned()],
             &["*-preview".to_owned()]
         ));
     }

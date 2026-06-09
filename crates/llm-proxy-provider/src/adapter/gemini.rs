@@ -359,7 +359,7 @@ impl GeminiAdapter {
         // are present, both are included.  The prepended system prompt comes first,
         // followed by CoreRole::System messages mapped to "user" role.  This may
         // create duplicate system content, but deduplication is deferred to a
-        // future phase since the caller typically provides one or the other.
+        // the caller typically provides one or the other.
         if !core.system.is_empty() {
             // Warn about non-text system content blocks (consistent with other adapters).
             for c in &core.system {

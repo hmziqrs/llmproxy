@@ -1048,7 +1048,7 @@ mod tests {
 
         let err = client.send(req).await.unwrap_err();
         match err {
-            ProviderError::Http(_) => {} // expected
+            ProviderError::Http { .. } => {} // expected
             other => panic!(
                 "expected ProviderError::Http for empty URL, got: {:?}",
                 other
@@ -1210,7 +1210,7 @@ mod tests {
             Err(_) => panic!("test timed out waiting for connection failure"),
         };
         match err {
-            ProviderError::Http(_) => {} // expected
+            ProviderError::Http { .. } => {} // expected
             other => panic!(
                 "expected ProviderError::Http for unreachable URL, got: {:?}",
                 other

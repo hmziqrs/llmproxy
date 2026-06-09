@@ -2,7 +2,7 @@
 //!
 //! Accepts an Anthropic-format request, decodes it through the Anthropic client
 //! adapter into a `CoreRequest`, and estimates the token count from the core
-//! representation. No legacy state is required.
+//! representation.
 
 use axum::body::Body;
 use axum::extract::{Path, State};
@@ -32,7 +32,7 @@ pub(crate) struct TokenCountResponse {
 ///
 /// This handler uses the core pipeline decode (`anthropic::decode_request`)
 /// rather than direct field access on `MessageRequest`, ensuring it works
-/// without legacy state.
+/// using the configured tokenizer.
 pub async fn count_tokens(
     State(state): State<AppState>,
     Path(provider): Path<String>,
@@ -170,7 +170,7 @@ async fn count_tokens_inner(
 #[cfg(test)]
 mod tests {
     #[test]
-    fn source_guard_token_count_no_legacy_imports() {
+    fn source_guard_token_count_uses_current_architecture() {
         let source = include_str!("token_count.rs");
         let prod = source
             .split_once("#[cfg(test)]")
@@ -179,7 +179,7 @@ mod tests {
 
         assert!(
             !prod.contains("ApiError"),
-            "token_count.rs must not use legacy ApiError"
+            "token_count.rs must use ServerError"
         );
         assert!(
             !prod.contains("crate::error::"),
@@ -187,11 +187,11 @@ mod tests {
         );
         assert!(
             !prod.contains("content_blocks()"),
-            "token_count.rs must not use legacy content_blocks() method"
+            "token_count.rs must not use removed content_blocks() method"
         );
         assert!(
             !prod.contains("system_text()"),
-            "token_count.rs must not use legacy system_text() method"
+            "token_count.rs must not use removed system_text() method"
         );
     }
 }
