@@ -51,7 +51,8 @@ async fn handle_chat_completions_inner(
     // Note: prepare_request takes a &[u8] reference (non-consuming) so the
     // body bytes remain available for the second parse below. The body bytes
     // are hashed for dedup, then deserialized as ChatCompletionRequest.
-    let ctx = core_pipeline::prepare_request(&state, &headers, &body, "/v1/chat/completions")?;
+    let request_path = format!("/providers/{provider}/v1/chat/completions");
+    let ctx = core_pipeline::prepare_request(&state, &headers, &body, &request_path)?;
 
     // Parse the OpenAI ChatCompletionRequest.
     let req: ChatCompletionRequest = serde_json::from_slice(&body)

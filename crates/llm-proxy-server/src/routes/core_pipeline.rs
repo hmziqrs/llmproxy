@@ -256,7 +256,7 @@ static PROVIDER_NAME_REGEX: std::sync::LazyLock<regex::Regex> = std::sync::LazyL
 });
 
 /// Validate that a provider name from a URL path contains only safe characters.
-fn validate_provider_name(name: &str) -> Result<(), RouteError> {
+pub(super) fn validate_provider_name(name: &str) -> Result<(), RouteError> {
     if name.is_empty() {
         return Err(RouteError::InvalidProviderName(
             "provider name is empty".to_owned(),
@@ -287,7 +287,7 @@ fn validate_and_clean_provider_name(provider_name: &str) -> Result<&str, RouteEr
 /// adapter_name                -> protocol + endpoint + headers
 /// requested_model             -> model_aliases -> upstream_model
 /// ```
-fn resolve_target(
+async fn resolve_target(
     state: &AppState,
     provider_name: &str,
     route_kind: ProviderRouteKind,
@@ -308,6 +308,29 @@ fn resolve_target(
                 RouteError::Internal(msg)
             }
         })?;
+
+    if providers
+        .get(provider_name)
+        .and_then(|provider| provider.catalog.as_ref())
+        .is_some_and(|catalog| catalog.enforce)
+    {
+        let provider = providers
+            .get(provider_name)
+            .ok_or_else(|| RouteError::UnknownProvider(provider_name.to_owned()))?;
+        let catalog = state
+            .model_catalogs()
+            .catalog(provider, false)
+            .await
+            .map_err(|error| RouteError::Internal(error.to_string()))?;
+        if !catalog
+            .iter()
+            .any(|model| model.id == adapter_target_config.upstream_model)
+        {
+            return Err(RouteError::ModelNotAllowed(
+                adapter_target_config.upstream_model.clone(),
+            ));
+        }
+    }
 
     let protocol = ProviderProtocol::parse(&adapter_target_config.protocol).ok_or_else(|| {
         RouteError::Internal(format!(
@@ -371,8 +394,9 @@ pub(crate) async fn handle_core_once(
         "processing request"
     );
 
-    let (target, adapter) =
-        resolve_target(&state, provider_name, route_kind, &core).inspect_err(|_| {
+    let (target, adapter) = resolve_target(&state, provider_name, route_kind, &core)
+        .await
+        .inspect_err(|_| {
             state.metrics.record_failure();
         })?;
 
@@ -514,8 +538,9 @@ pub(crate) async fn handle_core_stream(
         "processing streaming request"
     );
 
-    let (target, adapter) =
-        resolve_target(&state, provider_name, route_kind, &core).inspect_err(|_| {
+    let (target, adapter) = resolve_target(&state, provider_name, route_kind, &core)
+        .await
+        .inspect_err(|_| {
             state.metrics.record_failure();
         })?;
 
@@ -1278,12 +1303,11 @@ mod tests {
 
     // -- resolve_target with unknown provider -----------------------------------
 
-    #[test]
-    fn resolve_target_unknown_provider_returns_unknown_provider() {
+    #[tokio::test]
+    async fn resolve_target_unknown_provider_returns_unknown_provider() {
         use llm_proxy_core::AppConfig;
         use llm_proxy_core::ServerConfig;
         use llm_proxy_provider::{ProviderAdapterRegistry, ProxyClient};
-        use std::collections::HashMap;
 
         let app_config = AppConfig {
             server: ServerConfig {
@@ -1293,7 +1317,6 @@ mod tests {
                 hot_reload: false,
                 server_name: "test".to_owned(),
             },
-            models: HashMap::new(),
         };
 
         let providers =
@@ -1332,7 +1355,8 @@ mod tests {
             "nonexistent",
             ProviderRouteKind::ChatCompletions,
             &core,
-        );
+        )
+        .await;
         assert!(result.is_err());
         match result.unwrap_err() {
             RouteError::UnknownProvider(name) => assert_eq!(name, "nonexistent"),
@@ -1342,12 +1366,11 @@ mod tests {
 
     // -- resolve_target with empty registry returns unknown provider ------------
 
-    #[test]
-    fn resolve_target_empty_registry_returns_unknown_provider() {
+    #[tokio::test]
+    async fn resolve_target_empty_registry_returns_unknown_provider() {
         use llm_proxy_core::AppConfig;
         use llm_proxy_core::ServerConfig;
         use llm_proxy_provider::{ProviderAdapterRegistry, ProxyClient};
-        use std::collections::HashMap;
 
         let app_config = AppConfig {
             server: ServerConfig {
@@ -1357,7 +1380,6 @@ mod tests {
                 hot_reload: false,
                 server_name: "test".to_owned(),
             },
-            models: HashMap::new(),
         };
 
         let providers =
@@ -1396,7 +1418,8 @@ mod tests {
             "no-such-provider",
             ProviderRouteKind::Messages,
             &core,
-        );
+        )
+        .await;
         assert!(result.is_err());
         match result.unwrap_err() {
             RouteError::UnknownProvider(name) => assert_eq!(name, "no-such-provider"),

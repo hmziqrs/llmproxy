@@ -1,4 +1,4 @@
-//! `/v1/messages/count_tokens` handler.
+//! `/providers/{provider}/v1/messages/count_tokens` handler.
 //!
 //! Accepts an Anthropic-format request, decodes it through the Anthropic client
 //! adapter into a `CoreRequest`, and estimates the token count from the core
@@ -23,17 +23,9 @@ use super::error_response::{ClientProtocol, RouteError, route_error_response};
 #[serde(deny_unknown_fields)]
 pub(crate) struct TokenCountResponse {
     input_tokens: usize,
-    /// Non-standard extension: `token_count` duplicates `input_tokens`.
-    /// The Anthropic Messages API `count_tokens` endpoint returns only
-    /// `input_tokens`. This extra field is retained for backward
-    /// compatibility with existing clients that depend on this field name.
-    ///
-    /// TODO(phase-12): Remove this field once all known clients are migrated
-    /// to use `input_tokens` only. Track migration status before removing.
-    token_count: usize,
 }
 
-/// POST `/v1/messages/count_tokens`
+/// POST `/providers/{provider}/v1/messages/count_tokens`
 ///
 /// Accepts an Anthropic-format request, estimates the token count
 /// using the heuristic counter, and returns the result.
@@ -43,11 +35,11 @@ pub(crate) struct TokenCountResponse {
 /// without legacy state.
 pub async fn count_tokens(
     State(state): State<AppState>,
-    Path(_provider): Path<String>,
+    Path(provider): Path<String>,
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response<Body> {
-    match count_tokens_inner(&state, &headers, body).await {
+    match count_tokens_inner(&state, &provider, &headers, body).await {
         Ok(response) => response,
         Err(error) => route_error_response(ClientProtocol::Anthropic, error),
     }
@@ -55,11 +47,17 @@ pub async fn count_tokens(
 
 async fn count_tokens_inner(
     state: &AppState,
+    provider: &str,
     headers: &HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<Response<Body>, RouteError> {
     // Pre-flight: rate limit, dedup, request ID.
-    let ctx = core_pipeline::prepare_request(state, headers, &body, "/v1/messages/count_tokens")?;
+    core_pipeline::validate_provider_name(provider)?;
+    if state.providers().get(provider).is_none() {
+        return Err(RouteError::UnknownProvider(provider.to_owned()));
+    }
+    let request_path = format!("/providers/{provider}/v1/messages/count_tokens");
+    let ctx = core_pipeline::prepare_request(state, headers, &body, &request_path)?;
     // Parse and validate the Anthropic MessageRequest.
     let req: MessageRequest = serde_json::from_slice(&body)
         .map_err(|e| RouteError::InvalidRequest(format!("invalid JSON: {e}")))?;
@@ -143,7 +141,6 @@ async fn count_tokens_inner(
 
     let response = axum::Json(TokenCountResponse {
         input_tokens: count,
-        token_count: count,
     });
 
     let mut response = response.into_response();

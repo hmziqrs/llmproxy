@@ -7,6 +7,8 @@
 
 /// Provider adapter implementations and registry.
 pub mod adapter;
+/// Provider model discovery client and parsers.
+pub mod discovery;
 /// Provider error types and body sanitization.
 pub mod error;
 /// SSE framing for streaming provider responses.
@@ -18,6 +20,7 @@ pub use adapter::{
     AnthropicAdapter, GeminiAdapter, OpenAiChatAdapter, ProviderAdapter, ProviderAdapterRegistry,
     ProviderAdapterTarget, ProviderProtocol, ProviderStreamDecoder, ResponsesAdapter,
 };
+pub use discovery::DiscoveryClient;
 pub use error::ProviderError;
 pub use sse::{SseFrame, SseFramer};
 pub use transport::{AuthHeaders, ProxyClient, ProxyRequest};

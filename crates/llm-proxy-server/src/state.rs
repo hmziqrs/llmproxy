@@ -4,6 +4,7 @@ use std::time::Duration;
 use llm_proxy_core::{AppConfig, Counter, Metrics, ProviderRegistry};
 use llm_proxy_provider::{ProviderAdapterRegistry, ProxyClient};
 
+use crate::ModelCatalogService;
 use crate::middleware::{RateLimiter, RequestDeduplicator, RequestIdGenerator};
 
 /// Default rate limit (requests per minute) when no config override is provided.
@@ -77,6 +78,8 @@ pub struct AppState {
     pub(crate) request_dedup: Arc<RequestDeduplicator>,
     /// Request ID generator.
     pub(crate) request_id_gen: Arc<RequestIdGenerator>,
+    /// Mutable provider model catalog cache and discovery coordinator.
+    pub(crate) model_catalogs: Arc<ModelCatalogService>,
 }
 
 impl std::fmt::Debug for AppState {
@@ -102,6 +105,7 @@ impl std::fmt::Debug for AppState {
             .field("rate_limiter", &self.rate_limiter)
             .field("request_dedup", &self.request_dedup)
             .field("request_id_gen", &self.request_id_gen)
+            .field("model_catalogs", &self.model_catalogs)
             .finish()
     }
 }
@@ -116,6 +120,26 @@ impl AppState {
         proxy_client: ProxyClient,
         build: BuildInfo,
     ) -> Self {
+        Self::new_with_catalog_dir(
+            app_config,
+            providers,
+            provider_adapters,
+            proxy_client,
+            build,
+            None,
+        )
+    }
+
+    /// Construct `AppState` with an optional on-disk provider catalog directory.
+    #[must_use]
+    pub fn new_with_catalog_dir(
+        app_config: AppConfig,
+        providers: ProviderRegistry,
+        provider_adapters: ProviderAdapterRegistry,
+        proxy_client: ProxyClient,
+        build: BuildInfo,
+        catalog_dir: Option<std::path::PathBuf>,
+    ) -> Self {
         Self {
             app_config: Arc::new(app_config),
             providers: Arc::new(providers),
@@ -127,6 +151,7 @@ impl AppState {
             rate_limiter: Arc::new(RateLimiter::new(DEFAULT_RATE_LIMIT_RPM)),
             request_dedup: Arc::new(RequestDeduplicator::new()),
             request_id_gen: Arc::new(RequestIdGenerator::new()),
+            model_catalogs: Arc::new(ModelCatalogService::new(catalog_dir)),
         }
     }
 
@@ -148,6 +173,11 @@ impl AppState {
     /// Access the provider registry.
     pub fn providers(&self) -> &ProviderRegistry {
         &self.providers
+    }
+
+    /// Access the provider model catalog service.
+    pub fn model_catalogs(&self) -> &ModelCatalogService {
+        &self.model_catalogs
     }
 
     /// Return the bind address the server should listen on.
@@ -178,7 +208,6 @@ mod tests {
                 hot_reload: false,
                 server_name: "test-proxy".to_owned(),
             },
-            models: HashMap::new(),
         }
     }
 
@@ -236,7 +265,6 @@ mod tests {
             api_key: "sk-secret-key-99999".to_owned(),
             auth_style: AuthStyle::Bearer,
             adapters: HashMap::new(),
-            models: HashMap::new(),
             routes: ProviderRoutesConfig::default(),
             model_aliases: HashMap::new(),
             discovery: None,
@@ -329,8 +357,7 @@ mod tests {
     #[test]
     fn toml_provider_protocol_validation_against_builtin() {
         use llm_proxy_core::{
-            AuthStyle, ProviderAdapterConfig, ProviderConfig, ProviderModelConfig,
-            ProviderRoutesConfig,
+            AuthStyle, ProviderAdapterConfig, ProviderConfig, ProviderRoutesConfig,
         };
         let provider = ProviderConfig {
             name: "test".to_owned(),
@@ -352,16 +379,6 @@ mod tests {
                         protocol: "anthropic_messages".to_owned(),
                         endpoint: "https://example.com/v1/messages".to_owned(),
                         headers: HashMap::new(),
-                    },
-                );
-                m
-            },
-            models: {
-                let mut m = HashMap::new();
-                m.insert(
-                    "gpt-5.4".to_owned(),
-                    ProviderModelConfig {
-                        adapter: "chat".to_owned(),
                     },
                 );
                 m
@@ -401,7 +418,6 @@ mod tests {
                 );
                 m
             },
-            models: HashMap::new(),
             routes: ProviderRoutesConfig::default(),
             model_aliases: HashMap::new(),
             discovery: None,
@@ -518,7 +534,6 @@ mod tests {
                 );
                 m
             },
-            models: HashMap::new(),
             routes: ProviderRoutesConfig::default(),
             model_aliases: HashMap::new(),
             discovery: None,
@@ -542,7 +557,6 @@ mod tests {
                 );
                 m
             },
-            models: HashMap::new(),
             routes: ProviderRoutesConfig::default(),
             model_aliases: HashMap::new(),
             discovery: None,

@@ -27,7 +27,6 @@ fn state() -> AppState {
             hot_reload: false,
             server_name: "test-proxy".to_owned(),
         },
-        models: HashMap::new(),
     };
     let registry = ProviderRegistry::from_providers(vec![]).expect("empty registry");
     AppState::new(
@@ -65,7 +64,6 @@ fn state_with_provider() -> AppState {
             );
             m
         },
-        models: HashMap::new(),
         routes: ProviderRoutesConfig {
             messages: Some("messages".to_owned()),
             chat_completions: Some("messages".to_owned()),
@@ -84,7 +82,6 @@ fn state_with_provider() -> AppState {
                 hot_reload: false,
                 server_name: "test-proxy".to_owned(),
             },
-            models: HashMap::new(),
         },
         registry,
         ProviderAdapterRegistry::builtin(),
@@ -166,7 +163,7 @@ async fn messages_requires_auth_header() {
     });
     let req = Request::builder()
         .method("POST")
-        .uri("/v1/mock-provider/messages")
+        .uri("/providers/mock-provider/v1/messages")
         .header("content-type", "application/json")
         .body(Body::from(body.to_string()))
         .unwrap();
@@ -209,7 +206,7 @@ async fn messages_valid_json_parses_and_validates() {
     });
     let req = Request::builder()
         .method("POST")
-        .uri("/v1/mock-provider/messages")
+        .uri("/providers/mock-provider/v1/messages")
         .header("content-type", "application/json")
         .body(Body::from(body.to_string()))
         .unwrap();
@@ -252,7 +249,7 @@ async fn messages_invalid_json_returns_bad_request() {
     let app = build_router(state());
     let req = Request::builder()
         .method("POST")
-        .uri("/v1/mock-provider/messages")
+        .uri("/providers/mock-provider/v1/messages")
         .header("content-type", "application/json")
         .body(Body::from("this is not json"))
         .unwrap();
@@ -285,7 +282,7 @@ async fn messages_valid_json_missing_fields_returns_validation_error() {
     });
     let req = Request::builder()
         .method("POST")
-        .uri("/v1/mock-provider/messages")
+        .uri("/providers/mock-provider/v1/messages")
         .header("content-type", "application/json")
         .body(Body::from(body.to_string()))
         .unwrap();
@@ -316,7 +313,7 @@ async fn messages_valid_json_missing_fields_returns_validation_error() {
 
 #[tokio::test]
 async fn count_tokens_returns_estimate() {
-    let app = build_router(state());
+    let app = build_router(state_with_provider());
     let body = json!({
         "model": "claude-sonnet-4-6",
         "messages": [{ "role": "user", "content": "hello world" }],
@@ -324,7 +321,7 @@ async fn count_tokens_returns_estimate() {
     });
     let req = Request::builder()
         .method("POST")
-        .uri("/v1/mock-provider/messages/count_tokens")
+        .uri("/providers/mock-provider/v1/messages/count_tokens")
         .header("content-type", "application/json")
         .body(Body::from(body.to_string()))
         .unwrap();
@@ -375,7 +372,7 @@ async fn messages_wrong_field_type_returns_bad_request() {
     });
     let req = Request::builder()
         .method("POST")
-        .uri("/v1/mock-provider/messages")
+        .uri("/providers/mock-provider/v1/messages")
         .header("content-type", "application/json")
         .body(Body::from(body.to_string()))
         .unwrap();
@@ -403,7 +400,7 @@ async fn messages_unknown_fields_returns_bad_request() {
     });
     let req = Request::builder()
         .method("POST")
-        .uri("/v1/mock-provider/messages")
+        .uri("/providers/mock-provider/v1/messages")
         .header("content-type", "application/json")
         .body(Body::from(body.to_string()))
         .unwrap();
@@ -426,7 +423,7 @@ async fn messages_invalid_utf8_returns_bad_request() {
     // Raw non-UTF-8 bytes.
     let req = Request::builder()
         .method("POST")
-        .uri("/v1/mock-provider/messages")
+        .uri("/providers/mock-provider/v1/messages")
         .header("content-type", "application/json")
         .body(Body::from(vec![0x80, 0x81, 0x82]))
         .unwrap();
@@ -445,7 +442,7 @@ async fn messages_empty_body_returns_bad_request() {
     let app = build_router(state());
     let req = Request::builder()
         .method("POST")
-        .uri("/v1/mock-provider/messages")
+        .uri("/providers/mock-provider/v1/messages")
         .header("content-type", "application/json")
         .body(Body::empty())
         .unwrap();
@@ -468,7 +465,7 @@ async fn messages_oversized_body_returns_payload_too_large() {
     let oversized_body = "X".repeat(33 * 1024 * 1024);
     let req = Request::builder()
         .method("POST")
-        .uri("/v1/mock-provider/messages")
+        .uri("/providers/mock-provider/v1/messages")
         .header("content-type", "application/json")
         .body(Body::from(oversized_body))
         .unwrap();
@@ -540,7 +537,7 @@ async fn toml_ready_returns_ready() {
     assert_eq!(body["status"], "ready");
 }
 
-/// TOML mode: POST /v1/{provider}/messages with a registered provider passes the
+/// TOML mode: POST /providers/{provider}/v1/messages with a registered provider passes the
 /// request through to the upstream adapter. The model name is forwarded as-is, so
 /// an unknown model results in a downstream error (502) rather than a 400, because
 /// the proxy no longer validates model names locally.
@@ -554,7 +551,7 @@ async fn toml_messages_passes_through_to_upstream() {
     });
     let req = Request::builder()
         .method("POST")
-        .uri("/v1/mock-provider/messages")
+        .uri("/providers/mock-provider/v1/messages")
         .header("content-type", "application/json")
         .body(Body::from(body.to_string()))
         .unwrap();
@@ -582,7 +579,7 @@ async fn toml_messages_passes_through_to_upstream() {
 /// TOML mode: POST /v1/messages/count_tokens works without legacy state.
 #[tokio::test]
 async fn toml_count_tokens_returns_estimate() {
-    let app = build_router(state());
+    let app = build_router(state_with_provider());
     let body = json!({
         "model": "claude-sonnet-4-6",
         "messages": [{ "role": "user", "content": "hello world" }],
@@ -590,7 +587,7 @@ async fn toml_count_tokens_returns_estimate() {
     });
     let req = Request::builder()
         .method("POST")
-        .uri("/v1/mock-provider/messages/count_tokens")
+        .uri("/providers/mock-provider/v1/messages/count_tokens")
         .header("content-type", "application/json")
         .body(Body::from(body.to_string()))
         .unwrap();

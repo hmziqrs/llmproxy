@@ -123,7 +123,7 @@ impl fmt::Debug for ProviderAdapterTarget {
             .field("api_key", &"[REDACTED]")
             .field("requested_model", &self.requested_model)
             .field("upstream_model", &self.upstream_model)
-            .field("headers", &self.headers)
+            .field("header_names", &self.headers.keys().collect::<Vec<_>>())
             .finish()
     }
 }

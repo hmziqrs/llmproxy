@@ -1,13 +1,12 @@
 //! `GET /providers/{provider}/v1/models` handler.
 //!
-//! Returns the model catalog for a specific provider. Currently supports static
-//! catalog entries only; live discovery will be added in a follow-up phase.
+//! Returns the merged static and discovered model catalog for a provider.
 //!
 //! The response is a normalized superset model card that includes both OpenAI
 //! and Anthropic fields so either SDK can consume it.
 
 use axum::body::Body;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderValue, Response, header};
 use axum::response::IntoResponse;
 use serde::Serialize;
@@ -59,10 +58,17 @@ struct ModelCard {
     model_type: &'static str,
     /// Anthropic: human-readable display name.
     display_name: Option<String>,
+    /// Anthropic-compatible creation timestamp, absent when unknown.
+    created_at: Option<String>,
     /// The route kinds this model supports (non-standard extension).
     supports: Vec<String>,
     /// Maximum context length in tokens (non-standard extension).
     context_length: Option<u32>,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+pub(super) struct ModelsQuery {
+    refresh: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -71,16 +77,15 @@ struct ModelCard {
 
 /// `GET /providers/{provider}/v1/models`
 ///
-/// Returns the model catalog for the named provider. Currently returns only
-/// static catalog entries configured via `[[provider.catalog.models]]`.
-///
-/// Live discovery will be added in a follow-up phase. When no catalog is
-/// configured for the provider, returns an empty list.
+/// Returns the configured catalog, optionally refreshing discovery with
+/// `?refresh=live`. When no catalog is configured, returns an empty list.
 pub async fn handle_models(
     State(state): State<AppState>,
     Path(provider): Path<String>,
+    Query(query): Query<ModelsQuery>,
 ) -> Response<Body> {
-    match handle_models_inner(&state, &provider) {
+    let refresh_live = query.refresh.as_deref() == Some("live");
+    match handle_models_inner(&state, &provider, refresh_live).await {
         Ok(response) => response,
         Err(error) => {
             info!(error = %error, "models request failed");
@@ -89,9 +94,10 @@ pub async fn handle_models(
     }
 }
 
-fn handle_models_inner(
+async fn handle_models_inner(
     state: &AppState,
     provider_name: &str,
+    refresh_live: bool,
 ) -> Result<Response<Body>, RouteError> {
     // Look up the provider. Returns 404 if not found.
     let provider = state
@@ -99,12 +105,14 @@ fn handle_models_inner(
         .get(provider_name)
         .ok_or_else(|| RouteError::UnknownProvider(provider_name.to_owned()))?;
 
-    // Collect static catalog entries.
-    let entries = provider
-        .catalog
-        .as_ref()
-        .map(|c| c.models.as_slice())
-        .unwrap_or(&[]);
+    let entries = state
+        .model_catalogs()
+        .catalog(provider, refresh_live)
+        .await
+        .map_err(|error| RouteError::Upstream {
+            status: axum::http::StatusCode::BAD_GATEWAY,
+            body: error.to_string(),
+        })?;
 
     // Build model cards from static entries.
     let data: Vec<ModelCard> = entries
@@ -116,6 +124,7 @@ fn handle_models_inner(
             owned_by: provider.name.clone(),
             model_type: "model",
             display_name: entry.display_name.clone(),
+            created_at: None,
             supports: entry
                 .supports
                 .iter()
@@ -171,7 +180,6 @@ mod tests {
             api_key: "sk-test".to_owned(),
             auth_style: AuthStyle::Bearer,
             adapters: HashMap::new(),
-            models: HashMap::new(),
             routes: ProviderRoutesConfig::default(),
             model_aliases: HashMap::new(),
             discovery: None,
@@ -212,7 +220,6 @@ mod tests {
                     hot_reload: false,
                     server_name: "test".to_owned(),
                 },
-                models: HashMap::new(),
             },
             registry,
             llm_proxy_provider::ProviderAdapterRegistry::builtin(),
@@ -233,7 +240,6 @@ mod tests {
             api_key: "sk-test".to_owned(),
             auth_style: AuthStyle::Bearer,
             adapters: HashMap::new(),
-            models: HashMap::new(),
             routes: ProviderRoutesConfig::default(),
             model_aliases: HashMap::new(),
             discovery: None,
@@ -251,7 +257,6 @@ mod tests {
                     hot_reload: false,
                     server_name: "test".to_owned(),
                 },
-                models: HashMap::new(),
             },
             registry,
             llm_proxy_provider::ProviderAdapterRegistry::builtin(),
@@ -268,7 +273,9 @@ mod tests {
     #[tokio::test]
     async fn models_with_catalog_returns_entries() {
         let state = build_state_with_catalog();
-        let response = handle_models_inner(&state, "test-provider").expect("response");
+        let response = handle_models_inner(&state, "test-provider", false)
+            .await
+            .expect("response");
         assert_eq!(response.status(), StatusCode::OK);
 
         let body = axum::body::to_bytes(response.into_body(), 16384)
@@ -280,29 +287,31 @@ mod tests {
         assert_eq!(json["data"].as_array().unwrap().len(), 2);
         assert_eq!(json["has_more"], false);
 
-        // First model
+        // Catalog output is sorted by model ID for deterministic responses.
         let m1 = &json["data"][0];
-        assert_eq!(m1["id"], "deepseek-v3.1");
+        assert_eq!(m1["id"], "claude-sonnet-4");
         assert_eq!(m1["object"], "model");
         assert_eq!(m1["owned_by"], "test-provider");
-        assert_eq!(m1["display_name"], "DeepSeek V3.1");
-        assert_eq!(m1["context_length"], 131072);
+        assert_eq!(m1["display_name"], "Claude Sonnet 4");
+        assert_eq!(m1["context_length"], 200000);
 
         // Second model
         let m2 = &json["data"][1];
-        assert_eq!(m2["id"], "claude-sonnet-4");
-        assert_eq!(m2["display_name"], "Claude Sonnet 4");
-        assert_eq!(m2["context_length"], 200000);
+        assert_eq!(m2["id"], "deepseek-v3.1");
+        assert_eq!(m2["display_name"], "DeepSeek V3.1");
+        assert_eq!(m2["context_length"], 131072);
 
         // Pagination fields
-        assert_eq!(json["first_id"], "deepseek-v3.1");
-        assert_eq!(json["last_id"], "claude-sonnet-4");
+        assert_eq!(json["first_id"], "claude-sonnet-4");
+        assert_eq!(json["last_id"], "deepseek-v3.1");
     }
 
     #[tokio::test]
     async fn models_without_catalog_returns_empty_list() {
         let state = build_state_without_catalog();
-        let response = handle_models_inner(&state, "no-catalog").expect("response");
+        let response = handle_models_inner(&state, "no-catalog", false)
+            .await
+            .expect("response");
         assert_eq!(response.status(), StatusCode::OK);
 
         let body = axum::body::to_bytes(response.into_body(), 16384)
@@ -317,10 +326,10 @@ mod tests {
         assert!(json["last_id"].is_null());
     }
 
-    #[test]
-    fn models_unknown_provider_returns_404() {
+    #[tokio::test]
+    async fn models_unknown_provider_returns_404() {
         let state = build_state_with_catalog();
-        let result = handle_models_inner(&state, "nonexistent");
+        let result = handle_models_inner(&state, "nonexistent", false).await;
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(matches!(err, RouteError::UnknownProvider(_)));
@@ -329,7 +338,9 @@ mod tests {
     #[tokio::test]
     async fn model_card_has_no_credentials() {
         let state = build_state_with_catalog();
-        let response = handle_models_inner(&state, "test-provider").expect("response");
+        let response = handle_models_inner(&state, "test-provider", false)
+            .await
+            .expect("response");
 
         let body = axum::body::to_bytes(response.into_body(), 16384)
             .await

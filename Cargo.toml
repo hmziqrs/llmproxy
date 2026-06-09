@@ -36,6 +36,7 @@ serde_json = "1"
 toml = "0.8"
 humantime-serde = "1"
 regex = "1"
+time = { version = "=0.3.44", features = ["formatting", "parsing"] }
 
 # CLI
 clap = { version = "4", features = ["derive", "env"] }

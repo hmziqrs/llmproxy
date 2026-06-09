@@ -61,12 +61,9 @@ pub enum RouteError {
     /// Bad client input (malformed JSON, missing fields).
     #[error("invalid request: {0}")]
     InvalidRequest(String),
-    /// The requested model is not in the routing table.
-    ///
-    /// Retained for forward compatibility with catalog enforcement (Phase 5).
-    #[allow(dead_code)]
-    #[error("unknown model: {0}")]
-    UnknownModel(String),
+    /// The requested model is excluded by provider catalog enforcement.
+    #[error("model not allowed: {0}")]
+    ModelNotAllowed(String),
     /// The requested provider name is not registered.
     #[error("unknown provider: {0}")]
     UnknownProvider(String),
@@ -289,10 +286,10 @@ pub fn openai_stream_error_json_with_type(message: &str, error_type: &str) -> Op
 fn extract_error_fields(error: RouteError) -> (StatusCode, &'static str, String) {
     match error {
         RouteError::InvalidRequest(msg) => (StatusCode::BAD_REQUEST, "invalid_request_error", msg),
-        RouteError::UnknownModel(model) => (
+        RouteError::ModelNotAllowed(model) => (
             StatusCode::BAD_REQUEST,
             "invalid_request_error",
-            format!("unknown model: {model}"),
+            format!("model not allowed: {model}"),
         ),
         RouteError::UnknownProvider(provider) => (
             StatusCode::NOT_FOUND,
@@ -412,8 +409,8 @@ mod tests {
     }
 
     #[test]
-    fn anthropic_unknown_model_returns_400() {
-        let err = RouteError::UnknownModel("gpt-99".into());
+    fn anthropic_model_not_allowed_returns_400() {
+        let err = RouteError::ModelNotAllowed("gpt-99".into());
         let response = route_error_response(ClientProtocol::Anthropic, err);
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
@@ -512,8 +509,8 @@ mod tests {
     }
 
     #[test]
-    fn openai_unknown_model_returns_400() {
-        let err = RouteError::UnknownModel("gpt-99".into());
+    fn openai_model_not_allowed_returns_400() {
+        let err = RouteError::ModelNotAllowed("gpt-99".into());
         let response = route_error_response(ClientProtocol::OpenAiChat, err);
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
@@ -586,8 +583,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn openai_unknown_model_body_has_correct_structure() {
-        let err = RouteError::UnknownModel("gpt-99".into());
+    async fn openai_model_not_allowed_body_has_correct_structure() {
+        let err = RouteError::ModelNotAllowed("gpt-99".into());
         let response = route_error_response(ClientProtocol::OpenAiChat, err);
         let body = axum::body::to_bytes(response.into_body(), 4096)
             .await
@@ -797,8 +794,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn anthropic_unknown_model_body_has_correct_structure() {
-        let err = RouteError::UnknownModel("gpt-99".into());
+    async fn anthropic_model_not_allowed_body_has_correct_structure() {
+        let err = RouteError::ModelNotAllowed("gpt-99".into());
         let response = route_error_response(ClientProtocol::Anthropic, err);
         let body = axum::body::to_bytes(response.into_body(), 4096)
             .await

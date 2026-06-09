@@ -2,8 +2,8 @@
 //! validation for the routing system.
 //!
 //! This is the sole configuration system for the proxy, loaded from the main
-//! `config.toml` file. All server settings and model routing rules are defined
-//! through the types in this module.
+//! `config.toml` file. The main file contains server settings; provider files
+//! contain provider-scoped routing and catalog configuration.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -21,21 +21,12 @@ use crate::error::CoreError;
 
 /// Top-level TOML application configuration.
 ///
-/// Loaded from the main `config.toml` that defines server settings and model
-/// routing rules.
+/// Loaded from the main `config.toml`, which contains server settings only.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AppConfig {
     /// Server bind and operational settings.
     pub server: ServerConfig,
-    /// Legacy model routing table (ignored under provider-based routing).
-    ///
-    /// Keys are client-facing model names. This field is kept for backward
-    /// compatibility with existing `config.toml` files that contain a
-    /// `[models]` section. Under provider-based routing (`/v1/{provider}/...`),
-    /// this table is not consulted.
-    #[serde(default)]
-    pub models: HashMap<String, ModelRoute>,
 }
 
 // ---------------------------------------------------------------------------
@@ -105,10 +96,8 @@ pub struct ProviderConfig {
     /// Authentication header style.
     pub auth_style: AuthStyle,
     /// Named adapter configurations (protocol + endpoint pairs).
-    pub adapters: HashMap<String, ProviderAdapterConfig>,
-    /// Provider-local model-to-adapter mapping.
     #[serde(default)]
-    pub models: HashMap<String, ProviderModelConfig>,
+    pub adapters: HashMap<String, ProviderAdapterConfig>,
     /// Route kind to adapter name mapping (e.g. chat_completions -> openai_adapter).
     #[serde(default)]
     pub routes: ProviderRoutesConfig,
@@ -130,7 +119,6 @@ impl std::fmt::Debug for ProviderConfig {
             .field("api_key", &"[REDACTED]")
             .field("auth_style", &self.auth_style)
             .field("adapters", &self.adapters)
-            .field("models", &self.models)
             .field("routes", &self.routes)
             .field("model_aliases", &self.model_aliases)
             .field("discovery", &self.discovery)
@@ -164,7 +152,7 @@ pub enum AuthStyle {
 /// A single adapter entry within a provider.
 ///
 /// Maps a protocol name to an upstream endpoint URL.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderAdapterConfig {
     /// Protocol family (e.g. `"openai_chat_completions"`, `"anthropic_messages"`).
@@ -174,6 +162,16 @@ pub struct ProviderAdapterConfig {
     /// Static headers to include in upstream requests (e.g. anthropic-version).
     #[serde(default)]
     pub headers: HashMap<String, String>,
+}
+
+impl std::fmt::Debug for ProviderAdapterConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProviderAdapterConfig")
+            .field("protocol", &self.protocol)
+            .field("endpoint", &self.endpoint)
+            .field("header_names", &self.headers.keys().collect::<Vec<_>>())
+            .finish()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -221,18 +219,6 @@ impl ProviderRoutesConfig {
 }
 
 // ---------------------------------------------------------------------------
-// ProviderModelConfig
-// ---------------------------------------------------------------------------
-
-/// Maps a provider-local model name to an adapter within the same provider.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ProviderModelConfig {
-    /// Adapter name (must match a key in `ProviderConfig::adapters`).
-    pub adapter: String,
-}
-
-// ---------------------------------------------------------------------------
 // ProviderDiscoveryKind & ProviderDiscoveryConfig
 // ---------------------------------------------------------------------------
 
@@ -245,8 +231,10 @@ pub struct ProviderModelConfig {
 #[serde(rename_all = "snake_case")]
 pub enum ProviderDiscoveryKind {
     /// Generic OpenAI-style `GET /v1/models` returning `{ "data": [{ "id": ... }] }`.
+    #[serde(rename = "openai_compatible_models")]
     OpenAiCompatibleModels,
     /// OpenAI's own model-list endpoint (uses org-level auth).
+    #[serde(rename = "openai_models")]
     OpenAiModels,
     /// Anthropic model-list endpoint (`GET /v1/models` with `x-api-key`).
     AnthropicModels,
@@ -267,13 +255,30 @@ pub enum ProviderDiscoveryKind {
 /// kind = "openai_compatible_models"
 /// endpoint = "https://api.example.com/v1/models"
 /// ```
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderDiscoveryConfig {
     /// Which discovery backend protocol to use.
     pub kind: ProviderDiscoveryKind,
     /// Upstream URL to fetch the model list from.
     pub endpoint: String,
+    /// Static headers used only for discovery requests.
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
+}
+
+impl std::fmt::Debug for ProviderDiscoveryConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let endpoint = self
+            .endpoint
+            .split_once('?')
+            .map_or(self.endpoint.as_str(), |(base, _)| base);
+        f.debug_struct("ProviderDiscoveryConfig")
+            .field("kind", &self.kind)
+            .field("endpoint", &endpoint)
+            .field("header_names", &self.headers.keys().collect::<Vec<_>>())
+            .finish()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -385,23 +390,6 @@ impl Default for ProviderCatalogConfig {
 }
 
 // ---------------------------------------------------------------------------
-// ModelRoute (appears in main AppConfig)
-// ---------------------------------------------------------------------------
-
-/// A routing entry that maps a client-facing model name to a provider.
-///
-/// Optionally specifies a different upstream model name via `upstream_model`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ModelRoute {
-    /// Provider name (references a provider file by name).
-    pub provider: String,
-    /// Upstream model name to send to the provider. Defaults to the route key
-    /// (the client-facing model name) if absent.
-    pub upstream_model: Option<String>,
-}
-
-// ---------------------------------------------------------------------------
 // Validation error
 // ---------------------------------------------------------------------------
 
@@ -413,25 +401,6 @@ pub struct ModelRoute {
 #[derive(Debug, Clone, thiserror::Error)]
 #[non_exhaustive]
 pub enum ConfigValidationError {
-    /// A provider-local model references an adapter that does not exist
-    /// in the provider's `adapters` map.
-    #[error("provider \"{provider}\": model \"{model}\" references unknown adapter \"{adapter}\"")]
-    UnknownAdapter {
-        /// Provider name.
-        provider: String,
-        /// Model key within the provider.
-        model: String,
-        /// Adapter name that was not found.
-        adapter: String,
-    },
-    /// A provider-local model has an empty `adapter` reference.
-    #[error("provider \"{provider}\": model \"{model}\" has an empty adapter reference")]
-    EmptyAdapterInModel {
-        /// Provider name.
-        provider: String,
-        /// Model key within the provider.
-        model: String,
-    },
     /// An adapter `endpoint` URL is empty.
     #[error("provider \"{provider}\": adapter \"{adapter}\" has an empty endpoint")]
     EmptyEndpoint {
@@ -478,12 +447,6 @@ pub enum ConfigValidationError {
     /// An adapter name is empty.
     #[error("provider \"{provider}\": adapter name is empty")]
     EmptyAdapterName {
-        /// Provider name.
-        provider: String,
-    },
-    /// A provider-local model key is empty.
-    #[error("provider \"{provider}\": model key is empty")]
-    EmptyProviderModelKey {
         /// Provider name.
         provider: String,
     },
@@ -599,8 +562,6 @@ pub enum ConfigValidationError {
 /// - `api_key` is non-empty (after interpolation) and no unresolved `${VAR}` patterns remain
 /// - all adapter names, protocol names, and endpoints are non-empty (whitespace-only values are rejected)
 /// - adapter static headers reject CRLF characters and forbidden transport headers
-/// - all provider-local model keys and their adapter references are non-empty
-/// - every provider-local model points to an existing adapter
 /// - provider name is a URL-safe slug (lowercase ASCII letters, digits, hyphens, underscores)
 /// - route adapter references point to existing adapters
 /// - model alias keys and targets are non-empty
@@ -619,7 +580,7 @@ pub enum ConfigValidationError {
 /// Returns a [`ConfigValidationError`] variant describing the first validation
 /// failure encountered. Checks run in a defined order: provider name, unresolved
 /// env vars in `api_key`, empty `api_key`, adapter names/protocols/endpoints/headers,
-/// model keys/adapter references, protocol-name membership, route adapter references,
+/// protocol-name membership, route adapter references,
 /// and model alias validation.
 pub fn validate_provider_config(
     provider: &ProviderConfig,
@@ -729,25 +690,44 @@ pub fn validate_provider_config(
         }
     }
 
-    // Provider-local model validation.
-    for (model_key, model_cfg) in &provider.models {
-        if model_key.trim().is_empty() {
-            return Err(ConfigValidationError::EmptyProviderModelKey {
+    if let Some(discovery) = &provider.discovery {
+        let endpoint = discovery.endpoint.trim();
+        if endpoint.is_empty() {
+            return Err(ConfigValidationError::EmptyEndpoint {
                 provider: name.clone(),
+                adapter: "discovery".to_owned(),
             });
         }
-        if model_cfg.adapter.trim().is_empty() {
-            return Err(ConfigValidationError::EmptyAdapterInModel {
+        if !(endpoint.starts_with("http://") || endpoint.starts_with("https://")) {
+            return Err(ConfigValidationError::InvalidEndpointScheme {
                 provider: name.clone(),
-                model: model_key.clone(),
+                adapter: "discovery".to_owned(),
+                endpoint: discovery.endpoint.clone(),
             });
         }
-        if !provider.adapters.contains_key(&model_cfg.adapter) {
-            return Err(ConfigValidationError::UnknownAdapter {
-                provider: name.clone(),
-                model: model_key.clone(),
-                adapter: model_cfg.adapter.clone(),
-            });
+        for (header_name, header_value) in &discovery.headers {
+            if header_name.trim().is_empty() {
+                return Err(ConfigValidationError::EmptyHeaderName {
+                    provider: name.clone(),
+                    adapter: "discovery".to_owned(),
+                });
+            }
+            if header_name.contains(['\r', '\n']) || header_value.contains(['\r', '\n']) {
+                return Err(ConfigValidationError::HeaderContainsCrlf {
+                    provider: name.clone(),
+                    adapter: "discovery".to_owned(),
+                });
+            }
+            if matches!(
+                header_name.to_ascii_lowercase().as_str(),
+                "host" | "content-length" | "transfer-encoding" | "connection"
+            ) {
+                return Err(ConfigValidationError::ForbiddenHeader {
+                    provider: name.clone(),
+                    adapter: "discovery".to_owned(),
+                    header: header_name.clone(),
+                });
+            }
         }
     }
 
@@ -970,2220 +950,75 @@ pub fn load_provider_config(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{EnvVarGuard, TestEnvLock};
-    use std::io::Write as IoWrite;
-
-    /// Holds the mutex lock and env-var guards together so that
-    /// the lock is held for the entire lifetime of the env cleanup.
-    struct EnvScope {
-        _lock: TestEnvLock,
-        _guards: Vec<EnvVarGuard>,
-    }
-
-    /// Clean all env vars used by tests in this module.
-    ///
-    /// Uses the shared crate-level [`TEST_ENV_LOCK`](crate::test_support::TEST_ENV_LOCK)
-    /// so that tests in `config::tests` and `provider_config::tests` are
-    /// properly serialised with each other.
-    fn clean_env() -> EnvScope {
-        let lock = TestEnvLock::acquire();
-        let guards = vec![
-            EnvVarGuard::remove("LLM_PROXY_TEST_KEY"),
-            EnvVarGuard::remove("LLM_PROXY_TEST_PROVIDER_KEY"),
-            EnvVarGuard::remove("LLM_PROXY_EMPTY_KEY"),
-            EnvVarGuard::remove("__LLM_PROXY_NEVER_SET__"),
-        ];
-        EnvScope {
-            _lock: lock,
-            _guards: guards,
-        }
-    }
-
-    // -- Main TOML parse -------------------------------------------------------
 
     #[test]
-    fn main_toml_parse() {
-        let _env = clean_env();
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("config.toml");
-        let mut f = std::fs::File::create(&path).expect("create");
-        write!(
-            f,
-            r#"
-[server]
-bind = "127.0.0.1:3456"
-request_timeout = "300s"
-log_level = "info"
-hot_reload = false
-server_name = "llm-proxy"
-
-[models]
-"kimi-k2.6" = {{ provider = "opencode-go" }}
-"glm-5" = {{ provider = "opencode-go" }}
-"gpt-5.4" = {{ provider = "opencode-zen" }}
-"claude-4" = {{ provider = "opencode-zen", upstream_model = "claude-sonnet-4-20250514" }}
-"#
-        )
-        .expect("write");
-
-        let cfg = load_app_config(&path).expect("load");
-        assert_eq!(cfg.server.bind, "127.0.0.1:3456".parse().unwrap());
-        assert_eq!(cfg.server.request_timeout, Duration::from_secs(300));
-        assert_eq!(cfg.server.log_level, "info");
-        assert!(!cfg.server.hot_reload);
-        assert_eq!(cfg.server.server_name, "llm-proxy");
-
-        assert_eq!(cfg.models.len(), 4);
-        assert_eq!(cfg.models["kimi-k2.6"].provider, "opencode-go");
-        assert!(cfg.models["kimi-k2.6"].upstream_model.is_none());
-        assert_eq!(cfg.models["gpt-5.4"].provider, "opencode-zen");
-        assert!(cfg.models["gpt-5.4"].upstream_model.is_none());
-        assert_eq!(cfg.models["claude-4"].provider, "opencode-zen");
-        assert_eq!(
-            cfg.models["claude-4"].upstream_model.as_deref(),
-            Some("claude-sonnet-4-20250514")
+    fn app_config_rejects_removed_models_table() {
+        let result = toml::from_str::<AppConfig>(
+            "[server]\nbind = '127.0.0.1:3456'\n[models]\nfoo = { provider = 'bar' }\n",
         );
+        assert!(result.is_err());
     }
 
-    // -- Provider TOML parse ---------------------------------------------------
-
     #[test]
-    fn provider_toml_parse() {
-        let _env = clean_env();
-        let _g = EnvVarGuard::set("LLM_PROXY_TEST_PROVIDER_KEY", "sk-test-key-123");
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("provider.toml");
-        let mut f = std::fs::File::create(&path).expect("create");
-        write!(
-            f,
+    fn provider_debug_redacts_header_values_and_endpoint_query() {
+        let config: ProviderFile = toml::from_str(
             r#"
 [provider]
-name = "opencode-zen"
-api_key = "${{LLM_PROXY_TEST_PROVIDER_KEY}}"
-auth_style = "bearer"
-
-[provider.adapters.responses]
-protocol = "openai_responses"
-endpoint = "https://opencode.ai/zen/v1/responses"
-
-[provider.adapters.anthropic]
-protocol = "anthropic_messages"
-endpoint = "https://opencode.ai/zen/v1/messages"
-
-[provider.adapters.gemini]
-protocol = "gemini_generate_content"
-endpoint = "https://opencode.ai/zen/v1/models/{{model}}:generateContent"
-
-[provider.models]
-"gpt-5.4" = {{ adapter = "responses" }}
-"claude-sonnet-4-20250514" = {{ adapter = "anthropic" }}
-"gemini-3.5-flash" = {{ adapter = "gemini" }}
-"#
-        )
-        .expect("write");
-
-        let cfg = load_provider_config(&path, None).expect("load");
-        assert_eq!(cfg.name, "opencode-zen");
-        assert_eq!(cfg.api_key, "sk-test-key-123");
-        assert!(matches!(cfg.auth_style, AuthStyle::Bearer));
-        assert_eq!(cfg.adapters.len(), 3);
-        assert_eq!(cfg.adapters["responses"].protocol, "openai_responses");
-        assert_eq!(cfg.adapters["anthropic"].protocol, "anthropic_messages");
-        assert_eq!(cfg.adapters["gemini"].protocol, "gemini_generate_content");
-        assert_eq!(
-            cfg.adapters["gemini"].endpoint,
-            "https://opencode.ai/zen/v1/models/{model}:generateContent"
-        );
-        assert_eq!(cfg.models.len(), 3);
-        assert_eq!(cfg.models["gpt-5.4"].adapter, "responses");
-    }
-
-    // -- ${ENV_VAR} interpolation ----------------------------------------------
-
-    #[test]
-    fn env_var_interpolation_in_provider() {
-        let _env = clean_env();
-        let _g = EnvVarGuard::set("LLM_PROXY_TEST_KEY", "resolved-api-key");
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("provider.toml");
-        let mut f = std::fs::File::create(&path).expect("create");
-        write!(
-            f,
-            r#"
-[provider]
-name = "test"
-api_key = "${{LLM_PROXY_TEST_KEY}}"
+name = "example"
+api_key = "secret-api-key"
 auth_style = "bearer"
 
 [provider.adapters.chat]
 protocol = "openai_chat_completions"
 endpoint = "https://example.com/v1/chat/completions"
 
-[provider.models]
-"test-model" = {{ adapter = "chat" }}
-"#
-        )
-        .expect("write");
+[provider.adapters.chat.headers]
+x-secret = "adapter-secret"
 
-        let cfg = load_provider_config(&path, None).expect("load");
-        assert_eq!(cfg.api_key, "resolved-api-key");
-    }
+[provider.routes]
+chat_completions = "chat"
 
-    // -- Unknown env var fails validation --------------------------------------
+[provider.discovery]
+kind = "openai_compatible_models"
+endpoint = "https://example.com/v1/models?key=query-secret"
 
-    #[test]
-    fn unknown_env_var_fails_validation() {
-        let _env = clean_env();
-        let _g = EnvVarGuard::remove("__LLM_PROXY_NEVER_SET__");
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("provider.toml");
-        // Write the TOML directly (not via write!) to avoid brace escaping confusion.
-        let toml_content = r#"
-[provider]
-name = "test"
-api_key = "${__LLM_PROXY_NEVER_SET__}"
-auth_style = "bearer"
-
-[provider.adapters.chat]
-protocol = "openai_chat_completions"
-endpoint = "https://example.com/v1/chat/completions"
-
-[provider.models]
-"test-model" = { adapter = "chat" }
-"#;
-        std::fs::write(&path, toml_content).expect("write");
-
-        let result = load_provider_config(&path, None);
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("__LLM_PROXY_NEVER_SET__"),
-            "expected unresolved env var error, got: {err}"
-        );
-    }
-
-    // -- Empty env var fails validation ----------------------------------------
-
-    #[test]
-    fn empty_env_var_fails_validation() {
-        let _env = clean_env();
-        // Set the env var but to an empty string -- that should still fail.
-        let _g = EnvVarGuard::set("LLM_PROXY_EMPTY_KEY", "");
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("provider.toml");
-        let mut f = std::fs::File::create(&path).expect("create");
-        write!(
-            f,
-            r#"
-[provider]
-name = "test"
-api_key = "${{LLM_PROXY_EMPTY_KEY}}"
-auth_style = "bearer"
-
-[provider.adapters.chat]
-protocol = "openai_chat_completions"
-endpoint = "https://example.com/v1/chat/completions"
-
-[provider.models]
-"test-model" = {{ adapter = "chat" }}
-"#
-        )
-        .expect("write");
-
-        let result = load_provider_config(&path, None);
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("resolved to an empty value"),
-            "expected empty env var error, got: {err}"
-        );
-        assert!(
-            err.contains("LLM_PROXY_EMPTY_KEY"),
-            "error should mention the env var name, got: {err}"
-        );
-    }
-
-    // -- Literal empty API key fails validation --------------------------------
-
-    #[test]
-    fn literal_empty_api_key_fails_validation() {
-        let cfg = ProviderConfig {
-            name: "test".to_owned(),
-            api_key: String::new(),
-            auth_style: AuthStyle::Bearer,
-            adapters: HashMap::new(),
-            models: HashMap::new(),
-            routes: ProviderRoutesConfig::default(),
-            model_aliases: HashMap::new(),
-            discovery: None,
-            catalog: None,
-        };
-        let result = validate_provider_config(&cfg, None);
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("api_key is empty"),
-            "expected empty api_key error, got: {err}"
-        );
-    }
-
-    // -- Unknown TOML fields fail parse ----------------------------------------
-
-    #[test]
-    fn unknown_toml_fields_fail_parse() {
-        let _env = clean_env();
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("config.toml");
-        let mut f = std::fs::File::create(&path).expect("create");
-        write!(
-            f,
-            r#"
-[server]
-bind = "127.0.0.1:3456"
-request_timeout = "300s"
-log_level = "info"
-hot_reload = false
-server_name = "llm-proxy"
-unknown_field = "should_fail"
-
-[models]
-"#
-        )
-        .expect("write");
-
-        let result = load_app_config(&path);
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("unknown field"),
-            "expected unknown field error, got: {err}"
-        );
-    }
-
-    // -- ModelRoute with endpoint/protocol fields fails parse ------------------
-
-    #[test]
-    fn model_route_with_endpoint_fails_parse() {
-        let toml_str = r#"
-provider = "opencode-go"
-endpoint = "https://example.com"
-"#;
-        let result: Result<ModelRoute, _> = toml::from_str(toml_str);
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("unknown field"),
-            "expected unknown field error for endpoint, got: {err}"
-        );
-    }
-
-    #[test]
-    fn model_route_with_protocol_fails_parse() {
-        let toml_str = r#"
-provider = "opencode-go"
-protocol = "openai_chat_completions"
-"#;
-        let result: Result<ModelRoute, _> = toml::from_str(toml_str);
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("unknown field"),
-            "expected unknown field error for protocol, got: {err}"
-        );
-    }
-
-    // -- Provider-local unknown adapter fails validation -----------------------
-
-    #[test]
-    fn provider_local_unknown_adapter_fails_validation() {
-        let cfg = ProviderConfig {
-            name: "test".to_owned(),
-            api_key: "some-key".to_owned(),
-            auth_style: AuthStyle::Bearer,
-            adapters: {
-                let mut m = HashMap::new();
-                m.insert(
-                    "chat".to_owned(),
-                    ProviderAdapterConfig {
-                        protocol: "openai_chat_completions".to_owned(),
-                        endpoint: "https://example.com/v1".to_owned(),
-                        headers: HashMap::new(),
-                    },
-                );
-                m
-            },
-            models: {
-                let mut m = HashMap::new();
-                m.insert(
-                    "model-a".to_owned(),
-                    ProviderModelConfig {
-                        adapter: "nonexistent".to_owned(),
-                    },
-                );
-                m
-            },
-            routes: ProviderRoutesConfig::default(),
-            model_aliases: HashMap::new(),
-            discovery: None,
-            catalog: None,
-        };
-        let result = validate_provider_config(&cfg, None);
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("unknown adapter") && err.contains("nonexistent"),
-            "expected unknown adapter error, got: {err}"
-        );
-    }
-
-    // -- Known protocol passes validation when supplied by caller --------------
-
-    #[test]
-    fn known_protocol_passes_validation() {
-        let cfg = ProviderConfig {
-            name: "test".to_owned(),
-            api_key: "key".to_owned(),
-            auth_style: AuthStyle::Bearer,
-            adapters: {
-                let mut m = HashMap::new();
-                m.insert(
-                    "chat".to_owned(),
-                    ProviderAdapterConfig {
-                        protocol: "openai_chat_completions".to_owned(),
-                        endpoint: "https://example.com".to_owned(),
-                        headers: HashMap::new(),
-                    },
-                );
-                m
-            },
-            models: HashMap::new(),
-            routes: ProviderRoutesConfig::default(),
-            model_aliases: HashMap::new(),
-            discovery: None,
-            catalog: None,
-        };
-        let known = vec!["openai_chat_completions", "anthropic_messages"];
-        let result = validate_provider_config(&cfg, Some(&known));
-        assert!(
-            result.is_ok(),
-            "expected validation to pass, got: {result:?}"
-        );
-    }
-
-    // -- Unknown protocol fails validation when not supplied by caller ---------
-
-    #[test]
-    fn unknown_protocol_fails_validation() {
-        let cfg = ProviderConfig {
-            name: "test".to_owned(),
-            api_key: "key".to_owned(),
-            auth_style: AuthStyle::Bearer,
-            adapters: {
-                let mut m = HashMap::new();
-                m.insert(
-                    "chat".to_owned(),
-                    ProviderAdapterConfig {
-                        protocol: "totally_fake_protocol".to_owned(),
-                        endpoint: "https://example.com".to_owned(),
-                        headers: HashMap::new(),
-                    },
-                );
-                m
-            },
-            models: HashMap::new(),
-            routes: ProviderRoutesConfig::default(),
-            model_aliases: HashMap::new(),
-            discovery: None,
-            catalog: None,
-        };
-        let known = vec!["openai_chat_completions", "anthropic_messages"];
-        let result = validate_provider_config(&cfg, Some(&known));
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("unknown protocol") && err.contains("totally_fake_protocol"),
-            "expected unknown protocol error, got: {err}"
-        );
-    }
-
-    // -- ProviderConfig Debug redacts api_key ----------------------------------
-
-    #[test]
-    fn provider_config_debug_redacts_api_key() {
-        let cfg = ProviderConfig {
-            name: "test".to_owned(),
-            api_key: "super-secret-key-12345".to_owned(),
-            auth_style: AuthStyle::Bearer,
-            adapters: HashMap::new(),
-            models: HashMap::new(),
-            routes: ProviderRoutesConfig::default(),
-            model_aliases: HashMap::new(),
-            discovery: None,
-            catalog: None,
-        };
-        let debug_output = format!("{:?}", cfg);
-        assert!(
-            !debug_output.contains("super-secret-key-12345"),
-            "Debug output must not contain the actual api_key"
-        );
-        assert!(
-            debug_output.contains("[REDACTED]"),
-            "Debug output should show [REDACTED] for api_key"
-        );
-    }
-
-    // -- ProviderConfig api_key is not serialized ------------------------------
-
-    #[test]
-    fn provider_config_api_key_not_serialized() {
-        let cfg = ProviderConfig {
-            name: "test".to_owned(),
-            api_key: "secret-key-do-not-leak".to_owned(),
-            auth_style: AuthStyle::Bearer,
-            adapters: HashMap::new(),
-            models: HashMap::new(),
-            routes: ProviderRoutesConfig::default(),
-            model_aliases: HashMap::new(),
-            discovery: None,
-            catalog: None,
-        };
-        let toml_str = toml::to_string(&cfg).expect("serialize");
-        assert!(
-            !toml_str.contains("secret-key-do-not-leak"),
-            "api_key must not appear in serialized output"
-        );
-        // Verify intentional round-trip breakage: skip_serializing means the
-        // serialized output does not include api_key, so deserializing it
-        // without api_key fails (api_key is a required field). This is the
-        // expected behavior -- credentials should never round-trip through
-        // serialization.
-        let file = ProviderFile { provider: cfg };
-        let toml_str = toml::to_string_pretty(&file).expect("serialize");
-        let result: Result<ProviderFile, _> = toml::from_str(&toml_str);
-        assert!(
-            result.is_err(),
-            "deserialization should fail because skip_serializing omits api_key \
-             and api_key is a required field, got: {result:?}"
-        );
-    }
-
-    // -- deny_unknown_fields on all structs ------------------------------------
-
-    #[test]
-    fn provider_file_deny_unknown_fields() {
-        let toml_str = r#"
-[provider]
-name = "test"
-api_key = "key"
-auth_style = "bearer"
-bogus = true
-
-[provider.adapters.chat]
-protocol = "openai_chat_completions"
-endpoint = "https://example.com"
-"#;
-        let result: Result<ProviderFile, _> = toml::from_str(toml_str);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("unknown field"));
-    }
-
-    #[test]
-    fn provider_adapter_config_deny_unknown_fields() {
-        let toml_str = r#"
-protocol = "openai_chat_completions"
-endpoint = "https://example.com"
-extra = "nope"
-"#;
-        let result: Result<ProviderAdapterConfig, _> = toml::from_str(toml_str);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("unknown field"));
-    }
-
-    #[test]
-    fn provider_model_config_deny_unknown_fields() {
-        let toml_str = r#"
-adapter = "chat"
-bonus = "nope"
-"#;
-        let result: Result<ProviderModelConfig, _> = toml::from_str(toml_str);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("unknown field"));
-    }
-
-    #[test]
-    fn server_config_deny_unknown_fields() {
-        let toml_str = r#"
-bind = "127.0.0.1:3456"
-request_timeout = "300s"
-log_level = "info"
-hot_reload = false
-server_name = "llm-proxy"
-mystery = true
-"#;
-        let result: Result<ServerConfig, _> = toml::from_str(toml_str);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("unknown field"));
-    }
-
-    #[test]
-    fn app_config_deny_unknown_fields() {
-        // Put an unknown top-level field alongside server and models.
-        // TOML ordering: top-level keys before section headers.
-        let toml_str = r#"
-unknown_top_level = "nope"
-
-[server]
-bind = "127.0.0.1:3456"
-request_timeout = "300s"
-log_level = "info"
-hot_reload = false
-server_name = "llm-proxy"
-
-[models]
-"#;
-        let result: Result<AppConfig, _> = toml::from_str(toml_str);
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("unknown field"),
-            "expected unknown field error, got: {err}"
-        );
-    }
-
-    // -- Empty endpoint validation ---------------------------------------------
-
-    #[test]
-    fn empty_endpoint_fails_validation() {
-        let cfg = ProviderConfig {
-            name: "test".to_owned(),
-            api_key: "key".to_owned(),
-            auth_style: AuthStyle::Bearer,
-            adapters: {
-                let mut m = HashMap::new();
-                m.insert(
-                    "chat".to_owned(),
-                    ProviderAdapterConfig {
-                        protocol: "openai_chat_completions".to_owned(),
-                        endpoint: String::new(),
-                        headers: HashMap::new(),
-                    },
-                );
-                m
-            },
-            models: HashMap::new(),
-            routes: ProviderRoutesConfig::default(),
-            model_aliases: HashMap::new(),
-            discovery: None,
-            catalog: None,
-        };
-        let result = validate_provider_config(&cfg, None);
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("empty endpoint"),
-            "expected empty endpoint error, got: {err}"
-        );
-    }
-
-    // -- Empty provider name validation ----------------------------------------
-
-    #[test]
-    fn empty_provider_name_fails_validation() {
-        let cfg = ProviderConfig {
-            name: String::new(),
-            api_key: "key".to_owned(),
-            auth_style: AuthStyle::Bearer,
-            adapters: HashMap::new(),
-            models: HashMap::new(),
-            routes: ProviderRoutesConfig::default(),
-            model_aliases: HashMap::new(),
-            discovery: None,
-            catalog: None,
-        };
-        let result = validate_provider_config(&cfg, None);
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("provider name is empty"),
-            "expected empty provider name error, got: {err}"
-        );
-    }
-
-    // -- Empty protocol validation ---------------------------------------------
-
-    #[test]
-    fn empty_protocol_fails_validation() {
-        let cfg = ProviderConfig {
-            name: "test".to_owned(),
-            api_key: "key".to_owned(),
-            auth_style: AuthStyle::Bearer,
-            adapters: {
-                let mut m = HashMap::new();
-                m.insert(
-                    "chat".to_owned(),
-                    ProviderAdapterConfig {
-                        protocol: String::new(),
-                        endpoint: "https://example.com".to_owned(),
-                        headers: HashMap::new(),
-                    },
-                );
-                m
-            },
-            models: HashMap::new(),
-            routes: ProviderRoutesConfig::default(),
-            model_aliases: HashMap::new(),
-            discovery: None,
-            catalog: None,
-        };
-        let result = validate_provider_config(&cfg, None);
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("empty protocol"),
-            "expected empty protocol error, got: {err}"
-        );
-    }
-
-    // -- Empty adapter name validation -----------------------------------------
-
-    #[test]
-    fn empty_adapter_name_fails_validation() {
-        let cfg = ProviderConfig {
-            name: "test".to_owned(),
-            api_key: "key".to_owned(),
-            auth_style: AuthStyle::Bearer,
-            adapters: {
-                let mut m = HashMap::new();
-                m.insert(
-                    String::new(),
-                    ProviderAdapterConfig {
-                        protocol: "openai_chat_completions".to_owned(),
-                        endpoint: "https://example.com".to_owned(),
-                        headers: HashMap::new(),
-                    },
-                );
-                m
-            },
-            models: HashMap::new(),
-            routes: ProviderRoutesConfig::default(),
-            model_aliases: HashMap::new(),
-            discovery: None,
-            catalog: None,
-        };
-        let result = validate_provider_config(&cfg, None);
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("adapter name is empty"),
-            "expected empty adapter name error, got: {err}"
-        );
-    }
-
-    // -- AuthStyle deserialization variants ------------------------------------
-
-    #[test]
-    fn auth_style_bearer() {
-        let helper: AuthStyleHelper = toml::from_str(r#"auth_style = "bearer""#).expect("parse");
-        assert!(matches!(helper.auth_style, AuthStyle::Bearer));
-    }
-
-    #[test]
-    fn auth_style_x_api_key() {
-        let helper: AuthStyleHelper = toml::from_str(r#"auth_style = "x-api-key""#).expect("parse");
-        assert!(matches!(helper.auth_style, AuthStyle::XApiKey));
-    }
-
-    // Helper struct to test AuthStyle deserialization
-    #[derive(Deserialize)]
-    struct AuthStyleHelper {
-        auth_style: AuthStyle,
-    }
-
-    #[test]
-    fn auth_style_both() {
-        let helper: AuthStyleHelper = toml::from_str(r#"auth_style = "both""#).expect("parse");
-        assert!(matches!(helper.auth_style, AuthStyle::Both));
-    }
-
-    // -- TOML roundtrip --------------------------------------------------------
-
-    #[test]
-    fn app_config_toml_roundtrip() {
-        let _env = clean_env();
-        let original = AppConfig {
-            server: ServerConfig {
-                bind: "127.0.0.1:3456".parse().unwrap(),
-                request_timeout: Duration::from_secs(300),
-                log_level: "info".to_owned(),
-                hot_reload: false,
-                server_name: "llm-proxy".to_owned(),
-            },
-            models: {
-                let mut m = HashMap::new();
-                m.insert(
-                    "kimi-k2.6".to_owned(),
-                    ModelRoute {
-                        provider: "opencode-go".to_owned(),
-                        upstream_model: None,
-                    },
-                );
-                m.insert(
-                    "claude-4".to_owned(),
-                    ModelRoute {
-                        provider: "opencode-zen".to_owned(),
-                        upstream_model: Some("claude-sonnet-4-20250514".to_owned()),
-                    },
-                );
-                m
-            },
-        };
-        let toml_str = toml::to_string_pretty(&original).expect("serialize");
-        let back: AppConfig = toml::from_str(&toml_str).expect("deserialize");
-        assert_eq!(back.server.bind, original.server.bind);
-        assert_eq!(back.server.request_timeout, original.server.request_timeout);
-        assert_eq!(back.models.len(), 2);
-        assert_eq!(
-            back.models["claude-4"].upstream_model.as_deref(),
-            Some("claude-sonnet-4-20250514")
-        );
-    }
-
-    // -- Direct test for EmptyProviderModelKey ---------------------------------
-
-    #[test]
-    fn empty_provider_model_key_fails_validation() {
-        let cfg = ProviderConfig {
-            name: "test".to_owned(),
-            api_key: "key".to_owned(),
-            auth_style: AuthStyle::Bearer,
-            adapters: {
-                let mut m = HashMap::new();
-                m.insert(
-                    "chat".to_owned(),
-                    ProviderAdapterConfig {
-                        protocol: "openai_chat_completions".to_owned(),
-                        endpoint: "https://example.com".to_owned(),
-                        headers: HashMap::new(),
-                    },
-                );
-                m
-            },
-            models: {
-                let mut m = HashMap::new();
-                m.insert(
-                    String::new(),
-                    ProviderModelConfig {
-                        adapter: "chat".to_owned(),
-                    },
-                );
-                m
-            },
-            routes: ProviderRoutesConfig::default(),
-            model_aliases: HashMap::new(),
-            discovery: None,
-            catalog: None,
-        };
-        let result = validate_provider_config(&cfg, None);
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("model key is empty"),
-            "expected empty model key error, got: {err}"
-        );
-    }
-
-    // -- Direct test for empty adapter in model config -------------------------
-
-    #[test]
-    fn empty_adapter_in_model_fails_validation() {
-        let cfg = ProviderConfig {
-            name: "test".to_owned(),
-            api_key: "key".to_owned(),
-            auth_style: AuthStyle::Bearer,
-            adapters: {
-                let mut m = HashMap::new();
-                m.insert(
-                    "chat".to_owned(),
-                    ProviderAdapterConfig {
-                        protocol: "openai_chat_completions".to_owned(),
-                        endpoint: "https://example.com".to_owned(),
-                        headers: HashMap::new(),
-                    },
-                );
-                m
-            },
-            models: {
-                let mut m = HashMap::new();
-                m.insert(
-                    "my-model".to_owned(),
-                    ProviderModelConfig {
-                        adapter: String::new(),
-                    },
-                );
-                m
-            },
-            routes: ProviderRoutesConfig::default(),
-            model_aliases: HashMap::new(),
-            discovery: None,
-            catalog: None,
-        };
-        let result = validate_provider_config(&cfg, None);
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("empty adapter reference"),
-            "expected empty adapter in model error, got: {err}"
-        );
-    }
-
-    // -- Load nonexistent file fails -------------------------------------------
-
-    #[test]
-    fn load_app_config_nonexistent_file_fails() {
-        let result = load_app_config("/tmp/__llm_proxy_no_such_file_app__.toml");
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("failed to read config"),
-            "expected config load error, got: {err}"
-        );
-    }
-
-    #[test]
-    fn load_provider_config_nonexistent_file_fails() {
-        let result = load_provider_config("/tmp/__llm_proxy_no_such_file_provider__.toml", None);
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("failed to read config"),
-            "expected config load error, got: {err}"
-        );
-    }
-
-    // -- Malformed TOML fails --------------------------------------------------
-
-    #[test]
-    fn load_app_config_malformed_toml_fails() {
-        let _env = clean_env();
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("bad.toml");
-        std::fs::write(&path, "this is not valid toml {{{}}").expect("write");
-
-        let result = load_app_config(&path);
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("failed to parse config"),
-            "expected parse error, got: {err}"
-        );
-    }
-
-    #[test]
-    fn load_provider_config_malformed_toml_fails() {
-        let _env = clean_env();
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("bad.toml");
-        std::fs::write(&path, "this is not valid toml {{{}}").expect("write");
-
-        let result = load_provider_config(&path, None);
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("failed to parse config"),
-            "expected parse error, got: {err}"
-        );
-    }
-
-    // -- Missing required fields in TOML --------------------------------------
-
-    #[test]
-    fn load_app_config_missing_server_fails() {
-        let _env = clean_env();
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("config.toml");
-        std::fs::write(&path, "[models]\n").expect("write");
-
-        let result = load_app_config(&path);
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("failed to parse config"),
-            "expected parse error for missing server, got: {err}"
-        );
-    }
-
-    #[test]
-    fn load_app_config_missing_bind_fails() {
-        let _env = clean_env();
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("config.toml");
-        std::fs::write(
-            &path,
-            r#"
-[server]
-request_timeout = "300s"
-log_level = "info"
-hot_reload = false
-server_name = "llm-proxy"
-
-[models]
+[provider.discovery.headers]
+x-discovery-secret = "super-sensitive-value"
 "#,
         )
-        .expect("write");
-
-        let result = load_app_config(&path);
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("failed to parse config"),
-            "expected parse error for missing bind, got: {err}"
-        );
+        .expect("provider config");
+        let debug = format!("{:?}", config.provider);
+        assert!(!debug.contains("secret-api-key"));
+        assert!(!debug.contains("adapter-secret"));
+        assert!(!debug.contains("super-sensitive-value"));
+        assert!(!debug.contains("query-secret"));
     }
 
     #[test]
-    fn load_provider_config_missing_name_fails() {
-        let _env = clean_env();
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("provider.toml");
-        std::fs::write(
-            &path,
+    fn discovery_rejects_transport_headers() {
+        let mut provider: ProviderFile = toml::from_str(
             r#"
 [provider]
-api_key = "key"
-auth_style = "bearer"
-"#,
-        )
-        .expect("write");
-
-        let result = load_provider_config(&path, None);
-        assert!(result.is_err());
-    }
-
-    // -- Wrong field types in TOML --------------------------------------------
-
-    #[test]
-    fn load_app_config_wrong_bind_type_fails() {
-        let _env = clean_env();
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("config.toml");
-        std::fs::write(
-            &path,
-            r#"
-[server]
-bind = 3456
-request_timeout = "300s"
-log_level = "info"
-hot_reload = false
-server_name = "llm-proxy"
-
-[models]
-"#,
-        )
-        .expect("write");
-
-        let result = load_app_config(&path);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn load_app_config_wrong_hot_reload_type_fails() {
-        let _env = clean_env();
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("config.toml");
-        std::fs::write(
-            &path,
-            r#"
-[server]
-bind = "127.0.0.1:3456"
-request_timeout = "300s"
-log_level = "info"
-hot_reload = "not_a_bool"
-server_name = "llm-proxy"
-
-[models]
-"#,
-        )
-        .expect("write");
-
-        let result = load_app_config(&path);
-        assert!(result.is_err());
-    }
-
-    // -- Cross-field env var interpolation (endpoint field) --------------------
-
-    #[test]
-    fn env_var_interpolation_in_endpoint() {
-        let _env = clean_env();
-        let _g = EnvVarGuard::set("_LLM_PROXY_TEST_ENDPOINT", "https://custom.api.example.com");
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("provider.toml");
-        let mut f = std::fs::File::create(&path).expect("create");
-        write!(
-            f,
-            r#"
-[provider]
-name = "test"
-api_key = "static-key"
-auth_style = "bearer"
-
-[provider.adapters.chat]
-protocol = "openai_chat_completions"
-endpoint = "${{_LLM_PROXY_TEST_ENDPOINT}}/v1/chat/completions"
-
-[provider.models]
-"test-model" = {{ adapter = "chat" }}
-"#
-        )
-        .expect("write");
-
-        let cfg = load_provider_config(&path, None).expect("load");
-        assert_eq!(
-            cfg.adapters["chat"].endpoint,
-            "https://custom.api.example.com/v1/chat/completions"
-        );
-    }
-
-    // -- Provider TOML missing api_key fails at parse time ---------------------
-
-    #[test]
-    fn load_provider_config_missing_api_key_fails() {
-        let _env = clean_env();
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("provider.toml");
-        std::fs::write(
-            &path,
-            r#"
-[provider]
-name = "test"
-auth_style = "bearer"
-
-[provider.adapters.chat]
-protocol = "openai_chat_completions"
-endpoint = "https://example.com/v1/chat/completions"
-"#,
-        )
-        .expect("write");
-
-        let result = load_provider_config(&path, None);
-        assert!(result.is_err(), "expected error for missing api_key");
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("failed to parse config"),
-            "expected parse error for missing api_key, got: {err}"
-        );
-    }
-
-    // -- Unknown protocol passes when known_protocols is None ------------------
-
-    #[test]
-    fn unknown_protocol_passes_when_known_protocols_is_none() {
-        let cfg = ProviderConfig {
-            name: "test".to_owned(),
-            api_key: "key".to_owned(),
-            auth_style: AuthStyle::Bearer,
-            adapters: {
-                let mut m = HashMap::new();
-                m.insert(
-                    "chat".to_owned(),
-                    ProviderAdapterConfig {
-                        protocol: "totally_fake_protocol".to_owned(),
-                        endpoint: "https://example.com".to_owned(),
-                        headers: HashMap::new(),
-                    },
-                );
-                m
-            },
-            models: HashMap::new(),
-            routes: ProviderRoutesConfig::default(),
-            model_aliases: HashMap::new(),
-            discovery: None,
-            catalog: None,
-        };
-        // When known_protocols is None, protocol validation is skipped entirely.
-        let result = validate_provider_config(&cfg, None);
-        assert!(
-            result.is_ok(),
-            "unknown protocol should pass when known_protocols is None, got: {result:?}"
-        );
-    }
-
-    // -- Multiple env vars in a single api_key --------------------------------
-
-    #[test]
-    fn multiple_env_vars_in_api_key() {
-        let _env = clean_env();
-        let _g1 = EnvVarGuard::set("_LLM_PROXY_TEST_KEY_PART_A", "alpha");
-        let _g2 = EnvVarGuard::set("_LLM_PROXY_TEST_KEY_PART_B", "beta");
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("provider.toml");
-        let mut f = std::fs::File::create(&path).expect("create");
-        write!(
-            f,
-            r#"
-[provider]
-name = "test"
-api_key = "${{_LLM_PROXY_TEST_KEY_PART_A}}:${{_LLM_PROXY_TEST_KEY_PART_B}}"
-auth_style = "bearer"
-
-[provider.adapters.chat]
-protocol = "openai_chat_completions"
-endpoint = "https://example.com/v1/chat/completions"
-
-[provider.models]
-"test-model" = {{ adapter = "chat" }}
-"#
-        )
-        .expect("write");
-
-        let cfg = load_provider_config(&path, None).expect("load");
-        assert_eq!(cfg.api_key, "alpha:beta");
-    }
-
-    // -- Whitespace-only provider name fails validation -------------------------
-
-    #[test]
-    fn whitespace_only_provider_name_fails_validation() {
-        // Validation uses .trim().is_empty(), so whitespace-only names are
-        // rejected as semantically empty.
-        let cfg = ProviderConfig {
-            name: "   ".to_owned(),
-            api_key: "key".to_owned(),
-            auth_style: AuthStyle::Bearer,
-            adapters: HashMap::new(),
-            models: HashMap::new(),
-            routes: ProviderRoutesConfig::default(),
-            model_aliases: HashMap::new(),
-            discovery: None,
-            catalog: None,
-        };
-        let result = validate_provider_config(&cfg, None);
-        assert!(
-            result.is_err(),
-            "whitespace-only provider name should fail validation, got: {result:?}"
-        );
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("provider name is empty"),
-            "expected empty provider name error, got: {err}"
-        );
-    }
-
-    // -- Whitespace-only adapter name fails validation --------------------------
-
-    #[test]
-    fn whitespace_only_adapter_name_fails_validation() {
-        let cfg = ProviderConfig {
-            name: "test".to_owned(),
-            api_key: "key".to_owned(),
-            auth_style: AuthStyle::Bearer,
-            adapters: {
-                let mut m = HashMap::new();
-                m.insert(
-                    "   ".to_owned(),
-                    ProviderAdapterConfig {
-                        protocol: "openai_chat_completions".to_owned(),
-                        endpoint: "https://example.com".to_owned(),
-                        headers: HashMap::new(),
-                    },
-                );
-                m
-            },
-            models: HashMap::new(),
-            routes: ProviderRoutesConfig::default(),
-            model_aliases: HashMap::new(),
-            discovery: None,
-            catalog: None,
-        };
-        let result = validate_provider_config(&cfg, None);
-        assert!(
-            result.is_err(),
-            "whitespace-only adapter name should fail validation, got: {result:?}"
-        );
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("adapter name is empty"),
-            "expected empty adapter name error, got: {err}"
-        );
-    }
-
-    // -- Very long model name / endpoint is accepted ---------------------------
-
-    #[test]
-    fn very_long_endpoint_and_model_name_accepted() {
-        let long_name = "a".repeat(10_000);
-        let long_url = format!("https://example.com/{long_name}");
-        let cfg = ProviderConfig {
-            name: "test".to_owned(),
-            api_key: "key".to_owned(),
-            auth_style: AuthStyle::Bearer,
-            adapters: {
-                let mut m = HashMap::new();
-                m.insert(
-                    "chat".to_owned(),
-                    ProviderAdapterConfig {
-                        protocol: "openai_chat_completions".to_owned(),
-                        endpoint: long_url.clone(),
-                        headers: HashMap::new(),
-                    },
-                );
-                m
-            },
-            models: {
-                let mut m = HashMap::new();
-                m.insert(
-                    long_name.clone(),
-                    ProviderModelConfig {
-                        adapter: "chat".to_owned(),
-                    },
-                );
-                m
-            },
-            routes: ProviderRoutesConfig::default(),
-            model_aliases: HashMap::new(),
-            discovery: None,
-            catalog: None,
-        };
-        let result = validate_provider_config(&cfg, None);
-        assert!(
-            result.is_ok(),
-            "very long strings should pass validation, got: {result:?}"
-        );
-    }
-
-    // -- App config with unresolved env var in server field fails --------------
-
-    #[test]
-    fn load_app_config_unresolved_env_var_fails() {
-        let _env = clean_env();
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("config.toml");
-        std::fs::write(
-            &path,
-            r#"
-[server]
-bind = "127.0.0.1:3456"
-request_timeout = "300s"
-log_level = "info"
-hot_reload = false
-server_name = "${_LLM_PROXY_NEVER_EXISTS_FOR_APP_12345}"
-
-[models]
-"#,
-        )
-        .expect("write");
-
-        let result = load_app_config(&path);
-        assert!(
-            result.is_err(),
-            "expected error for unresolved env var in server field"
-        );
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("unresolvable environment variable"),
-            "expected unresolved env var error, got: {err}"
-        );
-    }
-
-    // -- App config with empty env var fails -----------------------------------
-
-    #[test]
-    fn load_app_config_empty_env_var_fails() {
-        let _env = clean_env();
-        let _g = EnvVarGuard::set("_LLM_PROXY_APP_EMPTY_VAR", "");
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("config.toml");
-        std::fs::write(
-            &path,
-            r#"
-[server]
-bind = "127.0.0.1:3456"
-request_timeout = "300s"
-log_level = "info"
-hot_reload = false
-server_name = "${_LLM_PROXY_APP_EMPTY_VAR}"
-
-[models]
-"#,
-        )
-        .expect("write");
-
-        let result = load_app_config(&path);
-        assert!(
-            result.is_err(),
-            "expected error for empty env var in server field"
-        );
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("resolved to an empty value"),
-            "expected empty env var error, got: {err}"
-        );
-    }
-
-    // -- Whitespace-only whitespace-only endpoint fails validation ----------------
-
-    #[test]
-    fn whitespace_only_endpoint_fails_validation() {
-        let cfg = ProviderConfig {
-            name: "test".to_owned(),
-            api_key: "key".to_owned(),
-            auth_style: AuthStyle::Bearer,
-            adapters: {
-                let mut m = HashMap::new();
-                m.insert(
-                    "chat".to_owned(),
-                    ProviderAdapterConfig {
-                        protocol: "openai_chat_completions".to_owned(),
-                        endpoint: "   ".to_owned(),
-                        headers: HashMap::new(),
-                    },
-                );
-                m
-            },
-            models: HashMap::new(),
-            routes: ProviderRoutesConfig::default(),
-            model_aliases: HashMap::new(),
-            discovery: None,
-            catalog: None,
-        };
-        let result = validate_provider_config(&cfg, None);
-        assert!(
-            result.is_err(),
-            "whitespace-only endpoint should fail validation, got: {result:?}"
-        );
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("empty endpoint"),
-            "expected empty endpoint error, got: {err}"
-        );
-    }
-
-    // -- Whitespace-only protocol fails validation --------------------------------
-
-    #[test]
-    fn whitespace_only_protocol_fails_validation() {
-        let cfg = ProviderConfig {
-            name: "test".to_owned(),
-            api_key: "key".to_owned(),
-            auth_style: AuthStyle::Bearer,
-            adapters: {
-                let mut m = HashMap::new();
-                m.insert(
-                    "chat".to_owned(),
-                    ProviderAdapterConfig {
-                        protocol: "   ".to_owned(),
-                        endpoint: "https://example.com".to_owned(),
-                        headers: HashMap::new(),
-                    },
-                );
-                m
-            },
-            models: HashMap::new(),
-            routes: ProviderRoutesConfig::default(),
-            model_aliases: HashMap::new(),
-            discovery: None,
-            catalog: None,
-        };
-        let result = validate_provider_config(&cfg, None);
-        assert!(
-            result.is_err(),
-            "whitespace-only protocol should fail validation, got: {result:?}"
-        );
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("empty protocol"),
-            "expected empty protocol error, got: {err}"
-        );
-    }
-
-    // -- Whitespace-only adapter reference in model fails validation ---------------
-
-    #[test]
-    fn whitespace_only_adapter_in_model_fails_validation() {
-        let cfg = ProviderConfig {
-            name: "test".to_owned(),
-            api_key: "key".to_owned(),
-            auth_style: AuthStyle::Bearer,
-            adapters: {
-                let mut m = HashMap::new();
-                m.insert(
-                    "chat".to_owned(),
-                    ProviderAdapterConfig {
-                        protocol: "openai_chat_completions".to_owned(),
-                        endpoint: "https://example.com".to_owned(),
-                        headers: HashMap::new(),
-                    },
-                );
-                m
-            },
-            models: {
-                let mut m = HashMap::new();
-                m.insert(
-                    "my-model".to_owned(),
-                    ProviderModelConfig {
-                        adapter: "   ".to_owned(),
-                    },
-                );
-                m
-            },
-            routes: ProviderRoutesConfig::default(),
-            model_aliases: HashMap::new(),
-            discovery: None,
-            catalog: None,
-        };
-        let result = validate_provider_config(&cfg, None);
-        assert!(
-            result.is_err(),
-            "whitespace-only adapter reference should fail validation, got: {result:?}"
-        );
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("empty adapter reference"),
-            "expected empty adapter reference error, got: {err}"
-        );
-    }
-
-    // -- Whitespace-only api_key fails validation ---------------------------------
-    //
-    // api_key validation uses .trim().is_empty() consistent with all other field
-    // checks, so whitespace-only api_keys are rejected.
-
-    #[test]
-    fn whitespace_only_api_key_fails_validation() {
-        let cfg = ProviderConfig {
-            name: "test".to_owned(),
-            api_key: "   ".to_owned(),
-            auth_style: AuthStyle::Bearer,
-            adapters: HashMap::new(),
-            models: HashMap::new(),
-            routes: ProviderRoutesConfig::default(),
-            model_aliases: HashMap::new(),
-            discovery: None,
-            catalog: None,
-        };
-        let result = validate_provider_config(&cfg, None);
-        assert!(
-            result.is_err(),
-            "whitespace-only api_key should fail validation, got: {result:?}"
-        );
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("api_key is empty"),
-            "expected empty api_key error, got: {err}"
-        );
-    }
-
-    // -- Empty TOML adapter name key via file --------------------------------------
-
-    #[test]
-    fn empty_toml_adapter_name_key_via_file_fails() {
-        let _env = clean_env();
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("provider.toml");
-        std::fs::write(
-            &path,
-            r#"
-[provider]
-name = "test"
+name = "example"
 api_key = "key"
 auth_style = "bearer"
 
-[provider.adapters.'']
-protocol = "openai_chat_completions"
-endpoint = "https://example.com/v1/chat/completions"
-
-[provider.models]
+[provider.discovery]
+kind = "openai_compatible_models"
+endpoint = "https://example.com/v1/models"
 "#,
         )
-        .expect("write");
-
-        let result = load_provider_config(&path, None);
-        assert!(result.is_err(), "expected error for empty adapter name key");
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("adapter name is empty"),
-            "expected empty adapter name error, got: {err}"
-        );
-    }
-
-    // -- Invalid UTF-8 in TOML file fails ------------------------------------------
-
-    #[test]
-    fn invalid_utf8_in_app_config_fails() {
-        let _env = clean_env();
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("config.toml");
-        // Write invalid UTF-8 bytes (BOM-like but corrupted).
-        std::fs::write(&path, b"\xff\xfe invalid utf8 content").expect("write");
-
-        let result = load_app_config(&path);
-        assert!(result.is_err(), "expected error for invalid UTF-8");
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("failed to read config"),
-            "expected config load error for invalid UTF-8, got: {err}"
-        );
-    }
-
-    #[test]
-    fn invalid_utf8_in_provider_config_fails() {
-        let _env = clean_env();
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("provider.toml");
-        std::fs::write(&path, b"\xff\xfe invalid utf8 content").expect("write");
-
-        let result = load_provider_config(&path, None);
-        assert!(result.is_err(), "expected error for invalid UTF-8");
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("failed to read config"),
-            "expected config load error for invalid UTF-8, got: {err}"
-        );
-    }
-
-    // -- App config with empty models map passes -----------------------------------
-
-    #[test]
-    fn load_app_config_empty_models_map_passes() {
-        let _env = clean_env();
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("config.toml");
-        std::fs::write(
-            &path,
-            r#"
-[server]
-bind = "127.0.0.1:3456"
-request_timeout = "300s"
-log_level = "info"
-hot_reload = false
-server_name = "llm-proxy"
-
-[models]
-"#,
-        )
-        .expect("write");
-
-        let cfg = load_app_config(&path).expect("load");
-        assert!(
-            cfg.models.is_empty(),
-            "empty models map should parse successfully"
-        );
-    }
-
-    // -- Minimal valid provider config (name + api_key + auth_style only) ----------
-
-    #[test]
-    fn minimal_valid_provider_config_passes() {
-        let cfg = ProviderConfig {
-            name: "test".to_owned(),
-            api_key: "key".to_owned(),
-            auth_style: AuthStyle::Bearer,
-            adapters: HashMap::new(),
-            models: HashMap::new(),
-            routes: ProviderRoutesConfig::default(),
-            model_aliases: HashMap::new(),
-            discovery: None,
-            catalog: None,
-        };
-        let result = validate_provider_config(&cfg, None);
-        assert!(
-            result.is_ok(),
-            "minimal provider config should pass validation, got: {result:?}"
-        );
-    }
-
-    // -- Duplicate env var references in same file ---------------------------------
-
-    #[test]
-    fn duplicate_env_var_references_in_same_file() {
-        let _env = clean_env();
-        let _g = EnvVarGuard::set("_LLM_PROXY_DUP_VAR", "shared-value");
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("provider.toml");
-        let mut f = std::fs::File::create(&path).expect("create");
-        write!(
-            f,
-            r#"
-[provider]
-name = "test"
-api_key = "${{_LLM_PROXY_DUP_VAR}}"
-auth_style = "bearer"
-
-[provider.adapters.chat]
-protocol = "openai_chat_completions"
-endpoint = "https://${{_LLM_PROXY_DUP_VAR}}/v1/chat/completions"
-
-[provider.models]
-"test-model" = {{ adapter = "chat" }}
-"#
-        )
-        .expect("write");
-
-        let cfg = load_provider_config(&path, None).expect("load");
-        assert_eq!(cfg.api_key, "shared-value");
-        assert_eq!(
-            cfg.adapters["chat"].endpoint,
-            "https://shared-value/v1/chat/completions"
-        );
-    }
-
-    // -- Env var interpolation in provider name ------------------------------------
-
-    #[test]
-    fn env_var_interpolation_in_provider_name() {
-        let _env = clean_env();
-        let _g = EnvVarGuard::set("_LLM_PROXY_PROVIDER_NAME_VAR", "dynamic-provider");
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("provider.toml");
-        let mut f = std::fs::File::create(&path).expect("create");
-        write!(
-            f,
-            r#"
-[provider]
-name = "${{_LLM_PROXY_PROVIDER_NAME_VAR}}"
-api_key = "static-key"
-auth_style = "bearer"
-
-[provider.adapters.chat]
-protocol = "openai_chat_completions"
-endpoint = "https://example.com/v1/chat/completions"
-
-[provider.models]
-"test-model" = {{ adapter = "chat" }}
-"#
-        )
-        .expect("write");
-
-        let cfg = load_provider_config(&path, None).expect("load");
-        assert_eq!(cfg.name, "dynamic-provider");
-    }
-
-    // -- Env var interpolation in adapter name -------------------------------------
-
-    #[test]
-    fn env_var_interpolation_in_adapter_name() {
-        let _env = clean_env();
-        let _g = EnvVarGuard::set("_LLM_PROXY_ADAPTER_NAME_VAR", "dynamic-adapter");
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("provider.toml");
-        let mut f = std::fs::File::create(&path).expect("create");
-        write!(
-            f,
-            r#"
-[provider]
-name = "test"
-api_key = "static-key"
-auth_style = "bearer"
-
-[provider.adapters."${{_LLM_PROXY_ADAPTER_NAME_VAR}}"]
-protocol = "openai_chat_completions"
-endpoint = "https://example.com/v1/chat/completions"
-
-[provider.models."test-model"]
-adapter = "${{_LLM_PROXY_ADAPTER_NAME_VAR}}"
-"#
-        )
-        .expect("write");
-
-        let cfg = load_provider_config(&path, None).expect("load");
-        assert!(cfg.adapters.contains_key("dynamic-adapter"));
-        assert_eq!(cfg.models["test-model"].adapter, "dynamic-adapter");
-    }
-
-    // -- Whitespace-only provider model key fails validation -----------------------
-
-    #[test]
-    fn whitespace_only_provider_model_key_fails_validation() {
-        let cfg = ProviderConfig {
-            name: "test".to_owned(),
-            api_key: "key".to_owned(),
-            auth_style: AuthStyle::Bearer,
-            adapters: {
-                let mut m = HashMap::new();
-                m.insert(
-                    "chat".to_owned(),
-                    ProviderAdapterConfig {
-                        protocol: "openai_chat_completions".to_owned(),
-                        endpoint: "https://example.com".to_owned(),
-                        headers: HashMap::new(),
-                    },
-                );
-                m
-            },
-            models: {
-                let mut m = HashMap::new();
-                m.insert(
-                    "   ".to_owned(),
-                    ProviderModelConfig {
-                        adapter: "chat".to_owned(),
-                    },
-                );
-                m
-            },
-            routes: ProviderRoutesConfig::default(),
-            model_aliases: HashMap::new(),
-            discovery: None,
-            catalog: None,
-        };
-        let result = validate_provider_config(&cfg, None);
-        assert!(
-            result.is_err(),
-            "whitespace-only model key should fail validation, got: {result:?}"
-        );
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("model key is empty"),
-            "expected empty model key error, got: {err}"
-        );
-    }
-
-    // -- Unresolved env var in endpoint field fails (not just api_key) -----------
-
-    #[test]
-    fn unresolved_env_var_in_endpoint_fails() {
-        let _env = clean_env();
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("provider.toml");
-        std::fs::write(
-            &path,
-            r#"
-[provider]
-name = "test"
-api_key = "static-key"
-auth_style = "bearer"
-
-[provider.adapters.chat]
-protocol = "openai_chat_completions"
-endpoint = "${_LLM_PROXY_NEVER_SET_ENDPOINT_VAR}/v1/chat/completions"
-"#,
-        )
-        .expect("write");
-
-        let result = load_provider_config(&path, None);
-        assert!(
-            result.is_err(),
-            "expected error for unresolved env var in endpoint, got: {result:?}"
-        );
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("unresolvable environment variable"),
-            "expected unresolvable env var error, got: {err}"
-        );
-        assert!(
-            err.contains("_LLM_PROXY_NEVER_SET_ENDPOINT_VAR"),
-            "error should mention the unresolved var name, got: {err}"
-        );
-    }
-
-    // -- Unresolved env var in provider name fails --------------------------------
-
-    #[test]
-    fn unresolved_env_var_in_provider_name_fails() {
-        let _env = clean_env();
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("provider.toml");
-        std::fs::write(
-            &path,
-            r#"
-[provider]
-name = "${_LLM_PROXY_NEVER_SET_NAME_VAR}"
-api_key = "static-key"
-auth_style = "bearer"
-"#,
-        )
-        .expect("write");
-
-        let result = load_provider_config(&path, None);
-        assert!(
-            result.is_err(),
-            "expected error for unresolved env var in provider name, got: {result:?}"
-        );
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("unresolvable environment variable"),
-            "expected unresolvable env var error, got: {err}"
-        );
-    }
-
-    // -- Unresolved env var in protocol field fails -------------------------------
-
-    #[test]
-    fn unresolved_env_var_in_protocol_fails() {
-        let _env = clean_env();
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("provider.toml");
-        std::fs::write(
-            &path,
-            r#"
-[provider]
-name = "test"
-api_key = "static-key"
-auth_style = "bearer"
-
-[provider.adapters.chat]
-protocol = "${_LLM_PROXY_NEVER_SET_PROTOCOL_VAR}"
-endpoint = "https://example.com/v1/chat/completions"
-"#,
-        )
-        .expect("write");
-
-        let result = load_provider_config(&path, None);
-        assert!(
-            result.is_err(),
-            "expected error for unresolved env var in protocol, got: {result:?}"
-        );
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("unresolvable environment variable"),
-            "expected unresolvable env var error, got: {err}"
-        );
-    }
-
-    // -- Unknown AuthStyle variant produces clear error ---------------------------
-
-    #[test]
-    fn unknown_auth_style_variant_produces_clear_error() {
-        let _env = clean_env();
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("provider.toml");
-        std::fs::write(
-            &path,
-            r#"
-[provider]
-name = "test"
-api_key = "key"
-auth_style = "digest"
-
-[provider.adapters.chat]
-protocol = "openai_chat_completions"
-endpoint = "https://example.com/v1/chat/completions"
-"#,
-        )
-        .expect("write");
-
-        let result = load_provider_config(&path, None);
-        assert!(
-            result.is_err(),
-            "expected error for unknown auth_style variant"
-        );
-        let err = result.unwrap_err().to_string();
-        // Serde enum deserialization reports unknown variants clearly.
-        assert!(
-            err.contains("digest") || err.contains("unknown variant"),
-            "error should mention the unknown variant, got: {err}"
-        );
-    }
-
-    // =========================================================================
-    // New config validation tests
-    // =========================================================================
-
-    /// Helper: build a minimal valid `ProviderConfig` for use as a test base.
-    ///
-    /// The returned config passes `validate_provider_config` as-is (no routes,
-    /// no model aliases, one valid adapter, no models).
-    fn valid_provider_config() -> ProviderConfig {
-        ProviderConfig {
-            name: "test".to_owned(),
-            api_key: "key".to_owned(),
-            auth_style: AuthStyle::Bearer,
-            adapters: {
-                let mut m = HashMap::new();
-                m.insert(
-                    "chat".to_owned(),
-                    ProviderAdapterConfig {
-                        protocol: "openai_chat_completions".to_owned(),
-                        endpoint: "https://example.com/v1/chat/completions".to_owned(),
-                        headers: HashMap::new(),
-                    },
-                );
-                m
-            },
-            models: HashMap::new(),
-            routes: ProviderRoutesConfig::default(),
-            model_aliases: HashMap::new(),
-            discovery: None,
-            catalog: None,
-        }
-    }
-
-    // -- Provider name format validation -----------------------------------------
-
-    #[test]
-    fn validate_rejects_provider_name_with_dots() {
-        let mut cfg = valid_provider_config();
-        cfg.name = "my.provider".to_owned();
-        let result = validate_provider_config(&cfg, None);
-        assert!(
-            result.is_err(),
-            "expected error for provider name with dots"
-        );
+        .expect("provider config");
+        provider
+            .provider
+            .discovery
+            .as_mut()
+            .expect("discovery")
+            .headers
+            .insert("host".to_owned(), "evil.example".to_owned());
         assert!(matches!(
-            result.unwrap_err(),
-            ConfigValidationError::InvalidProviderNameFormat { ref provider }
-                if provider == "my.provider"
-        ),);
-    }
-
-    #[test]
-    fn validate_rejects_provider_name_with_slashes() {
-        let mut cfg = valid_provider_config();
-        cfg.name = "my/provider".to_owned();
-        let result = validate_provider_config(&cfg, None);
-        assert!(
-            result.is_err(),
-            "expected error for provider name with slashes"
-        );
-        assert!(matches!(
-            result.unwrap_err(),
-            ConfigValidationError::InvalidProviderNameFormat { ref provider }
-                if provider == "my/provider"
-        ),);
-    }
-
-    #[test]
-    fn validate_rejects_provider_name_with_uppercase() {
-        let mut cfg = valid_provider_config();
-        cfg.name = "MyProvider".to_owned();
-        let result = validate_provider_config(&cfg, None);
-        assert!(
-            result.is_err(),
-            "expected error for provider name with uppercase"
-        );
-        assert!(matches!(
-            result.unwrap_err(),
-            ConfigValidationError::InvalidProviderNameFormat { ref provider }
-                if provider == "MyProvider"
-        ),);
-    }
-
-    #[test]
-    fn validate_rejects_provider_name_with_spaces() {
-        let mut cfg = valid_provider_config();
-        cfg.name = "my provider".to_owned();
-        let result = validate_provider_config(&cfg, None);
-        assert!(
-            result.is_err(),
-            "expected error for provider name with spaces"
-        );
-        assert!(matches!(
-            result.unwrap_err(),
-            ConfigValidationError::InvalidProviderNameFormat { ref provider }
-                if provider == "my provider"
-        ),);
-    }
-
-    #[test]
-    fn validate_accepts_valid_provider_name_slug() {
-        let mut cfg = valid_provider_config();
-        cfg.name = "my-provider_v2".to_owned();
-        let result = validate_provider_config(&cfg, None);
-        assert!(
-            result.is_ok(),
-            "valid slug 'my-provider_v2' should pass validation, got: {result:?}"
-        );
-    }
-
-    // -- Adapter header validation -----------------------------------------------
-
-    #[test]
-    fn validate_rejects_adapter_header_with_crlf() {
-        let mut cfg = valid_provider_config();
-        cfg.adapters.get_mut("chat").unwrap().headers =
-            vec![("x-custom".to_owned(), "bad\r\nvalue".to_owned())]
-                .into_iter()
-                .collect();
-        let result = validate_provider_config(&cfg, None);
-        assert!(result.is_err(), "expected error for header with CRLF");
-        assert!(matches!(
-            result.unwrap_err(),
-            ConfigValidationError::HeaderContainsCrlf { ref provider, ref adapter }
-                if provider == "test" && adapter == "chat"
-        ),);
-    }
-
-    #[test]
-    fn validate_rejects_adapter_header_with_lf_only() {
-        let mut cfg = valid_provider_config();
-        cfg.adapters.get_mut("chat").unwrap().headers =
-            vec![("x-custom".to_owned(), "bad\nvalue".to_owned())]
-                .into_iter()
-                .collect();
-        let result = validate_provider_config(&cfg, None);
-        assert!(result.is_err(), "expected error for header with LF");
-        assert!(matches!(
-            result.unwrap_err(),
-            ConfigValidationError::HeaderContainsCrlf { ref provider, ref adapter }
-                if provider == "test" && adapter == "chat"
-        ),);
-    }
-
-    #[test]
-    fn validate_rejects_forbidden_header_host() {
-        let mut cfg = valid_provider_config();
-        cfg.adapters.get_mut("chat").unwrap().headers =
-            vec![("Host".to_owned(), "evil.com".to_owned())]
-                .into_iter()
-                .collect();
-        let result = validate_provider_config(&cfg, None);
-        assert!(result.is_err(), "expected error for forbidden Host header");
-        assert!(matches!(
-            result.unwrap_err(),
-            ConfigValidationError::ForbiddenHeader { ref provider, ref adapter, ref header }
-                if provider == "test" && adapter == "chat" && header == "Host"
-        ),);
-    }
-
-    #[test]
-    fn validate_rejects_forbidden_header_content_length() {
-        let mut cfg = valid_provider_config();
-        cfg.adapters.get_mut("chat").unwrap().headers =
-            vec![("Content-Length".to_owned(), "9999".to_owned())]
-                .into_iter()
-                .collect();
-        let result = validate_provider_config(&cfg, None);
-        assert!(
-            result.is_err(),
-            "expected error for forbidden Content-Length header"
-        );
-        assert!(matches!(
-            result.unwrap_err(),
-            ConfigValidationError::ForbiddenHeader { ref provider, ref adapter, ref header }
-                if provider == "test" && adapter == "chat" && header == "Content-Length"
-        ),);
-    }
-
-    #[test]
-    fn validate_rejects_forbidden_header_transfer_encoding() {
-        let mut cfg = valid_provider_config();
-        cfg.adapters.get_mut("chat").unwrap().headers =
-            vec![("Transfer-Encoding".to_owned(), "chunked".to_owned())]
-                .into_iter()
-                .collect();
-        let result = validate_provider_config(&cfg, None);
-        assert!(
-            result.is_err(),
-            "expected error for forbidden Transfer-Encoding header"
-        );
-        assert!(matches!(
-            result.unwrap_err(),
-            ConfigValidationError::ForbiddenHeader { ref provider, ref adapter, ref header }
-                if provider == "test" && adapter == "chat" && header == "Transfer-Encoding"
-        ),);
-    }
-
-    #[test]
-    fn validate_rejects_forbidden_header_connection() {
-        let mut cfg = valid_provider_config();
-        cfg.adapters.get_mut("chat").unwrap().headers =
-            vec![("Connection".to_owned(), "keep-alive".to_owned())]
-                .into_iter()
-                .collect();
-        let result = validate_provider_config(&cfg, None);
-        assert!(
-            result.is_err(),
-            "expected error for forbidden Connection header"
-        );
-        assert!(matches!(
-            result.unwrap_err(),
-            ConfigValidationError::ForbiddenHeader { ref provider, ref adapter, ref header }
-                if provider == "test" && adapter == "chat" && header == "Connection"
-        ),);
-    }
-
-    #[test]
-    fn validate_rejects_empty_adapter_header_name() {
-        let mut cfg = valid_provider_config();
-        cfg.adapters.get_mut("chat").unwrap().headers = vec![(String::new(), "value".to_owned())]
-            .into_iter()
-            .collect();
-        let result = validate_provider_config(&cfg, None);
-        assert!(result.is_err(), "expected error for empty header name");
-        assert!(matches!(
-            result.unwrap_err(),
-            ConfigValidationError::EmptyHeaderName { ref provider, ref adapter }
-                if provider == "test" && adapter == "chat"
-        ),);
-    }
-
-    #[test]
-    fn validate_accepts_valid_adapter_headers() {
-        let mut cfg = valid_provider_config();
-        cfg.adapters.get_mut("chat").unwrap().headers =
-            vec![("anthropic-version".to_owned(), "2023-06-01".to_owned())]
-                .into_iter()
-                .collect();
-        let result = validate_provider_config(&cfg, None);
-        assert!(
-            result.is_ok(),
-            "valid adapter headers should pass validation, got: {result:?}"
-        );
-    }
-
-    // -- Route adapter cross-reference validation --------------------------------
-
-    #[test]
-    fn validate_rejects_empty_route_adapter_name() {
-        let mut cfg = valid_provider_config();
-        cfg.routes.chat_completions = Some("   ".to_owned());
-        let result = validate_provider_config(&cfg, None);
-        assert!(
-            result.is_err(),
-            "expected error for whitespace route adapter name"
-        );
-        assert!(matches!(
-            result.unwrap_err(),
-            ConfigValidationError::EmptyRouteAdapterName { ref provider, ref route_kind }
-                if provider == "test" && route_kind == "chat_completions"
-        ),);
-    }
-
-    #[test]
-    fn validate_rejects_unknown_route_adapter() {
-        let mut cfg = valid_provider_config();
-        cfg.routes.chat_completions = Some("nonexistent_adapter".to_owned());
-        let result = validate_provider_config(&cfg, None);
-        assert!(result.is_err(), "expected error for unknown route adapter");
-        assert!(matches!(
-            result.unwrap_err(),
-            ConfigValidationError::UnknownRouteAdapter { ref provider, ref route_kind, ref adapter }
-                if provider == "test"
-                    && route_kind == "chat_completions"
-                    && adapter == "nonexistent_adapter"
-        ),);
-    }
-
-    // -- Model alias validation --------------------------------------------------
-
-    #[test]
-    fn validate_rejects_empty_model_alias_key() {
-        let mut cfg = valid_provider_config();
-        cfg.model_aliases = vec![(String::new(), "target-model".to_owned())]
-            .into_iter()
-            .collect();
-        let result = validate_provider_config(&cfg, None);
-        assert!(result.is_err(), "expected error for empty model alias key");
-        assert!(matches!(
-            result.unwrap_err(),
-            ConfigValidationError::EmptyModelAliasKey { ref provider }
-                if provider == "test"
-        ),);
-    }
-
-    #[test]
-    fn validate_rejects_empty_model_alias_target() {
-        let mut cfg = valid_provider_config();
-        cfg.model_aliases = vec![("my-alias".to_owned(), String::new())]
-            .into_iter()
-            .collect();
-        let result = validate_provider_config(&cfg, None);
-        assert!(
-            result.is_err(),
-            "expected error for empty model alias target"
-        );
-        assert!(matches!(
-            result.unwrap_err(),
-            ConfigValidationError::EmptyModelAliasTarget { ref provider, ref alias }
-                if provider == "test" && alias == "my-alias"
-        ),);
+            validate_provider_config(&provider.provider, None),
+            Err(ConfigValidationError::ForbiddenHeader { .. })
+        ));
     }
 }

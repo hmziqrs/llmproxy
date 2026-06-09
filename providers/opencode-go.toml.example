@@ -16,10 +16,17 @@ endpoint = "https://opencode.ai/zen/go/v1/chat/completions"
 protocol = "anthropic_messages"
 endpoint = "https://opencode.ai/zen/go/v1/messages"
 
-[provider.models]
-# Map model names to adapter names.
-# "model-name" = { adapter = "adapter-name" }
-#
-# Uncomment and adjust after running `llm-proxy init`:
-# "kimi-k2.6" = { adapter = "chat" }
-# "glm-5" = { adapter = "chat" }
+[provider.routes]
+chat_completions = "chat"
+messages = "anthropic"
+
+# [provider.model_aliases]
+# "short-name" = "upstream-model-id"
+
+# [provider.discovery]
+# kind = "openai_compatible_models"
+# endpoint = "https://opencode.ai/zen/go/v1/models"
+
+# [provider.catalog]
+# mode = "hybrid"
+# enforce = false

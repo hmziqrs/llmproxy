@@ -24,10 +24,17 @@ endpoint = "https://opencode.ai/zen/v1/responses"
 protocol = "gemini_generate_content"
 endpoint = "https://opencode.ai/zen/v1/models/{model}:generateContent"
 
-[provider.models]
-# Map model names to adapter names.
-# "model-name" = { adapter = "adapter-name" }
-#
-# Uncomment and adjust after running `llm-proxy init`:
-# "gpt-5.4" = { adapter = "chat" }
-# "gemini-3.5-flash" = { adapter = "gemini" }
+[provider.routes]
+chat_completions = "chat"
+messages = "anthropic"
+
+# [provider.model_aliases]
+# "short-name" = "upstream-model-id"
+
+# [provider.discovery]
+# kind = "openai_compatible_models"
+# endpoint = "https://opencode.ai/zen/v1/models"
+
+# [provider.catalog]
+# mode = "hybrid"
+# enforce = false

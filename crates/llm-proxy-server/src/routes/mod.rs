@@ -41,13 +41,13 @@ const NOT_FOUND_BODY_DRAIN_LIMIT: usize = 1024;
 /// **Lightweight routes** (`/health`, `/ready`, `/version`):
 /// 1. `TraceLayer` -- logs every request and response, measures latency.
 ///
-/// **API routes** (`/v1/*`):
+/// **API routes** (`/providers/{provider}/v1/*`):
 /// 1. `DefaultBodyLimit` -- caps the request body for JSON extractors (runs
 ///    first so oversized payloads are rejected before the timeout starts).
 /// 2. `TraceLayer` -- logs every request and response, measures latency.
 /// 3. `TimeoutLayer` -- cancels requests exceeding `config.request_timeout`.
 ///
-/// `TimeoutLayer` is scoped to `/v1/*` only. Lightweight health/readiness
+/// `TimeoutLayer` is scoped to provider API routes only. Lightweight health/readiness
 /// endpoints respond instantly and must not be subject to a 408 timeout,
 /// which would confuse orchestrators (Kubernetes, load balancers).
 ///
@@ -89,13 +89,16 @@ pub fn router(state: AppState) -> Router {
         ));
 
     let api = Router::new()
-        .route("/v1/{provider}/messages", post(handle_messages))
-        .route("/v1/{provider}/messages/count_tokens", post(count_tokens))
+        .route("/providers/{provider}/v1/messages", post(handle_messages))
         .route(
-            "/v1/{provider}/chat/completions",
+            "/providers/{provider}/v1/messages/count_tokens",
+            post(count_tokens),
+        )
+        .route(
+            "/providers/{provider}/v1/chat/completions",
             post(handle_chat_completions),
         )
-        .route("/v1/{provider}/models", get(handle_models))
+        .route("/providers/{provider}/v1/models", get(handle_models))
         .layer(api_middleware);
 
     Router::new()
@@ -106,11 +109,11 @@ pub fn router(state: AppState) -> Router {
 }
 
 async fn not_found(req: Request) -> impl IntoResponse {
-    // Protocol-aware 404: return OpenAI-shaped errors for the /v1/chat/completions
-    // route and any path under /v1/chat/ (future OpenAI chat sub-routes), and
+    // Protocol-aware 404: return OpenAI-shaped errors for provider-scoped chat
+    // routes and any path under /v1/chat/ (future OpenAI chat sub-routes), and
     // Anthropic-shaped errors for everything else.
     //
-    // Boundary note: the starts_with("/v1/chat/") check covers future routes
+    // Boundary note: the path check covers future routes
     // like /v1/chat/edits. If a non-OpenAI protocol is ever mounted under
     // /v1/chat/, this heuristic must be updated.
     //
@@ -129,7 +132,7 @@ async fn not_found(req: Request) -> impl IntoResponse {
     // not have the same head-of-line blocking concern as HTTP/1.1 keep-alive.
     drop(axum::body::to_bytes(req.into_body(), NOT_FOUND_BODY_DRAIN_LIMIT).await);
 
-    if path == "/v1/chat/completions" || path.starts_with("/v1/chat/") {
+    if path.contains("/v1/chat/") {
         error_response::route_error_response(
             error_response::ClientProtocol::OpenAiChat,
             error_response::RouteError::NotFound,

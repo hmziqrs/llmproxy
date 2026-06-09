@@ -5,6 +5,8 @@
 
 #![deny(missing_docs)]
 
+/// Runtime provider model catalog cache and refresh service.
+pub mod catalog_service;
 /// Middleware components (dedup, rate limiter, request ID, IP extraction).
 pub mod middleware;
 /// Route handlers and router composition.
@@ -14,6 +16,7 @@ pub mod shutdown;
 /// Shared application state and build metadata.
 pub mod state;
 
+pub use catalog_service::{ModelCatalogService, write_catalog_atomic};
 pub use middleware::{RateLimiter, RequestDeduplicator, RequestIdGenerator};
 pub use shutdown::shutdown_signal;
 pub use state::{AppState, BuildInfo};

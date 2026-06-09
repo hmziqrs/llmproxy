@@ -16,8 +16,7 @@ use axum::{
     routing::post,
 };
 use llm_proxy_core::{
-    AppConfig, AuthStyle, ProviderAdapterConfig, ProviderConfig, ProviderModelConfig,
-    ProviderRegistry, ServerConfig,
+    AppConfig, AuthStyle, ProviderAdapterConfig, ProviderConfig, ProviderRegistry, ServerConfig,
 };
 use llm_proxy_provider::{ProviderAdapterRegistry, ProxyClient};
 use llm_proxy_server::{AppState, BuildInfo, build_router};
@@ -90,7 +89,7 @@ fn state_with_provider(
     mock_endpoint: &str,
     protocol: &str,
     adapter_name: &str,
-    model_name: &str,
+    _model_name: &str,
 ) -> AppState {
     // Build routes based on protocol so the provider-based routing can resolve.
     // Anthropic providers also support chat_completions for cross-protocol tests.
@@ -122,16 +121,6 @@ fn state_with_provider(
             );
             m
         },
-        models: {
-            let mut m = HashMap::new();
-            m.insert(
-                model_name.to_owned(),
-                ProviderModelConfig {
-                    adapter: adapter_name.to_owned(),
-                },
-            );
-            m
-        },
         routes,
         model_aliases: HashMap::new(),
         discovery: None,
@@ -148,7 +137,6 @@ fn state_with_provider(
             hot_reload: false,
             server_name: "test-proxy".to_owned(),
         },
-        models: HashMap::new(),
     };
 
     AppState::new(
@@ -197,7 +185,10 @@ async fn spawn_mock_server(response_body: Vec<u8>, content_type: &str) -> String
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     tokio::time::sleep(Duration::from_millis(50)).await;
-    format!("http://{}/v1/mock-provider/chat/completions", addr)
+    format!(
+        "http://{}/providers/mock-provider/v1/chat/completions",
+        addr
+    )
 }
 
 /// Spawn a local mock axum server returning OpenAI Chat non-streaming response.
@@ -238,7 +229,10 @@ async fn spawn_mock_openai_chat_stream() -> String {
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     tokio::time::sleep(Duration::from_millis(50)).await;
-    format!("http://{}/v1/mock-provider/chat/completions", addr)
+    format!(
+        "http://{}/providers/mock-provider/v1/chat/completions",
+        addr
+    )
 }
 
 /// Spawn a mock server that returns HTTP 500.
@@ -259,7 +253,10 @@ async fn spawn_mock_500() -> String {
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     tokio::time::sleep(Duration::from_millis(50)).await;
-    format!("http://{}/v1/mock-provider/chat/completions", addr)
+    format!(
+        "http://{}/providers/mock-provider/v1/chat/completions",
+        addr
+    )
 }
 
 /// Spawn a mock server that records the received request body.
@@ -290,7 +287,10 @@ async fn spawn_mock_with_body_capture(
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     tokio::time::sleep(Duration::from_millis(50)).await;
     (
-        format!("http://{}/v1/mock-provider/chat/completions", addr),
+        format!(
+            "http://{}/providers/mock-provider/v1/chat/completions",
+            addr
+        ),
         captured,
     )
 }
@@ -305,7 +305,6 @@ fn empty_state() -> AppState {
             hot_reload: false,
             server_name: "test-proxy".to_owned(),
         },
-        models: HashMap::new(),
     };
     let registry = ProviderRegistry::from_providers(vec![]).expect("empty registry");
     AppState::new(
@@ -326,7 +325,7 @@ fn empty_state() -> AppState {
 fn chat_request(body: &str) -> Request<Body> {
     Request::builder()
         .method("POST")
-        .uri("/v1/mock-provider/chat/completions")
+        .uri("/providers/mock-provider/v1/chat/completions")
         .header("content-type", "application/json")
         .body(Body::from(body.to_owned()))
         .unwrap()
@@ -606,7 +605,7 @@ async fn invalid_json_returns_openai_shaped_400() {
 
     let req = Request::builder()
         .method("POST")
-        .uri("/v1/mock-provider/chat/completions")
+        .uri("/providers/mock-provider/v1/chat/completions")
         .header("content-type", "application/json")
         .body(Body::from("this is not json"))
         .unwrap();
@@ -818,7 +817,7 @@ async fn streaming_tool_call_maps_to_delta_tool_calls() {
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     tokio::time::sleep(Duration::from_millis(50)).await;
-    let mock_url = format!("http://{}/v1/mock-provider/messages", addr);
+    let mock_url = format!("http://{}/providers/mock-provider/v1/messages", addr);
 
     // Use Anthropic provider (which supports tool call events in SSE),
     // but call the OpenAI chat/completions endpoint.
@@ -1156,7 +1155,7 @@ async fn not_found_anthropic_path_returns_anthropic_shaped_error() {
     // Use a path under /v1/messages that does NOT match any mounted route.
     let req = Request::builder()
         .method("POST")
-        .uri("/v1/mock-provider/messages/typo")
+        .uri("/providers/mock-provider/v1/messages/typo")
         .header("content-type", "application/json")
         .body(Body::empty())
         .unwrap();
@@ -1185,7 +1184,7 @@ async fn empty_body_returns_openai_shaped_400() {
     let app = build_router(empty_state());
     let req = Request::builder()
         .method("POST")
-        .uri("/v1/mock-provider/chat/completions")
+        .uri("/providers/mock-provider/v1/chat/completions")
         .header("content-type", "application/json")
         .body(Body::empty())
         .unwrap();
@@ -1211,7 +1210,7 @@ async fn wrong_field_types_returns_openai_shaped_400() {
     let app = build_router(empty_state());
     let req = Request::builder()
         .method("POST")
-        .uri("/v1/mock-provider/chat/completions")
+        .uri("/providers/mock-provider/v1/chat/completions")
         .header("content-type", "application/json")
         .body(Body::from(
             r#"{"model": 123, "messages": "hello", "stream": "yes"}"#.to_owned(),
@@ -1239,7 +1238,7 @@ async fn missing_model_returns_openai_shaped_400() {
     let app = build_router(empty_state());
     let req = Request::builder()
         .method("POST")
-        .uri("/v1/mock-provider/chat/completions")
+        .uri("/providers/mock-provider/v1/chat/completions")
         .header("content-type", "application/json")
         .body(Body::from(
             r#"{"messages": [{"role": "user", "content": "hello"}]}"#.to_owned(),
@@ -1273,7 +1272,7 @@ async fn missing_messages_returns_openai_shaped_400() {
     let app = build_router(empty_state());
     let req = Request::builder()
         .method("POST")
-        .uri("/v1/mock-provider/chat/completions")
+        .uri("/providers/mock-provider/v1/chat/completions")
         .header("content-type", "application/json")
         .body(Body::from(r#"{"model": "gpt-4o"}"#.to_owned()))
         .unwrap();
@@ -1305,7 +1304,7 @@ async fn invalid_utf8_body_returns_openai_shaped_400() {
     let app = build_router(empty_state());
     let req = Request::builder()
         .method("POST")
-        .uri("/v1/mock-provider/chat/completions")
+        .uri("/providers/mock-provider/v1/chat/completions")
         .header("content-type", "application/json")
         .body(Body::from(vec![0xff, 0xfe, 0x00, 0x01]))
         .unwrap();
@@ -1359,7 +1358,7 @@ async fn chat_completions_oversized_body_returns_payload_too_large() {
     let oversized_body = "X".repeat(33 * 1024 * 1024);
     let req = Request::builder()
         .method("POST")
-        .uri("/v1/mock-provider/chat/completions")
+        .uri("/providers/mock-provider/v1/chat/completions")
         .header("content-type", "application/json")
         .body(Body::from(oversized_body))
         .unwrap();
@@ -1401,7 +1400,7 @@ async fn stream_error_after_first_byte_emits_error_event() {
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     tokio::time::sleep(Duration::from_millis(50)).await;
-    let mock_url = format!("http://{}/v1/mock-provider/messages", addr);
+    let mock_url = format!("http://{}/providers/mock-provider/v1/messages", addr);
 
     let state = state_with_anthropic_provider(&mock_url);
     let app = build_router(state);
@@ -1456,7 +1455,7 @@ async fn upstream_disconnect_completes_with_synthetic_terminal() {
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     tokio::time::sleep(Duration::from_millis(50)).await;
-    let mock_url = format!("http://{}/v1/mock-provider/messages", addr);
+    let mock_url = format!("http://{}/providers/mock-provider/v1/messages", addr);
 
     let state = state_with_anthropic_provider(&mock_url);
     let app = build_router(state);
@@ -1649,7 +1648,7 @@ async fn invalid_provider_name_returns_400() {
     let app = build_router(empty_state());
     let req = Request::builder()
         .method("POST")
-        .uri("/v1/INVALID.NAME/chat/completions")
+        .uri("/providers/INVALID.NAME/v1/chat/completions")
         .header("content-type", "application/json")
         .body(Body::from(
             serde_json::json!({"model": "gpt-4o", "messages": []}).to_string(),
@@ -1681,7 +1680,6 @@ async fn same_model_routes_to_different_providers() {
         api_key: "key-a".to_owned(),
         auth_style: AuthStyle::Bearer,
         adapters: adapters_a,
-        models: HashMap::new(),
         routes: llm_proxy_core::ProviderRoutesConfig {
             chat_completions: Some("chat".to_owned()),
             messages: None,
@@ -1705,7 +1703,6 @@ async fn same_model_routes_to_different_providers() {
         api_key: "key-b".to_owned(),
         auth_style: AuthStyle::Bearer,
         adapters: adapters_b,
-        models: HashMap::new(),
         routes: llm_proxy_core::ProviderRoutesConfig {
             chat_completions: Some("chat".to_owned()),
             messages: None,
@@ -1725,7 +1722,6 @@ async fn same_model_routes_to_different_providers() {
                 hot_reload: false,
                 server_name: "test".to_owned(),
             },
-            models: HashMap::new(),
         },
         registry,
         ProviderAdapterRegistry::builtin(),
@@ -1744,7 +1740,7 @@ async fn same_model_routes_to_different_providers() {
     // Request to provider-a — should resolve (not 404 for unknown provider).
     let req_a = Request::builder()
         .method("POST")
-        .uri("/v1/provider-a/chat/completions")
+        .uri("/providers/provider-a/v1/chat/completions")
         .header("content-type", "application/json")
         .body(Body::from(body.clone()))
         .unwrap();
@@ -1760,7 +1756,7 @@ async fn same_model_routes_to_different_providers() {
     // Request to provider-b — same model, different provider.
     let req_b = Request::builder()
         .method("POST")
-        .uri("/v1/provider-b/chat/completions")
+        .uri("/providers/provider-b/v1/chat/completions")
         .header("content-type", "application/json")
         .body(Body::from(body))
         .unwrap();

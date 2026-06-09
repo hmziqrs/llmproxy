@@ -28,6 +28,8 @@
 
 #![deny(missing_docs)]
 
+/// Provider model catalog merge, filter, and cache-file types.
+pub mod catalog;
 /// Shared `${ENV_VAR}` interpolation for config files.
 pub mod env_interpolate;
 /// Crate-level error type.
@@ -47,15 +49,15 @@ pub mod token;
 #[cfg(test)]
 pub mod test_support;
 
+pub use catalog::{CatalogFile, CatalogFileMetadata, merge_catalog, model_allowed};
 pub use error::CoreError;
 pub use metrics::{Metrics, Snapshot};
 pub use pid::PidManager;
 pub use provider_config::{
-    AppConfig, AuthStyle, ConfigValidationError, ModelRoute, ProviderAdapterConfig,
-    ProviderCatalogConfig, ProviderCatalogMode, ProviderConfig, ProviderDiscoveryConfig,
-    ProviderDiscoveryKind, ProviderFile, ProviderModelConfig, ProviderRouteKind,
-    ProviderRoutesConfig, ServerConfig, StaticModelCatalogEntry, load_app_config,
-    load_provider_config, validate_provider_config,
+    AppConfig, AuthStyle, ConfigValidationError, ProviderAdapterConfig, ProviderCatalogConfig,
+    ProviderCatalogMode, ProviderConfig, ProviderDiscoveryConfig, ProviderDiscoveryKind,
+    ProviderFile, ProviderRouteKind, ProviderRoutesConfig, ServerConfig, StaticModelCatalogEntry,
+    load_app_config, load_provider_config, validate_provider_config,
 };
 pub use provider_registry::{ProviderAdapterTargetConfig, ProviderRegistry};
 pub use token::{Counter, MessageContent};
