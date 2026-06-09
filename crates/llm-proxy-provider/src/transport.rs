@@ -73,6 +73,11 @@ pub struct ProxyRequest {
     /// [`ProxyClient::send_stream`] for streaming requests. This field exists
     /// solely for structured logging and future metrics.
     pub stream: bool,
+    /// Static adapter headers from config (e.g. `anthropic-version`).
+    ///
+    /// These are validated at config-load time and applied to every upstream
+    /// request in addition to auth headers.
+    pub extra_headers: std::collections::HashMap<String, String>,
 }
 
 impl fmt::Debug for ProxyRequest {
@@ -152,6 +157,10 @@ impl ProxyClient {
 
         builder = apply_auth(builder, &req.auth);
 
+        for (name, value) in &req.extra_headers {
+            builder = builder.header(name.as_str(), value.as_str());
+        }
+
         let resp = builder.body(req.body).send().await?;
 
         check_status(resp).await
@@ -187,6 +196,10 @@ impl ProxyClient {
             .header("Accept", "text/event-stream");
 
         builder = apply_auth(builder, &req.auth);
+
+        for (name, value) in &req.extra_headers {
+            builder = builder.header(name.as_str(), value.as_str());
+        }
 
         let resp = builder.body(req.body).send().await?;
 
@@ -224,11 +237,20 @@ impl ProxyClient {
 /// Anthropic). Where possible, prefer `AuthStyle::Bearer` or
 /// `AuthStyle::XApiKey` to send the key in only one header.
 fn apply_auth(mut builder: reqwest::RequestBuilder, auth: &AuthHeaders) -> reqwest::RequestBuilder {
-    if auth.style != AuthStyle::XApiKey {
-        builder = builder.header("Authorization", format!("Bearer {}", auth.api_key));
-    }
-    if auth.style != AuthStyle::Bearer {
-        builder = builder.header("x-api-key", &auth.api_key);
+    match auth.style {
+        AuthStyle::Bearer => {
+            builder = builder.header("Authorization", format!("Bearer {}", auth.api_key));
+        }
+        AuthStyle::XApiKey => {
+            builder = builder.header("x-api-key", &auth.api_key);
+        }
+        AuthStyle::XGoogleApiKey => {
+            builder = builder.header("x-goog-api-key", &auth.api_key);
+        }
+        AuthStyle::Both => {
+            builder = builder.header("Authorization", format!("Bearer {}", auth.api_key));
+            builder = builder.header("x-api-key", &auth.api_key);
+        }
     }
     builder
 }
@@ -288,6 +310,7 @@ mod tests {
             },
             body: br#"{"model":"gpt-5"}"#.to_vec(),
             stream: false,
+            extra_headers: std::collections::HashMap::new(),
         };
         let debug_output = format!("{:?}", req);
         assert!(
@@ -319,24 +342,13 @@ mod tests {
     async fn echo_handler(headers: HeaderMap, body: bytes::Bytes) -> impl IntoResponse {
         let mut response_parts = Vec::new();
 
-        // Echo Content-Type
-        if let Some(ct) = headers.get("content-type") {
-            response_parts.push(format!("content-type: {}", ct.to_str().unwrap_or("?")));
-        }
-
-        // Echo Authorization
-        if let Some(auth) = headers.get("authorization") {
-            response_parts.push(format!("authorization: {}", auth.to_str().unwrap_or("?")));
-        }
-
-        // Echo x-api-key
-        if let Some(key) = headers.get("x-api-key") {
-            response_parts.push(format!("x-api-key: {}", key.to_str().unwrap_or("?")));
-        }
-
-        // Echo Accept
-        if let Some(accept) = headers.get("accept") {
-            response_parts.push(format!("accept: {}", accept.to_str().unwrap_or("?")));
+        // Echo all headers as "name: value" pairs.
+        for (name, value) in &headers {
+            response_parts.push(format!(
+                "{}: {}",
+                name.as_str(),
+                value.to_str().unwrap_or("?")
+            ));
         }
 
         // Echo body
@@ -438,6 +450,7 @@ mod tests {
             },
             body: br#"{"hello":"world"}"#.to_vec(),
             stream: false,
+            extra_headers: std::collections::HashMap::new(),
         };
 
         let resp = client.send(req).await.unwrap();
@@ -468,6 +481,7 @@ mod tests {
             },
             body: vec![],
             stream: false,
+            extra_headers: std::collections::HashMap::new(),
         };
 
         let resp = client.send(req).await.unwrap();
@@ -498,6 +512,7 @@ mod tests {
             },
             body: vec![],
             stream: false,
+            extra_headers: std::collections::HashMap::new(),
         };
 
         let resp = client.send(req).await.unwrap();
@@ -515,6 +530,107 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn x_google_api_key_sets_correct_header() {
+        let app = Router::new().route("/test", post(echo_handler));
+        let base = start_test_server(app).await;
+
+        let client = ProxyClient::new();
+        let req = ProxyRequest {
+            url: format!("{}/test", base),
+            auth: AuthHeaders {
+                style: AuthStyle::XGoogleApiKey,
+                api_key: "google-test-key".to_owned(),
+            },
+            body: vec![],
+            stream: false,
+            extra_headers: std::collections::HashMap::new(),
+        };
+
+        let resp = client.send(req).await.unwrap();
+        let text = String::from_utf8(resp).unwrap();
+        assert!(
+            text.contains("x-goog-api-key: google-test-key"),
+            "Response must contain x-goog-api-key header: {}",
+            text
+        );
+        // Must NOT contain Bearer or x-api-key.
+        assert!(
+            !text.contains("authorization:"),
+            "XGoogleApiKey must not set Authorization header: {}",
+            text
+        );
+        assert!(
+            !text.contains("x-api-key:"),
+            "XGoogleApiKey must not set x-api-key header: {}",
+            text
+        );
+    }
+
+    #[tokio::test]
+    async fn extra_headers_are_sent_in_non_streaming_request() {
+        let app = Router::new().route("/test", post(echo_handler));
+        let base = start_test_server(app).await;
+
+        let mut extra = std::collections::HashMap::new();
+        extra.insert("anthropic-version".to_owned(), "2023-06-01".to_owned());
+        extra.insert("x-custom".to_owned(), "custom-value".to_owned());
+
+        let client = ProxyClient::new();
+        let req = ProxyRequest {
+            url: format!("{}/test", base),
+            auth: AuthHeaders {
+                style: AuthStyle::Bearer,
+                api_key: "key".to_owned(),
+            },
+            body: vec![],
+            stream: false,
+            extra_headers: extra,
+        };
+
+        let resp = client.send(req).await.unwrap();
+        let text = String::from_utf8(resp).unwrap();
+        assert!(
+            text.contains("anthropic-version: 2023-06-01"),
+            "Response must contain static adapter header: {}",
+            text
+        );
+        assert!(
+            text.contains("x-custom: custom-value"),
+            "Response must contain static adapter header: {}",
+            text
+        );
+    }
+
+    #[tokio::test]
+    async fn extra_headers_are_sent_in_streaming_request() {
+        let app = Router::new().route("/test", post(echo_handler));
+        let base = start_test_server(app).await;
+
+        let mut extra = std::collections::HashMap::new();
+        extra.insert("x-stream-header".to_owned(), "stream-value".to_owned());
+
+        let client = ProxyClient::new();
+        let req = ProxyRequest {
+            url: format!("{}/test", base),
+            auth: AuthHeaders {
+                style: AuthStyle::Bearer,
+                api_key: "key".to_owned(),
+            },
+            body: br#"data: hello"#.to_vec(),
+            stream: true,
+            extra_headers: extra,
+        };
+
+        // The streaming request should succeed (status < 400) because the
+        // extra headers are applied before the body is sent.
+        let result = client.send_stream(req).await;
+        assert!(
+            result.is_ok(),
+            "streaming request with extra headers should succeed"
+        );
+    }
+
+    #[tokio::test]
     async fn content_type_always_set_to_application_json() {
         let app = Router::new().route("/test", post(echo_handler));
         let base = start_test_server(app).await;
@@ -528,6 +644,7 @@ mod tests {
             },
             body: br#"{"hello":"world"}"#.to_vec(),
             stream: false,
+            extra_headers: std::collections::HashMap::new(),
         };
 
         let resp = client.send(req).await.unwrap();
@@ -555,6 +672,7 @@ mod tests {
             },
             body: raw_body.clone(),
             stream: false,
+            extra_headers: std::collections::HashMap::new(),
         };
 
         let resp = client.send(req).await.unwrap();
@@ -596,6 +714,7 @@ mod tests {
             },
             body: vec![],
             stream: false,
+            extra_headers: std::collections::HashMap::new(),
         };
 
         let err = client.send(req).await.unwrap_err();
@@ -624,6 +743,7 @@ mod tests {
             },
             body: vec![],
             stream: true,
+            extra_headers: std::collections::HashMap::new(),
         };
 
         let result = client.send_stream(req).await;
@@ -655,6 +775,7 @@ mod tests {
             },
             body: vec![],
             stream: true,
+            extra_headers: std::collections::HashMap::new(),
         };
 
         let mut stream = client.send_stream(req).await.unwrap();
@@ -688,6 +809,7 @@ mod tests {
             },
             body: vec![],
             stream: false,
+            extra_headers: std::collections::HashMap::new(),
         };
 
         let resp = client.send(req).await.unwrap();
@@ -714,6 +836,7 @@ mod tests {
             },
             body: original_body.to_vec(),
             stream: false,
+            extra_headers: std::collections::HashMap::new(),
         };
 
         let resp = client.send(req).await.unwrap();
@@ -776,6 +899,7 @@ mod tests {
             },
             body: vec![],
             stream: true,
+            extra_headers: std::collections::HashMap::new(),
         };
 
         {
@@ -837,6 +961,7 @@ mod tests {
             },
             body: vec![],
             stream: true,
+            extra_headers: std::collections::HashMap::new(),
         };
 
         let mut stream = client.send_stream(req).await.unwrap();
@@ -893,6 +1018,7 @@ mod tests {
             },
             body: vec![],
             stream: true,
+            extra_headers: std::collections::HashMap::new(),
         };
 
         let mut stream = client.send_stream(req).await.unwrap();
@@ -917,6 +1043,7 @@ mod tests {
             },
             body: vec![],
             stream: false,
+            extra_headers: std::collections::HashMap::new(),
         };
 
         let err = client.send(req).await.unwrap_err();
@@ -950,6 +1077,7 @@ mod tests {
             },
             body: large_body.clone().into_bytes(),
             stream: false,
+            extra_headers: std::collections::HashMap::new(),
         };
 
         let resp = client.send(req).await.unwrap();
@@ -1045,6 +1173,7 @@ mod tests {
             },
             body: vec![],
             stream: false,
+            extra_headers: std::collections::HashMap::new(),
         };
 
         let resp = client.send(req).await.unwrap();
@@ -1070,6 +1199,7 @@ mod tests {
             },
             body: vec![],
             stream: false,
+            extra_headers: std::collections::HashMap::new(),
         };
 
         // Bound the test to 15 seconds as a safety net.

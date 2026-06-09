@@ -76,6 +76,9 @@ enum Commands {
         /// Path to config file (must be TOML).
         #[arg(short, long)]
         config: Option<PathBuf>,
+        /// Filter output to a single provider.
+        #[arg(long)]
+        provider: Option<String>,
     },
     /// Manage auto-start on login.
     Autostart {
@@ -134,9 +137,8 @@ server_name = "llm-proxy"
 
 /// Default provider TOML for opencode-go.
 ///
-/// Uses provider-based routing: adapters are matched by protocol to
-/// route kinds (chat completions, messages, etc.). Model-to-adapter
-/// mappings are in `[provider.models]`.
+/// Uses provider-based routing: inbound route kinds (chat completions,
+/// messages) are mapped to adapters in `[provider.routes]`.
 const DEFAULT_PROVIDER_OPENCODE_GO: &str = r#"[provider]
 name = "opencode-go"
 api_key = "${LLM_PROXY_OPENCODE_GO_KEY}"
@@ -150,20 +152,22 @@ endpoint = "https://opencode.ai/zen/go/v1/chat/completions"
 protocol = "anthropic_messages"
 endpoint = "https://opencode.ai/zen/go/v1/messages"
 
-[provider.models]
-"kimi-k2.6" = { adapter = "chat" }
-"glm-5" = { adapter = "chat" }
-"glm-5.1" = { adapter = "chat" }
-"qwen3.5-plus" = { adapter = "chat" }
-"deepseek-v4-pro" = { adapter = "chat" }
-"minimax-m2.5" = { adapter = "chat" }
+[provider.routes]
+chat_completions = "chat"
+messages = "anthropic"
+
+# [provider.model_aliases]
+# "alias" = "upstream-model-id"
+
+# [provider.discovery]
+# kind = "openai_compatible_models"
+# endpoint = "https://opencode.ai/zen/go/v1/models"
 "#;
 
 /// Default provider TOML for opencode-zen.
 ///
-/// Uses provider-based routing: adapters are matched by protocol to
-/// route kinds (chat completions, messages, etc.). Model-to-adapter
-/// mappings are in `[provider.models]`.
+/// Uses provider-based routing: inbound route kinds (chat completions,
+/// messages) are mapped to adapters in `[provider.routes]`.
 const DEFAULT_PROVIDER_OPENCODE_ZEN: &str = r#"[provider]
 name = "opencode-zen"
 api_key = "${LLM_PROXY_OPENCODE_ZEN_KEY}"
@@ -185,11 +189,16 @@ endpoint = "https://opencode.ai/zen/v1/responses"
 protocol = "gemini_generate_content"
 endpoint = "https://opencode.ai/zen/v1/models/{model}:generateContent"
 
-[provider.models]
-"gpt-5.4" = { adapter = "chat" }
-"gpt-5.4-pro" = { adapter = "chat" }
-"gemini-3.5-flash" = { adapter = "gemini" }
-"claude-sonnet-4-20250514" = { adapter = "anthropic" }
+[provider.routes]
+chat_completions = "chat"
+messages = "anthropic"
+
+# [provider.model_aliases]
+# "alias" = "upstream-model-id"
+
+# [provider.discovery]
+# kind = "openai_compatible_models"
+# endpoint = "https://opencode.ai/zen/v1/models"
 "#;
 
 // ---------------------------------------------------------------------------
@@ -437,7 +446,7 @@ async fn main() -> Result<()> {
         Commands::Status => cmd_status(),
         Commands::Init => cmd_init(),
         Commands::Validate { config } => cmd_validate(config),
-        Commands::Models { config } => cmd_models(config),
+        Commands::Models { config, provider } => cmd_models(config, provider),
         Commands::Autostart { action } => match action {
             AutostartAction::Enable { config, port } => cmd_autostart_enable(config, port),
             AutostartAction::Disable => cmd_autostart_disable(),
@@ -795,16 +804,23 @@ fn cmd_validate(config_path: Option<PathBuf>) -> Result<()> {
         println!("  (none)");
     } else {
         for provider in registry.iter() {
+            let route_count = provider
+                .routes
+                .chat_completions
+                .iter()
+                .chain(provider.routes.messages.iter())
+                .count();
             println!(
-                "  {} ({} adapters, {} models)",
+                "  {} ({} adapters, {} routes, {} aliases)",
                 provider.name,
                 provider.adapters.len(),
-                provider.models.len()
+                route_count,
+                provider.model_aliases.len()
             );
         }
     }
 
-    // Print provider route table: provider -> model -> adapter/protocol
+    // Print provider route table: route_kind -> adapter/protocol
     println!();
     println!("=== Provider Routes ===");
     if registry.is_empty() {
@@ -813,21 +829,29 @@ fn cmd_validate(config_path: Option<PathBuf>) -> Result<()> {
         let mut route_errors: Vec<String> = Vec::new();
         for provider in registry.iter() {
             println!("{}:", provider.name);
-            if provider.models.is_empty() {
-                println!("  (no models configured)");
+            let has_routes =
+                provider.routes.chat_completions.is_some() || provider.routes.messages.is_some();
+            if !has_routes {
+                println!("  (no routes configured)");
             } else {
-                for (model_name, model_cfg) in &provider.models {
-                    match provider.adapters.get(&model_cfg.adapter) {
+                let route_entries: Vec<(&str, &String)> = provider
+                    .routes
+                    .chat_completions
+                    .as_ref()
+                    .map(|a| ("chat_completions", a))
+                    .into_iter()
+                    .chain(provider.routes.messages.as_ref().map(|a| ("messages", a)))
+                    .collect();
+
+                for (route_kind, adapter_name) in &route_entries {
+                    match provider.adapters.get(*adapter_name) {
                         Some(adapter) => {
-                            println!(
-                                "  {} -> {}/{}",
-                                model_name, model_cfg.adapter, adapter.protocol
-                            );
+                            println!("  {} -> {}/{}", route_kind, adapter_name, adapter.protocol);
                         }
                         None => {
                             let msg = format!(
                                 "  {} -> ERROR: unknown adapter \"{}\"",
-                                model_name, model_cfg.adapter
+                                route_kind, adapter_name
                             );
                             println!("{}", msg);
                             route_errors.push(msg);
@@ -852,9 +876,8 @@ fn cmd_validate(config_path: Option<PathBuf>) -> Result<()> {
 
 /// Run the `models` command.
 ///
-/// Lists provider-scoped models from provider config files. Each provider's
-/// model-to-adapter mappings are displayed grouped by provider name.
-fn cmd_models(config_path: Option<PathBuf>) -> Result<()> {
+/// Lists provider routes and model aliases from provider config files.
+fn cmd_models(config_path: Option<PathBuf>, provider_filter: Option<String>) -> Result<()> {
     let path = resolve_config(config_path.as_deref());
 
     // Reject JSON config and non-TOML extensions.
@@ -876,16 +899,49 @@ fn cmd_models(config_path: Option<PathBuf>) -> Result<()> {
         return Ok(());
     }
 
-    println!("Provider-scoped models (from {}):", providers_dir.display());
+    let providers: Vec<_> = registry
+        .iter()
+        .filter(|p| {
+            provider_filter
+                .as_ref()
+                .is_none_or(|filter| p.name == *filter)
+        })
+        .collect();
+
+    if provider_filter.is_some() && providers.is_empty() {
+        let name = provider_filter.as_deref().unwrap_or("?");
+        bail!(
+            "provider \"{name}\" not found in {}",
+            providers_dir.display()
+        );
+    }
+
+    println!("Provider configuration (from {}):", providers_dir.display());
     println!();
-    for provider in registry.iter() {
-        if provider.models.is_empty() {
-            println!("  {}:", provider.name);
-            println!("    (no models configured, all models sent as-is to upstream)");
+    for provider in &providers {
+        println!("  {}:", provider.name);
+
+        // Show routes.
+        let has_routes =
+            provider.routes.chat_completions.is_some() || provider.routes.messages.is_some();
+        println!("    routes:");
+        if let Some(ref adapter) = provider.routes.chat_completions {
+            println!("      chat_completions -> {adapter}");
+        }
+        if let Some(ref adapter) = provider.routes.messages {
+            println!("      messages -> {adapter}");
+        }
+        if !has_routes {
+            println!("      (none configured)");
+        }
+
+        // Show model aliases.
+        println!("    model_aliases:");
+        if provider.model_aliases.is_empty() {
+            println!("      (none configured)");
         } else {
-            println!("  {}:", provider.name);
-            for (model_name, model_cfg) in &provider.models {
-                println!("    {} -> {}", model_name, model_cfg.adapter);
+            for (alias, target) in &provider.model_aliases {
+                println!("      {alias} -> {target}");
             }
         }
     }
@@ -1465,7 +1521,7 @@ mod tests {
         let cfg = load_provider_config(&path, None).expect("generated provider TOML should parse");
         assert_eq!(cfg.name, "opencode-go");
         assert!(!cfg.adapters.is_empty());
-        assert!(!cfg.models.is_empty());
+        assert!(cfg.routes.chat_completions.is_some());
     }
 
     // -- generated provider TOML parses as ProviderFile (zen) -------------------
@@ -1555,24 +1611,30 @@ mod tests {
 
         let registry = ProviderRegistry::load_from_dir(&providers_dir).expect("load providers");
 
-        // Verify every provider model's adapter reference resolves to a valid adapter
+        // Verify every provider route's adapter reference resolves to a valid adapter
         // with a non-empty protocol.
         for provider in registry.iter() {
-            for (model_name, model_cfg) in &provider.models {
-                let adapter = provider
-                    .adapters
-                    .get(&model_cfg.adapter)
-                    .unwrap_or_else(|| {
-                        panic!(
-                            "provider \"{}\": model \"{}\" references unknown adapter \"{}\"",
-                            provider.name, model_name, model_cfg.adapter
-                        )
-                    });
+            let route_entries: Vec<(&str, &String)> = provider
+                .routes
+                .chat_completions
+                .as_ref()
+                .map(|a| ("chat_completions", a))
+                .into_iter()
+                .chain(provider.routes.messages.as_ref().map(|a| ("messages", a)))
+                .collect();
+
+            for (route_kind, adapter_name) in &route_entries {
+                let adapter = provider.adapters.get(*adapter_name).unwrap_or_else(|| {
+                    panic!(
+                        "provider \"{}\": route \"{}\" references unknown adapter \"{}\"",
+                        provider.name, route_kind, adapter_name
+                    )
+                });
                 assert!(
                     !adapter.protocol.is_empty(),
                     "protocol should not be empty for {}/{}",
                     provider.name,
-                    model_name
+                    route_kind
                 );
             }
         }

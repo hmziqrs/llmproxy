@@ -1579,3 +1579,195 @@ async fn large_messages_array_is_handled() {
         "large messages array should not cause an internal server error"
     );
 }
+
+// ===========================================================================
+// Bare route 404 tests (locked decision: bare /v1/* not registered)
+// ===========================================================================
+
+/// Bare `/v1/chat/completions` (no provider segment) must return 404 with
+/// an OpenAI-shaped error envelope. This verifies locked decision #2:
+/// "Bare /v1/* API routes are not registered."
+#[tokio::test]
+async fn bare_v1_chat_completions_returns_404_openai_shaped() {
+    let app = build_router(empty_state());
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::json!({"model": "gpt-4o", "messages": []}).to_string(),
+        ))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    let resp_body: Value = serde_json::from_slice(
+        &axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+
+    // Must be OpenAI error shape.
+    assert!(resp_body["error"].is_object(), "must have error object");
+    assert!(resp_body["error"]["message"].is_string());
+}
+
+/// Bare `/v1/messages` (no provider segment) must return 404 with
+/// an Anthropic-shaped error envelope.
+#[tokio::test]
+async fn bare_v1_messages_returns_404_anthropic_shaped() {
+    let app = build_router(empty_state());
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/messages")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::json!({"model": "claude-3", "messages": []}).to_string(),
+        ))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    let resp_body: Value = serde_json::from_slice(
+        &axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+
+    // Must be Anthropic error shape (has "type" and "error" fields).
+    assert!(
+        resp_body["type"].is_string(),
+        "must have Anthropic 'type' field"
+    );
+}
+
+/// Provider name with invalid characters (uppercase, dots) must return 400.
+#[tokio::test]
+async fn invalid_provider_name_returns_400() {
+    let app = build_router(empty_state());
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/INVALID.NAME/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::json!({"model": "gpt-4o", "messages": []}).to_string(),
+        ))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "invalid provider name must return 400"
+    );
+}
+
+/// Same model name routed to different providers via URL path.
+#[tokio::test]
+async fn same_model_routes_to_different_providers() {
+    // Create two providers both supporting chat_completions.
+    let mut adapters_a = HashMap::new();
+    adapters_a.insert(
+        "chat".to_owned(),
+        ProviderAdapterConfig {
+            protocol: "openai_chat_completions".to_owned(),
+            endpoint: "https://provider-a.example.com/v1/chat/completions".to_owned(),
+            headers: HashMap::new(),
+        },
+    );
+    let provider_a = ProviderConfig {
+        name: "provider-a".to_owned(),
+        api_key: "key-a".to_owned(),
+        auth_style: AuthStyle::Bearer,
+        adapters: adapters_a,
+        models: HashMap::new(),
+        routes: llm_proxy_core::ProviderRoutesConfig {
+            chat_completions: Some("chat".to_owned()),
+            messages: None,
+        },
+        model_aliases: HashMap::new(),
+        discovery: None,
+        catalog: None,
+    };
+
+    let mut adapters_b = HashMap::new();
+    adapters_b.insert(
+        "chat".to_owned(),
+        ProviderAdapterConfig {
+            protocol: "openai_chat_completions".to_owned(),
+            endpoint: "https://provider-b.example.com/v1/chat/completions".to_owned(),
+            headers: HashMap::new(),
+        },
+    );
+    let provider_b = ProviderConfig {
+        name: "provider-b".to_owned(),
+        api_key: "key-b".to_owned(),
+        auth_style: AuthStyle::Bearer,
+        adapters: adapters_b,
+        models: HashMap::new(),
+        routes: llm_proxy_core::ProviderRoutesConfig {
+            chat_completions: Some("chat".to_owned()),
+            messages: None,
+        },
+        model_aliases: HashMap::new(),
+        discovery: None,
+        catalog: None,
+    };
+
+    let registry = ProviderRegistry::from_providers(vec![provider_a, provider_b]).unwrap();
+    let state = AppState::new(
+        AppConfig {
+            server: ServerConfig {
+                bind: "127.0.0.1:3456".parse().unwrap(),
+                request_timeout: Duration::from_secs(30),
+                log_level: "info".to_owned(),
+                hot_reload: false,
+                server_name: "test".to_owned(),
+            },
+            models: HashMap::new(),
+        },
+        registry,
+        ProviderAdapterRegistry::builtin(),
+        ProxyClient::new(),
+        BuildInfo {
+            name: "test",
+            version: "0.0.0",
+            target: "test",
+            git_sha: "test",
+        },
+    );
+    let app = build_router(state);
+
+    let body = serde_json::json!({"model": "gpt-4o", "messages": []}).to_string();
+
+    // Request to provider-a — should resolve (not 404 for unknown provider).
+    let req_a = Request::builder()
+        .method("POST")
+        .uri("/v1/provider-a/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(body.clone()))
+        .unwrap();
+    let resp_a = app.clone().oneshot(req_a).await.unwrap();
+    // Provider-a doesn't have a real upstream, so we expect an upstream error
+    // (502), NOT 404 unknown provider.
+    assert_ne!(
+        resp_a.status(),
+        StatusCode::NOT_FOUND,
+        "provider-a should resolve, not 404"
+    );
+
+    // Request to provider-b — same model, different provider.
+    let req_b = Request::builder()
+        .method("POST")
+        .uri("/v1/provider-b/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(body))
+        .unwrap();
+    let resp_b = app.oneshot(req_b).await.unwrap();
+    assert_ne!(
+        resp_b.status(),
+        StatusCode::NOT_FOUND,
+        "provider-b should resolve, not 404"
+    );
+}

@@ -390,6 +390,7 @@ pub(crate) fn build_proxy_request(
         },
         body,
         stream,
+        extra_headers: target.headers.clone(),
     }
 }
 

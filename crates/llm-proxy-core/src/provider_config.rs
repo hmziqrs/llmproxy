@@ -151,6 +151,8 @@ pub enum AuthStyle {
     Bearer,
     /// `x-api-key: <key>`
     XApiKey,
+    /// `x-goog-api-key: <key>` (Google/Gemini providers).
+    XGoogleApiKey,
     /// Both `Authorization: Bearer <key>` and `x-api-key: <key>`.
     Both,
 }
@@ -515,6 +517,75 @@ pub enum ConfigValidationError {
         /// The endpoint URL that has an invalid scheme.
         endpoint: String,
     },
+    /// An adapter header name or value contains CR or LF characters.
+    #[error("provider \"{provider}\": adapter \"{adapter}\" header contains CR/LF characters")]
+    HeaderContainsCrlf {
+        /// Provider name.
+        provider: String,
+        /// Adapter name.
+        adapter: String,
+    },
+    /// An adapter header uses a forbidden transport header name.
+    #[error("provider \"{provider}\": adapter \"{adapter}\" sets forbidden header \"{header}\"")]
+    ForbiddenHeader {
+        /// Provider name.
+        provider: String,
+        /// Adapter name.
+        adapter: String,
+        /// The forbidden header name.
+        header: String,
+    },
+    /// An adapter header name is empty.
+    #[error("provider \"{provider}\": adapter \"{adapter}\" has an empty header name")]
+    EmptyHeaderName {
+        /// Provider name.
+        provider: String,
+        /// Adapter name.
+        adapter: String,
+    },
+    /// A provider name contains invalid characters (must be URL-safe slug).
+    #[error(
+        "provider name \"{provider}\" contains invalid characters; \
+         only lowercase ASCII letters, digits, hyphens, and underscores are allowed"
+    )]
+    InvalidProviderNameFormat {
+        /// The invalid provider name.
+        provider: String,
+    },
+    /// A route adapter name is empty.
+    #[error("provider \"{provider}\": route \"{route_kind}\" has an empty adapter name")]
+    EmptyRouteAdapterName {
+        /// Provider name.
+        provider: String,
+        /// Route kind (e.g. "chat_completions" or "messages").
+        route_kind: String,
+    },
+    /// A route references an adapter that does not exist.
+    #[error(
+        "provider \"{provider}\": route \"{route_kind}\" references unknown adapter \"{adapter}\""
+    )]
+    UnknownRouteAdapter {
+        /// Provider name.
+        provider: String,
+        /// Route kind.
+        route_kind: String,
+        /// Adapter name.
+        adapter: String,
+    },
+    /// A model alias key is empty.
+    #[error("provider \"{provider}\": model alias key is empty")]
+    EmptyModelAliasKey {
+        /// Provider name.
+        provider: String,
+    },
+    /// A model alias target is empty.
+    #[error("provider \"{provider}\": model alias \"{alias}\" has an empty target")]
+    EmptyModelAliasTarget {
+        /// Provider name.
+        provider: String,
+        /// The alias key.
+        alias: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -527,8 +598,12 @@ pub enum ConfigValidationError {
 /// - provider name is non-empty (whitespace-only names are rejected)
 /// - `api_key` is non-empty (after interpolation) and no unresolved `${VAR}` patterns remain
 /// - all adapter names, protocol names, and endpoints are non-empty (whitespace-only values are rejected)
+/// - adapter static headers reject CRLF characters and forbidden transport headers
 /// - all provider-local model keys and their adapter references are non-empty
 /// - every provider-local model points to an existing adapter
+/// - provider name is a URL-safe slug (lowercase ASCII letters, digits, hyphens, underscores)
+/// - route adapter references point to existing adapters
+/// - model alias keys and targets are non-empty
 ///
 /// `known_protocols` is an optional list of protocol names that are compiled
 /// into the running binary. When `None`, protocol-name validation is skipped
@@ -543,8 +618,9 @@ pub enum ConfigValidationError {
 ///
 /// Returns a [`ConfigValidationError`] variant describing the first validation
 /// failure encountered. Checks run in a defined order: provider name, unresolved
-/// env vars in `api_key`, empty `api_key`, adapter names/protocols/endpoints,
-/// model keys/adapter references, and finally protocol-name membership.
+/// env vars in `api_key`, empty `api_key`, adapter names/protocols/endpoints/headers,
+/// model keys/adapter references, protocol-name membership, route adapter references,
+/// and model alias validation.
 pub fn validate_provider_config(
     provider: &ProviderConfig,
     known_protocols: Option<&[&str]>,
@@ -554,6 +630,16 @@ pub fn validate_provider_config(
     // Provider name must be non-empty (after trimming whitespace).
     if name.trim().is_empty() {
         return Err(ConfigValidationError::EmptyProviderName);
+    }
+
+    // Provider name must be a URL-safe slug.
+    static PROVIDER_NAME_SLUG: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"^[a-z0-9_-]+$").expect("valid provider name slug regex")
+    });
+    if !PROVIDER_NAME_SLUG.is_match(name) {
+        return Err(ConfigValidationError::InvalidProviderNameFormat {
+            provider: name.clone(),
+        });
     }
 
     // api_key checks.
@@ -610,6 +696,37 @@ pub fn validate_provider_config(
                 });
             }
         }
+
+        // Validate adapter static headers.
+        for (hname, hvalue) in &adapter_cfg.headers {
+            if hname.trim().is_empty() {
+                return Err(ConfigValidationError::EmptyHeaderName {
+                    provider: name.clone(),
+                    adapter: adapter_name.clone(),
+                });
+            }
+            if hname.contains('\r')
+                || hname.contains('\n')
+                || hvalue.contains('\r')
+                || hvalue.contains('\n')
+            {
+                return Err(ConfigValidationError::HeaderContainsCrlf {
+                    provider: name.clone(),
+                    adapter: adapter_name.clone(),
+                });
+            }
+            let lower = hname.to_ascii_lowercase();
+            if matches!(
+                lower.as_str(),
+                "host" | "content-length" | "transfer-encoding" | "connection"
+            ) {
+                return Err(ConfigValidationError::ForbiddenHeader {
+                    provider: name.clone(),
+                    adapter: adapter_name.clone(),
+                    header: hname.clone(),
+                });
+            }
+        }
     }
 
     // Provider-local model validation.
@@ -642,6 +759,55 @@ pub fn validate_provider_config(
                     provider: name.clone(),
                 });
             }
+        }
+    }
+
+    // Route adapter cross-reference validation.
+    if let Some(ref adapter_name) = provider.routes.chat_completions {
+        let aname = adapter_name.trim();
+        if aname.is_empty() {
+            return Err(ConfigValidationError::EmptyRouteAdapterName {
+                provider: name.clone(),
+                route_kind: "chat_completions".to_owned(),
+            });
+        }
+        if !provider.adapters.contains_key(aname) {
+            return Err(ConfigValidationError::UnknownRouteAdapter {
+                provider: name.clone(),
+                route_kind: "chat_completions".to_owned(),
+                adapter: aname.to_owned(),
+            });
+        }
+    }
+    if let Some(ref adapter_name) = provider.routes.messages {
+        let aname = adapter_name.trim();
+        if aname.is_empty() {
+            return Err(ConfigValidationError::EmptyRouteAdapterName {
+                provider: name.clone(),
+                route_kind: "messages".to_owned(),
+            });
+        }
+        if !provider.adapters.contains_key(aname) {
+            return Err(ConfigValidationError::UnknownRouteAdapter {
+                provider: name.clone(),
+                route_kind: "messages".to_owned(),
+                adapter: aname.to_owned(),
+            });
+        }
+    }
+
+    // Model alias validation.
+    for (alias_key, alias_target) in &provider.model_aliases {
+        if alias_key.trim().is_empty() {
+            return Err(ConfigValidationError::EmptyModelAliasKey {
+                provider: name.clone(),
+            });
+        }
+        if alias_target.trim().is_empty() {
+            return Err(ConfigValidationError::EmptyModelAliasTarget {
+                provider: name.clone(),
+                alias: alias_key.clone(),
+            });
         }
     }
 
@@ -2705,5 +2871,319 @@ endpoint = "https://example.com/v1/chat/completions"
             err.contains("digest") || err.contains("unknown variant"),
             "error should mention the unknown variant, got: {err}"
         );
+    }
+
+    // =========================================================================
+    // New config validation tests
+    // =========================================================================
+
+    /// Helper: build a minimal valid `ProviderConfig` for use as a test base.
+    ///
+    /// The returned config passes `validate_provider_config` as-is (no routes,
+    /// no model aliases, one valid adapter, no models).
+    fn valid_provider_config() -> ProviderConfig {
+        ProviderConfig {
+            name: "test".to_owned(),
+            api_key: "key".to_owned(),
+            auth_style: AuthStyle::Bearer,
+            adapters: {
+                let mut m = HashMap::new();
+                m.insert(
+                    "chat".to_owned(),
+                    ProviderAdapterConfig {
+                        protocol: "openai_chat_completions".to_owned(),
+                        endpoint: "https://example.com/v1/chat/completions".to_owned(),
+                        headers: HashMap::new(),
+                    },
+                );
+                m
+            },
+            models: HashMap::new(),
+            routes: ProviderRoutesConfig::default(),
+            model_aliases: HashMap::new(),
+            discovery: None,
+            catalog: None,
+        }
+    }
+
+    // -- Provider name format validation -----------------------------------------
+
+    #[test]
+    fn validate_rejects_provider_name_with_dots() {
+        let mut cfg = valid_provider_config();
+        cfg.name = "my.provider".to_owned();
+        let result = validate_provider_config(&cfg, None);
+        assert!(
+            result.is_err(),
+            "expected error for provider name with dots"
+        );
+        assert!(matches!(
+            result.unwrap_err(),
+            ConfigValidationError::InvalidProviderNameFormat { ref provider }
+                if provider == "my.provider"
+        ),);
+    }
+
+    #[test]
+    fn validate_rejects_provider_name_with_slashes() {
+        let mut cfg = valid_provider_config();
+        cfg.name = "my/provider".to_owned();
+        let result = validate_provider_config(&cfg, None);
+        assert!(
+            result.is_err(),
+            "expected error for provider name with slashes"
+        );
+        assert!(matches!(
+            result.unwrap_err(),
+            ConfigValidationError::InvalidProviderNameFormat { ref provider }
+                if provider == "my/provider"
+        ),);
+    }
+
+    #[test]
+    fn validate_rejects_provider_name_with_uppercase() {
+        let mut cfg = valid_provider_config();
+        cfg.name = "MyProvider".to_owned();
+        let result = validate_provider_config(&cfg, None);
+        assert!(
+            result.is_err(),
+            "expected error for provider name with uppercase"
+        );
+        assert!(matches!(
+            result.unwrap_err(),
+            ConfigValidationError::InvalidProviderNameFormat { ref provider }
+                if provider == "MyProvider"
+        ),);
+    }
+
+    #[test]
+    fn validate_rejects_provider_name_with_spaces() {
+        let mut cfg = valid_provider_config();
+        cfg.name = "my provider".to_owned();
+        let result = validate_provider_config(&cfg, None);
+        assert!(
+            result.is_err(),
+            "expected error for provider name with spaces"
+        );
+        assert!(matches!(
+            result.unwrap_err(),
+            ConfigValidationError::InvalidProviderNameFormat { ref provider }
+                if provider == "my provider"
+        ),);
+    }
+
+    #[test]
+    fn validate_accepts_valid_provider_name_slug() {
+        let mut cfg = valid_provider_config();
+        cfg.name = "my-provider_v2".to_owned();
+        let result = validate_provider_config(&cfg, None);
+        assert!(
+            result.is_ok(),
+            "valid slug 'my-provider_v2' should pass validation, got: {result:?}"
+        );
+    }
+
+    // -- Adapter header validation -----------------------------------------------
+
+    #[test]
+    fn validate_rejects_adapter_header_with_crlf() {
+        let mut cfg = valid_provider_config();
+        cfg.adapters.get_mut("chat").unwrap().headers =
+            vec![("x-custom".to_owned(), "bad\r\nvalue".to_owned())]
+                .into_iter()
+                .collect();
+        let result = validate_provider_config(&cfg, None);
+        assert!(result.is_err(), "expected error for header with CRLF");
+        assert!(matches!(
+            result.unwrap_err(),
+            ConfigValidationError::HeaderContainsCrlf { ref provider, ref adapter }
+                if provider == "test" && adapter == "chat"
+        ),);
+    }
+
+    #[test]
+    fn validate_rejects_adapter_header_with_lf_only() {
+        let mut cfg = valid_provider_config();
+        cfg.adapters.get_mut("chat").unwrap().headers =
+            vec![("x-custom".to_owned(), "bad\nvalue".to_owned())]
+                .into_iter()
+                .collect();
+        let result = validate_provider_config(&cfg, None);
+        assert!(result.is_err(), "expected error for header with LF");
+        assert!(matches!(
+            result.unwrap_err(),
+            ConfigValidationError::HeaderContainsCrlf { ref provider, ref adapter }
+                if provider == "test" && adapter == "chat"
+        ),);
+    }
+
+    #[test]
+    fn validate_rejects_forbidden_header_host() {
+        let mut cfg = valid_provider_config();
+        cfg.adapters.get_mut("chat").unwrap().headers =
+            vec![("Host".to_owned(), "evil.com".to_owned())]
+                .into_iter()
+                .collect();
+        let result = validate_provider_config(&cfg, None);
+        assert!(result.is_err(), "expected error for forbidden Host header");
+        assert!(matches!(
+            result.unwrap_err(),
+            ConfigValidationError::ForbiddenHeader { ref provider, ref adapter, ref header }
+                if provider == "test" && adapter == "chat" && header == "Host"
+        ),);
+    }
+
+    #[test]
+    fn validate_rejects_forbidden_header_content_length() {
+        let mut cfg = valid_provider_config();
+        cfg.adapters.get_mut("chat").unwrap().headers =
+            vec![("Content-Length".to_owned(), "9999".to_owned())]
+                .into_iter()
+                .collect();
+        let result = validate_provider_config(&cfg, None);
+        assert!(
+            result.is_err(),
+            "expected error for forbidden Content-Length header"
+        );
+        assert!(matches!(
+            result.unwrap_err(),
+            ConfigValidationError::ForbiddenHeader { ref provider, ref adapter, ref header }
+                if provider == "test" && adapter == "chat" && header == "Content-Length"
+        ),);
+    }
+
+    #[test]
+    fn validate_rejects_forbidden_header_transfer_encoding() {
+        let mut cfg = valid_provider_config();
+        cfg.adapters.get_mut("chat").unwrap().headers =
+            vec![("Transfer-Encoding".to_owned(), "chunked".to_owned())]
+                .into_iter()
+                .collect();
+        let result = validate_provider_config(&cfg, None);
+        assert!(
+            result.is_err(),
+            "expected error for forbidden Transfer-Encoding header"
+        );
+        assert!(matches!(
+            result.unwrap_err(),
+            ConfigValidationError::ForbiddenHeader { ref provider, ref adapter, ref header }
+                if provider == "test" && adapter == "chat" && header == "Transfer-Encoding"
+        ),);
+    }
+
+    #[test]
+    fn validate_rejects_forbidden_header_connection() {
+        let mut cfg = valid_provider_config();
+        cfg.adapters.get_mut("chat").unwrap().headers =
+            vec![("Connection".to_owned(), "keep-alive".to_owned())]
+                .into_iter()
+                .collect();
+        let result = validate_provider_config(&cfg, None);
+        assert!(
+            result.is_err(),
+            "expected error for forbidden Connection header"
+        );
+        assert!(matches!(
+            result.unwrap_err(),
+            ConfigValidationError::ForbiddenHeader { ref provider, ref adapter, ref header }
+                if provider == "test" && adapter == "chat" && header == "Connection"
+        ),);
+    }
+
+    #[test]
+    fn validate_rejects_empty_adapter_header_name() {
+        let mut cfg = valid_provider_config();
+        cfg.adapters.get_mut("chat").unwrap().headers = vec![(String::new(), "value".to_owned())]
+            .into_iter()
+            .collect();
+        let result = validate_provider_config(&cfg, None);
+        assert!(result.is_err(), "expected error for empty header name");
+        assert!(matches!(
+            result.unwrap_err(),
+            ConfigValidationError::EmptyHeaderName { ref provider, ref adapter }
+                if provider == "test" && adapter == "chat"
+        ),);
+    }
+
+    #[test]
+    fn validate_accepts_valid_adapter_headers() {
+        let mut cfg = valid_provider_config();
+        cfg.adapters.get_mut("chat").unwrap().headers =
+            vec![("anthropic-version".to_owned(), "2023-06-01".to_owned())]
+                .into_iter()
+                .collect();
+        let result = validate_provider_config(&cfg, None);
+        assert!(
+            result.is_ok(),
+            "valid adapter headers should pass validation, got: {result:?}"
+        );
+    }
+
+    // -- Route adapter cross-reference validation --------------------------------
+
+    #[test]
+    fn validate_rejects_empty_route_adapter_name() {
+        let mut cfg = valid_provider_config();
+        cfg.routes.chat_completions = Some("   ".to_owned());
+        let result = validate_provider_config(&cfg, None);
+        assert!(
+            result.is_err(),
+            "expected error for whitespace route adapter name"
+        );
+        assert!(matches!(
+            result.unwrap_err(),
+            ConfigValidationError::EmptyRouteAdapterName { ref provider, ref route_kind }
+                if provider == "test" && route_kind == "chat_completions"
+        ),);
+    }
+
+    #[test]
+    fn validate_rejects_unknown_route_adapter() {
+        let mut cfg = valid_provider_config();
+        cfg.routes.chat_completions = Some("nonexistent_adapter".to_owned());
+        let result = validate_provider_config(&cfg, None);
+        assert!(result.is_err(), "expected error for unknown route adapter");
+        assert!(matches!(
+            result.unwrap_err(),
+            ConfigValidationError::UnknownRouteAdapter { ref provider, ref route_kind, ref adapter }
+                if provider == "test"
+                    && route_kind == "chat_completions"
+                    && adapter == "nonexistent_adapter"
+        ),);
+    }
+
+    // -- Model alias validation --------------------------------------------------
+
+    #[test]
+    fn validate_rejects_empty_model_alias_key() {
+        let mut cfg = valid_provider_config();
+        cfg.model_aliases = vec![(String::new(), "target-model".to_owned())]
+            .into_iter()
+            .collect();
+        let result = validate_provider_config(&cfg, None);
+        assert!(result.is_err(), "expected error for empty model alias key");
+        assert!(matches!(
+            result.unwrap_err(),
+            ConfigValidationError::EmptyModelAliasKey { ref provider }
+                if provider == "test"
+        ),);
+    }
+
+    #[test]
+    fn validate_rejects_empty_model_alias_target() {
+        let mut cfg = valid_provider_config();
+        cfg.model_aliases = vec![("my-alias".to_owned(), String::new())]
+            .into_iter()
+            .collect();
+        let result = validate_provider_config(&cfg, None);
+        assert!(
+            result.is_err(),
+            "expected error for empty model alias target"
+        );
+        assert!(matches!(
+            result.unwrap_err(),
+            ConfigValidationError::EmptyModelAliasTarget { ref provider, ref alias }
+                if provider == "test" && alias == "my-alias"
+        ),);
     }
 }
