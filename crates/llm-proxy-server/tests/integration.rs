@@ -111,6 +111,7 @@ async fn health_returns_ok_with_body() {
     )
     .unwrap();
     assert_eq!(body["status"], "ok");
+    assert!(body.get("model_counts").is_none());
 }
 
 #[tokio::test]

@@ -1,6 +1,5 @@
 use axum::{Json, extract::State, http::StatusCode};
 use serde::Serialize;
-use std::collections::HashMap;
 
 use crate::state::AppState;
 
@@ -10,19 +9,11 @@ use crate::state::AppState;
 /// structs are outbound-only (`Serialize`, never `Deserialize` from external
 /// input). The attribute has no runtime effect on Serialize-only types.
 ///
-/// # Security note on model_counts
-///
-/// The `model_counts` field exposes internal routing information using
-/// composite keys of the form `"{provider}/{model}"` (provider name + model
-/// → request count). This should be gated behind
-/// authentication or redacted for unauthenticated access, as it reveals
-/// which providers and models are configured and their relative usage.
 #[derive(Serialize)]
 pub(crate) struct HealthBody {
     status: &'static str,
     service: String,
     metrics: HealthMetrics,
-    model_counts: HashMap<String, i64>,
 }
 
 /// Metrics snapshot included in the health response.
@@ -39,7 +30,10 @@ struct HealthMetrics {
     deduplicated: i64,
 }
 
-/// Liveness probe with expanded metrics.
+/// Liveness probe with aggregate metrics.
+///
+/// Per-provider and per-model counters are intentionally omitted because this
+/// endpoint is unauthenticated.
 pub async fn health(State(state): State<AppState>) -> (StatusCode, Json<HealthBody>) {
     let snapshot = state.metrics.get_snapshot();
 
@@ -57,7 +51,6 @@ pub async fn health(State(state): State<AppState>) -> (StatusCode, Json<HealthBo
                 rate_limited: snapshot.rate_limited,
                 deduplicated: snapshot.deduplicated,
             },
-            model_counts: snapshot.model_counts,
         }),
     )
 }

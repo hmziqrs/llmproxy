@@ -26,6 +26,40 @@ use crate::provider_config::{
     AuthStyle, ProviderConfig, ProviderRouteKind, StaticModelCatalogEntry, load_provider_config,
 };
 
+/// Typed failures from resolving a provider-scoped route.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum ProviderRouteResolutionError {
+    /// The requested provider is not registered.
+    #[error("unknown provider \"{provider}\": no provider config loaded with this name")]
+    UnknownProvider {
+        /// Requested provider name.
+        provider: String,
+    },
+    /// The provider has no adapter mapped for the requested route kind.
+    #[error(
+        "provider \"{provider}\" does not support route \"{route}\". Add a [provider.routes.{route}] entry mapping to an adapter name"
+    )]
+    UnsupportedRoute {
+        /// Provider name.
+        provider: String,
+        /// Route kind configuration key.
+        route: &'static str,
+    },
+    /// The configured route references an adapter that is absent at resolution time.
+    #[error(
+        "provider \"{provider}\": route references adapter \"{adapter}\" which does not exist in [provider.adapters]. Available adapters: {available}"
+    )]
+    MissingAdapter {
+        /// Provider name.
+        provider: String,
+        /// Missing adapter name.
+        adapter: String,
+        /// Human-readable list of configured adapters.
+        available: String,
+    },
+}
+
 // ---------------------------------------------------------------------------
 // ProviderAdapterTargetConfig
 // ---------------------------------------------------------------------------
@@ -290,7 +324,7 @@ impl ProviderRegistry {
     ///
     /// # Errors
     ///
-    /// Returns [`CoreError::ProviderResolution`] with an actionable message if:
+    /// Returns a typed [`ProviderRouteResolutionError`] if:
     ///
     /// - the provider is not in the registry,
     /// - the route kind is not configured for this provider,
@@ -300,13 +334,11 @@ impl ProviderRegistry {
         provider_name: &str,
         route_kind: ProviderRouteKind,
         requested_model: &str,
-    ) -> Result<ProviderAdapterTargetConfig, CoreError> {
+    ) -> Result<ProviderAdapterTargetConfig, ProviderRouteResolutionError> {
         // 1. Look up the provider.
         let provider = self.providers.get(provider_name).ok_or_else(|| {
-            CoreError::ProviderResolution {
-                message: format!(
-                    "unknown provider \"{provider_name}\": no provider config loaded with this name"
-                ),
+            ProviderRouteResolutionError::UnknownProvider {
+                provider: provider_name.to_owned(),
             }
         })?;
 
@@ -316,12 +348,9 @@ impl ProviderRegistry {
                 ProviderRouteKind::ChatCompletions => "chat_completions",
                 ProviderRouteKind::Messages => "messages",
             };
-            CoreError::ProviderResolution {
-                message: format!(
-                    "provider \"{}\" does not support route \"{}\". \
-                     Add a [provider.routes.{}] entry mapping to an adapter name",
-                    provider.name, route_name, route_name
-                ),
+            ProviderRouteResolutionError::UnsupportedRoute {
+                provider: provider.name.clone(),
+                route: route_name,
             }
         })?;
 
@@ -337,12 +366,10 @@ impl ProviderRegistry {
                     format!("{} (+{} more)", keys[..5].join(", "), keys.len() - 5)
                 }
             };
-            CoreError::ProviderResolution {
-                message: format!(
-                    "provider \"{}\": route references adapter \"{}\" which does not exist \
-                     in [provider.adapters]. Available adapters: {}",
-                    provider.name, adapter_name, available
-                ),
+            ProviderRouteResolutionError::MissingAdapter {
+                provider: provider.name.clone(),
+                adapter: adapter_name.to_owned(),
+                available,
             }
         })?;
 
@@ -442,5 +469,47 @@ mod tests {
         let debug = format!("{target:?}");
         assert!(!debug.contains("api-secret"));
         assert!(!debug.contains("header-secret"));
+    }
+
+    #[test]
+    fn provider_route_returns_typed_unknown_provider_error() {
+        let registry = ProviderRegistry::from_providers(Vec::new()).expect("registry");
+
+        let error = registry
+            .resolve_provider_route("missing", ProviderRouteKind::Messages, "model")
+            .expect_err("unknown provider");
+
+        assert!(matches!(
+            error,
+            ProviderRouteResolutionError::UnknownProvider { provider }
+                if provider == "missing"
+        ));
+    }
+
+    #[test]
+    fn provider_route_returns_typed_unsupported_route_error() {
+        let provider = ProviderConfig {
+            name: "example".to_owned(),
+            api_key: "key".to_owned(),
+            auth_style: AuthStyle::Bearer,
+            adapters: HashMap::new(),
+            routes: ProviderRoutesConfig::default(),
+            model_aliases: HashMap::new(),
+            discovery: None,
+            catalog: None,
+        };
+        let registry = ProviderRegistry::from_providers([provider]).expect("registry");
+
+        let error = registry
+            .resolve_provider_route("example", ProviderRouteKind::ChatCompletions, "model")
+            .expect_err("unsupported route");
+
+        assert!(matches!(
+            error,
+            ProviderRouteResolutionError::UnsupportedRoute {
+                provider,
+                route: "chat_completions"
+            } if provider == "example"
+        ));
     }
 }

@@ -11,9 +11,8 @@ use serde_json::Value;
 
 use crate::ProviderError;
 
-const MAX_PAGES: usize = 100;
-const MAX_MODELS: usize = 20_000;
-const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+const ANTHROPIC_VERSION_HEADER: &str = "anthropic-version";
+const DEFAULT_ANTHROPIC_VERSION: &str = "2023-06-01";
 
 /// GET-capable HTTP client for provider model discovery.
 #[derive(Debug, Clone)]
@@ -66,13 +65,13 @@ impl DiscoveryClient {
         })?;
         let mut models = Vec::new();
 
-        for _ in 0..MAX_PAGES {
+        for _ in 0..discovery.max_pages {
             let value = self.fetch_page(provider, &url).await?;
             parse_models(discovery.kind, &value, &mut models)?;
-            if models.len() > MAX_MODELS {
+            if models.len() > discovery.max_models {
                 return Err(ProviderError::InvalidConfig(format!(
-                    "provider \"{}\" discovery exceeded {MAX_MODELS} models",
-                    provider.name
+                    "provider \"{}\" discovery exceeded {} models",
+                    provider.name, discovery.max_models
                 )));
             }
 
@@ -85,8 +84,8 @@ impl DiscoveryClient {
         }
 
         Err(ProviderError::InvalidConfig(format!(
-            "provider \"{}\" discovery exceeded {MAX_PAGES} pages",
-            provider.name
+            "provider \"{}\" discovery exceeded {} pages",
+            provider.name, discovery.max_pages
         )))
     }
 
@@ -107,6 +106,14 @@ impl DiscoveryClient {
                 .bearer_auth(&provider.api_key)
                 .header("x-api-key", &provider.api_key),
         };
+        if discovery.kind == ProviderDiscoveryKind::AnthropicModels
+            && !discovery
+                .headers
+                .keys()
+                .any(|name| name.eq_ignore_ascii_case(ANTHROPIC_VERSION_HEADER))
+        {
+            request = request.header(ANTHROPIC_VERSION_HEADER, DEFAULT_ANTHROPIC_VERSION);
+        }
         for (name, value) in &discovery.headers {
             request = request.header(name, value);
         }
@@ -116,10 +123,11 @@ impl DiscoveryClient {
         let mut stream = response.bytes_stream();
         let mut bytes = Vec::new();
         while let Some(chunk) = stream.try_next().await? {
-            if bytes.len() + chunk.len() > MAX_RESPONSE_BYTES {
-                return Err(ProviderError::InvalidConfig(
-                    "discovery response exceeded 4 MiB".to_owned(),
-                ));
+            if bytes.len() + chunk.len() > discovery.max_response_bytes {
+                return Err(ProviderError::InvalidConfig(format!(
+                    "discovery response exceeded {} bytes",
+                    discovery.max_response_bytes
+                )));
             }
             bytes.extend_from_slice(&chunk);
         }
@@ -242,7 +250,175 @@ impl Default for DiscoveryClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::Json;
+    use axum::Router;
+    use axum::extract::State;
+    use axum::http::HeaderMap;
+    use axum::routing::get;
+    use llm_proxy_core::{ProviderDiscoveryConfig, ProviderRoutesConfig};
     use serde_json::json;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::net::TcpListener;
+
+    async fn echo_anthropic_version(headers: HeaderMap) -> Json<Value> {
+        let version = headers
+            .get(ANTHROPIC_VERSION_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("missing");
+        Json(json!({
+            "data": [{"id": version}],
+            "has_more": false
+        }))
+    }
+
+    async fn start_test_server(app: Router) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{address}/models")
+    }
+
+    fn discovery_provider(
+        endpoint: String,
+        kind: ProviderDiscoveryKind,
+        headers: HashMap<String, String>,
+    ) -> ProviderConfig {
+        ProviderConfig {
+            name: "test-provider".to_owned(),
+            api_key: "test-key".to_owned(),
+            auth_style: AuthStyle::XApiKey,
+            adapters: HashMap::new(),
+            routes: ProviderRoutesConfig::default(),
+            model_aliases: HashMap::new(),
+            discovery: Some(ProviderDiscoveryConfig {
+                kind,
+                endpoint,
+                headers,
+                max_pages: 100,
+                max_models: 20_000,
+                max_response_bytes: 4 * 1024 * 1024,
+            }),
+            catalog: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn anthropic_discovery_adds_default_version_header() {
+        let endpoint =
+            start_test_server(Router::new().route("/models", get(echo_anthropic_version))).await;
+        let provider = discovery_provider(
+            endpoint,
+            ProviderDiscoveryKind::AnthropicModels,
+            HashMap::new(),
+        );
+
+        let models = DiscoveryClient::default()
+            .discover(&provider)
+            .await
+            .expect("Anthropic discovery should succeed");
+
+        assert_eq!(models[0].id, DEFAULT_ANTHROPIC_VERSION);
+    }
+
+    #[tokio::test]
+    async fn anthropic_discovery_preserves_configured_version_header() {
+        let headers = HashMap::from([("Anthropic-Version".to_owned(), "2024-01-01".to_owned())]);
+        let endpoint =
+            start_test_server(Router::new().route("/models", get(echo_anthropic_version))).await;
+        let provider =
+            discovery_provider(endpoint, ProviderDiscoveryKind::AnthropicModels, headers);
+
+        let models = DiscoveryClient::default()
+            .discover(&provider)
+            .await
+            .expect("Anthropic discovery should succeed");
+
+        assert_eq!(models[0].id, "2024-01-01");
+    }
+
+    #[tokio::test]
+    async fn discovery_stops_at_configured_page_limit() {
+        async fn paginated_models(State(calls): State<Arc<AtomicUsize>>) -> Json<Value> {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Json(json!({
+                "models": [{
+                    "name": "models/gemini-pro",
+                    "supportedGenerationMethods": ["generateContent"]
+                }],
+                "nextPageToken": "next"
+            }))
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let endpoint = start_test_server(
+            Router::new()
+                .route("/models", get(paginated_models))
+                .with_state(Arc::clone(&calls)),
+        )
+        .await;
+        let mut provider = discovery_provider(
+            endpoint,
+            ProviderDiscoveryKind::GeminiModels,
+            HashMap::new(),
+        );
+        provider.discovery.as_mut().unwrap().max_pages = 1;
+
+        let error = DiscoveryClient::default()
+            .discover(&provider)
+            .await
+            .expect_err("page limit should stop pagination");
+
+        assert!(error.to_string().contains("exceeded 1 pages"));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn discovery_stops_at_configured_model_limit() {
+        let endpoint = start_test_server(Router::new().route(
+            "/models",
+            get(|| async { Json(json!({"data": [{"id": "a"}, {"id": "b"}]})) }),
+        ))
+        .await;
+        let mut provider = discovery_provider(
+            endpoint,
+            ProviderDiscoveryKind::OpenAiCompatibleModels,
+            HashMap::new(),
+        );
+        provider.discovery.as_mut().unwrap().max_models = 1;
+
+        let error = DiscoveryClient::default()
+            .discover(&provider)
+            .await
+            .expect_err("model limit should stop discovery");
+
+        assert!(error.to_string().contains("exceeded 1 models"));
+    }
+
+    #[tokio::test]
+    async fn discovery_stops_at_configured_response_size_limit() {
+        let endpoint = start_test_server(Router::new().route(
+            "/models",
+            get(|| async { Json(json!({"data": [{"id": "model"}]})) }),
+        ))
+        .await;
+        let mut provider = discovery_provider(
+            endpoint,
+            ProviderDiscoveryKind::OpenAiCompatibleModels,
+            HashMap::new(),
+        );
+        provider.discovery.as_mut().unwrap().max_response_bytes = 8;
+
+        let error = DiscoveryClient::default()
+            .discover(&provider)
+            .await
+            .expect_err("response size limit should stop discovery");
+
+        assert!(error.to_string().contains("exceeded 8 bytes"));
+    }
 
     #[test]
     fn openai_records_are_sorted_and_malformed_records_are_skipped() {

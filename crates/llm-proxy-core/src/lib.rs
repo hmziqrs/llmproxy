@@ -59,5 +59,7 @@ pub use provider_config::{
     ProviderFile, ProviderRouteKind, ProviderRoutesConfig, ServerConfig, StaticModelCatalogEntry,
     load_app_config, load_provider_config, validate_provider_config,
 };
-pub use provider_registry::{ProviderAdapterTargetConfig, ProviderRegistry};
+pub use provider_registry::{
+    ProviderAdapterTargetConfig, ProviderRegistry, ProviderRouteResolutionError,
+};
 pub use token::{Counter, MessageContent};

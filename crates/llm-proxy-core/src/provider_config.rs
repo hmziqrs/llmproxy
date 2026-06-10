@@ -254,6 +254,9 @@ pub enum ProviderDiscoveryKind {
 /// [provider.discovery]
 /// kind = "openai_compatible_models"
 /// endpoint = "https://api.example.com/v1/models"
+/// max_pages = 100
+/// max_models = 20000
+/// max_response_bytes = 4194304
 /// ```
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -265,6 +268,27 @@ pub struct ProviderDiscoveryConfig {
     /// Static headers used only for discovery requests.
     #[serde(default)]
     pub headers: HashMap<String, String>,
+    /// Maximum number of pages fetched during one discovery refresh.
+    #[serde(default = "default_discovery_max_pages")]
+    pub max_pages: usize,
+    /// Maximum number of model records accepted during one discovery refresh.
+    #[serde(default = "default_discovery_max_models")]
+    pub max_models: usize,
+    /// Maximum response body size accepted for each discovery page.
+    #[serde(default = "default_discovery_max_response_bytes")]
+    pub max_response_bytes: usize,
+}
+
+const fn default_discovery_max_pages() -> usize {
+    100
+}
+
+const fn default_discovery_max_models() -> usize {
+    20_000
+}
+
+const fn default_discovery_max_response_bytes() -> usize {
+    4 * 1024 * 1024
 }
 
 impl std::fmt::Debug for ProviderDiscoveryConfig {
@@ -277,6 +301,9 @@ impl std::fmt::Debug for ProviderDiscoveryConfig {
             .field("kind", &self.kind)
             .field("endpoint", &endpoint)
             .field("header_names", &self.headers.keys().collect::<Vec<_>>())
+            .field("max_pages", &self.max_pages)
+            .field("max_models", &self.max_models)
+            .field("max_response_bytes", &self.max_response_bytes)
             .finish()
     }
 }
@@ -549,6 +576,26 @@ pub enum ConfigValidationError {
         /// The alias key.
         alias: String,
     },
+    /// A configured model ID cannot be safely interpolated into a Gemini URL template.
+    #[error(
+        "provider \"{provider}\": {location} model ID \"{model}\" contains characters that are unsafe for Gemini URL templates"
+    )]
+    UnsafeGeminiModelId {
+        /// Provider name.
+        provider: String,
+        /// Configuration source, such as a catalog entry or alias target.
+        location: &'static str,
+        /// Unsafe model ID.
+        model: String,
+    },
+    /// A discovery resource limit is zero.
+    #[error("provider \"{provider}\": discovery limit \"{limit}\" must be greater than zero")]
+    InvalidDiscoveryLimit {
+        /// Provider name.
+        provider: String,
+        /// Invalid limit name.
+        limit: &'static str,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -565,6 +612,7 @@ pub enum ConfigValidationError {
 /// - provider name is a URL-safe slug (lowercase ASCII letters, digits, hyphens, underscores)
 /// - route adapter references point to existing adapters
 /// - model alias keys and targets are non-empty
+/// - static catalog IDs and alias targets used by Gemini URL templates are path-safe
 ///
 /// `known_protocols` is an optional list of protocol names that are compiled
 /// into the running binary. When `None`, protocol-name validation is skipped
@@ -729,14 +777,36 @@ pub fn validate_provider_config(
                 });
             }
         }
+        for (limit, value) in [
+            ("max_pages", discovery.max_pages),
+            ("max_models", discovery.max_models),
+            ("max_response_bytes", discovery.max_response_bytes),
+        ] {
+            if value == 0 {
+                return Err(ConfigValidationError::InvalidDiscoveryLimit {
+                    provider: name.clone(),
+                    limit,
+                });
+            }
+        }
     }
 
     // Catalog model entry validation.
+    let uses_gemini_model_template = provider.adapters.values().any(|adapter| {
+        adapter.protocol == "gemini_generate_content" && adapter.endpoint.contains("{model}")
+    });
     if let Some(catalog) = &provider.catalog {
         for entry in &catalog.models {
             if entry.id.trim().is_empty() {
                 return Err(ConfigValidationError::EmptyCatalogEntryId {
                     provider: name.clone(),
+                });
+            }
+            if uses_gemini_model_template && !is_safe_gemini_model_id(&entry.id) {
+                return Err(ConfigValidationError::UnsafeGeminiModelId {
+                    provider: name.clone(),
+                    location: "catalog entry",
+                    model: entry.id.clone(),
                 });
             }
         }
@@ -789,9 +859,26 @@ pub fn validate_provider_config(
                 alias: alias_key.clone(),
             });
         }
+        if uses_gemini_model_template && !is_safe_gemini_model_id(alias_target) {
+            return Err(ConfigValidationError::UnsafeGeminiModelId {
+                provider: name.clone(),
+                location: "model alias target",
+                model: alias_target.clone(),
+            });
+        }
     }
 
     Ok(())
+}
+
+fn is_safe_gemini_model_id(model: &str) -> bool {
+    let component = model.strip_prefix("models/").unwrap_or(model);
+    !component.is_empty()
+        && component != "."
+        && component != ".."
+        && component
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
 }
 
 // ---------------------------------------------------------------------------
@@ -1020,5 +1107,148 @@ endpoint = "https://example.com/v1/models"
             validate_provider_config(&provider.provider, None),
             Err(ConfigValidationError::ForbiddenHeader { .. })
         ));
+    }
+
+    #[test]
+    fn discovery_limits_use_secure_defaults() {
+        let provider: ProviderFile = toml::from_str(
+            r#"
+[provider]
+name = "example"
+api_key = "key"
+auth_style = "bearer"
+
+[provider.discovery]
+kind = "openai_compatible_models"
+endpoint = "https://example.com/v1/models"
+"#,
+        )
+        .expect("provider config");
+        let discovery = provider.provider.discovery.expect("discovery");
+
+        assert_eq!(
+            (
+                discovery.max_pages,
+                discovery.max_models,
+                discovery.max_response_bytes,
+            ),
+            (100, 20_000, 4 * 1024 * 1024)
+        );
+    }
+
+    #[test]
+    fn discovery_rejects_zero_limits() {
+        let provider: ProviderFile = toml::from_str(
+            r#"
+[provider]
+name = "example"
+api_key = "key"
+auth_style = "bearer"
+
+[provider.discovery]
+kind = "openai_compatible_models"
+endpoint = "https://example.com/v1/models"
+max_pages = 0
+"#,
+        )
+        .expect("provider config");
+
+        assert!(matches!(
+            validate_provider_config(&provider.provider, None),
+            Err(ConfigValidationError::InvalidDiscoveryLimit {
+                limit: "max_pages",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn gemini_alias_target_rejects_unsafe_url_template_characters() {
+        let provider: ProviderFile = toml::from_str(
+            r#"
+[provider]
+name = "gemini"
+api_key = "key"
+auth_style = "x-google-api-key"
+
+[provider.adapters.generate]
+protocol = "gemini_generate_content"
+endpoint = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+
+[provider.routes]
+messages = "generate"
+
+[provider.model_aliases]
+unsafe = "foo/../bar"
+"#,
+        )
+        .expect("provider config");
+
+        assert!(matches!(
+            validate_provider_config(&provider.provider, None),
+            Err(ConfigValidationError::UnsafeGeminiModelId {
+                location: "model alias target",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn gemini_static_catalog_entry_rejects_unsafe_url_template_characters() {
+        let provider: ProviderFile = toml::from_str(
+            r#"
+[provider]
+name = "gemini"
+api_key = "key"
+auth_style = "x-google-api-key"
+
+[provider.adapters.generate]
+protocol = "gemini_generate_content"
+endpoint = "https://generativelanguage.googleapis.com/v1beta/{model}:generateContent"
+
+[provider.routes]
+chat_completions = "generate"
+
+[[provider.catalog.models]]
+id = "models/group/gemini-pro"
+"#,
+        )
+        .expect("provider config");
+
+        assert!(matches!(
+            validate_provider_config(&provider.provider, None),
+            Err(ConfigValidationError::UnsafeGeminiModelId {
+                location: "catalog entry",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn gemini_resource_model_id_is_valid_at_config_load() {
+        let provider: ProviderFile = toml::from_str(
+            r#"
+[provider]
+name = "gemini"
+api_key = "key"
+auth_style = "x-google-api-key"
+
+[provider.adapters.generate]
+protocol = "gemini_generate_content"
+endpoint = "https://generativelanguage.googleapis.com/v1beta/{model}:generateContent"
+
+[provider.routes]
+chat_completions = "generate"
+
+[provider.model_aliases]
+pro = "models/gemini-2.5-pro"
+
+[[provider.catalog.models]]
+id = "models/gemini-2.5-pro"
+"#,
+        )
+        .expect("provider config");
+
+        assert!(validate_provider_config(&provider.provider, None).is_ok());
     }
 }

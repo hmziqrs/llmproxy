@@ -24,11 +24,7 @@ pub enum CoreError {
         /// Human-readable description of the validation failure.
         message: String,
     },
-    /// Provider registry resolution failed.
-    ///
-    /// Produced when [`ProviderRegistry::resolve_provider_route`] cannot resolve
-    /// a provider + route kind to a concrete adapter configuration because a
-    /// provider, adapter, or protocol is missing from the loaded registry.
+    /// Provider registry construction or protocol validation failed.
     #[error("provider resolution error: {message}")]
     ProviderResolution {
         /// Human-readable description of the resolution failure.

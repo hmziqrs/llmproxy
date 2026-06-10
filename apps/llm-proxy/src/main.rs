@@ -164,6 +164,9 @@ messages = "anthropic"
 # [provider.discovery]
 # kind = "openai_compatible_models"
 # endpoint = "https://opencode.ai/zen/go/v1/models"
+# max_pages = 100
+# max_models = 20000
+# max_response_bytes = 4194304
 "#;
 
 /// Default provider TOML for opencode-zen.
@@ -201,6 +204,9 @@ messages = "anthropic"
 # [provider.discovery]
 # kind = "openai_compatible_models"
 # endpoint = "https://opencode.ai/zen/v1/models"
+# max_pages = 100
+# max_models = 20000
+# max_response_bytes = 4194304
 "#;
 
 // ---------------------------------------------------------------------------

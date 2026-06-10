@@ -14,8 +14,7 @@ use axum::response::IntoResponse;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use bytes::Bytes;
 use futures::stream::{BoxStream, StreamExt};
-use llm_proxy_core::Metrics;
-use llm_proxy_core::ProviderRouteKind;
+use llm_proxy_core::{Metrics, ProviderRouteKind, ProviderRouteResolutionError};
 use llm_proxy_protocol::client::anthropic;
 use llm_proxy_protocol::client::anthropic::StreamEncoder as AnthropicStreamEncoder;
 use llm_proxy_protocol::client::openai_chat;
@@ -297,17 +296,7 @@ async fn resolve_target(
 
     let adapter_target_config = providers
         .resolve_provider_route(provider_name, route_kind, &core.model.requested)
-        .map_err(|e| {
-            // Map CoreError to specific RouteError variants for proper HTTP status codes.
-            let msg = e.to_string();
-            if msg.contains("unknown provider") {
-                RouteError::UnknownProvider(provider_name.to_owned())
-            } else if msg.contains("does not support route") || msg.contains("unsupported") {
-                RouteError::UnsupportedRoute(msg)
-            } else {
-                RouteError::Internal(msg)
-            }
-        })?;
+        .map_err(map_provider_route_error)?;
 
     if providers
         .get(provider_name)
@@ -363,6 +352,18 @@ async fn resolve_target(
     };
 
     Ok((provider_target, adapter))
+}
+
+fn map_provider_route_error(error: ProviderRouteResolutionError) -> RouteError {
+    match error {
+        ProviderRouteResolutionError::UnknownProvider { provider } => {
+            RouteError::UnknownProvider(provider)
+        }
+        error @ ProviderRouteResolutionError::UnsupportedRoute { .. } => {
+            RouteError::UnsupportedRoute(error.to_string())
+        }
+        error => RouteError::Internal(error.to_string()),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1258,6 +1259,18 @@ mod tests {
     }
 
     // -- map_provider_error -----------------------------------------------------
+
+    #[test]
+    fn provider_route_error_maps_unsupported_route_without_message_parsing() {
+        let error = ProviderRouteResolutionError::UnsupportedRoute {
+            provider: "example".to_owned(),
+            route: "messages",
+        };
+
+        let route_error = map_provider_route_error(error);
+
+        assert!(matches!(route_error, RouteError::UnsupportedRoute(_)));
+    }
 
     #[test]
     fn provider_api_error_maps_to_upstream() {

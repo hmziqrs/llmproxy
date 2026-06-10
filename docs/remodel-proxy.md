@@ -140,6 +140,9 @@ deepseek = "accounts/fireworks/models/deepseek-v3p1"
 [provider.discovery]
 kind = "fireworks_account_models"
 endpoint = "https://api.fireworks.ai/v1/accounts/fireworks/models"
+max_pages = 100
+max_models = 20000
+max_response_bytes = 4194304
 
 [provider.catalog]
 # Optional static model metadata. These entries are useful when a provider does
@@ -223,6 +226,9 @@ pub struct ProviderRoutesConfig {
 pub struct ProviderDiscoveryConfig {
     pub kind: ProviderDiscoveryKind,
     pub endpoint: String,
+    pub max_pages: usize,
+    pub max_models: usize,
+    pub max_response_bytes: usize,
 }
 
 pub struct ProviderCatalogConfig {
@@ -528,14 +534,16 @@ Discovery auth/HTTP behavior:
 - Discovery uses a separate GET-capable client, not the protocol-neutral POST
   transport used for completions.
 - Bearer-style providers use `Authorization: Bearer <key>`.
-- Anthropic discovery needs `x-api-key` and the configured Anthropic API
-  version header.
+- Anthropic discovery sends `x-api-key` and defaults `anthropic-version` to
+  `2023-06-01`; an explicit discovery header overrides that default.
 - Gemini discovery must support the API-key style required by the configured
   endpoint.
 - Discovery failures should not stop the server from starting unless the
   command explicitly requested `--live --require-success`.
 - Upstream discovery response bodies must be sanitized before logging, same as
   completion errors.
+- Discovery page count, model count, and per-page response size use configurable
+  nonzero limits with defaults of 100 pages, 20,000 models, and 4 MiB.
 - Follow provider pagination with a configured maximum page count and maximum
   model count.
 - De-duplicate model IDs deterministically and produce stable sorted output.
@@ -735,8 +743,8 @@ provider selection key.
 `crates/llm-proxy-server/src/routes/health.rs`:
 
 - Change model-only counters to provider plus model dimensions.
-- Recheck unauthenticated health exposure because it can reveal provider/model
-  usage.
+- Keep unauthenticated health output aggregate-only; do not expose
+  provider/model counters.
 
 `apps/llm-proxy/src/main.rs`:
 
@@ -814,8 +822,8 @@ Examples and docs:
 - Update architecture docs from "model routing" to "provider routing".
 - Update metrics labels from model-only to provider plus model so identical
   model IDs served by different providers do not collapse into one counter.
-- Review `/health` exposure because provider/model counters are currently
-  returned without inbound authentication.
+- Remove provider/model counters from unauthenticated `/health`; retain only
+  aggregate operational counters.
 
 ### Phase 7: Final Verification
 

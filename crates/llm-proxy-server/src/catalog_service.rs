@@ -315,6 +315,9 @@ mod tests {
                 kind: ProviderDiscoveryKind::OpenAiCompatibleModels,
                 endpoint,
                 headers: HashMap::new(),
+                max_pages: 100,
+                max_models: 20_000,
+                max_response_bytes: 4 * 1024 * 1024,
             }),
             catalog: Some(ProviderCatalogConfig {
                 mode: ProviderCatalogMode::Discovered,
