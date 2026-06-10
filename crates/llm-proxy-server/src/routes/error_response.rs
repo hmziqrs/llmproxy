@@ -30,9 +30,8 @@ use serde::Serialize;
 /// Each route knows which protocol its callers speak. The error response module
 /// uses this to produce the correct JSON envelope.
 ///
-/// Note: RateLimited and Conflict variants extend the plan's original 5-variant
-/// RouteError definition (InvalidRequest, UnknownModel, Upstream, ProviderDecode,
-/// Internal). These are used by prepare_request for rate limiting and deduplication.
+/// Rate limiting, deduplication, routing, and provider failures are represented
+/// by [`RouteError`] and encoded according to this protocol selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ClientProtocol {

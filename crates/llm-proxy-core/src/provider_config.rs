@@ -201,6 +201,7 @@ pub enum ProviderRouteKind {
 /// messages = "anthropic_adapter"
 /// ```
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProviderRoutesConfig {
     /// Route kind: adapter name for the `chat_completions` endpoint.
     pub chat_completions: Option<String>,
@@ -1043,6 +1044,23 @@ mod tests {
         let result = toml::from_str::<AppConfig>(
             "[server]\nbind = '127.0.0.1:3456'\n[models]\nfoo = { provider = 'bar' }\n",
         );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn provider_routes_rejects_unknown_fields() {
+        let result = toml::from_str::<ProviderFile>(
+            r#"
+[provider]
+name = "example"
+api_key = "key"
+auth_style = "bearer"
+
+[provider.routes]
+chat_completion = "chat"
+"#,
+        );
+
         assert!(result.is_err());
     }
 
