@@ -23,7 +23,8 @@ use std::path::Path;
 
 use crate::error::CoreError;
 use crate::provider_config::{
-    AuthStyle, ProviderConfig, ProviderRouteKind, StaticModelCatalogEntry, load_provider_config,
+    AuthStyle, ProviderConfig, ProviderRouteKind, StaticModelCatalogEntry, endpoint_without_query,
+    load_provider_config,
 };
 
 /// Typed failures from resolving a provider-scoped route.
@@ -103,7 +104,7 @@ impl std::fmt::Debug for ProviderAdapterTargetConfig {
             .field("provider_name", &self.provider_name)
             .field("adapter_name", &self.adapter_name)
             .field("protocol", &self.protocol)
-            .field("endpoint", &self.endpoint)
+            .field("endpoint", &endpoint_without_query(&self.endpoint))
             .field("auth_style", &self.auth_style)
             .field("api_key", &"[REDACTED]")
             .field("requested_model", &self.requested_model)
@@ -448,7 +449,7 @@ mod tests {
                 "chat".to_owned(),
                 ProviderAdapterConfig {
                     protocol: "openai_chat_completions".to_owned(),
-                    endpoint: "https://example.com/v1/chat/completions".to_owned(),
+                    endpoint: "https://example.com/v1/chat/completions?key=query-secret".to_owned(),
                     headers: HashMap::from([("x-secret".to_owned(), "header-secret".to_owned())]),
                 },
             )]),
@@ -469,6 +470,7 @@ mod tests {
         let debug = format!("{target:?}");
         assert!(!debug.contains("api-secret"));
         assert!(!debug.contains("header-secret"));
+        assert!(!debug.contains("query-secret"));
     }
 
     #[test]

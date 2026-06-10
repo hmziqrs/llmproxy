@@ -186,10 +186,16 @@ impl std::fmt::Debug for ProviderAdapterConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ProviderAdapterConfig")
             .field("protocol", &self.protocol)
-            .field("endpoint", &self.endpoint)
+            .field("endpoint", &endpoint_without_query(&self.endpoint))
             .field("header_names", &self.headers.keys().collect::<Vec<_>>())
             .finish()
     }
+}
+
+pub(crate) fn endpoint_without_query(endpoint: &str) -> &str {
+    endpoint
+        .split_once('?')
+        .map_or(endpoint, |(base, _query)| base)
 }
 
 // ---------------------------------------------------------------------------
@@ -312,13 +318,9 @@ const fn default_discovery_max_response_bytes() -> usize {
 
 impl std::fmt::Debug for ProviderDiscoveryConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let endpoint = self
-            .endpoint
-            .split_once('?')
-            .map_or(self.endpoint.as_str(), |(base, _)| base);
         f.debug_struct("ProviderDiscoveryConfig")
             .field("kind", &self.kind)
-            .field("endpoint", &endpoint)
+            .field("endpoint", &endpoint_without_query(&self.endpoint))
             .field("header_names", &self.headers.keys().collect::<Vec<_>>())
             .field("max_pages", &self.max_pages)
             .field("max_models", &self.max_models)
@@ -1145,7 +1147,7 @@ auth_style = "bearer"
 
 [provider.adapters.chat]
 protocol = "openai_chat_completions"
-endpoint = "https://example.com/v1/chat/completions"
+endpoint = "https://example.com/v1/chat/completions?key=adapter-query-secret"
 
 [provider.adapters.chat.headers]
 x-secret = "adapter-secret"
@@ -1165,6 +1167,7 @@ x-discovery-secret = "super-sensitive-value"
         let debug = format!("{:?}", config.provider);
         assert!(!debug.contains("secret-api-key"));
         assert!(!debug.contains("adapter-secret"));
+        assert!(!debug.contains("adapter-query-secret"));
         assert!(!debug.contains("super-sensitive-value"));
         assert!(!debug.contains("query-secret"));
     }

@@ -955,11 +955,13 @@ async fn cmd_models(
         }
 
         let catalog_config = provider.catalog.clone().unwrap_or_default();
-        let discovery_enabled = !matches!(
-            catalog_config.mode,
-            llm_proxy_core::ProviderCatalogMode::Static
-        );
-        let entries = if live && discovery_enabled {
+        let entries = if live {
+            if provider.discovery.is_none() {
+                bail!(
+                    "provider \"{}\" has no discovery configuration for --live",
+                    provider.name
+                );
+            }
             match discovery.discover(provider).await {
                 Ok(discovered) => {
                     let entries = merge_catalog(&catalog_config, &discovered);
@@ -1541,5 +1543,92 @@ endpoint = "http://{address}/models"
             std::fs::read_to_string(providers.join(".catalog").join("test-provider.toml")).unwrap();
         let catalog: CatalogFile = toml::from_str(&raw).unwrap();
         assert_eq!(catalog.catalog.models[0].id, "discovered-model");
+    }
+
+    #[tokio::test]
+    async fn models_live_fetches_even_in_static_catalog_mode() {
+        let app = Router::new().route(
+            "/models",
+            get(|| async {
+                (
+                    [("content-type", "application/json")],
+                    r#"{"data":[{"id":"discovered-model"}]}"#,
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let directory = tempfile::tempdir().unwrap();
+        let config = directory.path().join("config.toml");
+        std::fs::write(&config, DEFAULT_CONFIG_TOML).unwrap();
+        let providers = directory.path().join("providers");
+        std::fs::create_dir(&providers).unwrap();
+        std::fs::write(
+            providers.join("test-provider.toml"),
+            format!(
+                r#"[provider]
+name = "test-provider"
+api_key = "test-key"
+auth_style = "bearer"
+
+[provider.discovery]
+kind = "openai_compatible_models"
+endpoint = "http://{address}/models"
+
+[provider.catalog]
+mode = "static"
+"#
+            ),
+        )
+        .unwrap();
+
+        cmd_models(
+            Some(config),
+            Some("test-provider".to_owned()),
+            true,
+            true,
+            true,
+        )
+        .await
+        .unwrap();
+
+        let raw =
+            std::fs::read_to_string(providers.join(".catalog").join("test-provider.toml")).unwrap();
+        let catalog: CatalogFile = toml::from_str(&raw).unwrap();
+        assert_eq!(catalog.catalog.models[0].id, "discovered-model");
+    }
+
+    #[tokio::test]
+    async fn models_live_requires_discovery_configuration() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = directory.path().join("config.toml");
+        std::fs::write(&config, DEFAULT_CONFIG_TOML).unwrap();
+        let providers = directory.path().join("providers");
+        std::fs::create_dir(&providers).unwrap();
+        std::fs::write(
+            providers.join("test-provider.toml"),
+            r#"[provider]
+name = "test-provider"
+api_key = "test-key"
+auth_style = "bearer"
+"#,
+        )
+        .unwrap();
+
+        let error = cmd_models(
+            Some(config),
+            Some("test-provider".to_owned()),
+            true,
+            false,
+            false,
+        )
+        .await
+        .expect_err("--live requires discovery configuration");
+
+        assert!(error.to_string().contains("no discovery configuration"));
     }
 }

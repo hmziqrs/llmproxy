@@ -1,12 +1,8 @@
 # llm-proxy
 
-One OpenAI-compatible API in front of multiple LLM providers. Pool
-keys, log usage, fail over.
-
-## Status
-
-Scaffolding. The workspace builds. The server does not serve anything
-yet.
+A provider-scoped LLM proxy with OpenAI Chat Completions and Anthropic
+Messages client endpoints, normalized protocol translation, streaming, model
+catalogs, and optional live model discovery.
 
 ## Layout
 
@@ -29,10 +25,21 @@ cargo build --release
 ## Run
 
 ~~~
-./target/release/llm-proxy --config ./config.toml
+./target/release/llm-proxy validate --config ./config.toml
+./target/release/llm-proxy serve --config ./config.toml
 ~~~
 
-Config schema is not final. It will change.
+Every API request names its provider in the path:
+
+~~~text
+POST /providers/{provider}/v1/chat/completions
+POST /providers/{provider}/v1/messages
+POST /providers/{provider}/v1/messages/count_tokens
+GET  /providers/{provider}/v1/models
+~~~
+
+See `docs/remodel-proxy.md` and the files under `providers/` for configuration
+examples.
 
 ## References
 

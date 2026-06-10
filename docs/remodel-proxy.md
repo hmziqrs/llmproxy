@@ -16,6 +16,17 @@ URL provider -> provider config -> inbound route kind -> adapter
 request model -> upstream model
 ```
 
+## Implementation Status
+
+Implemented and audited as of June 11, 2026. The provider-scoped routes,
+configuration schema, registry resolution, protocol adapters, model discovery,
+catalog cache and enforcement, CLI commands, and protocol-aware errors described
+below are present in the workspace.
+
+The implementation is verified with the final formatting, workspace test,
+Clippy, and removed-symbol scans listed in [Final Verification](#phase-7-final-verification).
+The phase sections remain as design and implementation history.
+
 ## Design Principles
 
 - Provider selection is static and explicit in the URL.

@@ -82,18 +82,19 @@ pub struct ProxyRequest {
 
 impl fmt::Debug for ProxyRequest {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // NOTE: The URL field is not sanitized for query-string secrets.
-        // Callers must never include API keys in query parameters; use
-        // AuthHeaders instead.  If URL redaction becomes necessary (e.g.
-        // for structured logging), add a regex-based redaction step here
-        // similar to `sanitize_upstream_error_body` in the server crate.
         f.debug_struct("ProxyRequest")
-            .field("url", &self.url)
+            .field("url", &endpoint_without_query(&self.url))
             .field("auth", &self.auth)
             .field("body_len", &self.body.len())
             .field("stream", &self.stream)
             .finish()
     }
+}
+
+fn endpoint_without_query(endpoint: &str) -> &str {
+    endpoint
+        .split_once('?')
+        .map_or(endpoint, |(base, _query)| base)
 }
 
 // ---------------------------------------------------------------------------
@@ -303,7 +304,7 @@ mod tests {
     #[test]
     fn proxy_request_debug_redacts_api_key() {
         let req = ProxyRequest {
-            url: "https://api.example.com/v1/chat/completions".to_owned(),
+            url: "https://api.example.com/v1/chat/completions?key=query-secret".to_owned(),
             auth: AuthHeaders {
                 style: AuthStyle::Bearer,
                 api_key: "sk-super-secret-key-12345".to_owned(),
@@ -323,6 +324,7 @@ mod tests {
             "Debug output must contain redacted marker: {}",
             debug_output
         );
+        assert!(!debug_output.contains("query-secret"));
     }
 
     // -----------------------------------------------------------------------

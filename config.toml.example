@@ -8,4 +8,12 @@ bind = "127.0.0.1:3456"
 request_timeout = "300s"
 log_level = "info"
 hot_reload = false
+# Requests per minute allowed per client IP. 0 disables rate limiting.
+# Direct loopback connections are exempt unless trust_forwarded_headers = true.
+rate_limit_rpm = 100
+# Use X-Forwarded-For / X-Real-IP for client identity. Enable only behind a
+# trusted reverse proxy that overwrites these headers.
+trust_forwarded_headers = false
+# Window for rejecting identical path/body requests. "0ms" disables dedup.
+dedup_window = "0ms"
 server_name = "llm-proxy"

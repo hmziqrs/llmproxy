@@ -117,7 +117,7 @@ impl fmt::Debug for ProviderAdapterTarget {
             .field("provider_name", &self.provider_name)
             .field("adapter_name", &self.adapter_name)
             .field("protocol", &self.protocol)
-            .field("endpoint", &self.endpoint)
+            .field("endpoint", &endpoint_without_query(&self.endpoint))
             .field("auth_style", &self.auth_style)
             .field("api_key", &"[REDACTED]")
             .field("requested_model", &self.requested_model)
@@ -125,6 +125,12 @@ impl fmt::Debug for ProviderAdapterTarget {
             .field("header_names", &self.headers.keys().collect::<Vec<_>>())
             .finish()
     }
+}
+
+fn endpoint_without_query(endpoint: &str) -> &str {
+    endpoint
+        .split_once('?')
+        .map_or(endpoint, |(base, _query)| base)
 }
 
 // ---------------------------------------------------------------------------
@@ -654,7 +660,7 @@ mod tests {
             provider_name: "test".into(),
             adapter_name: "openai-chat".into(),
             protocol: ProviderProtocol::OpenAiChatCompletions,
-            endpoint: "https://api.openai.com/v1/chat/completions".into(),
+            endpoint: "https://api.openai.com/v1/chat/completions?key=query-secret".into(),
             auth_style: AuthStyle::Bearer,
             api_key: "sk-test-super-secret-key-1234567890".into(),
             requested_model: "gpt-4o".into(),
@@ -670,6 +676,7 @@ mod tests {
             debug.contains("[REDACTED]"),
             "Debug output must show [REDACTED] for api_key"
         );
+        assert!(!debug.contains("query-secret"));
     }
 
     // -- Finish reason mapping -----------------------------------------------
