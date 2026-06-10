@@ -4,10 +4,14 @@
 //! and client IP extraction.
 
 use std::collections::HashMap;
+use std::convert::Infallible;
+use std::net::SocketAddr;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
+use axum::extract::{ConnectInfo, FromRequestParts};
+use axum::http::request::Parts;
 use sha2::{Digest, Sha256};
 
 // ---------------------------------------------------------------------------
@@ -16,9 +20,10 @@ use sha2::{Digest, Sha256};
 
 /// Deduplicates requests based on a SHA-256 hash of the request path and body.
 ///
-/// Tracks in-flight request hashes with a configurable deduplication window
-/// (default: 500 ms).  If a second request with the same path and body arrives
-/// while the first is still in-flight, the duplicate is rejected.
+/// Tracks in-flight request hashes with a configurable deduplication window.
+/// The standalone type defaults to 500 ms; server configuration defaults to
+/// disabled. If a second request with the same path and body arrives during a
+/// nonzero window, the duplicate is rejected.
 ///
 /// The request path is included in the hash so that the same body sent to
 /// different protocol endpoints (e.g. `/v1/messages` vs `/v1/chat/completions`)
@@ -67,6 +72,9 @@ impl RequestDeduplicator {
     /// endpoints (e.g. `/v1/messages` vs `/v1/chat/completions`) that
     /// happen to carry the same body.
     pub fn is_duplicate_with_path(&self, path: &str, body: &[u8]) -> bool {
+        if self.window_ms == 0 {
+            return false;
+        }
         let hash = Self::hash_path_body(path, body);
         let now = Instant::now();
 
@@ -157,7 +165,7 @@ impl RateLimiter {
     /// Create a new rate limiter.
     ///
     /// `max_requests_per_minute` is the maximum number of requests allowed
-    /// per client IP per minute.
+    /// per client IP per minute. `0` disables rate limiting.
     pub fn new(max_requests_per_minute: u32) -> Self {
         Self {
             buckets: Mutex::new(HashMap::new()),
@@ -169,6 +177,9 @@ impl RateLimiter {
     ///
     /// Returns `true` if the request is allowed, `false` if rate-limited.
     pub fn is_allowed(&self, client_ip: &str) -> bool {
+        if self.max_requests_per_minute == 0.0 {
+            return true;
+        }
         let mut buckets = self.buckets.lock().unwrap_or_else(|e| {
             tracing::warn!("rate limiter mutex poisoned; recovering from panic");
             e.into_inner()
@@ -239,42 +250,32 @@ impl Default for RequestIdGenerator {
 // Client IP extraction
 // ---------------------------------------------------------------------------
 
-/// Extract the client IP from request headers or connection info.
-///
-/// Checks `X-Forwarded-For` first (leftmost IP), then `X-Real-IP`, then
-/// falls back to connection info.
-///
-/// # Trust assumption
-///
-/// This function trusts `X-Forwarded-For` and `X-Real-IP` headers without
-/// validation. If the proxy is deployed behind a reverse proxy, these headers
-/// can be spoofed by clients to bypass rate limiting. The proxy should only
-/// be deployed behind a trusted reverse proxy that overwrites these headers.
-///
-/// # `trust_forwarded_headers` config option
-///
-/// A `trust_forwarded_headers` boolean config option should be added. When set to
-/// `false`, this function will skip `X-Forwarded-For` and `X-Real-IP` and
-/// rely solely on connection info.  This is needed for deployments where
-/// the proxy is directly exposed to the internet without a trusted reverse
-/// proxy.  The config option should live in `ServerConfig` and be wired
-/// through `AppState` to this function.
-pub fn get_client_ip(
-    headers: &axum::http::HeaderMap,
-    connect_info: Option<&axum::extract::ConnectInfo<std::net::SocketAddr>>,
-) -> String {
-    get_client_ip_inner(headers, connect_info, true)
+/// Optional peer socket metadata for handlers that also run in router-only tests.
+#[derive(Clone, Copy, Debug)]
+pub struct OptionalConnectInfo(pub Option<SocketAddr>);
+
+impl<S> FromRequestParts<S> for OptionalConnectInfo
+where
+    S: Send + Sync,
+{
+    type Rejection = Infallible;
+
+    fn from_request_parts(
+        parts: &mut Parts,
+        _state: &S,
+    ) -> impl Future<Output = Result<Self, Self::Rejection>> + Send {
+        let address = parts
+            .extensions
+            .get::<ConnectInfo<SocketAddr>>()
+            .map(|connect_info| connect_info.0);
+        async move { Ok(Self(address)) }
+    }
 }
 
-/// Inner implementation that accepts a `trust_forwarded_headers` flag.
-///
-/// When `trust_forwarded_headers` is `false`, the `X-Forwarded-For` and
-/// `X-Real-IP` headers are ignored and only connection info is used.
-/// This prevents IP spoofing when the proxy is directly exposed to the
-/// internet without a trusted reverse proxy.
-pub fn get_client_ip_inner(
+/// Extract the client IP from trusted forwarding headers or connection info.
+pub fn get_client_ip(
     headers: &axum::http::HeaderMap,
-    connect_info: Option<&axum::extract::ConnectInfo<std::net::SocketAddr>>,
+    connect_info: Option<&SocketAddr>,
     trust_forwarded_headers: bool,
 ) -> String {
     if trust_forwarded_headers {
@@ -303,7 +304,7 @@ pub fn get_client_ip_inner(
 
     // Fall back to connection info.
     if let Some(ci) = connect_info {
-        return ci.0.ip().to_string();
+        return ci.ip().to_string();
     }
 
     "unknown".to_owned()
@@ -400,7 +401,14 @@ mod tests {
         assert!(dedup.is_duplicate(b"hello"));
     }
 
-    // -- get_client_ip_inner ---------------------------------------------------
+    #[test]
+    fn dedup_zero_window_is_disabled() {
+        let dedup = RequestDeduplicator::with_window_ms(0);
+        assert!(!dedup.is_duplicate(b"hello"));
+        assert!(!dedup.is_duplicate(b"hello"));
+    }
+
+    // -- get_client_ip ---------------------------------------------------------
 
     #[test]
     fn client_ip_trust_forwarded_headers_false_ignores_headers() {
@@ -409,13 +417,10 @@ mod tests {
 
         let mut headers = HeaderMap::new();
         headers.insert("x-forwarded-for", "1.2.3.4".parse().unwrap());
-        let connect_info = axum::extract::ConnectInfo(SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
-            8080,
-        ));
+        let connect_info = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
 
         // With trust_forwarded_headers = false, should use connection info.
-        let ip = super::get_client_ip_inner(&headers, Some(&connect_info), false);
+        let ip = super::get_client_ip(&headers, Some(&connect_info), false);
         assert_eq!(
             ip, "127.0.0.1",
             "should ignore X-Forwarded-For when trust=false"
@@ -429,13 +434,18 @@ mod tests {
 
         let mut headers = HeaderMap::new();
         headers.insert("x-forwarded-for", "1.2.3.4".parse().unwrap());
-        let connect_info = axum::extract::ConnectInfo(SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
-            8080,
-        ));
+        let connect_info = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
 
         // With trust_forwarded_headers = true, should use X-Forwarded-For.
-        let ip = super::get_client_ip_inner(&headers, Some(&connect_info), true);
+        let ip = super::get_client_ip(&headers, Some(&connect_info), true);
         assert_eq!(ip, "1.2.3.4", "should use X-Forwarded-For when trust=true");
+    }
+
+    #[test]
+    fn rate_limiter_zero_limit_is_disabled() {
+        let limiter = RateLimiter::new(0);
+        for _ in 0..1_000 {
+            assert!(limiter.is_allowed("127.0.0.1"));
+        }
     }
 }

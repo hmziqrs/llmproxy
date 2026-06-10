@@ -38,8 +38,9 @@ These decisions are part of the implementation plan:
    in the path.
 3. `GET /providers/{provider}/v1/models` is the canonical model-list route.
 4. Discovery does not run automatically during server startup.
-5. Normal `/models` reads use static plus cached catalog data. Live refresh is
-   explicit through CLI or a `refresh=live` query.
+5. Normal `/models` reads use static plus cached catalog data. A
+   `refresh=live` query refreshes only when the cache TTL has expired, while
+   CLI `--live` always performs an upstream fetch.
 6. Cross-protocol mappings such as `messages = "chat"` are allowed because the
    normalized core protocol exists specifically to translate between client and
    provider protocols. The operator must declare the mapping explicitly.
@@ -107,8 +108,16 @@ bind = "127.0.0.1:3456"
 request_timeout = "300s"
 log_level = "info"
 hot_reload = false
+rate_limit_rpm = 100
+trust_forwarded_headers = false
+dedup_window = "0ms"
 server_name = "llm-proxy"
 ```
+
+`hot_reload = true` is rejected because hot reload is not implemented.
+`rate_limit_rpm = 0` disables rate limiting; direct loopback clients are
+exempt. Forwarding headers are ignored unless `trust_forwarded_headers = true`.
+`dedup_window = "0ms"` disables identical-request rejection.
 
 Provider config owns provider details, adapters, inbound route mapping, and
 optional discovery:
@@ -183,13 +192,16 @@ kind = "anthropic_models"
 endpoint = "https://api.anthropic.com/v1/models"
 ```
 
+The Anthropic adapter and discovery client both default `anthropic-version` to
+`2023-06-01`; configured adapter or discovery headers override the default.
+
 For Gemini:
 
 ```toml
 [provider]
 name = "gemini"
 api_key = "${GEMINI_API_KEY}"
-auth_style = "x-api-key"
+auth_style = "x-google-api-key"
 
 [provider.adapters.generate_content]
 protocol = "gemini_generate_content"
@@ -226,6 +238,7 @@ pub struct ProviderRoutesConfig {
 pub struct ProviderDiscoveryConfig {
     pub kind: ProviderDiscoveryKind,
     pub endpoint: String,
+    pub headers: HashMap<String, String>,
     pub max_pages: usize,
     pub max_models: usize,
     pub max_response_bytes: usize,
@@ -277,10 +290,11 @@ as `anthropic-version`. Header names and values must be validated against CRLF
 injection, and forbidden transport headers such as `Host`, `Content-Length`,
 and `Transfer-Encoding` must be rejected.
 
-Auth configuration must cover the real provider requirements used by both
-inference and discovery. At minimum, support Bearer, `x-api-key`, and
-`x-goog-api-key`; query-string API keys should only be added if a provider
-cannot use a header, and secret query values must be redacted from Debug/logs.
+Auth configuration covers the real provider requirements used by both
+inference and discovery. TOML values are `bearer`, `x-api-key`,
+`x-google-api-key`, and `both`. The Google style sends the actual
+`x-goog-api-key` header; `both` sends Bearer and `x-api-key`. Secret values are
+redacted from Debug/logs.
 
 The provider route kind describes the inbound client endpoint, not the upstream
 protocol. For example, either of these is valid:
@@ -417,7 +431,7 @@ anthropic:
 
 - New default behavior should list cached catalogs if present.
 - `--provider <name> --live` should fetch the provider model list using
-  `[provider.discovery]`.
+  `[provider.discovery]`, regardless of cache freshness.
 - `--write-catalog` should persist the discovered catalog to a separate catalog
   cache file, not rewrite the provider TOML that may contain secret references.
 
@@ -544,6 +558,9 @@ Discovery auth/HTTP behavior:
   completion errors.
 - Discovery page count, model count, and per-page response size use configurable
   nonzero limits with defaults of 100 pages, 20,000 models, and 4 MiB.
+- Exceeding any configured discovery limit fails the refresh rather than
+  returning a truncated catalog. A last known-good cache remains available as
+  stale fallback unless the caller requires success.
 - Follow provider pagination with a configured maximum page count and maximum
   model count.
 - De-duplicate model IDs deterministically and produce stable sorted output.
@@ -583,6 +600,8 @@ Catalog normalization rules:
 - Keep unknown provider metadata in a raw JSON field only if needed later.
 - For Gemini, strip a leading `models/` prefix only for display; preserve the
   exact value required by the adapter path.
+- Gemini catalog enforcement treats `gemini-x` and `models/gemini-x` as the
+  same model ID, matching endpoint-template expansion behavior.
 - Filter Gemini models to ones whose `supportedActions` include
   `generateContent` for generation routes.
 - Do not require provider prefixes inside provider-scoped routes. A request to
@@ -599,9 +618,11 @@ Models endpoint response:
   `object`, `created`, `owned_by`) and Anthropic fields (`type`,
   `display_name`, `created_at`) so common SDKs can ignore fields they do not
   use.
-- Keep pagination deterministic.
-- Include Anthropic pagination fields (`first_id`, `last_id`, `has_more`) where
-  applicable while retaining OpenAI-compatible root fields.
+- Keep output deterministic. The endpoint currently returns the complete
+  merged catalog in one response rather than implementing proxy-side paging.
+- Include Anthropic pagination fields (`first_id`, `last_id`, `has_more`) while
+  retaining OpenAI-compatible root fields; `has_more` is currently always
+  `false` because the full merged catalog is returned.
 - Never return provider credentials, raw discovery headers, or unfiltered raw
   provider metadata.
 - Model IDs are provider-local because `/providers/{provider}/v1/models` has no

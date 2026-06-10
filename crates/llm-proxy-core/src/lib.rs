@@ -49,7 +49,9 @@ pub mod token;
 #[cfg(test)]
 pub mod test_support;
 
-pub use catalog::{CatalogFile, CatalogFileMetadata, merge_catalog, model_allowed};
+pub use catalog::{
+    CatalogFile, CatalogFileMetadata, merge_catalog, model_allowed, parse_catalog_file,
+};
 pub use error::CoreError;
 pub use metrics::{Metrics, Snapshot};
 pub use pid::PidManager;

@@ -44,10 +44,28 @@ pub struct ServerConfig {
     pub request_timeout: Duration,
     /// Log level: `"trace"`, `"debug"`, `"info"`, `"warn"`, `"error"`.
     pub log_level: String,
-    /// Whether to hot-reload config files at runtime.
+    /// Reserved hot-reload flag. Configuration loading rejects `true`.
     pub hot_reload: bool,
+    /// Per-client requests allowed per minute. `0` disables rate limiting.
+    #[serde(default = "default_rate_limit_rpm")]
+    pub rate_limit_rpm: u32,
+    /// Whether client identity may use `X-Forwarded-For` and `X-Real-IP`.
+    #[serde(default)]
+    pub trust_forwarded_headers: bool,
+    /// Window for rejecting identical path/body requests. `0s` disables deduplication.
+    #[serde(default = "default_dedup_window")]
+    #[serde(with = "humantime_serde")]
+    pub dedup_window: Duration,
     /// Public server name reported in version/health endpoints.
     pub server_name: String,
+}
+
+const fn default_rate_limit_rpm() -> u32 {
+    100
+}
+
+const fn default_dedup_window() -> Duration {
+    Duration::ZERO
 }
 
 // ---------------------------------------------------------------------------
@@ -941,6 +959,13 @@ pub fn load_app_config(path: impl AsRef<Path>) -> Result<AppConfig, CoreError> {
     }
 
     let cfg: AppConfig = toml::from_str(&interpolated).map_err(CoreError::ConfigParse)?;
+    if cfg.server.hot_reload {
+        return Err(CoreError::ConfigValidation {
+            message:
+                "server.hot_reload=true is not supported; restart the server after config changes"
+                    .to_owned(),
+        });
+    }
     Ok(cfg)
 }
 
@@ -1045,6 +1070,51 @@ mod tests {
             "[server]\nbind = '127.0.0.1:3456'\n[models]\nfoo = { provider = 'bar' }\n",
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn app_config_defaults_operational_controls() {
+        let config: AppConfig = toml::from_str(
+            r#"
+[server]
+bind = "127.0.0.1:3456"
+request_timeout = "300s"
+log_level = "info"
+hot_reload = false
+server_name = "test"
+"#,
+        )
+        .expect("app config");
+
+        assert_eq!(config.server.rate_limit_rpm, 100);
+        assert!(!config.server.trust_forwarded_headers);
+        assert_eq!(config.server.dedup_window, Duration::ZERO);
+    }
+
+    #[test]
+    fn load_app_config_rejects_enabled_hot_reload() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[server]
+bind = "127.0.0.1:3456"
+request_timeout = "300s"
+log_level = "info"
+hot_reload = true
+server_name = "test"
+"#,
+        )
+        .unwrap();
+
+        let error = load_app_config(&path).expect_err("hot reload is unsupported");
+
+        assert!(
+            error
+                .to_string()
+                .contains("hot_reload=true is not supported")
+        );
     }
 
     #[test]

@@ -51,17 +51,20 @@ impl ModelCatalogService {
         provider: &ProviderConfig,
         refresh_live: bool,
     ) -> Result<Vec<StaticModelCatalogEntry>, ProviderError> {
-        self.load_disk_cache(provider).await?;
         let config = provider.catalog.clone().unwrap_or_default();
+        self.load_disk_cache(provider).await?;
         let discovery_enabled = !matches!(config.mode, llm_proxy_core::ProviderCatalogMode::Static)
             && provider.discovery.is_some();
         if refresh_live && discovery_enabled && !self.cache_is_fresh(provider).await {
             if let Err(error) = self.refresh(provider).await {
-                let has_fallback = self.cache.read().await.contains_key(&provider.name)
-                    || provider
-                        .catalog
-                        .as_ref()
-                        .is_some_and(|catalog| !catalog.models.is_empty());
+                let stale = self
+                    .cache
+                    .read()
+                    .await
+                    .get(&provider.name)
+                    .map(|file| file.catalog.models.clone())
+                    .unwrap_or_default();
+                let has_fallback = !merge_catalog(&config, &stale).is_empty();
                 if !has_fallback {
                     return Err(error);
                 }
@@ -122,7 +125,16 @@ impl ModelCatalogService {
             },
         };
         if let Some(cache_dir) = &self.cache_dir {
-            if let Err(error) = write_catalog_atomic(cache_dir, &file) {
+            let cache_dir = cache_dir.clone();
+            let file_to_write = file.clone();
+            let write_result = tokio::task::spawn_blocking(move || {
+                write_catalog_atomic(&cache_dir, &file_to_write)
+            })
+            .await
+            .map_err(|error| {
+                ProviderError::InvalidConfig(format!("catalog cache write task failed: {error}"))
+            })?;
+            if let Err(error) = write_result {
                 self.record_refresh_outcome(&provider.name, Some(error.to_string()))?;
                 return Err(error);
             }
@@ -179,17 +191,20 @@ impl ModelCatalogService {
             return Ok(());
         };
         let path = cache_dir.join(format!("{}.toml", provider.name));
-        if !path.exists() {
-            return Ok(());
-        }
-        let metadata = std::fs::symlink_metadata(&path).map_err(invalid_cache)?;
+        let metadata = match tokio::fs::symlink_metadata(&path).await {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(invalid_cache(error)),
+        };
         if metadata.file_type().is_symlink() || !metadata.is_file() {
             return Err(ProviderError::InvalidConfig(format!(
                 "catalog cache must be a regular non-symlink file: {}",
                 path.display()
             )));
         }
-        let raw = std::fs::read_to_string(&path).map_err(invalid_cache)?;
+        let raw = tokio::fs::read_to_string(&path)
+            .await
+            .map_err(invalid_cache)?;
         let file: CatalogFile = toml::from_str(&raw).map_err(|error| {
             ProviderError::InvalidConfig(format!(
                 "failed to parse catalog cache {}: {error}",
@@ -418,5 +433,23 @@ mod tests {
         assert_eq!(models[0].id, "cached-model");
         assert_eq!(count.load(Ordering::SeqCst), 1);
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn discovered_mode_does_not_treat_static_models_as_refresh_fallback() {
+        let (endpoint, count) = failing_server().await;
+        let mut provider = provider(endpoint);
+        provider.catalog.as_mut().unwrap().models = vec![StaticModelCatalogEntry {
+            id: "static-only".to_owned(),
+            display_name: None,
+            supports: Vec::new(),
+            context_length: None,
+        }];
+        let service = ModelCatalogService::new(None);
+
+        let result = service.catalog(&provider, true).await;
+
+        assert!(result.is_err());
+        assert_eq!(count.load(Ordering::SeqCst), 1);
     }
 }

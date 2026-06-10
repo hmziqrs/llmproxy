@@ -169,6 +169,9 @@ fn state_with_provider(
             log_level: "info".to_owned(),
             hot_reload: false,
             server_name: "test-proxy".to_owned(),
+            rate_limit_rpm: 100,
+            trust_forwarded_headers: false,
+            dedup_window: Duration::from_millis(500),
         },
     };
 

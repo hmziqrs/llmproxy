@@ -13,12 +13,13 @@
 //! - `autostart` Manage auto-start on login (enable / disable / status)
 
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use llm_proxy_core::{
-    AppConfig, CatalogFile, CatalogFileMetadata, ProviderRegistry, load_app_config, merge_catalog,
+    AppConfig, CatalogFile, CatalogFileMetadata, ProviderConfig, ProviderRegistry, load_app_config,
+    merge_catalog, parse_catalog_file,
 };
 use llm_proxy_provider::{DiscoveryClient, ProviderAdapterRegistry, ProxyClient};
 use llm_proxy_server::{
@@ -134,6 +135,9 @@ bind = "127.0.0.1:3456"
 request_timeout = "300s"
 log_level = "info"
 hot_reload = false
+rate_limit_rpm = 100
+trust_forwarded_headers = false
+dedup_window = "0ms"
 server_name = "llm-proxy"
 "#;
 
@@ -515,9 +519,12 @@ async fn cmd_serve(
     );
 
     // Serve with graceful shutdown.
-    let result = axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await;
+    let result = axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await;
 
     cleanup.await;
 
@@ -759,6 +766,15 @@ fn cmd_validate(config_path: Option<PathBuf>) -> Result<()> {
     );
     println!("  log_level:       {}", app_config.server.log_level);
     println!("  hot_reload:      {}", app_config.server.hot_reload);
+    println!("  rate_limit_rpm:  {}", app_config.server.rate_limit_rpm);
+    println!(
+        "  trust_forwarded_headers: {}",
+        app_config.server.trust_forwarded_headers
+    );
+    println!(
+        "  dedup_window:    {}ms",
+        app_config.server.dedup_window.as_millis()
+    );
     println!("  server_name:     {}", app_config.server.server_name);
 
     // Load and validate providers.
@@ -846,6 +862,19 @@ fn cmd_validate(config_path: Option<PathBuf>) -> Result<()> {
                 "config has {} route resolution error(s)",
                 route_errors.len()
             );
+        }
+    }
+
+    let cache_dir = providers_dir.join(".catalog");
+    let warnings: Vec<_> = registry
+        .iter()
+        .filter_map(|provider| catalog_enforcement_warning(provider, &cache_dir))
+        .collect();
+    if !warnings.is_empty() {
+        println!();
+        println!("=== Warnings ===");
+        for warning in warnings {
+            println!("  WARNING: {warning}");
         }
     }
 
@@ -1241,6 +1270,13 @@ fn load_toml_state(
         .validate_protocols(known_protocols)
         .with_context(|| "validating provider protocols")?;
 
+    let cache_dir = providers_dir.join(".catalog");
+    for provider in registry.iter() {
+        if let Some(warning) = catalog_enforcement_warning(provider, &cache_dir) {
+            tracing::warn!(provider = %provider.name, "{warning}");
+        }
+    }
+
     info!(
         config = %path.display(),
         providers = registry.len(),
@@ -1253,7 +1289,33 @@ fn load_toml_state(
         adapter_registry,
         proxy_client,
         build_info(),
-        Some(providers_dir.join(".catalog")),
+        Some(cache_dir),
+    ))
+}
+
+fn catalog_enforcement_warning(provider: &ProviderConfig, cache_dir: &Path) -> Option<String> {
+    let catalog = provider.catalog.as_ref()?;
+    if !catalog.enforce || !merge_catalog(catalog, &[]).is_empty() {
+        return None;
+    }
+
+    let cache_path = cache_dir.join(format!("{}.toml", provider.name));
+    let cached_models = std::fs::symlink_metadata(&cache_path)
+        .ok()
+        .filter(|metadata| metadata.file_type().is_file() && !metadata.file_type().is_symlink())
+        .and_then(|_| std::fs::read_to_string(&cache_path).ok())
+        .and_then(|raw| parse_catalog_file(&raw).ok())
+        .filter(|cache| cache.catalog.provider == provider.name)
+        .map(|cache| cache.catalog.models)
+        .unwrap_or_default();
+
+    if !merge_catalog(catalog, &cached_models).is_empty() {
+        return None;
+    }
+
+    Some(format!(
+        "provider \"{}\" has catalog enforcement enabled but no allowed models; requests will be rejected until static models are configured or live discovery writes a cache",
+        provider.name
     ))
 }
 
@@ -1332,6 +1394,12 @@ mod tests {
 
     use super::*;
 
+    fn provider_config(raw: &str) -> ProviderConfig {
+        toml::from_str::<llm_proxy_core::ProviderFile>(raw)
+            .unwrap()
+            .provider
+    }
+
     #[test]
     fn models_flags_parse_together() {
         let cli = Cli::try_parse_from([
@@ -1358,6 +1426,67 @@ mod tests {
         assert!(live);
         assert!(write_catalog);
         assert!(require_success);
+    }
+
+    #[test]
+    fn enforcement_warning_respects_discovered_mode() {
+        let provider = provider_config(
+            r#"[provider]
+name = "test-provider"
+api_key = "test-key"
+auth_style = "bearer"
+
+[provider.catalog]
+mode = "discovered"
+enforce = true
+
+[[provider.catalog.models]]
+id = "static-model"
+"#,
+        );
+        let directory = tempfile::tempdir().unwrap();
+
+        let warning = catalog_enforcement_warning(&provider, directory.path());
+
+        assert!(warning.is_some());
+    }
+
+    #[test]
+    fn enforcement_warning_accepts_usable_cache() {
+        let provider = provider_config(
+            r#"[provider]
+name = "test-provider"
+api_key = "test-key"
+auth_style = "bearer"
+
+[provider.catalog]
+mode = "discovered"
+enforce = true
+"#,
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let cache = CatalogFile {
+            catalog: CatalogFileMetadata {
+                provider: "test-provider".to_owned(),
+                source: "live".to_owned(),
+                generated_at: "2026-06-10T00:00:00Z".to_owned(),
+                models: vec![llm_proxy_core::StaticModelCatalogEntry {
+                    id: "cached-model".to_owned(),
+                    display_name: None,
+                    supports: Vec::new(),
+                    context_length: None,
+                }],
+            },
+        };
+        std::fs::write(
+            directory.path().join("test-provider.toml"),
+            toml::to_string(&cache).unwrap(),
+        )
+        .unwrap();
+
+        let warning = catalog_enforcement_warning(&provider, directory.path());
+
+        assert!(warning.is_none());
     }
 
     #[tokio::test]

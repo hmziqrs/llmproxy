@@ -219,13 +219,17 @@ pub(crate) struct RequestContext {
 pub(crate) fn prepare_request(
     state: &AppState,
     headers: &HeaderMap,
+    connect_info: Option<&std::net::SocketAddr>,
     body: &[u8],
     path: &str,
 ) -> Result<RequestContext, RouteError> {
     let request_id = state.request_id_gen.next_id();
-    let client_ip = get_client_ip(headers, None);
+    let trust_forwarded_headers = state.trust_forwarded_headers();
+    let client_ip = get_client_ip(headers, connect_info, trust_forwarded_headers);
+    let direct_loopback =
+        !trust_forwarded_headers && connect_info.is_some_and(|address| address.ip().is_loopback());
 
-    if !state.rate_limiter.is_allowed(&client_ip) {
+    if !direct_loopback && !state.rate_limiter.is_allowed(&client_ip) {
         state.metrics.record_rate_limited();
         return Err(RouteError::RateLimited);
     }
@@ -311,10 +315,11 @@ async fn resolve_target(
             .catalog(provider, false)
             .await
             .map_err(|error| RouteError::Internal(error.to_string()))?;
-        if !catalog
-            .iter()
-            .any(|model| model.id == adapter_target_config.upstream_model)
-        {
+        if !catalog_contains_model(
+            &catalog,
+            &adapter_target_config.upstream_model,
+            &adapter_target_config.protocol,
+        ) {
             return Err(RouteError::ModelNotAllowed(
                 adapter_target_config.upstream_model.clone(),
             ));
@@ -364,6 +369,23 @@ fn map_provider_route_error(error: ProviderRouteResolutionError) -> RouteError {
         }
         error => RouteError::Internal(error.to_string()),
     }
+}
+
+fn catalog_contains_model(
+    catalog: &[llm_proxy_core::StaticModelCatalogEntry],
+    upstream_model: &str,
+    protocol: &str,
+) -> bool {
+    if protocol == "gemini_generate_content" {
+        let requested = upstream_model
+            .strip_prefix("models/")
+            .unwrap_or(upstream_model);
+        return catalog
+            .iter()
+            .any(|model| model.id.strip_prefix("models/").unwrap_or(&model.id) == requested);
+    }
+
+    catalog.iter().any(|model| model.id == upstream_model)
 }
 
 // ---------------------------------------------------------------------------
@@ -1232,6 +1254,39 @@ pub(crate) fn protocol_error_to_route(e: llm_proxy_protocol::client::ProtocolErr
 mod tests {
     use super::*;
 
+    fn state_with_operational_config(
+        rate_limit_rpm: u32,
+        trust_forwarded_headers: bool,
+    ) -> AppState {
+        let app_config = llm_proxy_core::AppConfig {
+            server: llm_proxy_core::ServerConfig {
+                bind: "127.0.0.1:3456".parse().unwrap(),
+                request_timeout: std::time::Duration::from_secs(60),
+                log_level: "info".to_owned(),
+                hot_reload: false,
+                rate_limit_rpm,
+                trust_forwarded_headers,
+                dedup_window: std::time::Duration::ZERO,
+                server_name: "test".to_owned(),
+            },
+        };
+        let providers =
+            llm_proxy_core::ProviderRegistry::from_providers(vec![]).expect("empty registry");
+
+        AppState::new(
+            app_config,
+            providers,
+            llm_proxy_provider::ProviderAdapterRegistry::builtin(),
+            llm_proxy_provider::ProxyClient::new(),
+            crate::state::BuildInfo {
+                name: "test",
+                version: "0.0.0",
+                target: "test",
+                git_sha: "test",
+            },
+        )
+    }
+
     // -- protocol_error_to_route ------------------------------------------------
 
     #[test]
@@ -1258,6 +1313,32 @@ mod tests {
         assert!(matches!(route_err, RouteError::Internal(_)));
     }
 
+    #[test]
+    fn direct_loopback_bypasses_rate_limit() {
+        let state = state_with_operational_config(1, false);
+        let headers = HeaderMap::new();
+        let address = "127.0.0.1:12345".parse().unwrap();
+
+        assert!(prepare_request(&state, &headers, Some(&address), b"one", "/test").is_ok());
+        assert!(prepare_request(&state, &headers, Some(&address), b"two", "/test").is_ok());
+    }
+
+    #[test]
+    fn untrusted_forwarded_headers_cannot_bypass_rate_limit() {
+        let state = state_with_operational_config(1, false);
+        let address = "198.51.100.10:12345".parse().unwrap();
+        let mut first_headers = HeaderMap::new();
+        first_headers.insert("x-forwarded-for", "203.0.113.1".parse().unwrap());
+        let mut second_headers = HeaderMap::new();
+        second_headers.insert("x-forwarded-for", "203.0.113.2".parse().unwrap());
+
+        assert!(prepare_request(&state, &first_headers, Some(&address), b"one", "/test").is_ok());
+        assert!(matches!(
+            prepare_request(&state, &second_headers, Some(&address), b"two", "/test"),
+            Err(RouteError::RateLimited)
+        ));
+    }
+
     // -- map_provider_error -----------------------------------------------------
 
     #[test]
@@ -1270,6 +1351,38 @@ mod tests {
         let route_error = map_provider_route_error(error);
 
         assert!(matches!(route_error, RouteError::UnsupportedRoute(_)));
+    }
+
+    #[test]
+    fn gemini_catalog_enforcement_accepts_unprefixed_requested_model() {
+        let catalog = vec![llm_proxy_core::StaticModelCatalogEntry {
+            id: "models/gemini-2.5-pro".to_owned(),
+            display_name: None,
+            supports: Vec::new(),
+            context_length: None,
+        }];
+
+        assert!(catalog_contains_model(
+            &catalog,
+            "gemini-2.5-pro",
+            "gemini_generate_content"
+        ));
+    }
+
+    #[test]
+    fn non_gemini_catalog_enforcement_remains_exact() {
+        let catalog = vec![llm_proxy_core::StaticModelCatalogEntry {
+            id: "models/example".to_owned(),
+            display_name: None,
+            supports: Vec::new(),
+            context_length: None,
+        }];
+
+        assert!(!catalog_contains_model(
+            &catalog,
+            "example",
+            "openai_chat_completions"
+        ));
     }
 
     #[test]
@@ -1312,6 +1425,9 @@ mod tests {
                 log_level: "info".to_owned(),
                 hot_reload: false,
                 server_name: "test".to_owned(),
+                rate_limit_rpm: 100,
+                trust_forwarded_headers: false,
+                dedup_window: std::time::Duration::from_millis(500),
             },
         };
 
@@ -1375,6 +1491,9 @@ mod tests {
                 log_level: "info".to_owned(),
                 hot_reload: false,
                 server_name: "test".to_owned(),
+                rate_limit_rpm: 100,
+                trust_forwarded_headers: false,
+                dedup_window: std::time::Duration::from_millis(500),
             },
         };
 

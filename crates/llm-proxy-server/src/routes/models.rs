@@ -7,8 +7,9 @@
 
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
-use axum::http::{HeaderValue, Response, header};
+use axum::http::{HeaderValue, Response, StatusCode, header};
 use axum::response::IntoResponse;
+use llm_proxy_provider::ProviderError;
 use serde::Serialize;
 use tracing::info;
 
@@ -110,10 +111,7 @@ async fn handle_models_inner(
         .model_catalogs()
         .catalog(provider, refresh_live)
         .await
-        .map_err(|error| RouteError::Upstream {
-            status: axum::http::StatusCode::BAD_GATEWAY,
-            body: error.to_string(),
-        })?;
+        .map_err(map_catalog_error)?;
 
     // Build model cards from static entries.
     let data: Vec<ModelCard> = entries
@@ -158,6 +156,27 @@ async fn handle_models_inner(
     );
 
     Ok(response)
+}
+
+fn map_catalog_error(error: ProviderError) -> RouteError {
+    match error {
+        ProviderError::Api { status, body } => RouteError::Upstream {
+            status: StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
+            body,
+        },
+        ProviderError::Http {
+            message,
+            timeout: true,
+        } => RouteError::UpstreamTimeout(message),
+        ProviderError::Http {
+            message,
+            timeout: false,
+        } => RouteError::Upstream {
+            status: StatusCode::BAD_GATEWAY,
+            body: message,
+        },
+        error => RouteError::Internal(error.to_string()),
+    }
 }
 
 // ===========================================================================
@@ -220,6 +239,9 @@ mod tests {
                     log_level: "info".to_owned(),
                     hot_reload: false,
                     server_name: "test".to_owned(),
+                    rate_limit_rpm: 100,
+                    trust_forwarded_headers: false,
+                    dedup_window: std::time::Duration::from_millis(500),
                 },
             },
             registry,
@@ -257,6 +279,9 @@ mod tests {
                     log_level: "info".to_owned(),
                     hot_reload: false,
                     server_name: "test".to_owned(),
+                    rate_limit_rpm: 100,
+                    trust_forwarded_headers: false,
+                    dedup_window: std::time::Duration::from_millis(500),
                 },
             },
             registry,
@@ -334,6 +359,32 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(matches!(err, RouteError::UnknownProvider(_)));
+    }
+
+    #[test]
+    fn invalid_catalog_config_maps_to_internal_error() {
+        let error = ProviderError::InvalidConfig(
+            "failed to parse catalog cache /Users/example/private/catalog.toml".to_owned(),
+        );
+
+        let route_error = map_catalog_error(error);
+
+        assert!(matches!(route_error, RouteError::Internal(_)));
+    }
+
+    #[test]
+    fn sanitized_upstream_api_error_remains_upstream_error() {
+        let error = ProviderError::api(429, "rate limited".to_owned());
+
+        let route_error = map_catalog_error(error);
+
+        assert!(matches!(
+            route_error,
+            RouteError::Upstream {
+                status: StatusCode::TOO_MANY_REQUESTS,
+                ..
+            }
+        ));
     }
 
     #[tokio::test]

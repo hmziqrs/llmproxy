@@ -16,6 +16,7 @@ use llm_proxy_protocol::anthropic::MessageRequest;
 use llm_proxy_protocol::client::anthropic;
 use tracing::info;
 
+use crate::middleware::OptionalConnectInfo;
 use crate::state::AppState;
 
 use super::core_pipeline;
@@ -28,10 +29,11 @@ use super::error_response::{ClientProtocol, RouteError, route_error_response};
 pub async fn handle_messages(
     State(state): State<AppState>,
     Path(provider): Path<String>,
+    OptionalConnectInfo(connect_info): OptionalConnectInfo,
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response<Body> {
-    match handle_messages_inner(state, provider, headers, body).await {
+    match handle_messages_inner(state, provider, connect_info, headers, body).await {
         Ok(response) => response,
         Err(error) => {
             info!(error = %error, "request failed");
@@ -44,12 +46,19 @@ pub async fn handle_messages(
 async fn handle_messages_inner(
     state: AppState,
     provider: String,
+    connect_info: Option<std::net::SocketAddr>,
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<Response<Body>, RouteError> {
     // Pre-flight: rate limit, dedup, request ID.
     let request_path = format!("/providers/{provider}/v1/messages");
-    let ctx = core_pipeline::prepare_request(&state, &headers, &body, &request_path)?;
+    let ctx = core_pipeline::prepare_request(
+        &state,
+        &headers,
+        connect_info.as_ref(),
+        &body,
+        &request_path,
+    )?;
 
     // Parse and validate the Anthropic MessageRequest.
     let req: MessageRequest = serde_json::from_slice(&body)

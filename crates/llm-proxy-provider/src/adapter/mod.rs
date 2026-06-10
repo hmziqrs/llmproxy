@@ -396,6 +396,15 @@ pub(crate) fn build_proxy_request(
     stream: bool,
     url: String,
 ) -> ProxyRequest {
+    let mut extra_headers = target.headers.clone();
+    if target.protocol == ProviderProtocol::AnthropicMessages
+        && !extra_headers
+            .keys()
+            .any(|name| name.eq_ignore_ascii_case("anthropic-version"))
+    {
+        extra_headers.insert("anthropic-version".to_owned(), "2023-06-01".to_owned());
+    }
+
     ProxyRequest {
         url,
         auth: AuthHeaders {
@@ -404,7 +413,7 @@ pub(crate) fn build_proxy_request(
         },
         body,
         stream,
-        extra_headers: target.headers.clone(),
+        extra_headers,
     }
 }
 
@@ -803,6 +812,32 @@ mod tests {
     #[test]
     fn truncate_str_safe_zero_max_len() {
         assert_eq!(truncate_str_safe("hello", 0), "");
+    }
+
+    #[test]
+    fn anthropic_requests_default_version_header() {
+        let target = make_target(ProviderProtocol::AnthropicMessages);
+        let request = build_proxy_request(Vec::new(), &target, false, target.endpoint.clone());
+
+        assert_eq!(
+            request.extra_headers.get("anthropic-version"),
+            Some(&"2023-06-01".to_owned())
+        );
+    }
+
+    #[test]
+    fn anthropic_requests_preserve_configured_version_header() {
+        let mut target = make_target(ProviderProtocol::AnthropicMessages);
+        target
+            .headers
+            .insert("Anthropic-Version".to_owned(), "2024-01-01".to_owned());
+        let request = build_proxy_request(Vec::new(), &target, false, target.endpoint.clone());
+
+        assert_eq!(
+            request.extra_headers.get("Anthropic-Version"),
+            Some(&"2024-01-01".to_owned())
+        );
+        assert!(!request.extra_headers.contains_key("anthropic-version"));
     }
 
     // -- Helpers --------------------------------------------------------------

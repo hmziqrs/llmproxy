@@ -13,6 +13,7 @@ use llm_proxy_protocol::anthropic::MessageRequest;
 use llm_proxy_protocol::client::anthropic;
 use serde::Serialize;
 
+use crate::middleware::OptionalConnectInfo;
 use crate::state::AppState;
 
 use super::core_pipeline;
@@ -36,10 +37,11 @@ pub(crate) struct TokenCountResponse {
 pub async fn count_tokens(
     State(state): State<AppState>,
     Path(provider): Path<String>,
+    OptionalConnectInfo(connect_info): OptionalConnectInfo,
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response<Body> {
-    match count_tokens_inner(&state, &provider, &headers, body).await {
+    match count_tokens_inner(&state, &provider, connect_info.as_ref(), &headers, body).await {
         Ok(response) => response,
         Err(error) => route_error_response(ClientProtocol::Anthropic, error),
     }
@@ -48,6 +50,7 @@ pub async fn count_tokens(
 async fn count_tokens_inner(
     state: &AppState,
     provider: &str,
+    connect_info: Option<&std::net::SocketAddr>,
     headers: &HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<Response<Body>, RouteError> {
@@ -57,7 +60,7 @@ async fn count_tokens_inner(
         return Err(RouteError::UnknownProvider(provider.to_owned()));
     }
     let request_path = format!("/providers/{provider}/v1/messages/count_tokens");
-    let ctx = core_pipeline::prepare_request(state, headers, &body, &request_path)?;
+    let ctx = core_pipeline::prepare_request(state, headers, connect_info, &body, &request_path)?;
     // Parse and validate the Anthropic MessageRequest.
     let req: MessageRequest = serde_json::from_slice(&body)
         .map_err(|e| RouteError::InvalidRequest(format!("invalid JSON: {e}")))?;

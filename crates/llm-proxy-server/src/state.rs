@@ -7,14 +7,6 @@ use llm_proxy_provider::{ProviderAdapterRegistry, ProxyClient};
 use crate::ModelCatalogService;
 use crate::middleware::{RateLimiter, RequestDeduplicator, RequestIdGenerator};
 
-/// Default rate limit (requests per minute) when no config override is provided.
-///
-/// TODO: Make this configurable via TOML.
-/// TODO: Add a maximum capacity to the rate limiter HashMap (e.g. 100K entries
-/// with LRU eviction) to prevent unbounded memory growth under DDoS with many
-/// unique IPs.
-const DEFAULT_RATE_LIMIT_RPM: u32 = 100;
-
 /// Static information about this binary.
 #[derive(Debug, Clone)]
 pub struct BuildInfo {
@@ -140,6 +132,9 @@ impl AppState {
         build: BuildInfo,
         catalog_dir: Option<std::path::PathBuf>,
     ) -> Self {
+        let rate_limit_rpm = app_config.server.rate_limit_rpm;
+        let dedup_window_ms =
+            u64::try_from(app_config.server.dedup_window.as_millis()).unwrap_or(u64::MAX);
         Self {
             app_config: Arc::new(app_config),
             providers: Arc::new(providers),
@@ -148,8 +143,8 @@ impl AppState {
             build: Arc::new(build),
             token_counter: Arc::new(Counter::new()),
             metrics: Arc::new(Metrics::new()),
-            rate_limiter: Arc::new(RateLimiter::new(DEFAULT_RATE_LIMIT_RPM)),
-            request_dedup: Arc::new(RequestDeduplicator::new()),
+            rate_limiter: Arc::new(RateLimiter::new(rate_limit_rpm)),
+            request_dedup: Arc::new(RequestDeduplicator::with_window_ms(dedup_window_ms)),
             request_id_gen: Arc::new(RequestIdGenerator::new()),
             model_catalogs: Arc::new(ModelCatalogService::new(catalog_dir)),
         }
@@ -163,6 +158,11 @@ impl AppState {
     /// Server name for responses and version endpoints.
     pub fn server_name(&self) -> &str {
         &self.app_config.server.server_name
+    }
+
+    /// Whether trusted reverse-proxy headers may determine client identity.
+    pub fn trust_forwarded_headers(&self) -> bool {
+        self.app_config.server.trust_forwarded_headers
     }
 
     /// Access the TOML app config.
@@ -207,6 +207,9 @@ mod tests {
                 log_level: "info".to_owned(),
                 hot_reload: false,
                 server_name: "test-proxy".to_owned(),
+                rate_limit_rpm: 100,
+                trust_forwarded_headers: false,
+                dedup_window: Duration::from_millis(500),
             },
         }
     }

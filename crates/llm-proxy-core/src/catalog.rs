@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
-use crate::{ProviderCatalogConfig, ProviderCatalogMode, StaticModelCatalogEntry};
+use crate::{CoreError, ProviderCatalogConfig, ProviderCatalogMode, StaticModelCatalogEntry};
 
 /// Metadata stored alongside a persisted provider catalog.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -28,6 +28,11 @@ pub struct CatalogFileMetadata {
 pub struct CatalogFile {
     /// Cache metadata.
     pub catalog: CatalogFileMetadata,
+}
+
+/// Parse a persisted catalog cache file.
+pub fn parse_catalog_file(raw: &str) -> Result<CatalogFile, CoreError> {
+    toml::from_str(raw).map_err(CoreError::ConfigParse)
 }
 
 /// Merge static and discovered catalog entries according to provider config.
