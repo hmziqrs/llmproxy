@@ -5,6 +5,10 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[lib]
+name = "llm_proxy_app"
+path = "src/lib.rs"
+
 [[bin]]
 name = "llm-proxy"
 path = "src/main.rs"
