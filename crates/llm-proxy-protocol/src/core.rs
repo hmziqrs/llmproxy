@@ -534,7 +534,11 @@ where
                     }
                 }
             }
-            Ok(Some(result))
+            if result.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(result))
+            }
         }
         Some(other) => Err(de::Error::custom(format!(
             "stop must be a string, array of strings, or null, found {}",
@@ -552,6 +556,33 @@ fn json_type_name(val: &serde_json::Value) -> &'static str {
         serde_json::Value::String(_) => "string",
         serde_json::Value::Array(_) => "array",
         serde_json::Value::Object(_) => "object",
+    }
+}
+
+impl SamplingOptions {
+    /// Validate sampling parameters and return the first error, if any.
+    ///
+    /// Checks that:
+    /// - `temperature`, if present, is >= 0.
+    /// - `top_p`, if present, is in `[0, 1]`.
+    /// - `max_tokens`, if present, is > 0.
+    pub fn validate(&self) -> Result<(), String> {
+        if let Some(t) = self.temperature {
+            if t < 0.0 {
+                return Err(format!("temperature must be >= 0, got {t}"));
+            }
+        }
+        if let Some(p) = self.top_p {
+            if !(0.0..=1.0).contains(&p) {
+                return Err(format!("top_p must be in [0, 1], got {p}"));
+            }
+        }
+        if let Some(m) = self.max_tokens {
+            if m <= 0 {
+                return Err(format!("max_tokens must be > 0, got {m}"));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -2458,7 +2489,7 @@ mod tests {
     fn sampling_options_stop_deserializes_empty_array() {
         let json = r#"{"stop": []}"#;
         let opts: SamplingOptions = serde_json::from_str(json).expect("deserialize");
-        assert_eq!(opts.stop, Some(vec![]));
+        assert_eq!(opts.stop, None);
     }
 
     #[test]

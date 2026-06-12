@@ -177,6 +177,10 @@ impl ProviderStreamDecoder for OpenAiChatStreamDecoder {
                             .and_then(|f| f.name.as_deref())
                             .unwrap_or("");
                         if func_name.is_empty() {
+                            tracing::warn!(
+                                index = oi,
+                                "OpenAI: tool_call without function name, skipping tool call"
+                            );
                             continue;
                         }
 

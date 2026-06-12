@@ -14,7 +14,7 @@ use axum::http::{HeaderMap, Response};
 use llm_proxy_core::ProviderRouteKind;
 use llm_proxy_protocol::client::openai_chat;
 use llm_proxy_protocol::openai::ChatCompletionRequest;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::middleware::OptionalConnectInfo;
 use crate::state::AppState;
@@ -36,7 +36,7 @@ pub async fn handle_chat_completions(
     match handle_chat_completions_inner(state, provider, connect_info, headers, body).await {
         Ok(response) => response,
         Err(error) => {
-            info!(error = %error, "request failed");
+            warn!(error = %error, "request failed");
             route_error_response(ClientProtocol::OpenAiChat, error)
         }
     }

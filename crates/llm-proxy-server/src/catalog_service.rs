@@ -104,9 +104,15 @@ impl ModelCatalogService {
             .filter(|outcome| outcome.completed_at >= requested_at)
             .cloned()
         {
-            return outcome
-                .error
-                .map_or(Ok(()), |error| Err(ProviderError::InvalidConfig(error)));
+            return outcome.error.map_or(Ok(()), |error| {
+                // Preserve the original error category where possible. The cached
+                // error string came from a prior ProviderError's Display output,
+                // so we wrap it as InvalidConfig to preserve the message. This is
+                // acceptable because: (a) the original error already failed once
+                // (so retry semantics are identical), and (b) the caller logs the
+                // full message at warn level before deciding whether to fall back.
+                Err(ProviderError::InvalidConfig(error))
+            });
         }
 
         let models = match self.discovery.discover(provider).await {
@@ -132,6 +138,12 @@ impl ModelCatalogService {
             })
             .await
             .map_err(|error| {
+                if error.is_panic() {
+                    tracing::warn!(
+                        "catalog cache write task panicked; this may indicate a bug in the \
+                         serialization or filesystem code"
+                    );
+                }
                 ProviderError::InvalidConfig(format!("catalog cache write task failed: {error}"))
             })?;
             if let Err(error) = write_result {
@@ -184,6 +196,11 @@ impl ModelCatalogService {
     }
 
     async fn load_disk_cache(&self, provider: &ProviderConfig) -> Result<(), ProviderError> {
+        if !is_safe_provider_slug(&provider.name) {
+            return Err(ProviderError::InvalidConfig(
+                "catalog provider must be a lowercase URL-safe slug".to_owned(),
+            ));
+        }
         if self.cache.read().await.contains_key(&provider.name) {
             return Ok(());
         }
@@ -287,8 +304,12 @@ pub fn write_catalog_atomic(cache_dir: &Path, file: &CatalogFile) -> Result<(), 
     Ok(())
 }
 
+/// Maximum allowed length for a provider slug.
+const MAX_PROVIDER_SLUG_LEN: usize = 128;
+
 fn is_safe_provider_slug(provider: &str) -> bool {
     !provider.is_empty()
+        && provider.len() <= MAX_PROVIDER_SLUG_LEN
         && provider.bytes().all(|byte| {
             byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_')
         })
@@ -568,5 +589,88 @@ mod tests {
         );
 
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    // -- is_safe_provider_slug tests -------------------------------------------
+
+    #[test]
+    fn safe_slug_accepts_valid_names() {
+        assert!(is_safe_provider_slug("openai"));
+        assert!(is_safe_provider_slug("my-provider"));
+        assert!(is_safe_provider_slug("provider_123"));
+        assert!(is_safe_provider_slug("a"));
+    }
+
+    #[test]
+    fn safe_slug_rejects_empty() {
+        assert!(!is_safe_provider_slug(""));
+    }
+
+    #[test]
+    fn safe_slug_rejects_uppercase() {
+        assert!(!is_safe_provider_slug("OpenAI"));
+    }
+
+    #[test]
+    fn safe_slug_rejects_path_traversal() {
+        assert!(!is_safe_provider_slug("../outside"));
+        assert!(!is_safe_provider_slug("a/b"));
+    }
+
+    #[test]
+    fn safe_slug_rejects_exceeds_max_length() {
+        let long_name = "a".repeat(129);
+        assert!(!is_safe_provider_slug(&long_name), "129-char name should be rejected");
+        let at_limit = "a".repeat(128);
+        assert!(is_safe_provider_slug(&at_limit), "128-char name should be accepted");
+    }
+
+    // -- cache_is_fresh logic tests --------------------------------------------
+
+    #[tokio::test]
+    async fn cache_is_fresh_returns_true_within_ttl() {
+        let directory = temp_dir();
+        let now = time::OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        write_catalog_atomic(&directory, &catalog_file(&now)).unwrap();
+
+        let service = ModelCatalogService::new(Some(directory.clone()));
+        let provider = provider("http://127.0.0.1:0/models".to_owned());
+        // load_disk_cache so the in-memory cache is populated
+        service.load_disk_cache(&provider).await.unwrap();
+        assert!(
+            service.cache_is_fresh(&provider).await,
+            "cache with current timestamp should be fresh within TTL"
+        );
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cache_is_fresh_returns_false_for_expired() {
+        let directory = temp_dir();
+        // generated_at far in the past (well beyond any reasonable TTL)
+        write_catalog_atomic(&directory, &catalog_file("2020-01-01T00:00:00Z")).unwrap();
+
+        let service = ModelCatalogService::new(Some(directory.clone()));
+        let provider = provider("http://127.0.0.1:0/models".to_owned());
+        service.load_disk_cache(&provider).await.unwrap();
+        assert!(
+            !service.cache_is_fresh(&provider).await,
+            "cache with 2020 timestamp should be expired"
+        );
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cache_is_fresh_returns_false_when_empty() {
+        let service = ModelCatalogService::new(None);
+        let provider = provider("http://127.0.0.1:0/models".to_owned());
+        assert!(
+            !service.cache_is_fresh(&provider).await,
+            "cache with no entries should not be fresh"
+        );
     }
 }

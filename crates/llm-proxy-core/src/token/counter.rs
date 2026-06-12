@@ -46,7 +46,7 @@ impl Counter {
             return 0;
         }
         // Rough approximation: ~4 characters per token.
-        let estimate = text.len() / 4;
+        let estimate = text.chars().count() / 4;
         // Always count at least 1 token for non-empty text.
         estimate.max(1)
     }

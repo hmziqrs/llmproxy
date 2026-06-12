@@ -306,7 +306,7 @@ fn extract_error_fields(error: RouteError) -> (StatusCode, &'static str, String)
         RouteError::Upstream { status, body } => (
             map_upstream_status(status),
             "api_error",
-            truncate_error_body(&body),
+            truncate_error_body(&sanitize_upstream_body(&body)),
         ),
         RouteError::UpstreamTimeout(_msg) => (
             StatusCode::GATEWAY_TIMEOUT,
@@ -388,6 +388,20 @@ pub(crate) fn truncate_with_suffix(s: &str, max_len: usize, suffix: &str) -> Str
 /// included within this budget).
 fn truncate_error_body(body: &str) -> String {
     truncate_with_suffix(body, MAX_ERROR_MESSAGE_LEN, TRUNCATED_SUFFIX)
+}
+
+/// Compiled regex for URL redaction in upstream error bodies.
+static UPSTREAM_URL_REDACT_REGEX: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"https?://\S+").expect("valid URL redaction regex")
+    });
+
+/// Sanitize upstream error bodies to prevent leaking hostnames, URL paths,
+/// or connection details in client responses. Redacts URL-like patterns.
+fn sanitize_upstream_body(body: &str) -> String {
+    UPSTREAM_URL_REDACT_REGEX
+        .replace_all(body, "[url-redacted]")
+        .into_owned()
 }
 
 // ===========================================================================

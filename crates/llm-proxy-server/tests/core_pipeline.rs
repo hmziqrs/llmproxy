@@ -29,6 +29,28 @@ use serde_json::{Value, json};
 use tower::ServiceExt;
 
 // ---------------------------------------------------------------------------
+// Mock server readiness helper
+// ---------------------------------------------------------------------------
+
+/// Wait for a mock server to be ready by polling its TCP port.
+///
+/// Replaces `tokio::time::sleep(Duration::from_millis(50))` with a
+/// deterministic readiness check that retries until the server accepts
+/// a connection or the timeout elapses.
+async fn wait_for_ready(addr: std::net::SocketAddr) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if tokio::net::TcpStream::connect(addr).await.is_ok() {
+            return;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("mock server at {addr} did not become ready within 5 s");
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Mock upstream server helpers
 // ---------------------------------------------------------------------------
 
@@ -242,7 +264,7 @@ async fn spawn_mock_server(response_body: Vec<u8>, content_type: &str) -> String
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    wait_for_ready(addr).await;
     format!("http://{}/providers/mock-provider/v1/messages", addr)
 }
 
@@ -305,7 +327,7 @@ async fn spawn_mock_anthropic_stream() -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    wait_for_ready(addr).await;
     format!("http://{}/providers/mock-provider/v1/messages", addr)
 }
 
@@ -336,7 +358,7 @@ async fn spawn_mock_openai_chat_stream() -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    wait_for_ready(addr).await;
     format!("http://{}/providers/mock-provider/v1/messages", addr)
 }
 
@@ -371,7 +393,7 @@ async fn spawn_mock_openai_responses_stream() -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    wait_for_ready(addr).await;
     format!("http://{}/providers/mock-provider/v1/messages", addr)
 }
 
@@ -396,7 +418,7 @@ async fn spawn_mock_gemini_stream() -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    wait_for_ready(addr).await;
     format!("http://{}/providers/mock-provider/v1/messages", addr)
 }
 
@@ -417,7 +439,7 @@ async fn spawn_mock_500() -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    wait_for_ready(addr).await;
     format!("http://{}/providers/mock-provider/v1/messages", addr)
 }
 
@@ -448,7 +470,7 @@ async fn spawn_mock_malformed_stream() -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    wait_for_ready(addr).await;
     format!("http://{}/providers/mock-provider/v1/messages", addr)
 }
 
@@ -480,7 +502,7 @@ async fn spawn_mock_disconnect_stream() -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    wait_for_ready(addr).await;
     format!("http://{}/providers/mock-provider/v1/messages", addr)
 }
 
@@ -506,7 +528,7 @@ async fn spawn_mock_with_request_tracker(response_body: Vec<u8>) -> (String, Arc
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    wait_for_ready(addr).await;
     (
         format!("http://{}/providers/mock-provider/v1/messages", addr),
         received,
@@ -540,7 +562,7 @@ async fn spawn_mock_with_body_capture(
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    wait_for_ready(addr).await;
     (
         format!("http://{}/providers/mock-provider/v1/messages", addr),
         captured,
@@ -639,9 +661,10 @@ async fn upstream_500_returns_502() {
     assert_eq!(resp_body["error"]["type"], "api_error");
 }
 
-/// unknown model returns 400 and does not call upstream
+/// unknown model is passed through to upstream (provider-based routing does not
+/// validate model names locally; the upstream provider decides)
 #[tokio::test]
-async fn unknown_model_passes_through_to_upstream() {
+async fn unknown_model_is_passed_through() {
     let (mock_url, received) = spawn_mock_with_request_tracker(anthropic_success_response()).await;
     let state = state_with_anthropic_provider(&mock_url);
     let app = build_router(state);
@@ -1143,75 +1166,194 @@ async fn stream_terminal_event_emitted_after_decoder_finish() {
 // ===========================================================================
 
 /// Rate-limited request returns 429 Too Many Requests.
+///
+/// Uses a state configured with rpm=1 so that the second request is
+/// deterministically rejected.
 #[tokio::test]
 async fn rate_limited_request_returns_429() {
     let mock_url = spawn_mock_anthropic_non_stream().await;
-    let state = state_with_anthropic_provider(&mock_url);
+    // Build state with rpm=1 so the second request is deterministically rejected.
+    let provider = ProviderConfig {
+        name: "mock-provider".to_owned(),
+        api_key: "test-key".to_owned(),
+        auth_style: AuthStyle::Bearer,
+        adapters: {
+            let mut m = HashMap::new();
+            m.insert(
+                "messages".to_owned(),
+                ProviderAdapterConfig {
+                    protocol: "anthropic_messages".to_owned(),
+                    endpoint: mock_url,
+                    headers: HashMap::new(),
+                },
+            );
+            m
+        },
+        routes: llm_proxy_core::ProviderRoutesConfig {
+            messages: Some("messages".to_owned()),
+            chat_completions: None,
+        },
+        model_aliases: HashMap::new(),
+        discovery: None,
+        catalog: None,
+    };
+    let registry = ProviderRegistry::from_providers(vec![provider]).expect("registry");
+    let state = AppState::new(
+        AppConfig {
+            server: ServerConfig {
+                bind: "127.0.0.1:3456".parse().unwrap(),
+                request_timeout: Duration::from_secs(300),
+                log_level: "info".to_owned(),
+                hot_reload: false,
+                server_name: "test-proxy".to_owned(),
+                rate_limit_rpm: 1,
+                trust_forwarded_headers: false,
+                dedup_window: Duration::from_millis(500),
+            },
+        },
+        registry,
+        ProviderAdapterRegistry::builtin(),
+        ProxyClient::new(),
+        BuildInfo {
+            name: "test",
+            version: "0.0.0",
+            target: "test",
+            git_sha: "test",
+        },
+    );
     let app = build_router(state);
 
-    // Send enough requests to exceed the default rate limit (100 RPM).
-    // Use unique bodies so dedup does not interfere.
-    for i in 0..=100 {
-        let body = json!({
-            "model": "claude-sonnet-4-6",
-            "messages": [{ "role": "user", "content": format!("hello {i}") }],
-            "max_tokens": 64
-        });
-        let resp = app
-            .clone()
-            .oneshot(messages_request(&body.to_string()))
+    // First request should be allowed (rpm=1, 1 token available).
+    let body1 = json!({
+        "model": "claude-sonnet-4-6",
+        "messages": [{ "role": "user", "content": "hello one" }],
+        "max_tokens": 64
+    });
+    let resp1 = app
+        .clone()
+        .oneshot(messages_request(&body1.to_string()))
+        .await
+        .unwrap();
+    // The first request may succeed (200) or fail for non-rate-limit reasons.
+    // It must NOT be 429.
+    assert_ne!(
+        resp1.status(),
+        StatusCode::TOO_MANY_REQUESTS,
+        "first request should not be rate-limited"
+    );
+
+    // Second request should be rate-limited (token bucket depleted).
+    let body2 = json!({
+        "model": "claude-sonnet-4-6",
+        "messages": [{ "role": "user", "content": "hello two" }],
+        "max_tokens": 64
+    });
+    let resp2 = app
+        .clone()
+        .oneshot(messages_request(&body2.to_string()))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp2.status(),
+        StatusCode::TOO_MANY_REQUESTS,
+        "second request should be rate-limited with rpm=1"
+    );
+    let resp_body: Value = serde_json::from_slice(
+        &axum::body::to_bytes(resp2.into_body(), 64 * 1024)
             .await
-            .unwrap();
-        if resp.status() == StatusCode::TOO_MANY_REQUESTS {
-            // Success: hit rate limit and got 429.
-            let resp_body: Value = serde_json::from_slice(
-                &axum::body::to_bytes(resp.into_body(), 64 * 1024)
-                    .await
-                    .unwrap(),
-            )
-            .unwrap();
-            assert_eq!(resp_body["type"], "error");
-            assert_eq!(resp_body["error"]["type"], "rate_limit_error");
-            return;
-        }
-    }
-    // If we didn't hit the rate limit, the test still passes -- the rate
-    // limiter has a high threshold and we may not exhaust it in a fast test.
-    // The important thing is the variant exists and compiles correctly.
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(resp_body["type"], "error");
+    assert_eq!(resp_body["error"]["type"], "rate_limit_error");
 }
 
 /// Duplicate request returns 409 Conflict.
+///
+/// Uses a large dedup window (60 s) so the second request is deterministically
+/// caught as a duplicate.
 #[tokio::test]
 async fn duplicate_request_returns_409() {
     let mock_url = spawn_mock_anthropic_non_stream().await;
-    let state = state_with_anthropic_provider(&mock_url);
+    // Build state with a 60-second dedup window so the duplicate is guaranteed
+    // to be caught, and rpm=100 so rate limiting does not interfere.
+    let provider = ProviderConfig {
+        name: "mock-provider".to_owned(),
+        api_key: "test-key".to_owned(),
+        auth_style: AuthStyle::Bearer,
+        adapters: {
+            let mut m = HashMap::new();
+            m.insert(
+                "messages".to_owned(),
+                ProviderAdapterConfig {
+                    protocol: "anthropic_messages".to_owned(),
+                    endpoint: mock_url,
+                    headers: HashMap::new(),
+                },
+            );
+            m
+        },
+        routes: llm_proxy_core::ProviderRoutesConfig {
+            messages: Some("messages".to_owned()),
+            chat_completions: None,
+        },
+        model_aliases: HashMap::new(),
+        discovery: None,
+        catalog: None,
+    };
+    let registry = ProviderRegistry::from_providers(vec![provider]).expect("registry");
+    let state = AppState::new(
+        AppConfig {
+            server: ServerConfig {
+                bind: "127.0.0.1:3456".parse().unwrap(),
+                request_timeout: Duration::from_secs(300),
+                log_level: "info".to_owned(),
+                hot_reload: false,
+                server_name: "test-proxy".to_owned(),
+                rate_limit_rpm: 100,
+                trust_forwarded_headers: false,
+                dedup_window: Duration::from_secs(60),
+            },
+        },
+        registry,
+        ProviderAdapterRegistry::builtin(),
+        ProxyClient::new(),
+        BuildInfo {
+            name: "test",
+            version: "0.0.0",
+            target: "test",
+            git_sha: "test",
+        },
+    );
     let app = build_router(state);
 
     let body = make_messages_body("claude-sonnet-4-6", false);
 
     // First request should succeed or fail for non-dedup reasons.
     let resp1 = app.clone().oneshot(messages_request(&body)).await.unwrap();
-    assert_ne!(resp1.status(), StatusCode::CONFLICT);
+    assert_ne!(resp1.status(), StatusCode::CONFLICT, "first request should not be a duplicate");
 
-    // Second request with the same body should be deduplicated.
+    // Second request with the same body and path should be deduplicated.
     let resp2 = app.oneshot(messages_request(&body)).await.unwrap();
-    if resp2.status() == StatusCode::CONFLICT {
-        let resp_body: Value = serde_json::from_slice(
-            &axum::body::to_bytes(resp2.into_body(), 64 * 1024)
-                .await
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(resp_body["type"], "error");
-        assert!(
-            resp_body["error"]["message"]
-                .as_str()
-                .unwrap()
-                .contains("duplicate")
-        );
-    }
-    // If dedup doesn't flag it (e.g. TTL expired), that's fine for the test.
-    // The important thing is the variant exists and compiles correctly.
+    assert_eq!(
+        resp2.status(),
+        StatusCode::CONFLICT,
+        "second identical request should be deduplicated"
+    );
+    let resp_body: Value = serde_json::from_slice(
+        &axum::body::to_bytes(resp2.into_body(), 64 * 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(resp_body["type"], "error");
+    assert!(
+        resp_body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("duplicate"),
+        "error message should mention 'duplicate'"
+    );
 }
 
 // ===========================================================================

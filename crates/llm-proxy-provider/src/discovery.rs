@@ -120,6 +120,18 @@ impl DiscoveryClient {
 
         let response = request.send().await?;
         let status = response.status();
+        if !status.is_success() {
+            // Read only a small prefix of the error body for diagnostics.
+            let body_prefix = response
+                .bytes()
+                .await
+                .map(|b| {
+                    let end = b.len().min(2048);
+                    String::from_utf8_lossy(&b[..end]).into_owned()
+                })
+                .unwrap_or_else(|e| format!("<failed to read error body: {}>", e));
+            return Err(ProviderError::api(status.as_u16(), body_prefix));
+        }
         let mut stream = response.bytes_stream();
         let mut bytes = Vec::new();
         while let Some(chunk) = stream.try_next().await? {
@@ -130,12 +142,6 @@ impl DiscoveryClient {
                 )));
             }
             bytes.extend_from_slice(&chunk);
-        }
-        if !status.is_success() {
-            return Err(ProviderError::api(
-                status.as_u16(),
-                String::from_utf8_lossy(&bytes).into_owned(),
-            ));
         }
         serde_json::from_slice(&bytes).map_err(ProviderError::from)
     }
@@ -242,6 +248,13 @@ fn next_page(kind: ProviderDiscoveryKind, value: &Value) -> Option<(&'static str
 }
 
 impl Default for DiscoveryClient {
+    /// Returns a default discovery client.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the underlying `reqwest::Client` cannot be constructed (e.g.
+    /// due to a TLS backend initialization failure). Use [`DiscoveryClient::try_new`]
+    /// for a fallible constructor.
     fn default() -> Self {
         Self::try_new().expect("default discovery HTTP client configuration is valid")
     }

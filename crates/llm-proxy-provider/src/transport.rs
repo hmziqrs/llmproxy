@@ -91,7 +91,7 @@ impl fmt::Debug for ProxyRequest {
     }
 }
 
-fn endpoint_without_query(endpoint: &str) -> &str {
+pub(crate) fn endpoint_without_query(endpoint: &str) -> &str {
     endpoint
         .split_once('?')
         .map_or(endpoint, |(base, _query)| base)

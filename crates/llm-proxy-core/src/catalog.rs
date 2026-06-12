@@ -77,7 +77,19 @@ pub fn model_allowed(model: &str, allow: &[String], deny: &[String]) -> bool {
     allowed && (!denied || explicitly_allowed)
 }
 
+/// Cache of compiled glob-to-regex patterns.
+///
+/// Avoids recompiling the same glob pattern on every call to [`glob_matches`].
+/// Uses `LazyLock` for thread-safe one-time initialization per unique pattern.
+static GLOB_CACHE: std::sync::Mutex<Vec<(String, Regex)>> = std::sync::Mutex::new(Vec::new());
+
 fn glob_matches(pattern: &str, value: &str) -> bool {
+    let mut cache = GLOB_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    // Check if we already compiled this pattern.
+    if let Some((_, regex)) = cache.iter().find(|(p, _)| p == pattern) {
+        return regex.is_match(value);
+    }
+    // Compile and cache the new pattern.
     let mut expression = String::with_capacity(pattern.len() + 2);
     expression.push('^');
     for ch in pattern.chars() {
@@ -88,7 +100,13 @@ fn glob_matches(pattern: &str, value: &str) -> bool {
         }
     }
     expression.push('$');
-    Regex::new(&expression).is_ok_and(|regex| regex.is_match(value))
+    let regex = match Regex::new(&expression) {
+        Ok(re) => re,
+        Err(_) => return false,
+    };
+    let matched = regex.is_match(value);
+    cache.push((pattern.to_owned(), regex));
+    matched
 }
 
 #[cfg(test)]
@@ -142,6 +160,47 @@ mod tests {
             &["*".to_owned(), "model-preview".to_owned()],
             &["*-preview".to_owned()]
         ));
+    }
+
+    #[test]
+    fn parse_catalog_file_rejects_invalid_toml() {
+        let result = parse_catalog_file("this is not valid toml [[");
+        assert!(
+            result.is_err(),
+            "expected error for invalid TOML input"
+        );
+        assert!(
+            matches!(result.unwrap_err(), CoreError::ConfigParse(_)),
+            "expected CoreError::ConfigParse variant"
+        );
+    }
+
+    #[test]
+    fn discovered_mode_only_uses_discovered_entries() {
+        let cfg = config(ProviderCatalogMode::Discovered);
+        let merged = merge_catalog(
+            &cfg,
+            &[model("discovered-a", None), model("discovered-b", None)],
+        );
+        assert_eq!(merged.len(), 2);
+        assert!(merged.iter().any(|m| m.id == "discovered-a"));
+        assert!(merged.iter().any(|m| m.id == "discovered-b"));
+        // Static "shared" model should NOT be present in Discovered mode.
+        assert!(!merged.iter().any(|m| m.id == "shared"));
+    }
+
+    #[test]
+    fn static_mode_only_uses_static_entries() {
+        let cfg = config(ProviderCatalogMode::Static);
+        let merged = merge_catalog(
+            &cfg,
+            &[model("discovered-a", None), model("shared", Some("discovered"))],
+        );
+        // Only static entries should be present.
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].id, "shared");
+        // The static display_name should win since only static entries are used.
+        assert_eq!(merged[0].display_name.as_deref(), Some("static"));
     }
 
     #[test]

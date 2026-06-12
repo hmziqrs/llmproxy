@@ -71,16 +71,43 @@ impl SseFramer {
     /// Call this when the upstream stream ends. If there is partial data in the
     /// buffer, it is emitted as a frame.
     pub fn finish(&mut self) -> Result<Vec<SseFrame>, ProviderError> {
-        // If there is anything left in the buffer, treat it as a line.
+        let mut frames = Vec::new();
+
         if !self.buffer.is_empty() {
-            // Attempt UTF-8 decode of the remaining bytes.
-            let text = str::from_utf8(&self.buffer).map_err(ProviderError::from)?;
-            let line = text.trim_end_matches('\r').to_owned();
-            self.buffer.clear();
-            self.process_line(&line);
+            // Process any complete lines first (up to the last newline).
+            // This avoids UTF-8 decode failures from partial multi-byte
+            // sequences that may appear after the last newline.
+            if let Some(last_nl) = self.buffer.iter().rposition(|&b| b == b'\n') {
+                // Drain complete lines through the last newline.
+                let complete = self.buffer[..last_nl + 1].to_vec();
+                self.buffer.drain(..last_nl + 1);
+                // Complete lines ending at a newline boundary are valid UTF-8.
+                let text = str::from_utf8(&complete).map_err(ProviderError::from)?;
+                for line in text.lines() {
+                    let trimmed = line.trim_end_matches('\r');
+                    if trimmed.is_empty() {
+                        if let Some(frame) = self.take_current_frame() {
+                            frames.push(frame);
+                        }
+                    } else {
+                        self.process_line(trimmed);
+                    }
+                }
+            }
+
+            // Handle any remaining bytes after the last newline (no trailing newline).
+            if !self.buffer.is_empty() {
+                let text = str::from_utf8(&self.buffer).map_err(ProviderError::from)?;
+                let line = text.trim_end_matches('\r').to_owned();
+                self.buffer.clear();
+                self.process_line(&line);
+            }
         }
-        let frame = self.take_current_frame();
-        Ok(frame.into_iter().collect())
+
+        if let Some(frame) = self.take_current_frame() {
+            frames.push(frame);
+        }
+        Ok(frames)
     }
 
     // -----------------------------------------------------------------------
@@ -97,21 +124,25 @@ impl SseFramer {
         let mut frames = Vec::new();
 
         while let Some(nl_pos) = self.buffer.iter().position(|&b| b == b'\n') {
-            // Extract the line bytes (excluding the newline itself).
-            let line_bytes = self.buffer[..nl_pos].to_vec();
-            // Remove the line + newline from the buffer.
-            self.buffer.drain(..nl_pos + 1);
-
-            // Trim trailing \r bytes.
-            let line_bytes = match line_bytes.iter().rposition(|&b| b != b'\r') {
-                Some(pos) => &line_bytes[..=pos],
-                None => &[][..], // Line was all \r characters.
+            // Find the last non-\r byte in the line (before the newline).
+            // This lets us trim trailing \r bytes using a slice reference
+            // instead of allocating a separate Vec.
+            let trimmed_end = match self.buffer[..nl_pos].iter().rposition(|&b| b != b'\r') {
+                Some(pos) => pos + 1, // exclusive end
+                None => 0,             // Line was all \r characters.
             };
 
-            // Decode the trimmed line as UTF-8. The line is guaranteed to be
-            // valid UTF-8 because it ends at a \n boundary which is a single
-            // byte; any partial multi-byte UTF-8 sequence would not contain \n.
-            let line = str::from_utf8(line_bytes).map_err(ProviderError::from)?;
+            // Decode the trimmed line as UTF-8 and convert to an owned string
+            // so we release the immutable borrow on self.buffer before draining.
+            // The line is guaranteed to be valid UTF-8 because it ends at a \n
+            // boundary which is a single byte; any partial multi-byte UTF-8
+            // sequence would not contain \n.
+            let line = str::from_utf8(&self.buffer[..trimmed_end])
+                .map_err(ProviderError::from)?
+                .to_owned();
+
+            // Remove the line + newline from the buffer.
+            self.buffer.drain(..nl_pos + 1);
 
             if line.is_empty() {
                 // Blank line = frame boundary.
@@ -119,7 +150,7 @@ impl SseFramer {
                     frames.push(frame);
                 }
             } else {
-                self.process_line(line);
+                self.process_line(&line);
             }
         }
 

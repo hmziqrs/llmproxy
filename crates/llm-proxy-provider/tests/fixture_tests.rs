@@ -451,6 +451,7 @@ fn extract_content_variant(v: &serde_json::Value) -> String {
                             | "ToolUse"
                             | "ToolResult"
                             | "Thinking"
+                            | "RedactedThinking"
                             | "Image"
                             | "Document"
                             | "Audio"

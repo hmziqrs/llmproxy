@@ -73,20 +73,20 @@ impl MessageRequest {
                 }
                 // Try array of SystemContentBlock.
                 if let Some(arr) = value.as_array() {
-                    let mut text = String::new();
+                    let mut parts: Vec<String> = Vec::new();
                     for item in arr {
                         if let Ok(block) =
                             serde_json::from_value::<SystemContentBlock>(item.clone())
                         {
                             if block.r#type == "text" {
                                 if let Some(t) = block.text {
-                                    text.push_str(&t);
+                                    parts.push(t);
                                 }
                             }
                         }
                     }
-                    if !text.is_empty() {
-                        return text;
+                    if !parts.is_empty() {
+                        return parts.join("\n");
                     }
                 }
                 // Fallback: raw JSON string.
@@ -227,6 +227,16 @@ impl Message {
             for item in arr {
                 if let Ok(b) = serde_json::from_value::<ContentBlock>(item.clone()) {
                     blocks.push(b);
+                } else {
+                    let block_type = item
+                        .as_object()
+                        .and_then(|obj| obj.get("type"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown");
+                    tracing::warn!(
+                        block_type,
+                        "content_blocks: skipping unparseable array item"
+                    );
                 }
             }
             return blocks;
@@ -390,6 +400,52 @@ impl ContentBlock {
             source: None,
             cache_control: None,
             data: Some(data),
+        }
+    }
+
+    /// Create an image content block.
+    #[must_use]
+    pub fn new_image(source: ImageSource) -> Self {
+        ContentBlock {
+            r#type: "image".to_owned(),
+            text: None,
+            id: None,
+            tool_use_id: None,
+            name: None,
+            input: None,
+            output: None,
+            content: None,
+            is_error: None,
+            thinking: None,
+            signature: None,
+            source: Some(source),
+            cache_control: None,
+            data: None,
+        }
+    }
+
+    /// Create a tool_result content block.
+    #[must_use]
+    pub fn new_tool_result(
+        tool_use_id: String,
+        content: Option<serde_json::Value>,
+        is_error: Option<bool>,
+    ) -> Self {
+        ContentBlock {
+            r#type: "tool_result".to_owned(),
+            text: None,
+            id: None,
+            tool_use_id: Some(tool_use_id),
+            name: None,
+            input: None,
+            output: None,
+            content,
+            is_error,
+            thinking: None,
+            signature: None,
+            source: None,
+            cache_control: None,
+            data: None,
         }
     }
 
@@ -847,7 +903,7 @@ mod tests {
             thinking: None,
             tool_choice: None,
         };
-        assert_eq!(req.system_text(), "You are helpful. Be concise.");
+        assert_eq!(req.system_text(), "You are helpful. \nBe concise.");
     }
 
     // -- content_blocks -----------------------------------------------------

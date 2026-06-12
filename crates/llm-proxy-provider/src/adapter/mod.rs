@@ -33,6 +33,9 @@ use crate::error::ProviderError;
 use crate::sse::SseFrame;
 use crate::transport::{AuthHeaders, ProxyRequest};
 
+/// Anthropic API version header value used when the caller does not supply one.
+const ANTHROPIC_VERSION: &str = "2023-06-01";
+
 // ---------------------------------------------------------------------------
 // ProviderProtocol
 // ---------------------------------------------------------------------------
@@ -127,11 +130,7 @@ impl fmt::Debug for ProviderAdapterTarget {
     }
 }
 
-fn endpoint_without_query(endpoint: &str) -> &str {
-    endpoint
-        .split_once('?')
-        .map_or(endpoint, |(base, _query)| base)
-}
+pub(crate) use crate::transport::endpoint_without_query;
 
 // ---------------------------------------------------------------------------
 // ProviderAdapter enum
@@ -408,7 +407,7 @@ pub(crate) fn build_proxy_request(
             .keys()
             .any(|name| name.eq_ignore_ascii_case("anthropic-version"))
     {
-        extra_headers.insert("anthropic-version".to_owned(), "2023-06-01".to_owned());
+        extra_headers.insert("anthropic-version".to_owned(), ANTHROPIC_VERSION.to_owned());
     }
 
     ProxyRequest {
@@ -828,7 +827,7 @@ mod tests {
 
         assert_eq!(
             request.extra_headers.get("anthropic-version"),
-            Some(&"2023-06-01".to_owned())
+            Some(&ANTHROPIC_VERSION.to_owned())
         );
     }
 

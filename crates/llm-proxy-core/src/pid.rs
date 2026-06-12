@@ -43,11 +43,13 @@ impl PidManager {
 
     /// Read the PID from the PID file. Returns `None` if the file does not exist.
     pub fn read_pid(&self) -> Result<Option<u32>> {
-        if !self.pid_file.exists() {
-            return Ok(None);
-        }
-        let content = std::fs::read_to_string(&self.pid_file)
-            .with_context(|| format!("reading PID file {}", self.pid_file.display()))?;
+        let content = match std::fs::read_to_string(&self.pid_file) {
+            Ok(c) => c,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => {
+                return Err(e).with_context(|| format!("reading PID file {}", self.pid_file.display()));
+            }
+        };
         let pid: u32 = content
             .trim()
             .parse()
@@ -73,11 +75,12 @@ impl PidManager {
     ///
     /// Silently succeeds if the file does not exist.
     pub fn remove_pid(&self) -> Result<()> {
-        if self.pid_file.exists() {
-            std::fs::remove_file(&self.pid_file)
-                .with_context(|| format!("removing PID file {}", self.pid_file.display()))?;
+        match std::fs::remove_file(&self.pid_file) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e)
+                .with_context(|| format!("removing PID file {}", self.pid_file.display())),
         }
-        Ok(())
     }
 
     /// Check if a process with the given PID is running.

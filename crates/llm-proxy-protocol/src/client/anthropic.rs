@@ -139,6 +139,10 @@ fn decode_system(system: &Option<serde_json::Value>) -> Vec<CoreContent> {
                                 "non-text system block skipped during Anthropic decode"
                             );
                         }
+                    } else {
+                        tracing::warn!(
+                            "decode_system: skipping system array item that failed deserialization"
+                        );
                     }
                 }
                 return result;
@@ -189,13 +193,27 @@ fn decode_content_block(block: ContentBlock) -> Result<CoreContent, ProtocolErro
                 .unwrap_or(serde_json::Value::Null);
             Ok(CoreContent::Image { source })
         }
-        "tool_use" => Ok(CoreContent::ToolUse {
-            id: block.id.unwrap_or_default(),
-            name: block.name.unwrap_or_default(),
-            input: block
-                .input
-                .unwrap_or(serde_json::Value::Object(serde_json::Map::new())),
-        }),
+        "tool_use" => {
+            let id = block.id.unwrap_or_default();
+            if id.is_empty() {
+                return Err(ProtocolError::Decode(
+                    "tool_use block missing required 'id' field".into(),
+                ));
+            }
+            let name = block.name.unwrap_or_default();
+            if name.is_empty() {
+                return Err(ProtocolError::Decode(
+                    "tool_use block missing required 'name' field".into(),
+                ));
+            }
+            Ok(CoreContent::ToolUse {
+                id,
+                name,
+                input: block
+                    .input
+                    .unwrap_or(serde_json::Value::Object(serde_json::Map::new())),
+            })
+        }
         "tool_result" => {
             let is_error = block.is_error.unwrap_or(false);
             let inner_content = if let Some(ref content_val) = block.content {
@@ -232,6 +250,10 @@ fn decode_content_block(block: ContentBlock) -> Result<CoreContent, ProtocolErro
                             }
                         }
                         if blocks.is_empty() {
+                            tracing::warn!(
+                                "tool_result: all inner content blocks failed to parse; \
+                                 synthesizing empty text block"
+                            );
                             vec![CoreContent::Text {
                                 text: String::new(),
                                 cache: None,
@@ -260,8 +282,14 @@ fn decode_content_block(block: ContentBlock) -> Result<CoreContent, ProtocolErro
                     vec![CoreContent::Text { text, cache: None }]
                 }
             };
+            let tool_use_id = block.tool_use_id.unwrap_or_default();
+            if tool_use_id.is_empty() {
+                return Err(ProtocolError::Decode(
+                    "tool_result block missing required 'tool_use_id' field".into(),
+                ));
+            }
             Ok(CoreContent::ToolResult {
-                tool_use_id: block.tool_use_id.unwrap_or_default(),
+                tool_use_id,
                 content: inner_content,
                 is_error,
             })
@@ -391,11 +419,7 @@ fn encode_content_block(content: CoreContent) -> Result<ContentBlock, ProtocolEr
                     media_type: String::new(),
                     data: String::new(),
                 });
-            let mut block = ContentBlock::new_text(String::new());
-            block.r#type = "image".to_owned();
-            block.text = None;
-            block.source = Some(img_source);
-            Ok(block)
+            Ok(ContentBlock::new_image(img_source))
         }
         CoreContent::ToolUse { id, name, input } => Ok(ContentBlock::new_tool_use(id, name, input)),
         CoreContent::ToolResult {
@@ -414,13 +438,7 @@ fn encode_content_block(content: CoreContent) -> Result<ContentBlock, ProtocolEr
             } else {
                 Some(serde_json::to_value(&content).unwrap_or(serde_json::Value::Null))
             };
-            let mut block = ContentBlock::new_text(String::new());
-            block.r#type = "tool_result".to_owned();
-            block.text = None;
-            block.tool_use_id = Some(tool_use_id);
-            block.content = content_val;
-            block.is_error = Some(is_error);
-            Ok(block)
+            Ok(ContentBlock::new_tool_result(tool_use_id, content_val, Some(is_error)))
         }
         CoreContent::Thinking { text, signature } => {
             let mut block = ContentBlock::new_thinking(text);
@@ -792,6 +810,19 @@ impl StreamEncoder {
                 // (encode_error_does_not_leak_secret_in_message) verifies that
                 // a CoreStreamError containing a secret-like string propagates
                 // verbatim -- the defense must be at construction time, not here.
+                //
+                // Length cap: truncate the error message to 1024 characters to
+                // prevent excessively large SSE payloads from upstream errors.
+                let msg = error.message();
+                let capped_msg = if msg.len() > 1024 {
+                    tracing::warn!(
+                        original_len = msg.len(),
+                        "stream error message exceeds 1024 chars; truncating for client-facing SSE"
+                    );
+                    msg[..1024].to_owned()
+                } else {
+                    msg.to_owned()
+                };
                 events.push(MessageEvent {
                     r#type: "error".to_owned(),
                     message: None,
@@ -801,7 +832,7 @@ impl StreamEncoder {
                     usage: None,
                     error: Some(ApiError {
                         r#type: encode_error_kind(&error.kind),
-                        message: error.message().to_owned(),
+                        message: capped_msg,
                     }),
                 });
             }

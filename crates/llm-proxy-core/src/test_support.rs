@@ -24,7 +24,9 @@ pub static TEST_ENV_LOCK: Mutex<()> = Mutex::new(());
 /// RAII wrapper that holds the test env mutex lock.
 ///
 /// Acquire via [`TestEnvLock::acquire`]. The lock is released when this value
-/// is dropped.
+/// is dropped. This is a test utility for serialising environment-variable-mutating
+/// tests to prevent race conditions.
+#[allow(dead_code)]
 #[derive(Debug)]
 pub struct TestEnvLock {
     _guard: std::sync::MutexGuard<'static, ()>,
@@ -41,7 +43,12 @@ impl TestEnvLock {
 /// RAII guard that saves an environment variable on creation and restores it
 /// (or removes it) on drop.
 ///
+/// This is a test utility for safely setting/removing environment variables
+/// in unit tests. It ensures the variable is always restored to its original
+/// state when the guard is dropped, even if the test panics.
+///
 /// Must only be used while holding [`TestEnvLock`] to guarantee thread safety.
+#[allow(dead_code)]
 #[derive(Debug)]
 pub struct EnvVarGuard {
     key: String,

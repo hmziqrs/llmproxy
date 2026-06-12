@@ -728,35 +728,7 @@ pub fn validate_provider_config(
         }
 
         // Validate adapter static headers.
-        for (hname, hvalue) in &adapter_cfg.headers {
-            if hname.trim().is_empty() {
-                return Err(ConfigValidationError::EmptyHeaderName {
-                    provider: name.clone(),
-                    adapter: adapter_name.clone(),
-                });
-            }
-            if hname.contains('\r')
-                || hname.contains('\n')
-                || hvalue.contains('\r')
-                || hvalue.contains('\n')
-            {
-                return Err(ConfigValidationError::HeaderContainsCrlf {
-                    provider: name.clone(),
-                    adapter: adapter_name.clone(),
-                });
-            }
-            let lower = hname.to_ascii_lowercase();
-            if matches!(
-                lower.as_str(),
-                "host" | "content-length" | "transfer-encoding" | "connection"
-            ) {
-                return Err(ConfigValidationError::ForbiddenHeader {
-                    provider: name.clone(),
-                    adapter: adapter_name.clone(),
-                    header: hname.clone(),
-                });
-            }
-        }
+        validate_headers(&adapter_cfg.headers, name, adapter_name)?;
     }
 
     if let Some(discovery) = &provider.discovery {
@@ -774,30 +746,7 @@ pub fn validate_provider_config(
                 endpoint: discovery.endpoint.clone(),
             });
         }
-        for (header_name, header_value) in &discovery.headers {
-            if header_name.trim().is_empty() {
-                return Err(ConfigValidationError::EmptyHeaderName {
-                    provider: name.clone(),
-                    adapter: "discovery".to_owned(),
-                });
-            }
-            if header_name.contains(['\r', '\n']) || header_value.contains(['\r', '\n']) {
-                return Err(ConfigValidationError::HeaderContainsCrlf {
-                    provider: name.clone(),
-                    adapter: "discovery".to_owned(),
-                });
-            }
-            if matches!(
-                header_name.to_ascii_lowercase().as_str(),
-                "host" | "content-length" | "transfer-encoding" | "connection"
-            ) {
-                return Err(ConfigValidationError::ForbiddenHeader {
-                    provider: name.clone(),
-                    adapter: "discovery".to_owned(),
-                    header: header_name.clone(),
-                });
-            }
-        }
+        validate_headers(&discovery.headers, name, "discovery")?;
         for (limit, value) in [
             ("max_pages", discovery.max_pages),
             ("max_models", discovery.max_models),
@@ -892,6 +841,61 @@ pub fn validate_provider_config(
     Ok(())
 }
 
+/// Forbidden HTTP header names that providers must not set via static headers.
+///
+/// These headers are managed by the HTTP transport layer and must not be
+/// overridden by provider configuration, as doing so could break request
+/// routing, authentication, or connection handling.
+const FORBIDDEN_HEADERS: &[&str] = &[
+    "authorization",
+    "cookie",
+    "set-cookie",
+    "upgrade",
+    "proxy-authorization",
+    "host",
+    "connection",
+    "content-length",
+    "transfer-encoding",
+];
+
+/// Validate a map of static headers for CRLF injection and forbidden header names.
+///
+/// Shared between adapter header validation and discovery header validation
+/// to avoid duplicating the same checks.
+fn validate_headers(
+    headers: &HashMap<String, String>,
+    provider: &str,
+    adapter: &str,
+) -> Result<(), ConfigValidationError> {
+    for (hname, hvalue) in headers {
+        if hname.trim().is_empty() {
+            return Err(ConfigValidationError::EmptyHeaderName {
+                provider: provider.to_owned(),
+                adapter: adapter.to_owned(),
+            });
+        }
+        if hname.contains('\r')
+            || hname.contains('\n')
+            || hvalue.contains('\r')
+            || hvalue.contains('\n')
+        {
+            return Err(ConfigValidationError::HeaderContainsCrlf {
+                provider: provider.to_owned(),
+                adapter: adapter.to_owned(),
+            });
+        }
+        let lower = hname.to_ascii_lowercase();
+        if FORBIDDEN_HEADERS.contains(&lower.as_str()) {
+            return Err(ConfigValidationError::ForbiddenHeader {
+                provider: provider.to_owned(),
+                adapter: adapter.to_owned(),
+                header: hname.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
 fn is_safe_gemini_model_id(model: &str) -> bool {
     let component = model.strip_prefix("models/").unwrap_or(model);
     !component.is_empty()
@@ -943,6 +947,7 @@ pub fn load_app_config(path: impl AsRef<Path>) -> Result<AppConfig, CoreError> {
                     message: format!(
                         "app config environment variable \"{var_name}\" resolved to an empty value"
                     ),
+                    source: None,
                 });
             }
         }
@@ -957,6 +962,7 @@ pub fn load_app_config(path: impl AsRef<Path>) -> Result<AppConfig, CoreError> {
     if let Some(var) = find_unresolved_env_var(&interpolated) {
         return Err(CoreError::ConfigValidation {
             message: format!("app config contains unresolvable environment variable \"{var}\""),
+            source: None,
         });
     }
 
@@ -966,6 +972,7 @@ pub fn load_app_config(path: impl AsRef<Path>) -> Result<AppConfig, CoreError> {
             message:
                 "server.hot_reload=true is not supported; restart the server after config changes"
                     .to_owned(),
+            source: None,
         });
     }
     Ok(cfg)
@@ -1030,6 +1037,7 @@ pub fn load_provider_config(
                         var: var_name,
                     }
                     .to_string(),
+                    source: None,
                 });
             }
             Some(_) => {}
@@ -1047,12 +1055,14 @@ pub fn load_provider_config(
             message: format!(
                 "provider config contains unresolvable environment variable \"{var}\""
             ),
+            source: None,
         });
     }
     let file: ProviderFile = toml::from_str(&interpolated).map_err(CoreError::ConfigParse)?;
     validate_provider_config(&file.provider, known_protocols).map_err(|e| {
         CoreError::ConfigValidation {
             message: e.to_string(),
+            source: Some(Box::new(e)),
         }
     })?;
     Ok(file.provider)

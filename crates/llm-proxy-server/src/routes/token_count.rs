@@ -20,6 +20,13 @@ use super::core_pipeline;
 use super::error_response::{ClientProtocol, RouteError, route_error_response};
 
 /// Response body for the token count endpoint.
+///
+/// **Note:** The `input_tokens` value is an approximation based on a heuristic
+/// word/character-level counter, not an exact count from the upstream provider's
+/// tokenizer. It intentionally excludes tool definitions, non-text content blocks
+/// (images, documents), and tool-result content. This estimate is sufficient for
+/// gating requests by approximate size but should not be used for precise billing
+/// or token accounting.
 #[derive(Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct TokenCountResponse {

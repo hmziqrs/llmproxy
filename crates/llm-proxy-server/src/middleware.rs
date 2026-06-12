@@ -22,6 +22,14 @@ use sha2::{Digest, Sha256};
 /// memory growth from unique-body requests.
 const MAX_DEDUP_ENTRIES: usize = 10_000;
 
+/// Maximum body size (in bytes) eligible for dedup tracking. Bodies larger
+/// than this are never hashed or tracked to avoid expensive SHA-256 computation
+/// on large payloads and prevent memory pressure from storing many hash entries.
+/// 64 KiB is chosen as a reasonable threshold: most LLM API requests with
+/// moderate context fit within this limit, while very large file uploads or
+/// multi-turn conversations with huge contexts are excluded from dedup.
+const MAX_DEDUP_BODY_SIZE: usize = 64 * 1024;
+
 /// Deduplicates requests based on a SHA-256 hash of the request path and body.
 ///
 /// Tracks in-flight request hashes with a configurable deduplication window.
@@ -77,6 +85,10 @@ impl RequestDeduplicator {
     /// happen to carry the same body.
     pub fn is_duplicate_with_path(&self, path: &str, body: &[u8]) -> bool {
         if self.window_ms == 0 {
+            return false;
+        }
+        // Skip dedup for large bodies to avoid expensive hashing and memory pressure.
+        if body.len() > MAX_DEDUP_BODY_SIZE {
             return false;
         }
         let hash = Self::hash_path_body(path, body);
@@ -163,14 +175,23 @@ impl ClientTokenBucket {
 /// Per-IP rate limiter using token buckets.
 ///
 /// Each client IP gets its own bucket allowing `max_requests_per_minute`
-/// requests per minute.
+/// requests per minute. Pruning of stale entries occurs periodically
+/// (every `PRUNE_INTERVAL` requests) rather than on every call to reduce
+/// per-request overhead under high load.
 #[derive(Debug)]
 pub struct RateLimiter {
     /// Per-IP token buckets.
     buckets: Mutex<HashMap<String, ClientTokenBucket>>,
     /// Maximum requests per minute per client.
     max_requests_per_minute: f64,
+    /// Counter for periodic pruning. Pruning runs every `PRUNE_INTERVAL` requests.
+    prune_counter: AtomicU64,
 }
+
+/// Number of requests between prune sweeps. Trade-off: lower values prune
+/// more aggressively but add overhead; higher values reduce overhead but
+/// allow stale entries to linger longer.
+const PRUNE_INTERVAL: u64 = 128;
 
 impl RateLimiter {
     /// Create a new rate limiter.
@@ -181,6 +202,7 @@ impl RateLimiter {
         Self {
             buckets: Mutex::new(HashMap::new()),
             max_requests_per_minute: max_requests_per_minute as f64,
+            prune_counter: AtomicU64::new(0),
         }
     }
 
@@ -196,14 +218,14 @@ impl RateLimiter {
             e.into_inner()
         });
 
-        // Evict stale entries to prevent unbounded memory growth.
-        // Prune entries not accessed within the last 5 minutes. Always prune
-        // (not just when above a threshold) so stale entries from low but
-        // steady traffic do not accumulate indefinitely.
-        let now = std::time::Instant::now();
-        buckets.retain(|_, bucket| {
-            now.duration_since(bucket.last_refill) < std::time::Duration::from_secs(300)
-        });
+        // Periodic pruning: evict stale entries every PRUNE_INTERVAL requests
+        // to prevent unbounded memory growth without paying the cost on every call.
+        if self.prune_counter.fetch_add(1, Ordering::Relaxed) % PRUNE_INTERVAL == 0 {
+            let now = std::time::Instant::now();
+            buckets.retain(|_, bucket| {
+                now.duration_since(bucket.last_refill) < std::time::Duration::from_secs(300)
+            });
+        }
 
         // Refill rate: tokens per second.
         let refill_rate = self.max_requests_per_minute / 60.0;
@@ -469,5 +491,42 @@ mod tests {
         for _ in 0..1_000 {
             assert!(limiter.is_allowed("127.0.0.1"));
         }
+    }
+
+    #[test]
+    fn rate_limiter_rejects_requests_at_the_limit() {
+        // With 1 RPM, the first request should be allowed and the second rejected.
+        let limiter = RateLimiter::new(1);
+        assert!(
+            limiter.is_allowed("10.0.0.1"),
+            "first request should be allowed"
+        );
+        assert!(
+            !limiter.is_allowed("10.0.0.1"),
+            "second request should be rejected at 1 RPM limit"
+        );
+    }
+
+    #[test]
+    fn dedup_large_body_is_not_tracked() {
+        let dedup = RequestDeduplicator::with_window_ms(5000);
+        let large_body = vec![b'x'; 65 * 1024]; // 65 KiB > 64 KiB cap
+        // Large bodies should never be tracked as duplicates.
+        assert!(!dedup.is_duplicate_with_path("/v1/messages", &large_body));
+        assert!(
+            !dedup.is_duplicate_with_path("/v1/messages", &large_body),
+            "large body should not be tracked for dedup"
+        );
+    }
+
+    #[test]
+    fn dedup_body_at_cap_is_still_tracked() {
+        let dedup = RequestDeduplicator::with_window_ms(5000);
+        let body_at_cap = vec![b'x'; 64 * 1024]; // Exactly at 64 KiB cap
+        assert!(!dedup.is_duplicate_with_path("/v1/messages", &body_at_cap));
+        assert!(
+            dedup.is_duplicate_with_path("/v1/messages", &body_at_cap),
+            "body at exactly the cap should still be tracked"
+        );
     }
 }

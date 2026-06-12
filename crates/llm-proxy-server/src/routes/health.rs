@@ -65,6 +65,11 @@ pub(crate) struct ReadyBody {
 
 /// Readiness probe. Returns 200. Will check downstream state in a
 /// later phase.
+///
+/// This is currently a tautology (always returns "ready") because the proxy
+/// has no external dependencies to check at startup. Future readiness checks
+/// may include: verifying provider catalog cache freshness, confirming at
+/// least one provider is configured, or checking downstream connectivity.
 pub async fn ready() -> (StatusCode, Json<ReadyBody>) {
     (StatusCode::OK, Json(ReadyBody { status: "ready" }))
 }

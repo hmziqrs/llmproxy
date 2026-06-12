@@ -234,7 +234,15 @@ pub struct ChatCompletionRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub top_p: Option<f64>,
     /// Upper bound on tokens generated in the response.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    ///
+    /// OpenAI renamed `max_tokens` to `max_completion_tokens` in later API
+    /// versions.  Both names are accepted via the serde alias; the canonical
+    /// field name follows the newer convention.
+    #[serde(
+        rename = "max_completion_tokens",
+        alias = "max_tokens",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub max_tokens: Option<i32>,
     /// Reasoning effort level (e.g. `"low"`, `"medium"`, `"high"`).
     #[serde(skip_serializing_if = "Option::is_none")]

@@ -76,15 +76,10 @@ mod tests {
 
     #[test]
     fn interpolates_known_var() {
-        let _g = crate::test_support::TestEnvLock::acquire();
-        unsafe {
-            std::env::set_var("_LLM_PROXY_TEST_INTERPOLATE", "hello");
-        }
+        let _lock = crate::test_support::TestEnvLock::acquire();
+        let _guard = crate::test_support::EnvVarGuard::set("_LLM_PROXY_TEST_INTERPOLATE", "hello");
         let result = interpolate_env_vars("key = ${_LLM_PROXY_TEST_INTERPOLATE}");
         assert_eq!(result, "key = hello");
-        unsafe {
-            std::env::remove_var("_LLM_PROXY_TEST_INTERPOLATE");
-        }
     }
 
     #[test]

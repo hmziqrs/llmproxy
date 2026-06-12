@@ -159,8 +159,14 @@ async fn version_returns_build_info() {
     assert_eq!(body["git_sha"], "test");
 }
 
+/// Messages route accepts requests without x-api-key header.
+///
+/// The proxy does not enforce authentication itself -- it forwards the
+/// configured provider API key to the upstream. The upstream is unreachable
+/// (dummy endpoint), so the response is a 502 Bad Gateway, not a 404 (route
+/// is registered) or a 401 (the proxy does not check auth headers).
 #[tokio::test]
-async fn messages_requires_auth_header() {
+async fn messages_without_auth_header_reaches_upstream() {
     let app = build_router(state_with_provider());
     // Minimal Anthropic-shaped request without x-api-key.
     let body = json!({
@@ -175,9 +181,23 @@ async fn messages_requires_auth_header() {
         .body(Body::from(body.to_string()))
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
-    // The proxy requires an x-api-key header; without it the upstream
-    // call should fail, but the route itself must be registered (not 404).
-    assert_ne!(resp.status(), StatusCode::NOT_FOUND);
+    // The route is registered (not 404) and the proxy forwards the request
+    // using its configured API key. The upstream is unreachable, so we get
+    // 502 Bad Gateway (or 500 for a routing error).
+    let status = resp.status();
+    assert_ne!(
+        status,
+        StatusCode::NOT_FOUND,
+        "route must be registered"
+    );
+    let valid_statuses = [
+        StatusCode::BAD_GATEWAY,           // 502 - upstream unreachable
+        StatusCode::INTERNAL_SERVER_ERROR, // 500 - routing error
+    ];
+    assert!(
+        valid_statuses.contains(&status),
+        "expected downstream error for unreachable upstream without auth header, got {status}"
+    );
 }
 
 #[tokio::test]

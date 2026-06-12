@@ -290,10 +290,16 @@ impl GeminiAdapter {
                     CoreContent::ToolResult {
                         tool_use_id,
                         content: result_content,
-                        ..
+                        is_error,
                     } => {
                         // Encode tool-result as a functionResponse part.
                         // Build the response payload from the result content.
+                        if *is_error {
+                            tracing::warn!(
+                                tool_use_id,
+                                "Gemini: is_error flag in ToolResult is not representable in Gemini wire format and will be dropped"
+                            );
+                        }
                         let response_val: serde_json::Value = if result_content.is_empty() {
                             serde_json::json!({"result": ""})
                         } else {

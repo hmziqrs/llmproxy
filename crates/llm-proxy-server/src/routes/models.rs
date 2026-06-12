@@ -50,7 +50,10 @@ struct ModelCard {
     id: String,
     /// OpenAI: always `"model"`.
     object: &'static str,
-    /// OpenAI: Unix timestamp of creation (0 when unknown).
+    /// OpenAI: Unix timestamp of creation. Set to the epoch (0) as a sentinel
+    /// value because the static catalog entries do not carry a creation timestamp.
+    /// A future improvement should propagate the discovered_at or generated_at
+    /// field from the catalog metadata.
     created: u64,
     /// OpenAI: owner identifier (provider name).
     owned_by: String,
@@ -175,7 +178,16 @@ fn map_catalog_error(error: ProviderError) -> RouteError {
             status: StatusCode::BAD_GATEWAY,
             body: message,
         },
-        error => RouteError::Internal(error.to_string()),
+        ProviderError::Serialize(_)
+        | ProviderError::Utf8(_)
+        | ProviderError::SseFraming(_)
+        | ProviderError::EmptyResponse(_)
+        | ProviderError::InvalidConfig(_) => {
+            RouteError::Internal(error.to_string())
+        }
+        // ProviderError is #[non_exhaustive] so a wildcard arm is required
+        // to handle future variants added to the enum.
+        _ => RouteError::Internal(error.to_string()),
     }
 }
 

@@ -226,6 +226,12 @@ pub(crate) fn prepare_request(
     let request_id = state.request_id_gen.next_id();
     let trust_forwarded_headers = state.trust_forwarded_headers();
     let client_ip = get_client_ip(headers, connect_info, trust_forwarded_headers);
+    // Security: loopback bypass is intentional for local development and testing.
+    // When `trust_forwarded_headers` is false, the connection-info IP is guaranteed
+    // to be the actual TCP peer (not spoofable via headers). This means only
+    // processes on the same machine can bypass rate limiting. When
+    // `trust_forwarded_headers` is true, the loopback check is disabled because
+    // the peer IP may be spoofed by an intermediate reverse proxy.
     let direct_loopback =
         !trust_forwarded_headers && connect_info.is_some_and(|address| address.ip().is_loopback());
 
@@ -611,6 +617,11 @@ pub(crate) async fn handle_core_stream(
     // will see the proxy-generated ID instead. This is acceptable for v1;
     // a future improvement could pre-flight the first event to extract the
     // real upstream ID before constructing the encoder.
+    //
+    // TODO(v2): Buffer the first CoreEvent to extract the upstream message ID
+    // from CoreEvent::MessageStart, then construct the client encoder with the
+    // real ID. This avoids clients seeing proxy-generated IDs that differ from
+    // the upstream's own ID.
     let msg_id = match client_protocol {
         ClientProtocol::OpenAiChat => format!("chatcmpl-{}", uuid::Uuid::new_v4()),
         ClientProtocol::Anthropic => format!("msg_{}", uuid::Uuid::new_v4()),
@@ -806,6 +817,12 @@ fn build_sse_output_stream(
     >,
     ctx: StreamContext,
 ) -> BoxStream<'static, Event> {
+    // SSE channel buffer size. 256 events provides ~256 KB of headroom (typical
+    // SSE events are ~1 KB). If the client reads slowly and the buffer fills,
+    // backpressure is applied naturally via the tokio mpsc channel. A larger
+    // buffer reduces the chance of blocking the stream processing task at the
+    // cost of more memory per concurrent stream. This value could be made
+    // configurable via AppState in a future release if tuning is needed.
     let (tx, rx) = tokio::sync::mpsc::channel::<Event>(256);
     let cancel = tokio_util::sync::CancellationToken::new();
     let cancel_clone = cancel.clone();

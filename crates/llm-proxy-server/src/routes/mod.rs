@@ -24,7 +24,17 @@ use messages::handle_messages;
 use models::handle_models;
 use token_count::count_tokens;
 
-const MAX_BODY_BYTES: usize = 32 * 1024 * 1024; // 32 MiB
+/// Maximum request body size for API routes (32 MiB).
+///
+/// This limit applies to all `/providers/{provider}/v1/*` routes via
+/// `DefaultBodyLimit`. The value is chosen to accommodate large multi-turn
+/// conversations with tool-use payloads while protecting against resource
+/// exhaustion. Requests exceeding this limit receive a 413 Payload Too Large
+/// response before any JSON parsing or upstream forwarding occurs.
+///
+/// Note: This limit does NOT apply to lightweight health/readiness/version
+/// endpoints, which accept no request body.
+const MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
 
 /// Maximum body size to drain for 404 fallback responses.
 ///
@@ -124,7 +134,14 @@ async fn not_found(req: Request) -> impl IntoResponse {
     // not have the same head-of-line blocking concern as HTTP/1.1 keep-alive.
     drop(axum::body::to_bytes(req.into_body(), NOT_FOUND_BODY_DRAIN_LIMIT).await);
 
-    if path.contains("/v1/chat/") {
+    // Match `/v1/chat/completions` and `/providers/{provider}/v1/chat/completions`
+    // more specifically to avoid false positives on unrelated `/v1/chat/` paths.
+    // The heuristic checks for the full `chat/completions` segment to reduce
+    // the chance of matching future non-OpenAI routes under `/v1/chat/`.
+    let is_openai_chat_path = path.contains("/v1/chat/completions")
+        || path.contains("/v1/chat/edits");
+
+    if is_openai_chat_path {
         error_response::route_error_response(
             error_response::ClientProtocol::OpenAiChat,
             error_response::RouteError::NotFound,

@@ -24,6 +24,28 @@ use serde_json::{Value, json};
 use tower::ServiceExt;
 
 // ---------------------------------------------------------------------------
+// Mock server readiness helper
+// ---------------------------------------------------------------------------
+
+/// Wait for a mock server to be ready by polling its TCP port.
+///
+/// Replaces `tokio::time::sleep(Duration::from_millis(50))` with a
+/// deterministic readiness check that retries until the server accepts
+/// a connection or the timeout elapses.
+async fn wait_for_ready(addr: std::net::SocketAddr) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if tokio::net::TcpStream::connect(addr).await.is_ok() {
+            return;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("mock server at {addr} did not become ready within 5 s");
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Mock upstream server helpers
 // ---------------------------------------------------------------------------
 
@@ -187,7 +209,7 @@ async fn spawn_mock_server(response_body: Vec<u8>, content_type: &str) -> String
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    wait_for_ready(addr).await;
     format!(
         "http://{}/providers/mock-provider/v1/chat/completions",
         addr
@@ -231,7 +253,7 @@ async fn spawn_mock_openai_chat_stream() -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    wait_for_ready(addr).await;
     format!(
         "http://{}/providers/mock-provider/v1/chat/completions",
         addr
@@ -255,7 +277,7 @@ async fn spawn_mock_500() -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    wait_for_ready(addr).await;
     format!(
         "http://{}/providers/mock-provider/v1/chat/completions",
         addr
@@ -288,7 +310,7 @@ async fn spawn_mock_with_body_capture(
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    wait_for_ready(addr).await;
     (
         format!(
             "http://{}/providers/mock-provider/v1/chat/completions",
@@ -546,7 +568,8 @@ async fn route_preserves_fields_through_core() {
 
     // The OpenAI adapter should have preserved these fields.
     assert_eq!(upstream_json["model"], "gpt-4o");
-    assert_eq!(upstream_json["max_tokens"], 256);
+    // max_tokens serializes as max_completion_tokens per OpenAI API convention
+    assert_eq!(upstream_json["max_completion_tokens"], 256);
     assert_eq!(upstream_json["temperature"], 0.7);
     assert_eq!(upstream_json["top_p"], 0.9);
     // Tools and tool_choice should be preserved.
@@ -822,7 +845,7 @@ async fn streaming_tool_call_maps_to_delta_tool_calls() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    wait_for_ready(addr).await;
     let mock_url = format!("http://{}/providers/mock-provider/v1/messages", addr);
 
     // Use Anthropic provider (which supports tool call events in SSE),
@@ -1125,10 +1148,12 @@ fn source_guard_chat_rs_architecture_boundaries() {
 #[tokio::test]
 async fn not_found_openai_path_returns_openai_shaped_error() {
     let app = build_router(empty_state());
-    // Use a typoed path that does NOT match any mounted route.
+    // Use a path that contains the OpenAI chat completions segment but has an
+    // extra suffix so it does NOT match the mounted route. The path still
+    // matches the OpenAI protocol heuristic in the 404 handler.
     let req = Request::builder()
         .method("POST")
-        .uri("/v1/chat/completin")
+        .uri("/providers/mock-provider/v1/chat/completions/extra")
         .header("content-type", "application/json")
         .body(Body::empty())
         .unwrap();
@@ -1405,7 +1430,7 @@ async fn stream_error_after_first_byte_emits_error_event() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    wait_for_ready(addr).await;
     let mock_url = format!("http://{}/providers/mock-provider/v1/messages", addr);
 
     let state = state_with_anthropic_provider(&mock_url);
@@ -1460,7 +1485,7 @@ async fn upstream_disconnect_completes_with_synthetic_terminal() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    wait_for_ready(addr).await;
     let mock_url = format!("http://{}/providers/mock-provider/v1/messages", addr);
 
     let state = state_with_anthropic_provider(&mock_url);

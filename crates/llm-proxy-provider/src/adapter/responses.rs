@@ -13,8 +13,8 @@ use llm_proxy_protocol::core::{
     ModelRef, StopReason, Usage, UsageProvenance,
 };
 use llm_proxy_protocol::zen::{
-    ResponsesChunk, ResponsesInput, ResponsesReasoning, ResponsesRequest, ResponsesResponse,
-    ResponsesTool, ResponsesUsage,
+    ResponsesChunk, ResponsesInput, ResponsesOutput, ResponsesReasoning, ResponsesRequest,
+    ResponsesResponse, ResponsesTool, ResponsesUsage,
 };
 
 use super::{
@@ -212,23 +212,7 @@ impl ProviderStreamDecoder for ResponsesStreamDecoder {
                 // Extract stop reason from output if present, falling back to
                 // saw_tool_call for streams where function_call output items
                 // may not be present on the response.completed event.
-                let stop_reason = if let Some(ref outputs) = chunk.output {
-                    outputs
-                        .iter()
-                        .find(|o| o.r#type == "function_call")
-                        .map(|_| StopReason::ToolUse)
-                        .unwrap_or_else(|| {
-                            if self.saw_tool_call {
-                                StopReason::ToolUse
-                            } else {
-                                StopReason::EndTurn
-                            }
-                        })
-                } else if self.saw_tool_call {
-                    StopReason::ToolUse
-                } else {
-                    StopReason::EndTurn
-                };
+                let stop_reason = self.infer_stop_reason(chunk.output.as_ref());
 
                 if !self.stop_sent {
                     self.stop_sent = true;
@@ -249,25 +233,7 @@ impl ProviderStreamDecoder for ResponsesStreamDecoder {
 
                 if !self.stop_sent {
                     self.stop_sent = true;
-                    // Check for function_call outputs in the chunk, same as
-                    // response.completed.
-                    let stop_reason = if let Some(ref outputs) = chunk.output {
-                        outputs
-                            .iter()
-                            .find(|o| o.r#type == "function_call")
-                            .map(|_| StopReason::ToolUse)
-                            .unwrap_or_else(|| {
-                                if self.saw_tool_call {
-                                    StopReason::ToolUse
-                                } else {
-                                    StopReason::EndTurn
-                                }
-                            })
-                    } else if self.saw_tool_call {
-                        StopReason::ToolUse
-                    } else {
-                        StopReason::EndTurn
-                    };
+                    let stop_reason = self.infer_stop_reason(chunk.output.as_ref());
                     events.push(CoreEvent::MessageStop {
                         stop_reason,
                         stop_sequence: None,
@@ -351,6 +317,23 @@ impl ResponsesStreamDecoder {
             self.content_index += 1;
         }
     }
+
+    /// Infer the stop reason from output items and whether a tool call was seen.
+    ///
+    /// Checks for `function_call` output items in the chunk. If none are found,
+    /// falls back to the `saw_tool_call` flag that was set during streaming.
+    fn infer_stop_reason(&self, outputs: Option<&Vec<ResponsesOutput>>) -> StopReason {
+        if let Some(outs) = outputs {
+            if outs.iter().any(|o| o.r#type == "function_call") {
+                return StopReason::ToolUse;
+            }
+        }
+        if self.saw_tool_call {
+            StopReason::ToolUse
+        } else {
+            StopReason::EndTurn
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -425,6 +408,18 @@ impl ResponsesAdapter {
                         name,
                         input: tool_input,
                     } => {
+                        // If there was text content before this tool use, emit it
+                        // as a separate input item first to avoid duplicate role
+                        // entries in a single input item.
+                        if !text_parts.is_empty() {
+                            let text: String = text_parts.join("");
+                            input.push(ResponsesInput {
+                                role: role.to_owned(),
+                                content: Some(serde_json::Value::String(text)),
+                            });
+                            text_parts.clear();
+                        }
+
                         // Encode ToolUse as a function_call output item for the
                         // Responses API format (used when replaying prior turns).
                         // The Responses API represents prior tool calls as input

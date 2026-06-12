@@ -228,6 +228,7 @@ impl ProviderRegistry {
                         first_path,
                         file_path.display()
                     ),
+                    source: None,
                 });
             }
 
@@ -260,6 +261,7 @@ impl ProviderRegistry {
                         "duplicate provider name \"{}\": defined in multiple entries",
                         existing.name
                     ),
+                    source: None,
                 });
             }
             map.insert(provider.name.clone(), provider);
@@ -304,6 +306,7 @@ impl ProviderRegistry {
                             "provider \"{}\": adapter \"{}\" uses unknown protocol \"{}\"",
                             provider.name, adapter_name, adapter_cfg.protocol
                         ),
+                        source: None,
                     });
                 }
             }
@@ -512,6 +515,122 @@ mod tests {
                 provider,
                 route: "chat_completions"
             } if provider == "example"
+        ));
+    }
+
+    // -- load_from_dir tests ---------------------------------------------------
+
+    /// Helper: write a minimal valid provider TOML file into `dir`.
+    fn write_provider(dir: &std::path::Path, filename: &str, name: &str) {
+        let content = format!(
+            r#"
+[provider]
+name = "{name}"
+api_key = "test-key"
+auth_style = "bearer"
+
+[provider.adapters.chat]
+protocol = "openai_chat_completions"
+endpoint = "https://example.com/v1/chat/completions"
+
+[provider.routes]
+chat_completions = "chat"
+"#
+        );
+        std::fs::write(dir.join(filename), content).expect("write provider toml");
+    }
+
+    #[test]
+    fn load_from_dir_loads_valid_providers() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        write_provider(dir.path(), "alpha.toml", "alpha");
+        write_provider(dir.path(), "beta.toml", "beta");
+
+        let registry = ProviderRegistry::load_from_dir(dir.path()).expect("load_from_dir");
+        assert_eq!(registry.len(), 2);
+        assert!(registry.get("alpha").is_some());
+        assert!(registry.get("beta").is_some());
+    }
+
+    #[test]
+    fn load_from_dir_rejects_duplicate_provider_names() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        write_provider(dir.path(), "a.toml", "dup");
+        write_provider(dir.path(), "b.toml", "dup");
+
+        let err = ProviderRegistry::load_from_dir(dir.path()).expect_err("duplicate");
+        assert!(
+            matches!(err, CoreError::ProviderResolution { .. }),
+            "expected ProviderResolution error for duplicates, got: {err:?}"
+        );
+        assert!(err.to_string().contains("duplicate provider name"));
+    }
+
+    #[test]
+    fn load_from_dir_skips_non_toml_files() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        write_provider(dir.path(), "valid.toml", "valid");
+        std::fs::write(dir.path().join("readme.md"), "not a config").expect("write readme");
+
+        let registry = ProviderRegistry::load_from_dir(dir.path()).expect("load_from_dir");
+        assert_eq!(registry.len(), 1);
+        assert!(registry.get("valid").is_some());
+    }
+
+    #[test]
+    fn load_from_dir_handles_empty_directory() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let registry = ProviderRegistry::load_from_dir(dir.path()).expect("load_from_dir");
+        assert!(registry.is_empty());
+    }
+
+    #[test]
+    fn load_from_dir_skips_symlinks() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        write_provider(dir.path(), "real.toml", "real");
+
+        // Create a symlink to the real file.
+        #[cfg(unix)]
+        {
+            let link = dir.path().join("linked.toml");
+            std::os::unix::fs::symlink(dir.path().join("real.toml"), &link)
+                .expect("create symlink");
+        }
+        // On non-Unix, skip symlink creation (test still passes; just fewer entries).
+        let registry = ProviderRegistry::load_from_dir(dir.path()).expect("load_from_dir");
+        // Should only have "real" -- the symlink must be skipped.
+        assert!(registry.get("real").is_some());
+        assert_eq!(registry.len(), 1, "symlink should be skipped");
+    }
+
+    // -- MissingAdapter test ---------------------------------------------------
+
+    #[test]
+    fn resolve_provider_route_returns_missing_adapter_error() {
+        // Build a provider with a route that points to a non-existent adapter.
+        let provider = ProviderConfig {
+            name: "broken".to_owned(),
+            api_key: "key".to_owned(),
+            auth_style: AuthStyle::Bearer,
+            adapters: HashMap::new(), // no adapters defined
+            routes: ProviderRoutesConfig {
+                chat_completions: Some("nonexistent_adapter".to_owned()),
+                messages: None,
+            },
+            model_aliases: HashMap::new(),
+            discovery: None,
+            catalog: None,
+        };
+        let registry = ProviderRegistry::from_providers(vec![provider]).expect("registry");
+
+        let error = registry
+            .resolve_provider_route("broken", ProviderRouteKind::ChatCompletions, "model")
+            .expect_err("missing adapter");
+
+        assert!(matches!(
+            error,
+            ProviderRouteResolutionError::MissingAdapter { provider, adapter, .. }
+                if provider == "broken" && adapter == "nonexistent_adapter"
         ));
     }
 }

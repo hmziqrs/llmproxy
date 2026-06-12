@@ -317,6 +317,7 @@ mod tests {
             "rate_limiter",
             "request_dedup",
             "request_id_gen",
+            "model_catalogs",
         ] {
             assert!(
                 debug_output.contains(field),
