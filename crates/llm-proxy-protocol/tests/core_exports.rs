@@ -127,3 +127,57 @@ fn core_request_full_round_trip() {
     let back: CoreRequest = serde_json::from_str(&json).expect("CoreRequest should deserialize");
     assert_eq!(req, back, "CoreRequest round-trip should be structurally equal");
 }
+
+/// Verify that CoreResponse round-trips with full structural equality.
+///
+/// Analogous to `core_request_full_round_trip` but exercises the response type
+/// with diverse content variants (Text, ToolUse, Thinking) and all CoreResponse
+/// fields including usage, stop_reason, stop_sequence, and provider_meta.
+#[test]
+fn core_response_full_round_trip() {
+    let mut provider_meta = serde_json::Map::new();
+    provider_meta.insert(
+        "log_id".into(),
+        serde_json::Value::String("log_abc".into()),
+    );
+    let resp = CoreResponse {
+        id: Some("resp_round_trip".into()),
+        model: ModelRef {
+            requested: "test-model".into(),
+            upstream: None,
+        },
+        content: vec![
+            CoreContent::Thinking {
+                text: "reasoning about the question".into(),
+                signature: Some("sig_abc".into()),
+            },
+            CoreContent::Text {
+                text: "Here is my answer".into(),
+                cache: None,
+            },
+            CoreContent::ToolUse {
+                id: "call_1".into(),
+                name: "search".into(),
+                input: serde_json::json!({"query": "rust serde"}),
+            },
+        ],
+        stop_reason: StopReason::ToolUse,
+        stop_sequence: Some("\n".into()),
+        usage: Usage {
+            input_tokens: 42,
+            output_tokens: 87,
+            reasoning_tokens: Some(15),
+            cache_creation_input_tokens: Some(100),
+            cache_read_input_tokens: None,
+            provenance: UsageProvenance::ProviderReported,
+        },
+        provider_meta,
+    };
+    let json = serde_json::to_string(&resp).expect("CoreResponse should serialize");
+    let back: CoreResponse =
+        serde_json::from_str(&json).expect("CoreResponse should deserialize");
+    assert_eq!(
+        resp, back,
+        "CoreResponse round-trip should be structurally equal"
+    );
+}

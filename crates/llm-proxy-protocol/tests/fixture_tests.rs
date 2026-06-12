@@ -20,9 +20,7 @@
 
 use llm_proxy_protocol::anthropic::{MessageEvent, MessageRequest as AnthropicMessageRequest};
 use llm_proxy_protocol::client::{anthropic as anthropic_adapter, openai_chat as openai_adapter};
-use llm_proxy_protocol::core::{
-    CoreContent, CoreEvent, CoreResponse, ModelRef, StopReason, Usage, UsageProvenance,
-};
+use llm_proxy_protocol::core::{CoreEvent, CoreResponse};
 use llm_proxy_protocol::openai::{ChatCompletionChunk, ChatCompletionRequest};
 
 use std::fs;
@@ -33,18 +31,6 @@ use std::path::Path;
 // ---------------------------------------------------------------------------
 
 const FIXTURE_ROOT: &str = "tests/fixtures";
-
-/// Convert an i64 token count to i32 with an overflow assertion.
-///
-/// Token counts in JSON are i64 but the protocol uses i32. This helper catches
-/// overflow in test fixtures (which should never have values exceeding i32::MAX).
-fn i64_to_i32_tokens(val: i64, field_name: &str, adapter: &str) -> i32 {
-    assert!(
-        val <= i32::MAX as i64,
-        "{adapter}: {field_name} value {val} exceeds i32::MAX in test fixture"
-    );
-    val as i32
-}
 
 /// Read a fixture file as a parsed JSON value.
 fn read_fixture(dir: &Path, name: &str) -> serde_json::Value {
@@ -114,279 +100,6 @@ fn assert_malformed_returns_error(adapter: &str, input_json: &serde_json::Value)
         result.is_err(),
         "expected error for malformed input in adapter {adapter}, got success"
     );
-}
-
-/// Build a CoreResponse from the output.json fixture fields for non-stream cases.
-fn build_core_response_from_output(adapter: &str, output_json: &serde_json::Value) -> CoreResponse {
-    match adapter {
-        "anthropic" => {
-            let content = output_json
-                .get("content")
-                .and_then(|c| c.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|block| {
-                            let t = block.get("type")?.as_str()?;
-                            match t {
-                                "text" => Some(CoreContent::Text {
-                                    text: block
-                                        .get("text")
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or("")
-                                        .into(),
-                                    cache: None,
-                                }),
-                                "tool_use" => Some(CoreContent::ToolUse {
-                                    id: block
-                                        .get("id")
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or_else(|| panic!(
-                                            "anthropic tool_use block missing 'id' field in output.json for {adapter}"
-                                        ))
-                                        .into(),
-                                    name: block
-                                        .get("name")
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or_else(|| panic!(
-                                            "anthropic tool_use block missing 'name' field in output.json for {adapter}"
-                                        ))
-                                        .into(),
-                                    input: block.get("input").cloned().unwrap_or(
-                                        serde_json::Value::Object(serde_json::Map::new()),
-                                    ),
-                                }),
-                                "thinking" => Some(CoreContent::Thinking {
-                                    text: block
-                                        .get("thinking")
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or("")
-                                        .into(),
-                                    signature: block
-                                        .get("signature")
-                                        .and_then(|v| v.as_str())
-                                        .map(String::from),
-                                }),
-                                "redacted_thinking" => Some(CoreContent::RedactedThinking {
-                                    data: block.get("data").cloned().unwrap_or(
-                                        serde_json::Value::Object(serde_json::Map::new()),
-                                    ),
-                                }),
-                                "image" => Some(CoreContent::Image {
-                                    source: block.get("source").cloned().unwrap_or(
-                                        serde_json::Value::Object(serde_json::Map::new()),
-                                    ),
-                                }),
-                                "document" => Some(CoreContent::Document {
-                                    source: block.get("source").cloned().unwrap_or(
-                                        serde_json::Value::Object(serde_json::Map::new()),
-                                    ),
-                                }),
-                                "audio" => Some(CoreContent::Audio {
-                                    source: block.get("source").cloned().unwrap_or(
-                                        serde_json::Value::Object(serde_json::Map::new()),
-                                    ),
-                                }),
-                                "video" => Some(CoreContent::Video {
-                                    source: block.get("source").cloned().unwrap_or(
-                                        serde_json::Value::Object(serde_json::Map::new()),
-                                    ),
-                                }),
-                                "refusal" => Some(CoreContent::Refusal {
-                                    text: block
-                                        .get("text")
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or("")
-                                        .into(),
-                                }),
-                                "tool_result" => Some(CoreContent::ToolResult {
-                                    tool_use_id: block
-                                        .get("tool_use_id")
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or_else(|| panic!(
-                                            "anthropic tool_result block missing 'tool_use_id' field in output.json for {adapter}"
-                                        ))
-                                        .into(),
-                                    content: Vec::new(),
-                                    is_error: block
-                                        .get("is_error")
-                                        .and_then(|v| v.as_bool())
-                                        .unwrap_or(false),
-                                }),
-                                _ => panic!(
-                                    "build_core_response_from_output (anthropic): \
-                                     unknown content type in output.json. Add a branch."
-                                ),
-                            }
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-            let stop_reason = match output_json
-                .get("stop_reason")
-                .and_then(|v| v.as_str())
-                .unwrap_or_else(|| panic!("anthropic output.json must contain 'stop_reason' field"))
-            {
-                "end_turn" => StopReason::EndTurn,
-                "max_tokens" => StopReason::MaxTokens,
-                "tool_use" => StopReason::ToolUse,
-                "stop_sequence" => StopReason::StopSequence,
-                _ => StopReason::Unknown,
-            };
-            let usage_json = output_json
-                .get("usage")
-                .cloned()
-                .unwrap_or(serde_json::json!({}));
-            CoreResponse {
-                id: output_json
-                    .get("id")
-                    .and_then(|v| v.as_str())
-                    .map(String::from),
-                model: ModelRef {
-                    requested: output_json
-                        .get("model")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("unknown")
-                        .into(),
-                    upstream: None,
-                },
-                content,
-                stop_reason,
-                stop_sequence: output_json
-                    .get("stop_sequence")
-                    .and_then(|v| v.as_str())
-                    .map(String::from),
-                usage: Usage {
-                    input_tokens: i64_to_i32_tokens(
-                        usage_json.get("input_tokens").and_then(|v| v.as_i64()).unwrap_or(0),
-                        "input_tokens", adapter,
-                    ),
-                    output_tokens: i64_to_i32_tokens(
-                        usage_json.get("output_tokens").and_then(|v| v.as_i64()).unwrap_or(0),
-                        "output_tokens", adapter,
-                    ),
-                    reasoning_tokens: None,
-                    cache_creation_input_tokens: None,
-                    cache_read_input_tokens: None,
-                    provenance: UsageProvenance::ProviderReported,
-                },
-                provider_meta: serde_json::Map::new(),
-            }
-        }
-        "openai_chat" => {
-            let choice = output_json
-                .get("choices")
-                .and_then(|c| c.as_array())
-                .and_then(|a| a.first());
-            let msg = choice.and_then(|c| c.get("message"));
-            let mut content = Vec::new();
-            if let Some(msg) = msg {
-                if let Some(text) = msg.get("content").and_then(|v| v.as_str()) {
-                    if !text.is_empty() {
-                        content.push(CoreContent::Text {
-                            text: text.into(),
-                            cache: None,
-                        });
-                    }
-                }
-                if let Some(reasoning) = msg.get("reasoning_content").and_then(|v| v.as_str()) {
-                    content.insert(
-                        0,
-                        CoreContent::Thinking {
-                            text: reasoning.into(),
-                            signature: None,
-                        },
-                    );
-                }
-                if let Some(tool_calls) = msg.get("tool_calls").and_then(|v| v.as_array()) {
-                    for tc in tool_calls {
-                        let args: serde_json::Value = tc
-                            .get("function")
-                            .and_then(|f| f.get("arguments"))
-                            .and_then(|a| a.as_str())
-                            .and_then(|a| serde_json::from_str(a).ok())
-                            .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
-                        content.push(CoreContent::ToolUse {
-                            id: tc.get("id").and_then(|v| v.as_str())
-                                .unwrap_or_else(|| panic!(
-                                    "openai_chat tool_call missing 'id' field in output.json"
-                                ))
-                                .into(),
-                            name: tc
-                                .get("function")
-                                .and_then(|f| f.get("name"))
-                                .and_then(|v| v.as_str())
-                                .unwrap_or_else(|| panic!(
-                                    "openai_chat tool_call missing 'function.name' field in output.json"
-                                ))
-                                .into(),
-                            input: args,
-                        });
-                    }
-                }
-                // Handle refusal content in OpenAI responses.
-                if let Some(refusal) = msg.get("refusal").and_then(|v| v.as_str()) {
-                    if !refusal.is_empty() {
-                        content.push(CoreContent::Refusal {
-                            text: refusal.into(),
-                        });
-                    }
-                }
-            }
-            let finish_reason = choice
-                .and_then(|c| c.get("finish_reason"))
-                .and_then(|v| v.as_str())
-                .unwrap_or_else(|| {
-                    panic!("openai_chat output.json must contain 'finish_reason' in choices[0]")
-                });
-            let stop_reason = match finish_reason {
-                "stop" => StopReason::EndTurn,
-                "length" => StopReason::MaxTokens,
-                "tool_calls" => StopReason::ToolUse,
-                "content_filter" => StopReason::Refusal,
-                _ => StopReason::Unknown,
-            };
-            let usage_json = output_json
-                .get("usage")
-                .cloned()
-                .unwrap_or(serde_json::json!({}));
-            CoreResponse {
-                id: output_json
-                    .get("id")
-                    .and_then(|v| v.as_str())
-                    .map(String::from),
-                model: ModelRef {
-                    requested: output_json
-                        .get("model")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("unknown")
-                        .into(),
-                    upstream: None,
-                },
-                content,
-                stop_reason,
-                stop_sequence: output_json
-                    .get("stop_sequence")
-                    .and_then(|v| v.as_str())
-                    .map(String::from),
-                usage: Usage {
-                    input_tokens: i64_to_i32_tokens(
-                        usage_json.get("prompt_tokens").and_then(|v| v.as_i64()).unwrap_or(0),
-                        "prompt_tokens", adapter,
-                    ),
-                    output_tokens: i64_to_i32_tokens(
-                        usage_json.get("completion_tokens").and_then(|v| v.as_i64()).unwrap_or(0),
-                        "completion_tokens", adapter,
-                    ),
-                    reasoning_tokens: None,
-                    cache_creation_input_tokens: None,
-                    cache_read_input_tokens: None,
-                    provenance: UsageProvenance::ProviderReported,
-                },
-                provider_meta: serde_json::Map::new(),
-            }
-        }
-        _ => panic!("unknown adapter: {adapter}"),
-    }
 }
 
 /// Verify that encoding a CoreResponse produces output that matches output.json.
@@ -531,20 +244,16 @@ fn run_non_stream_fixture(adapter: &str, case: &str) {
 
     assert_decode_matches_core(adapter, &input, &core);
 
-    // Encode direction: construct a CoreResponse from the adapter-specific
-    // output.json via build_core_response_from_output, encode it back through
-    // the adapter, and compare key fields with output.json.
-    //
-    // NOTE: This is not a fully independent round-trip -- the CoreResponse is
-    // built from the same output.json it is compared against.  The decode
-    // direction (above) is the true cross-format test.  The encode direction
-    // primarily verifies that encode_response produces structurally correct
-    // output for a given CoreResponse.  If core-response.json fixtures are
-    // added in a future audit, the encode test should construct CoreResponse
-    // from those instead.
+    // Encode direction: load the independently-authored core-response.json
+    // (normalized CoreResponse), encode it through the adapter, and compare
+    // key fields with output.json.  This breaks the tautology where the
+    // CoreResponse was previously derived from the same output.json it was
+    // compared against.
     if dir.join("output.json").exists() {
         let output = read_fixture(&dir, "output.json");
-        let response = build_core_response_from_output(adapter, &output);
+        let core_response_raw = read_fixture_raw(&dir, "core-response.json");
+        let response: CoreResponse = serde_json::from_str(&core_response_raw)
+            .unwrap_or_else(|e| panic!("failed to parse core-response.json: {e}"));
         assert_encode_matches_output(adapter, response, &output);
     }
 }
@@ -690,6 +399,10 @@ fn all_anthropic_non_stream_fixtures_have_required_files() {
                 dir.join("output.json").exists(),
                 "anthropic/{case}/output.json is missing"
             );
+            assert!(
+                dir.join("core-response.json").exists(),
+                "anthropic/{case}/core-response.json is missing"
+            );
         }
     }
 }
@@ -722,6 +435,10 @@ fn all_openai_non_stream_fixtures_have_required_files() {
             assert!(
                 dir.join("output.json").exists(),
                 "openai_chat/{case}/output.json is missing"
+            );
+            assert!(
+                dir.join("core-response.json").exists(),
+                "openai_chat/{case}/core-response.json is missing"
             );
         }
     }
@@ -791,31 +508,31 @@ fn required_client_non_stream_cases() -> Vec<(&'static str, Vec<&'static str>)> 
     vec![
         (
             "plain-text-request",
-            vec!["input.json", "core.json", "output.json"],
+            vec!["input.json", "core.json", "output.json", "core-response.json"],
         ),
         (
             "system-prompt",
-            vec!["input.json", "core.json", "output.json"],
+            vec!["input.json", "core.json", "output.json", "core-response.json"],
         ),
-        ("tool-call", vec!["input.json", "core.json", "output.json"]),
+        ("tool-call", vec!["input.json", "core.json", "output.json", "core-response.json"]),
         (
             "tool-result",
-            vec!["input.json", "core.json", "output.json"],
+            vec!["input.json", "core.json", "output.json", "core-response.json"],
         ),
-        ("thinking", vec!["input.json", "core.json", "output.json"]),
+        ("thinking", vec!["input.json", "core.json", "output.json", "core-response.json"]),
         (
             "cache-control",
-            vec!["input.json", "core.json", "output.json"],
+            vec!["input.json", "core.json", "output.json", "core-response.json"],
         ),
         (
             "tool-choice",
-            vec!["input.json", "core.json", "output.json"],
+            vec!["input.json", "core.json", "output.json", "core-response.json"],
         ),
         (
             "stop-reason",
-            vec!["input.json", "core.json", "output.json"],
+            vec!["input.json", "core.json", "output.json", "core-response.json"],
         ),
-        ("usage", vec!["input.json", "core.json", "output.json"]),
+        ("usage", vec!["input.json", "core.json", "output.json", "core-response.json"]),
         ("malformed", vec!["input.json"]),
         // TODO: Additional cases for the next audit round:
         //   multiple-messages, refusal, redacted-thinking, image/document/audio/video
@@ -893,6 +610,22 @@ fn coverage_matrix_all_required_client_fixtures_exist() {
 // ---------------------------------------------------------------------------
 // Streaming fixture validation tests
 // ---------------------------------------------------------------------------
+
+// TODO(streaming-audit): The streaming fixture tests below only validate
+// structure (core-events.json deserializes, SSE files contain valid SSE lines,
+// encoder produces some valid output).  They do NOT perform strict byte-level
+// comparison of the encoded output.sse against the fixture's output.sse.  This
+// gap exists because:
+//   1. The StreamEncoder may emit additional framing events (e.g.
+//      content_block_start/stop) not explicitly listed in the minimal
+//      core-events.json representation.
+//   2. A strict comparison would require normalizing SSE whitespace and event
+//      ordering, or building a SSE parser that extracts structured events from
+//      both the actual output and output.sse for semantic comparison.
+//   3. The streaming decode path (input.sse -> CoreEvents) is not yet
+//      implemented for client adapters (only provider adapters have
+//      StreamDecoder).
+// Adding strict output.sse comparison is deferred to a future audit round.
 
 /// Verify that the core-events.json fixture can be deserialized into CoreEvent
 /// values. This is a basic validation that streaming fixtures are well-formed.

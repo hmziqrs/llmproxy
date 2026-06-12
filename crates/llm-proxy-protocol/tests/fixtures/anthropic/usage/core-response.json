@@ -1,0 +1,16 @@
+{
+  "id": "msg_test",
+  "model": { "requested": "claude-sonnet-4-20250514", "upstream": null },
+  "content": [{ "Text": { "text": "Hi there!", "cache": null } }],
+  "stop_reason": "EndTurn",
+  "stop_sequence": null,
+  "usage": {
+    "input_tokens": 100,
+    "output_tokens": 200,
+    "reasoning_tokens": null,
+    "cache_creation_input_tokens": null,
+    "cache_read_input_tokens": null,
+    "provenance": "ProviderReported"
+  },
+  "provider_meta": {}
+}

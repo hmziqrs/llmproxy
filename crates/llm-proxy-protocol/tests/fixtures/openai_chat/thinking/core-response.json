@@ -1,0 +1,19 @@
+{
+  "id": "chatcmpl-test",
+  "model": { "requested": "gpt-4o", "upstream": null },
+  "content": [
+    { "Thinking": { "text": "Let me think about this...", "signature": null } },
+    { "Text": { "text": "The answer is 42", "cache": null } }
+  ],
+  "stop_reason": "EndTurn",
+  "stop_sequence": null,
+  "usage": {
+    "input_tokens": 10,
+    "output_tokens": 20,
+    "reasoning_tokens": null,
+    "cache_creation_input_tokens": null,
+    "cache_read_input_tokens": null,
+    "provenance": "ProviderReported"
+  },
+  "provider_meta": {}
+}
