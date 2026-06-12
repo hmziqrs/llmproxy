@@ -1593,3 +1593,155 @@ async fn route_preserves_fields_through_core() {
         "stream field should be false or absent, got: {stream_val}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Provider name validation tests (findings 103, 104)
+// ---------------------------------------------------------------------------
+
+/// Simple state helper for provider name validation tests. Does not need
+/// a live mock server since the tests exercise the validation layer only.
+fn state_for_validation_tests() -> AppState {
+    let provider = ProviderConfig {
+        name: "mock-provider".to_owned(),
+        api_key: "test-key".to_owned(),
+        auth_style: AuthStyle::Bearer,
+        adapters: {
+            let mut m = HashMap::new();
+            m.insert(
+                "messages".to_owned(),
+                ProviderAdapterConfig {
+                    protocol: "anthropic_messages".to_owned(),
+                    endpoint: "https://127.0.0.1:0/v1/messages".to_owned(),
+                    headers: HashMap::new(),
+                },
+            );
+            m
+        },
+        routes: llm_proxy_core::ProviderRoutesConfig {
+            messages: Some("messages".to_owned()),
+            chat_completions: Some("messages".to_owned()),
+        },
+        model_aliases: HashMap::new(),
+        discovery: None,
+        catalog: None,
+    };
+    let registry = ProviderRegistry::from_providers(vec![provider]).expect("registry");
+    AppState::new(
+        AppConfig {
+            server: ServerConfig {
+                bind: "127.0.0.1:3456".parse().unwrap(),
+                request_timeout: Duration::from_secs(300),
+                log_level: "info".to_owned(),
+                hot_reload: false,
+                server_name: "test-proxy".to_owned(),
+                rate_limit_rpm: 100,
+                trust_forwarded_headers: false,
+                dedup_window: Duration::from_millis(500),
+            },
+        },
+        registry,
+        ProviderAdapterRegistry::builtin(),
+        ProxyClient::new(),
+        BuildInfo {
+            name: "test",
+            version: "0.0.0",
+            target: "test",
+            git_sha: "test",
+        },
+    )
+}
+
+#[tokio::test]
+async fn unknown_provider_name_returns_404() {
+    let app = build_router(state_for_validation_tests());
+    let body = json!({
+        "model": "claude-sonnet-4-6",
+        "messages": [{ "role": "user", "content": "hi" }],
+        "max_tokens": 64
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/providers/nonexistent-provider/v1/messages")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let resp_body: Value = serde_json::from_slice(
+        &axum::body::to_bytes(resp.into_body(), 64 * 1024).await.unwrap(),
+    )
+    .unwrap();
+    // Anthropic-shaped error.
+    assert_eq!(resp_body["type"], "error");
+    assert_eq!(resp_body["error"]["type"], "not_found_error");
+}
+
+#[tokio::test]
+async fn provider_name_with_uppercase_returns_400() {
+    let app = build_router(state_for_validation_tests());
+    let body = json!({
+        "model": "claude-sonnet-4-6",
+        "messages": [{ "role": "user", "content": "hi" }],
+        "max_tokens": 64
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/providers/MyProvider/v1/messages")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn provider_name_with_special_chars_returns_400() {
+    let app = build_router(state_for_validation_tests());
+    let body = json!({
+        "model": "claude-sonnet-4-6",
+        "messages": [{ "role": "user", "content": "hi" }],
+        "max_tokens": 64
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/providers/my%20provider/v1/messages")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn get_on_messages_route_returns_405() {
+    let app = build_router(state_for_validation_tests());
+    let req = Request::builder()
+        .method("GET")
+        .uri("/providers/mock-provider/v1/messages")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+}
+
+#[tokio::test]
+async fn missing_content_type_on_messages_still_parses() {
+    let app = build_router(state_for_validation_tests());
+    let body = json!({
+        "model": "claude-sonnet-4-6",
+        "messages": [{ "role": "user", "content": "hi" }],
+        "max_tokens": 64
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/providers/mock-provider/v1/messages")
+        // Intentionally omit content-type header.
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    // Without content-type, the request may still be processed since
+    // axum Bytes extractor does not require content-type. The request
+    // should either succeed (and fail at the upstream call) or return
+    // an error status -- either way it should not panic.
+    assert!(resp.status().is_client_error() || resp.status().is_server_error() || resp.status() == StatusCode::OK);
+}

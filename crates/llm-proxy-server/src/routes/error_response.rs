@@ -252,19 +252,6 @@ fn openai_error_response(error: RouteError) -> Response<Body> {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Build an OpenAI-shaped SSE error JSON string for in-band stream errors.
-///
-/// Defaults to `"api_error"` as the error type. For other error types, use
-/// [`openai_stream_error_json_with_type`] directly.
-///
-/// Reuses the same typed structs (`OpenAiErrorBody`, `OpenAiErrorDetail`) as
-/// the HTTP error path so both paths go through the same compile-time-validated
-/// serialization.
-#[allow(dead_code)]
-pub fn openai_stream_error_json(message: &str) -> Option<String> {
-    openai_stream_error_json_with_type(message, "api_error")
-}
-
 /// Build an OpenAI-shaped SSE error JSON string with a custom error type.
 pub fn openai_stream_error_json_with_type(message: &str, error_type: &str) -> Option<String> {
     let body = OpenAiErrorBody {
@@ -362,6 +349,13 @@ fn map_upstream_status(upstream: StatusCode) -> StatusCode {
                     upstream_status = code,
                     "upstream returned a status that may indicate a configuration issue \
                      (auth failure, forbidden, or not found); mapping to 502 for client"
+                );
+            } else if code < 400 {
+                // Informational (1xx), success (2xx), or redirect (3xx) codes should
+                // never reach the error path. Log at debug level for diagnostics.
+                tracing::debug!(
+                    upstream_status = code,
+                    "unexpected 1xx/2xx/3xx upstream status in error path; mapping to 502"
                 );
             }
             StatusCode::BAD_GATEWAY
@@ -890,5 +884,25 @@ mod tests {
     fn client_protocol_equality() {
         assert_eq!(ClientProtocol::Anthropic, ClientProtocol::Anthropic);
         assert_ne!(ClientProtocol::Anthropic, ClientProtocol::OpenAiChat);
+    }
+
+    // -- openai_stream_error_json_with_type (finding 55) -----------------------
+
+    #[test]
+    fn stream_error_json_produces_valid_structure() {
+        let json_str = openai_stream_error_json_with_type("test error", "server_error");
+        assert!(json_str.is_some());
+        let json: serde_json::Value = serde_json::from_str(&json_str.unwrap()).unwrap();
+        assert_eq!(json["error"]["message"], "test error");
+        assert_eq!(json["error"]["type"], "server_error");
+        assert!(json["error"]["code"].is_null());
+    }
+
+    #[test]
+    fn stream_error_json_with_empty_message() {
+        let json_str = openai_stream_error_json_with_type("", "api_error");
+        assert!(json_str.is_some());
+        let json: serde_json::Value = serde_json::from_str(&json_str.unwrap()).unwrap();
+        assert_eq!(json["error"]["message"], "");
     }
 }

@@ -51,9 +51,9 @@ impl ModelCatalogService {
         provider: &ProviderConfig,
         refresh_live: bool,
     ) -> Result<Vec<StaticModelCatalogEntry>, ProviderError> {
-        let config = provider.catalog.clone().unwrap_or_default();
+        let config_ref = provider.catalog.as_ref();
         self.load_disk_cache(provider).await?;
-        let discovery_enabled = !matches!(config.mode, llm_proxy_core::ProviderCatalogMode::Static)
+        let discovery_enabled = config_ref.is_some_and(|c| !matches!(c.mode, llm_proxy_core::ProviderCatalogMode::Static))
             && provider.discovery.is_some();
         if refresh_live && discovery_enabled && !self.cache_is_fresh(provider).await {
             if let Err(error) = self.refresh(provider).await {
@@ -64,8 +64,11 @@ impl ModelCatalogService {
                     .get(&provider.name)
                     .map(|file| file.catalog.models.clone())
                     .unwrap_or_default();
-                let has_fallback = !merge_catalog(&config, &stale).is_empty();
-                if !has_fallback {
+                let merged = merge_catalog(
+                    &config_ref.cloned().unwrap_or_default(),
+                    &stale,
+                );
+                if merged.is_empty() {
                     return Err(error);
                 }
                 tracing::warn!(provider = %provider.name, error = %error, "catalog refresh failed; using stale/static catalog");
@@ -79,7 +82,7 @@ impl ModelCatalogService {
             .get(&provider.name)
             .map(|file| file.catalog.models.clone())
             .unwrap_or_default();
-        Ok(merge_catalog(&config, &discovered))
+        Ok(merge_catalog(&config_ref.cloned().unwrap_or_default(), &discovered))
     }
 
     async fn refresh(&self, provider: &ProviderConfig) -> Result<(), ProviderError> {
@@ -177,7 +180,13 @@ impl ModelCatalogService {
     }
 
     async fn cache_is_fresh(&self, provider: &ProviderConfig) -> bool {
-        let ttl = provider.catalog.clone().unwrap_or_default().cache_ttl;
+        let ttl = provider
+            .catalog
+            .as_ref()
+            .map_or_else(std::time::Duration::default, |c| c.cache_ttl);
+        // Clamp the TTL seconds to i64 range to avoid silent wrapping on
+        // absurdly large values. In practice, TTL is always well within range.
+        let ttl_secs = i64::try_from(ttl.as_secs()).unwrap_or(i64::MAX);
         self.cache
             .read()
             .await
@@ -189,9 +198,7 @@ impl ModelCatalogService {
                 )
                 .ok()
                 .map(|generated_at| time::OffsetDateTime::now_utc() - generated_at)
-                .is_some_and(|age| {
-                    age.whole_seconds() >= 0 && age.whole_seconds() < ttl.as_secs() as i64
-                })
+                .is_some_and(|age| age.whole_seconds() >= 0 && age.whole_seconds() < ttl_secs)
             })
     }
 
@@ -671,6 +678,129 @@ mod tests {
         assert!(
             !service.cache_is_fresh(&provider).await,
             "cache with no entries should not be fresh"
+        );
+    }
+
+    // -- cache_is_fresh boundary tests (findings 4, 10) ------------------------
+
+    #[tokio::test]
+    async fn cache_is_fresh_with_zero_ttl_is_always_stale() {
+        let directory = temp_dir();
+        let now = time::OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        write_catalog_atomic(&directory, &catalog_file(&now)).unwrap();
+
+        let service = ModelCatalogService::new(Some(directory.clone()));
+        let mut provider = provider("http://127.0.0.1:0/models".to_owned());
+        provider.catalog.as_mut().unwrap().cache_ttl = Duration::ZERO;
+        service.load_disk_cache(&provider).await.unwrap();
+        assert!(
+            !service.cache_is_fresh(&provider).await,
+            "cache with zero TTL should always be stale"
+        );
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cache_is_fresh_with_future_timestamp_is_stale() {
+        let directory = temp_dir();
+        // A timestamp far in the future (clock skew)
+        let future = time::OffsetDateTime::now_utc() + time::Duration::hours(1);
+        let future_str = future
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        write_catalog_atomic(&directory, &catalog_file(&future_str)).unwrap();
+
+        let service = ModelCatalogService::new(Some(directory.clone()));
+        let provider = provider("http://127.0.0.1:0/models".to_owned());
+        service.load_disk_cache(&provider).await.unwrap();
+        assert!(
+            !service.cache_is_fresh(&provider).await,
+            "cache with future timestamp should be stale (age < 0)"
+        );
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cache_is_fresh_with_malformed_timestamp_is_stale() {
+        let directory = temp_dir();
+        write_catalog_atomic(&directory, &catalog_file("not-a-valid-timestamp")).unwrap();
+
+        let service = ModelCatalogService::new(Some(directory.clone()));
+        let provider = provider("http://127.0.0.1:0/models".to_owned());
+        service.load_disk_cache(&provider).await.unwrap();
+        assert!(
+            !service.cache_is_fresh(&provider).await,
+            "cache with malformed timestamp should be stale"
+        );
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    // -- Concurrent successful refresh test (finding 13) -----------------------
+
+    async fn succeeding_server(model_ids: Vec<&str>) -> (String, Arc<AtomicUsize>) {
+        let count = Arc::new(AtomicUsize::new(0));
+        let models_json = model_ids
+            .iter()
+            .map(|id| format!("{{\"id\":\"{id}\"}}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let body = format!("{{\"object\":\"list\",\"data\":[{models_json}]}}");
+        let body_clone = body.clone();
+        let count_clone = count.clone();
+        let app = Router::new().route(
+            "/models",
+            get(move || {
+                let b = body_clone.clone();
+                let c = count_clone.clone();
+                async move {
+                    c.fetch_add(1, Ordering::SeqCst);
+                    (StatusCode::OK, [(axum::http::header::CONTENT_TYPE, "application/json")], b)
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{address}/models"), count)
+    }
+
+    #[tokio::test]
+    async fn concurrent_successful_refreshes_are_single_flight() {
+        let (endpoint, count) = succeeding_server(vec!["model-a", "model-b"]).await;
+        let provider = Arc::new(provider(endpoint));
+        let service = Arc::new(ModelCatalogService::new(None));
+        let barrier = Arc::new(tokio::sync::Barrier::new(6));
+        let mut tasks = Vec::new();
+        for _ in 0..6 {
+            let provider = provider.clone();
+            let service = service.clone();
+            let barrier = barrier.clone();
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                service.catalog(&provider, true).await
+            }));
+        }
+        let mut all_ok = true;
+        for task in tasks {
+            let result = task.await.unwrap();
+            if let Ok(models) = &result {
+                assert_eq!(models.len(), 2, "should have 2 models");
+            } else {
+                all_ok = false;
+            }
+        }
+        assert!(all_ok, "all concurrent catalog() calls should succeed");
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            1,
+            "only one HTTP request should be made (single-flight)"
         );
     }
 }

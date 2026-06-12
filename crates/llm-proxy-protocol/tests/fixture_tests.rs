@@ -34,6 +34,18 @@ use std::path::Path;
 
 const FIXTURE_ROOT: &str = "tests/fixtures";
 
+/// Convert an i64 token count to i32 with an overflow assertion.
+///
+/// Token counts in JSON are i64 but the protocol uses i32. This helper catches
+/// overflow in test fixtures (which should never have values exceeding i32::MAX).
+fn i64_to_i32_tokens(val: i64, field_name: &str, adapter: &str) -> i32 {
+    assert!(
+        val <= i32::MAX as i64,
+        "{adapter}: {field_name} value {val} exceeds i32::MAX in test fixture"
+    );
+    val as i32
+}
+
 /// Read a fixture file as a parsed JSON value.
 fn read_fixture(dir: &Path, name: &str) -> serde_json::Value {
     let path = dir.join(name);
@@ -128,12 +140,16 @@ fn build_core_response_from_output(adapter: &str, output_json: &serde_json::Valu
                                     id: block
                                         .get("id")
                                         .and_then(|v| v.as_str())
-                                        .unwrap_or("")
+                                        .unwrap_or_else(|| panic!(
+                                            "anthropic tool_use block missing 'id' field in output.json for {adapter}"
+                                        ))
                                         .into(),
                                     name: block
                                         .get("name")
                                         .and_then(|v| v.as_str())
-                                        .unwrap_or("")
+                                        .unwrap_or_else(|| panic!(
+                                            "anthropic tool_use block missing 'name' field in output.json for {adapter}"
+                                        ))
                                         .into(),
                                     input: block.get("input").cloned().unwrap_or(
                                         serde_json::Value::Object(serde_json::Map::new()),
@@ -186,7 +202,9 @@ fn build_core_response_from_output(adapter: &str, output_json: &serde_json::Valu
                                     tool_use_id: block
                                         .get("tool_use_id")
                                         .and_then(|v| v.as_str())
-                                        .unwrap_or("")
+                                        .unwrap_or_else(|| panic!(
+                                            "anthropic tool_result block missing 'tool_use_id' field in output.json for {adapter}"
+                                        ))
                                         .into(),
                                     content: Vec::new(),
                                     is_error: block
@@ -233,16 +251,19 @@ fn build_core_response_from_output(adapter: &str, output_json: &serde_json::Valu
                 },
                 content,
                 stop_reason,
-                stop_sequence: None,
+                stop_sequence: output_json
+                    .get("stop_sequence")
+                    .and_then(|v| v.as_str())
+                    .map(String::from),
                 usage: Usage {
-                    input_tokens: usage_json
-                        .get("input_tokens")
-                        .and_then(|v| v.as_i64())
-                        .unwrap_or(0) as i32,
-                    output_tokens: usage_json
-                        .get("output_tokens")
-                        .and_then(|v| v.as_i64())
-                        .unwrap_or(0) as i32,
+                    input_tokens: i64_to_i32_tokens(
+                        usage_json.get("input_tokens").and_then(|v| v.as_i64()).unwrap_or(0),
+                        "input_tokens", adapter,
+                    ),
+                    output_tokens: i64_to_i32_tokens(
+                        usage_json.get("output_tokens").and_then(|v| v.as_i64()).unwrap_or(0),
+                        "output_tokens", adapter,
+                    ),
                     reasoning_tokens: None,
                     cache_creation_input_tokens: None,
                     cache_read_input_tokens: None,
@@ -285,12 +306,18 @@ fn build_core_response_from_output(adapter: &str, output_json: &serde_json::Valu
                             .and_then(|a| serde_json::from_str(a).ok())
                             .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
                         content.push(CoreContent::ToolUse {
-                            id: tc.get("id").and_then(|v| v.as_str()).unwrap_or("").into(),
+                            id: tc.get("id").and_then(|v| v.as_str())
+                                .unwrap_or_else(|| panic!(
+                                    "openai_chat tool_call missing 'id' field in output.json"
+                                ))
+                                .into(),
                             name: tc
                                 .get("function")
                                 .and_then(|f| f.get("name"))
                                 .and_then(|v| v.as_str())
-                                .unwrap_or("")
+                                .unwrap_or_else(|| panic!(
+                                    "openai_chat tool_call missing 'function.name' field in output.json"
+                                ))
                                 .into(),
                             input: args,
                         });
@@ -337,16 +364,19 @@ fn build_core_response_from_output(adapter: &str, output_json: &serde_json::Valu
                 },
                 content,
                 stop_reason,
-                stop_sequence: None,
+                stop_sequence: output_json
+                    .get("stop_sequence")
+                    .and_then(|v| v.as_str())
+                    .map(String::from),
                 usage: Usage {
-                    input_tokens: usage_json
-                        .get("prompt_tokens")
-                        .and_then(|v| v.as_i64())
-                        .unwrap_or(0) as i32,
-                    output_tokens: usage_json
-                        .get("completion_tokens")
-                        .and_then(|v| v.as_i64())
-                        .unwrap_or(0) as i32,
+                    input_tokens: i64_to_i32_tokens(
+                        usage_json.get("prompt_tokens").and_then(|v| v.as_i64()).unwrap_or(0),
+                        "prompt_tokens", adapter,
+                    ),
+                    output_tokens: i64_to_i32_tokens(
+                        usage_json.get("completion_tokens").and_then(|v| v.as_i64()).unwrap_or(0),
+                        "completion_tokens", adapter,
+                    ),
                     reasoning_tokens: None,
                     cache_creation_input_tokens: None,
                     cache_read_input_tokens: None,
@@ -487,6 +517,11 @@ fn run_non_stream_fixture(adapter: &str, case: &str) {
     let input = read_fixture(&dir, "input.json");
 
     // Special handling for malformed cases -- only input.json is needed.
+    //
+    // Note: this relies on the exact directory name "malformed". If multiple
+    // malformed variants are needed in the future (e.g. "malformed-empty-messages",
+    // "malformed-no-model"), either use a marker file like `malformed.flag` inside
+    // the fixture directory, or explicitly list all malformed variant names here.
     if case == "malformed" {
         assert_malformed_returns_error(adapter, &input);
         return;
@@ -692,17 +727,13 @@ fn all_openai_non_stream_fixtures_have_required_files() {
     }
 }
 
-/// Verify that all streaming fixtures have the required files.
+/// Returns the list of all streaming fixture (adapter, case) pairs.
 ///
-/// Client streaming fixtures require:
-/// - `input.sse`: Optional reference file showing the corresponding provider wire
-///   format. Not consumed by any test, but serves as documentation of the provider
-///   stream that would produce these CoreEvents.
-/// - `core-events.json`: The CoreEvent sequence to encode through the StreamEncoder.
-/// - `output.sse`: The expected SSE output from the StreamEncoder.
-#[test]
-fn all_streaming_fixtures_have_required_files() {
-    let streaming_cases = [
+/// Used by `all_streaming_fixtures_have_required_files`,
+/// `streaming_core_events_json_is_valid`, `streaming_sse_fixtures_are_well_formed`,
+/// and `streaming_encode_round_trip` to avoid duplicating the case list.
+fn all_streaming_cases() -> Vec<(&'static str, &'static str)> {
+    vec![
         ("anthropic", "streaming-text"),
         ("anthropic", "streaming-tool"),
         ("anthropic", "streaming-usage"),
@@ -715,8 +746,20 @@ fn all_streaming_fixtures_have_required_files() {
         ("openai_chat", "streaming-error"),
         ("openai_chat", "streaming-ping"),
         ("openai_chat", "streaming-thinking"),
-    ];
-    for (adapter, case) in &streaming_cases {
+    ]
+}
+
+/// Verify that all streaming fixtures have the required files.
+///
+/// Client streaming fixtures require:
+/// - `input.sse`: Optional reference file showing the corresponding provider wire
+///   format. Not consumed by any test, but serves as documentation of the provider
+///   stream that would produce these CoreEvents.
+/// - `core-events.json`: The CoreEvent sequence to encode through the StreamEncoder.
+/// - `output.sse`: The expected SSE output from the StreamEncoder.
+#[test]
+fn all_streaming_fixtures_have_required_files() {
+    for (adapter, case) in &all_streaming_cases() {
         let dir = Path::new(FIXTURE_ROOT).join(adapter).join(case);
         assert!(
             dir.join("input.sse").exists(),
@@ -859,21 +902,7 @@ fn coverage_matrix_all_required_client_fixtures_exist() {
 /// validate fixture structure only, not adapter behavior.
 #[test]
 fn streaming_core_events_json_is_valid() {
-    let streaming_cases = [
-        ("anthropic", "streaming-text"),
-        ("anthropic", "streaming-tool"),
-        ("anthropic", "streaming-usage"),
-        ("anthropic", "streaming-error"),
-        ("anthropic", "streaming-ping"),
-        ("anthropic", "streaming-thinking"),
-        ("openai_chat", "streaming-text"),
-        ("openai_chat", "streaming-tool"),
-        ("openai_chat", "streaming-usage"),
-        ("openai_chat", "streaming-error"),
-        ("openai_chat", "streaming-ping"),
-        ("openai_chat", "streaming-thinking"),
-    ];
-    for (adapter, case) in &streaming_cases {
+    for (adapter, case) in &all_streaming_cases() {
         let dir = Path::new(FIXTURE_ROOT).join(adapter).join(case);
         let raw = read_fixture_raw(&dir, "core-events.json");
         let events: Vec<CoreEvent> = serde_json::from_str(&raw)
@@ -890,21 +919,7 @@ fn streaming_core_events_json_is_valid() {
 /// the protocol produces no output (e.g. OpenAI ping is a no-op).
 #[test]
 fn streaming_sse_fixtures_are_well_formed() {
-    let streaming_cases = [
-        ("anthropic", "streaming-text"),
-        ("anthropic", "streaming-tool"),
-        ("anthropic", "streaming-usage"),
-        ("anthropic", "streaming-error"),
-        ("anthropic", "streaming-ping"),
-        ("anthropic", "streaming-thinking"),
-        ("openai_chat", "streaming-text"),
-        ("openai_chat", "streaming-tool"),
-        ("openai_chat", "streaming-usage"),
-        ("openai_chat", "streaming-error"),
-        ("openai_chat", "streaming-ping"),
-        ("openai_chat", "streaming-thinking"),
-    ];
-    for (adapter, case) in &streaming_cases {
+    for (adapter, case) in &all_streaming_cases() {
         let dir = Path::new(FIXTURE_ROOT).join(adapter).join(case);
 
         // input.sse should always have content (it represents client input).
@@ -955,23 +970,7 @@ fn streaming_sse_fixtures_are_well_formed() {
 /// events to ensure the encode path handles all CoreEvent variants.
 #[test]
 fn streaming_encode_round_trip() {
-    // Cases where output.sse is non-empty.
-    let cases = [
-        ("anthropic", "streaming-text"),
-        ("anthropic", "streaming-tool"),
-        ("anthropic", "streaming-usage"),
-        ("anthropic", "streaming-thinking"),
-        ("anthropic", "streaming-error"),
-        ("anthropic", "streaming-ping"),
-        ("openai_chat", "streaming-text"),
-        ("openai_chat", "streaming-tool"),
-        ("openai_chat", "streaming-usage"),
-        ("openai_chat", "streaming-thinking"),
-        ("openai_chat", "streaming-error"),
-        ("openai_chat", "streaming-ping"),
-    ];
-
-    for (adapter, case) in &cases {
+    for (adapter, case) in &all_streaming_cases() {
         let dir = Path::new(FIXTURE_ROOT).join(adapter).join(case);
 
         let core_events_raw = read_fixture_raw(&dir, "core-events.json");
@@ -1028,6 +1027,12 @@ fn streaming_encode_round_trip() {
                 );
             }
             "openai_chat" => {
+                // NOTE: created is hard-coded to 1000 and include_usage is false.
+                // This means the streaming encode test does not exercise the
+                // include_usage=true code path (which emits a final usage chunk).
+                // TODO: Derive include_usage from the fixture data (e.g. set to
+                // true for streaming-usage cases) to ensure the usage-reporting
+                // path is tested.
                 let mut encoder = openai_adapter::StreamEncoder::new(msg_id, model, 1000, false);
                 let mut total_data_lines = 0;
 

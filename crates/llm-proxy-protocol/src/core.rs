@@ -65,6 +65,11 @@ impl fmt::Debug for OpaqueJsonRef<'_> {
 /// Bool and Number values are shown without their actual values for consistency
 /// with the redaction policy: a malicious payload could encode secret fragments
 /// in number values or boolean field names.
+///
+/// Note: `String(N chars)` reveals the string length. This is an intentional
+/// trade-off: hiding the length would make debugging harder (e.g. diagnosing
+/// empty vs populated fields). If this becomes a security concern, change to
+/// `String(_)`.
 fn redact_value(val: &serde_json::Value, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     match val {
         serde_json::Value::Null => f.write_str("Null"),
@@ -210,6 +215,13 @@ pub enum CoreRole {
 /// Variants cover text, media, tool interactions, and extended thinking.
 /// Each variant is a struct-like enum arm so that fields are named and
 /// self-documenting.
+///
+/// Note: `deny_unknown_fields` is applied to ensure that serialization
+/// round-trips are lossless. If a provider adds new fields to a content
+/// block variant that the proxy does not model, those fields will be
+/// rejected at deserialization. This is intentional for the core protocol
+/// type: provider-specific passthrough should use `provider_hints` or the
+/// extra maps on wire-format types rather than extending core variants.
 #[non_exhaustive]
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -272,6 +284,11 @@ pub enum CoreContent {
     /// Redacted thinking block whose plaintext is not available.
     RedactedThinking {
         /// Opaque redacted data.
+        ///
+        /// Uses `serde_json::Value` rather than `String` because providers may
+        /// encode the redacted data in different forms (base64 string, JSON object,
+        /// etc.). The Anthropic adapter always converts non-string values to a JSON
+        /// string during serialization.
         data: serde_json::Value,
     },
     /// A model refusal to answer.
@@ -431,6 +448,28 @@ pub struct CoreTool {
     pub input_schema: serde_json::Value,
 }
 
+impl CoreTool {
+    /// Constructs a new `CoreTool`, validating that `input_schema` is a JSON object.
+    ///
+    /// Returns `Err` if `input_schema` is not a JSON object (i.e. is null, a string,
+    /// a number, a boolean, or an array). Tool parameter schemas should always be
+    /// JSON objects.
+    pub fn new(
+        name: String,
+        description: Option<String>,
+        input_schema: serde_json::Value,
+    ) -> Result<Self, &'static str> {
+        if !input_schema.is_object() {
+            return Err("input_schema must be a JSON object");
+        }
+        Ok(Self {
+            name,
+            description,
+            input_schema,
+        })
+    }
+}
+
 impl fmt::Debug for CoreTool {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CoreTool")
@@ -485,8 +524,16 @@ impl fmt::Debug for CoreToolChoice {
 #[serde(deny_unknown_fields)]
 pub struct SamplingOptions {
     /// Sampling temperature.
+    ///
+    /// Non-finite values (NaN, Infinity) are rejected at deserialization time
+    /// because `serde_json` silently converts them to `null`, causing them to
+    /// become `None` during round-trips.
+    #[serde(default, deserialize_with = "deserialize_finite_or_none")]
     pub temperature: Option<f64>,
     /// Nucleus sampling parameter.
+    ///
+    /// See [`Self::temperature`] for non-finite value handling.
+    #[serde(default, deserialize_with = "deserialize_finite_or_none")]
     pub top_p: Option<f64>,
     /// Maximum number of tokens to generate.
     pub max_tokens: Option<i32>,
@@ -506,6 +553,24 @@ pub struct SamplingOptions {
     /// Anthropic: `{"type": "enabled", "budget_tokens": N}`.
     /// Not a secret-bearing field by design.
     pub thinking: Option<serde_json::Value>,
+}
+
+/// Custom deserializer for `Option<f64>` that rejects NaN and Infinity.
+///
+/// `serde_json` silently converts non-finite floats to `null` during
+/// serialization, causing them to become `None` on round-trip.  This
+/// deserializer catches the problem at the point of ingestion instead.
+fn deserialize_finite_or_none<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let val: Option<f64> = Option::deserialize(deserializer)?;
+    match val {
+        Some(v) if !v.is_finite() => Err(serde::de::Error::custom(format!(
+            "non-finite float value ({v}); temperature and top_p must be finite numbers"
+        ))),
+        other => Ok(other),
+    }
 }
 
 /// Custom deserializer for `SamplingOptions::stop` that accepts a bare string,
@@ -731,6 +796,11 @@ pub enum StopReason {
     /// An error occurred.
     Error,
     /// The stop reason is not recognised.
+    ///
+    /// Serializes to `"Unknown"`. If preserving the original provider value is
+    /// needed (similar to `CacheControlType::Other(String)`), this variant can
+    /// be changed to `Unknown(String)` in a future version. Currently the
+    /// original value is lost during normalization.
     Unknown,
 }
 
@@ -743,6 +813,11 @@ pub enum StopReason {
 /// Must carry provenance.  Never report fabricated or zero-filled usage as
 /// [`UsageProvenance::ProviderReported`]; absent or zero-filled provider
 /// usage is [`UsageProvenance::SyntheticZero`] / [`UsageProvenance::Unknown`].
+///
+/// Uses `i32` for token counts for consistency with provider wire formats
+/// (JSON integers) and the Anthropic/OpenAI API types. The ~2.1 billion limit
+/// is well beyond any realistic single request. If aggregated or batch usage
+/// is needed in the future, consider widening to `i64`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Usage {
@@ -1087,7 +1162,7 @@ impl CoreStreamErrorKind {
     /// - `RateLimit` -> 429
     /// - `Upstream` -> 502
     /// - `Internal` -> 500
-    pub fn http_status(self) -> u16 {
+    pub fn http_status(&self) -> u16 {
         match self {
             Self::InvalidRequest => 400,
             Self::Authentication => 401,

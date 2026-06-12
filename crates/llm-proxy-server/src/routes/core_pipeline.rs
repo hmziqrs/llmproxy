@@ -255,6 +255,12 @@ pub(crate) fn prepare_request(
 // resolve target helper
 // ---------------------------------------------------------------------------
 
+/// Maximum length for a provider name in URL path parameters.
+///
+/// Prevents regex DoS from arbitrarily long names. 128 characters is generous
+/// enough for any realistic provider identifier.
+const MAX_PROVIDER_NAME_LEN: usize = 128;
+
 /// Regex for validating provider names in URL paths.
 ///
 /// Provider names must be ASCII lowercase letters, digits, hyphens, and
@@ -271,6 +277,11 @@ pub(super) fn validate_provider_name(name: &str) -> Result<(), RouteError> {
             "provider name is empty".to_owned(),
         ));
     }
+    if name.len() > MAX_PROVIDER_NAME_LEN {
+        return Err(RouteError::InvalidProviderName(format!(
+            "provider name exceeds maximum length of {MAX_PROVIDER_NAME_LEN} characters"
+        )));
+    }
     if !PROVIDER_NAME_REGEX.is_match(name) {
         return Err(RouteError::InvalidProviderName(format!(
             "provider name \"{name}\" contains invalid characters; \
@@ -280,8 +291,13 @@ pub(super) fn validate_provider_name(name: &str) -> Result<(), RouteError> {
     Ok(())
 }
 
-/// Map provider name from URL path, validating it first.
-fn validate_and_clean_provider_name(provider_name: &str) -> Result<&str, RouteError> {
+/// Validate a provider name extracted from the URL path.
+///
+/// This is a thin wrapper around [`validate_provider_name`] used at handler
+/// entry points as defense-in-depth. Axum's `Path<String>` extractor does not
+/// perform character validation, so this ensures the provider name is safe
+/// before it is used in format strings or lookups.
+fn validate_provider_name_ref(provider_name: &str) -> Result<&str, RouteError> {
     validate_provider_name(provider_name)?;
     Ok(provider_name)
 }
@@ -308,27 +324,28 @@ async fn resolve_target(
         .resolve_provider_route(provider_name, route_kind, &core.model.requested)
         .map_err(map_provider_route_error)?;
 
-    if providers
-        .get(provider_name)
-        .and_then(|provider| provider.catalog.as_ref())
-        .is_some_and(|catalog| catalog.enforce)
-    {
-        let provider = providers
-            .get(provider_name)
-            .ok_or_else(|| RouteError::UnknownProvider(provider_name.to_owned()))?;
-        let catalog = state
-            .model_catalogs()
-            .catalog(provider, false)
-            .await
-            .map_err(|error| RouteError::Internal(error.to_string()))?;
-        if !catalog_contains_model(
-            &catalog,
-            &adapter_target_config.upstream_model,
-            &adapter_target_config.protocol,
-        ) {
-            return Err(RouteError::ModelNotAllowed(
-                adapter_target_config.upstream_model.clone(),
-            ));
+    // Catalog enforcement: fetch the provider once and check both the
+    // enforcement flag and the model catalog in a single lookup.
+    if let Some(provider) = providers.get(provider_name) {
+        if provider
+            .catalog
+            .as_ref()
+            .is_some_and(|catalog| catalog.enforce)
+        {
+            let catalog = state
+                .model_catalogs()
+                .catalog(provider, false)
+                .await
+                .map_err(|error| RouteError::Internal(error.to_string()))?;
+            if !catalog_contains_model(
+                &catalog,
+                &adapter_target_config.upstream_model,
+                &adapter_target_config.protocol,
+            ) {
+                return Err(RouteError::ModelNotAllowed(
+                    adapter_target_config.upstream_model.clone(),
+                ));
+            }
         }
     }
 
@@ -411,7 +428,7 @@ pub(crate) async fn handle_core_once(
     core: CoreRequest,
     client_protocol: ClientProtocol,
 ) -> Result<Response<Body>, RouteError> {
-    validate_and_clean_provider_name(provider_name)?;
+    validate_provider_name_ref(provider_name)?;
 
     state.metrics.record_request(false);
 
@@ -555,7 +572,7 @@ pub(crate) async fn handle_core_stream(
     core: CoreRequest,
     client_protocol: ClientProtocol,
 ) -> Result<Response<Body>, RouteError> {
-    validate_and_clean_provider_name(provider_name)?;
+    validate_provider_name_ref(provider_name)?;
 
     state.metrics.record_request(true);
 
@@ -661,7 +678,7 @@ pub(crate) async fn handle_core_stream(
     let first_event = first_byte_rx.await.map_err(|_| {
         state.metrics.record_failure();
         RouteError::Internal(
-            "stream task exited unexpectedly before first event (possible panic)".to_owned(),
+            "stream task exited before first event (possible panic, cancellation, or empty stream)".to_owned(),
         )
     })?;
 
@@ -1228,7 +1245,7 @@ static URL_REDACT_REGEX: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock
 /// `e.to_string()`, which for reqwest errors can contain full URLs including
 /// hostnames and paths. This function replaces such details with generic
 /// messages while preserving enough context for debugging.
-fn sanitize_upstream_error_body(msg: &str) -> String {
+pub(super) fn sanitize_upstream_error_body(msg: &str) -> String {
     // Truncate to MAX_SANITIZE_LEN as a safety net. The suffix is included
     // within this budget. The actual error body in RouteError::Upstream is
     // further truncated by truncate_error_body() in the error response encoder.

@@ -25,8 +25,10 @@ use super::error_response::{ClientProtocol, RouteError, route_error_response};
 ///
 /// Follows the OpenAI `/v1/models` response shape as the base, with Anthropic
 /// pagination fields added as a superset.
+///
+/// Note: `#[serde(deny_unknown_fields)]` is intentionally omitted because this
+/// is a Serialize-only type (never deserialized from external input).
 #[derive(Serialize)]
-#[serde(deny_unknown_fields)]
 struct ModelsResponse {
     /// OpenAI-compatible: always `"list"`.
     object: &'static str,
@@ -43,8 +45,10 @@ struct ModelsResponse {
 /// A normalized model card containing both OpenAI and Anthropic fields.
 ///
 /// Common SDKs should be able to ignore fields they do not use.
+///
+/// Note: `#[serde(deny_unknown_fields)]` is intentionally omitted because this
+/// is a Serialize-only type (never deserialized from external input).
 #[derive(Serialize)]
-#[serde(deny_unknown_fields)]
 struct ModelCard {
     /// OpenAI: model identifier.
     id: String,
@@ -65,7 +69,7 @@ struct ModelCard {
     /// Anthropic-compatible creation timestamp, absent when unknown.
     created_at: Option<String>,
     /// The route kinds this model supports (non-standard extension).
-    supports: Vec<String>,
+    supports: Vec<&'static str>,
     /// Maximum context length in tokens (non-standard extension).
     context_length: Option<u32>,
 }
@@ -117,6 +121,11 @@ async fn handle_models_inner(
         .map_err(map_catalog_error)?;
 
     // Build model cards from static entries.
+    // Extract first/last IDs from entries (before building ModelCards) to
+    // avoid cloning from the already-owned Vec.
+    let first_id = entries.first().map(|m| m.id.clone());
+    let last_id = entries.last().map(|m| m.id.clone());
+
     let data: Vec<ModelCard> = entries
         .iter()
         .map(|entry| ModelCard {
@@ -131,18 +140,13 @@ async fn handle_models_inner(
                 .supports
                 .iter()
                 .map(|k| match k {
-                    llm_proxy_core::ProviderRouteKind::ChatCompletions => {
-                        "chat_completions".to_owned()
-                    }
-                    llm_proxy_core::ProviderRouteKind::Messages => "messages".to_owned(),
+                    llm_proxy_core::ProviderRouteKind::ChatCompletions => "chat_completions",
+                    llm_proxy_core::ProviderRouteKind::Messages => "messages",
                 })
                 .collect(),
             context_length: entry.context_length,
         })
         .collect();
-
-    let first_id = data.first().map(|m| m.id.clone());
-    let last_id = data.last().map(|m| m.id.clone());
 
     let response = ModelsResponse {
         object: "list",
@@ -163,21 +167,33 @@ async fn handle_models_inner(
 
 fn map_catalog_error(error: ProviderError) -> RouteError {
     match error {
-        ProviderError::Api { status, body } => RouteError::Upstream {
-            status: StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
-            body,
-        },
+        ProviderError::Api { status, body } => {
+            let status_code = StatusCode::from_u16(status).unwrap_or_else(|_| {
+                tracing::warn!(
+                    status,
+                    "invalid HTTP status from catalog provider; mapping to 502"
+                );
+                StatusCode::BAD_GATEWAY
+            });
+            RouteError::Upstream {
+                status: status_code,
+                body,
+            }
+        }
         ProviderError::Http {
-            message,
+            message: _,
             timeout: true,
-        } => RouteError::UpstreamTimeout(message),
+        } => RouteError::UpstreamTimeout("upstream request timed out".to_owned()),
         ProviderError::Http {
             message,
             timeout: false,
-        } => RouteError::Upstream {
-            status: StatusCode::BAD_GATEWAY,
-            body: message,
-        },
+        } => {
+            let sanitized = super::core_pipeline::sanitize_upstream_error_body(&message);
+            RouteError::Upstream {
+                status: StatusCode::BAD_GATEWAY,
+                body: sanitized,
+            }
+        }
         ProviderError::Serialize(_)
         | ProviderError::Utf8(_)
         | ProviderError::SseFraming(_)

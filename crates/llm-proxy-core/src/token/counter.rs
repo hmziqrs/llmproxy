@@ -5,9 +5,12 @@
 //! the Go reference implementation so that unit-test expectations stay aligned.
 
 /// A single chat message with a role and content string.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct MessageContent {
     /// The role of the message author (e.g. `"user"`, `"assistant"`, `"system"`).
+    ///
+    /// Role validation is the caller's responsibility. The counter does not
+    /// enforce valid role strings.
     pub role: String,
     /// The text content of the message.
     pub content: String,
@@ -23,11 +26,18 @@ impl MessageContent {
     }
 }
 
+/// Approximate number of characters per token for estimation purposes.
+///
+/// This is a rough heuristic; actual token counts vary by tokenizer and
+/// language. Multi-byte UTF-8 characters are counted individually (not by
+/// byte length), so CJK text and emoji get more accurate estimates.
+const CHARS_PER_TOKEN: usize = 4;
+
 /// Simplified token counter.
 ///
-/// Uses a rough heuristic of 4 characters per token rather than a full BPE
-/// encoding. Good enough for cost estimation and rate-limiting decisions where
-/// exact counts are not required.
+/// Uses a rough heuristic of [`CHARS_PER_TOKEN`] characters per token rather
+/// than a full BPE encoding. Good enough for cost estimation and rate-limiting
+/// decisions where exact counts are not required.
 #[derive(Debug, Clone, Default)]
 pub struct Counter;
 
@@ -39,14 +49,16 @@ impl Counter {
 
     /// Estimate the number of tokens in a single text string.
     ///
-    /// Uses the approximation of 4 characters per token, with a minimum of 1
-    /// token for any non-empty string.
+    /// Uses the approximation of [`CHARS_PER_TOKEN`] characters per token,
+    /// counting Unicode code points (not bytes). Returns a minimum of 1 token
+    /// for any non-empty string, including whitespace-only input.
     pub fn count_tokens(&self, text: &str) -> usize {
         if text.is_empty() {
             return 0;
         }
-        // Rough approximation: ~4 characters per token.
-        let estimate = text.chars().count() / 4;
+        // Count Unicode code points, not bytes, for better accuracy with
+        // multi-byte characters (CJK, emoji, etc.).
+        let estimate = text.chars().count() / CHARS_PER_TOKEN;
         // Always count at least 1 token for non-empty text.
         estimate.max(1)
     }
@@ -56,13 +68,19 @@ impl Counter {
     /// The formula mirrors the Go reference implementation:
     ///
     /// ```text
-    /// total = base_tokens (3) + system_tokens + overhead (5)
-    ///       + sum(count_tokens(role) + count_tokens(content) + 5 for each message)
+    /// total = BASE_TOKENS + system_tokens + SYSTEM_OVERHEAD
+    ///       + sum(count_tokens(role) + count_tokens(content) + PER_MESSAGE_OVERHEAD)
     /// ```
     ///
-    /// The extra `5` per message accounts for formatting overhead (role labels,
-    /// separator tokens, etc.).
+    /// The extra [`PER_MESSAGE_OVERHEAD`] per message accounts for formatting
+    /// overhead (role labels, separator tokens, etc.).
+    ///
+    /// Note: `system` is a flat string. If the upstream protocol supports
+    /// multiple system blocks, the caller must pre-concatenate them.
+    /// Role validation is the caller's responsibility.
     pub fn count_messages(&self, system: &str, messages: &[MessageContent]) -> usize {
+        // Mirrors the Go reference implementation constants:
+        //   BASE_TOKENS = 3, PER_MESSAGE_OVERHEAD = 5, SYSTEM_OVERHEAD = 5
         const BASE_TOKENS: usize = 3;
         const PER_MESSAGE_OVERHEAD: usize = 5;
         const SYSTEM_OVERHEAD: usize = 5;
@@ -192,5 +210,53 @@ mod tests {
     fn counter_default_is_valid() {
         let counter = Counter;
         assert_eq!(counter.count_tokens("hello"), 1);
+    }
+
+    #[test]
+    fn count_messages_empty_role() {
+        let counter = Counter::new();
+        let messages = vec![MessageContent::new("", "hello")];
+        // base(3) + system(0) + sys_overhead(5) + role("") + content(1) + per_msg(5)
+        // = 3 + 0 + 5 + 0 + 1 + 5 = 14
+        let total = counter.count_messages("", &messages);
+        assert_eq!(total, 14);
+    }
+
+    #[test]
+    fn count_messages_empty_content() {
+        let counter = Counter::new();
+        let messages = vec![MessageContent::new("user", "")];
+        // base(3) + system(0) + sys_overhead(5) + role(1) + content(0) + per_msg(5)
+        // = 3 + 0 + 5 + 1 + 0 + 5 = 14
+        let total = counter.count_messages("", &messages);
+        assert_eq!(total, 14);
+    }
+
+    #[test]
+    fn count_tokens_whitespace_only() {
+        let counter = Counter::new();
+        // Whitespace-only string is non-empty, so minimum 1 token.
+        assert_eq!(counter.count_tokens("   "), 1);
+        assert_eq!(counter.count_tokens("\t\n"), 1);
+    }
+
+    #[test]
+    fn count_tokens_multibyte_unicode() {
+        let counter = Counter::new();
+        // Emoji: U+1F600 is 4 bytes but 1 code point. 1/4 = 0 -> max(0,1) = 1.
+        assert_eq!(counter.count_tokens("\u{1F600}"), 1);
+        // CJK string: 4 characters (each 3 bytes in UTF-8). 4/4 = 1 token.
+        assert_eq!(counter.count_tokens("\u{4F60}\u{597D}\u{4E16}\u{754C}"), 1);
+        // 8 CJK characters: 8/4 = 2 tokens.
+        let cjk_8: String = "\u{4F60}\u{597D}\u{4E16}\u{754C}\u{4F60}\u{597D}\u{4E16}\u{754C}"
+            .to_string();
+        assert_eq!(counter.count_tokens(&cjk_8), 2);
+    }
+
+    #[test]
+    fn count_tokens_mixed_ascii_unicode() {
+        let counter = Counter::new();
+        // "hello" (5 chars) + emoji (1 char) = 6 chars. 6/4 = 1.
+        assert_eq!(counter.count_tokens("hello\u{1F600}"), 1);
     }
 }

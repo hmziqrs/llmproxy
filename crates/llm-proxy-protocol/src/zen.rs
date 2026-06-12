@@ -178,6 +178,11 @@ pub struct GeminiRequest {
     /// Tools available to the model.
     pub tools: Vec<GeminiTool>,
     /// When `Some(true)` the server streams chunked responses.
+    ///
+    /// Note: The Gemini API typically accepts stream as a query parameter
+    /// (`?alt=sse`) rather than a body field. This field is kept for internal
+    /// bookkeeping by the adapter, which should translate it to the appropriate
+    /// query parameter when constructing the HTTP request.
     pub stream: Option<bool>,
 }
 
@@ -315,14 +320,19 @@ pub struct GeminiCandidate {
 }
 
 /// Token usage metadata reported by the Gemini API.
+///
+/// Uses manual `#[serde(rename)]` attributes for consistency with other Gemini
+/// types in this module, rather than `rename_all = "camelCase"`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct GeminiUsage {
     /// Number of tokens in the prompt.
+    #[serde(rename = "promptTokenCount")]
     pub prompt_token_count: i32,
     /// Number of tokens across all candidates.
+    #[serde(rename = "candidatesTokenCount")]
     pub candidates_token_count: i32,
     /// Total tokens (prompt + candidates).
+    #[serde(rename = "totalTokenCount")]
     pub total_token_count: i32,
 }
 
@@ -338,4 +348,117 @@ pub struct GeminiStreamChunk {
     /// Token usage metadata (usually present on the final chunk).
     #[serde(rename = "usageMetadata")]
     pub usage_metadata: Option<GeminiUsage>,
+}
+
+// ===========================================================================
+// Tests
+// ===========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn responses_request_round_trip() {
+        let req = ResponsesRequest {
+            model: "gpt-4o".into(),
+            input: vec![ResponsesInput {
+                role: "user".into(),
+                content: Some(serde_json::json!("hello")),
+            }],
+            stream: Some(true),
+            tools: vec![],
+            reasoning: None,
+            tool_choice: None,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let back: ResponsesRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.model, "gpt-4o");
+        assert_eq!(back.input.len(), 1);
+    }
+
+    #[test]
+    fn gemini_request_round_trip() {
+        let req = GeminiRequest {
+            contents: vec![GeminiContent {
+                role: "user".into(),
+                parts: vec![GeminiPart::text("hello".into())],
+            }],
+            generation_config: Some(GeminiGenerationConfig {
+                temperature: Some(0.7),
+                top_p: None,
+                max_output_tokens: Some(1024),
+                stop_sequences: None,
+            }),
+            tools: vec![],
+            stream: Some(true),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let back: GeminiRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.contents.len(), 1);
+        assert!(back.generation_config.is_some());
+    }
+
+    #[test]
+    fn gemini_response_round_trip() {
+        let resp = GeminiResponse {
+            candidates: vec![GeminiCandidate {
+                content: GeminiContent {
+                    role: "model".into(),
+                    parts: vec![GeminiPart::text("hi there".into())],
+                },
+                finish_reason: Some("STOP".into()),
+            }],
+            usage_metadata: Some(GeminiUsage {
+                prompt_token_count: 10,
+                candidates_token_count: 5,
+                total_token_count: 15,
+            }),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let back: GeminiResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.candidates.len(), 1);
+        let usage = back.usage_metadata.unwrap();
+        assert_eq!(usage.prompt_token_count, 10);
+        assert_eq!(usage.total_token_count, 15);
+    }
+
+    #[test]
+    fn gemini_usage_camel_case_serialization() {
+        let usage = GeminiUsage {
+            prompt_token_count: 100,
+            candidates_token_count: 50,
+            total_token_count: 150,
+        };
+        let json = serde_json::to_string(&usage).unwrap();
+        assert!(json.contains("promptTokenCount"), "expected camelCase: {json}");
+        assert!(json.contains("candidatesTokenCount"), "expected camelCase: {json}");
+        assert!(json.contains("totalTokenCount"), "expected camelCase: {json}");
+    }
+
+    #[test]
+    fn responses_chunk_round_trip() {
+        let chunk = ResponsesChunk {
+            r#type: "response.output_text.delta".into(),
+            id: Some("resp_123".into()),
+            delta: Some("hello".into()),
+            output: None,
+            usage: None,
+            error: None,
+        };
+        let json = serde_json::to_string(&chunk).unwrap();
+        let back: ResponsesChunk = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.delta.as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn gemini_stream_chunk_round_trip() {
+        let chunk = GeminiStreamChunk {
+            candidates: vec![],
+            usage_metadata: None,
+        };
+        let json = serde_json::to_string(&chunk).unwrap();
+        let back: GeminiStreamChunk = serde_json::from_str(&json).unwrap();
+        assert!(back.candidates.is_empty());
+    }
 }

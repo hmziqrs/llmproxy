@@ -87,9 +87,7 @@ pub fn decode_request(req: MessageRequest) -> Result<CoreRequest, ProtocolError>
         raw: raw_meta,
     };
 
-    let provider_hints = ProviderHints {
-        raw: serde_json::Map::new(),
-    };
+    let provider_hints = ProviderHints::default();
 
     Ok(CoreRequest {
         model,
@@ -119,6 +117,10 @@ fn decode_system(system: &Option<serde_json::Value>) -> Vec<CoreContent> {
             }
             if let Some(arr) = value.as_array() {
                 let mut result = Vec::new();
+                // Note: each array item is cloned before deserialization because
+                // `serde_json::from_value` takes ownership and the array is borrowed
+                // from the request. An alternative would be to take ownership of the
+                // entire system value, but that would change the decode_system signature.
                 for item in arr {
                     if let Ok(block) = serde_json::from_value::<SystemContentBlock>(item.clone()) {
                         if block.r#type == "text" {
@@ -133,7 +135,17 @@ fn decode_system(system: &Option<serde_json::Value>) -> Vec<CoreContent> {
                             // yet supported -- log a warning so they are not silently lost.
                             // Truncate block_type to limit log output from client input.
                             let bt = block.r#type.as_str();
-                            let truncated = if bt.len() > 64 { &bt[..64] } else { bt };
+                            // Char-boundary-safe truncation: avoids panics on
+                            // multi-byte UTF-8 characters in client-supplied data.
+                            let truncated = if bt.len() > 64 {
+                                let mut end = 64;
+                                while !bt.is_char_boundary(end) && end > 0 {
+                                    end -= 1;
+                                }
+                                &bt[..end]
+                            } else {
+                                bt
+                            };
                             tracing::warn!(
                                 block_type = truncated,
                                 "non-text system block skipped during Anthropic decode"
@@ -238,8 +250,17 @@ fn decode_content_block(block: ContentBlock) -> Result<CoreContent, ProtocolErro
                                 match decode_content_block(cb) {
                                     Ok(core) => blocks.push(core),
                                     Err(ProtocolError::Decode(msg)) => {
+                                        // Char-boundary-safe truncation for log output.
                                         let truncated =
-                                            if msg.len() > 64 { &msg[..64] } else { &msg };
+                                            if msg.len() > 64 {
+                                                let mut end = 64;
+                                                while !msg.is_char_boundary(end) && end > 0 {
+                                                    end -= 1;
+                                                }
+                                                &msg[..end]
+                                            } else {
+                                                &msg
+                                            };
                                         tracing::warn!(
                                             block_type = truncated,
                                             "skipping unknown block inside tool_result content array"
@@ -305,9 +326,14 @@ fn decode_content_block(block: ContentBlock) -> Result<CoreContent, ProtocolErro
             // Unknown block types cannot be safely represented -- return an error
             // so the caller knows data was lost rather than silently creating
             // an empty text block. Truncate the block_type to limit log output
-            // from potentially malicious client input.
+            // from potentially malicious client input. Char-boundary-safe
+            // truncation avoids panics on multi-byte UTF-8.
             let truncated = if other.len() > 64 {
-                &other[..64]
+                let mut end = 64;
+                while !other.is_char_boundary(end) && end > 0 {
+                    end -= 1;
+                }
+                &other[..end]
             } else {
                 other
             };
@@ -334,6 +360,11 @@ fn decode_tool_choice(value: serde_json::Value) -> CoreToolChoice {
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_owned();
+                if name.is_empty() {
+                    tracing::warn!(
+                        "Anthropic tool_choice type 'tool' has empty or missing name field"
+                    );
+                }
                 CoreToolChoice::Tool { name }
             }
             _ => CoreToolChoice::Raw(value),
@@ -414,10 +445,16 @@ fn encode_content_block(content: CoreContent) -> Result<ContentBlock, ProtocolEr
         }
         CoreContent::Image { source } => {
             let img_source =
-                serde_json::from_value(source).unwrap_or_else(|_| anthropic::ImageSource {
-                    r#type: String::new(),
-                    media_type: String::new(),
-                    data: String::new(),
+                serde_json::from_value(source).unwrap_or_else(|e| {
+                    tracing::warn!(
+                        error = %e,
+                        "Image source deserialization failed; producing empty ImageSource fallback"
+                    );
+                    anthropic::ImageSource {
+                        r#type: String::new(),
+                        media_type: String::new(),
+                        data: String::new(),
+                    }
                 });
             Ok(ContentBlock::new_image(img_source))
         }
@@ -589,6 +626,10 @@ impl StreamEncoder {
     /// Encode a single [`CoreEvent`] into zero or more Anthropic [`MessageEvent`]s.
     pub fn encode_event(&mut self, event: CoreEvent) -> Result<Vec<MessageEvent>, ProtocolError> {
         if self.finished {
+            tracing::trace!(
+                event = ?event,
+                "StreamEncoder: dropping event after stream finished"
+            );
             return Ok(Vec::new());
         }
 

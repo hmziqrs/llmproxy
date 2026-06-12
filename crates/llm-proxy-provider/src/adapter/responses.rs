@@ -166,13 +166,16 @@ impl ProviderStreamDecoder for ResponsesStreamDecoder {
                         if !self.tool_call_started {
                             self.close_content_if_open();
                             self.tool_call_started = true;
+                            let synthetic_id =
+                                format!("__responses_missing_{}__", self.content_index);
                             tracing::warn!(
-                                "Responses: emitting ToolCallStart with empty id/name \
+                                synthetic_id = synthetic_id,
+                                "Responses: emitting synthetic ToolCallStart \
                                  (no prior response.output_item.added event)"
                             );
                             events.push(CoreEvent::ToolCallStart {
                                 index: self.content_index,
-                                id: String::new(),
+                                id: synthetic_id,
                                 name: String::new(),
                             });
                         }
@@ -187,9 +190,16 @@ impl ProviderStreamDecoder for ResponsesStreamDecoder {
                 // If ToolCallStart was never emitted, emit one now before stop.
                 if !self.tool_call_started {
                     self.close_content_if_open();
+                    let synthetic_id =
+                        format!("__responses_missing_{}__", self.content_index);
+                    tracing::warn!(
+                        synthetic_id = synthetic_id,
+                        "Responses: emitting synthetic ToolCallStart at arguments.done \
+                         (no prior response.output_item.added event)"
+                    );
                     events.push(CoreEvent::ToolCallStart {
                         index: self.content_index,
-                        id: String::new(),
+                        id: synthetic_id,
                         name: String::new(),
                     });
                 }
@@ -367,8 +377,13 @@ impl ResponsesAdapter {
                     CoreContent::Text { text, .. } => Some(text.as_str()),
                     _ => None,
                 })
-                .collect::<Vec<_>>()
-                .join("\n");
+                .fold(String::new(), |mut acc, s| {
+                    if !acc.is_empty() {
+                        acc.push('\n');
+                    }
+                    acc.push_str(s);
+                    acc
+                });
             if !system_text.is_empty() {
                 input.push(ResponsesInput {
                     role: "developer".to_owned(),
@@ -384,6 +399,8 @@ impl ResponsesAdapter {
                 CoreRole::Assistant => "assistant",
                 CoreRole::System => "developer",
                 CoreRole::Tool => "user",
+                // Future CoreRole variants are mapped to "user" as a safe default.
+                // Update this match when new variants are added to CoreRole.
                 _ => "user",
             };
 

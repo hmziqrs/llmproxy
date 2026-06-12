@@ -2036,9 +2036,6 @@ dependencies = [
 [[package]]
 name = "llm-proxy-api"
 version = "0.1.0"
-dependencies = [
- "llm-proxy-core",
-]
 
 [[package]]
 name = "llm-proxy-core"
@@ -2116,9 +2113,6 @@ dependencies = [
 [[package]]
 name = "llm-proxy-storage"
 version = "0.1.0"
-dependencies = [
- "llm-proxy-core",
-]
 
 [[package]]
 name = "lock_api"

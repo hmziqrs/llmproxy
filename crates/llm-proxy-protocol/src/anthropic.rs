@@ -110,6 +110,11 @@ impl MessageRequest {
                 "messages is required".to_owned(),
             ));
         }
+        if self.max_tokens <= 0 {
+            return Err(crate::client::ProtocolError::InvalidRequest(
+                format!("max_tokens must be positive, got {}", self.max_tokens),
+            ));
+        }
         Ok(())
     }
 }
@@ -155,6 +160,11 @@ pub struct CacheControl {
 /// Unknown metadata fields beyond `user_id` are preserved in the `extra`
 /// flattened map so they can be forwarded to `RequestMetadata.raw` during
 /// decode rather than silently dropped.
+///
+/// Note: `deny_unknown_fields` is intentionally omitted because this struct
+/// uses `#[serde(flatten)]` to capture unknown fields. The flattened `extra`
+/// map may grow large with arbitrary client metadata; callers that need to
+/// bound payload size should check `extra.len()` before forwarding.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Metadata {
     /// An external identifier for the end-user.
@@ -198,6 +208,7 @@ impl Message {
     /// "content": [{"type":"text","text":"hello"}]
     /// ```
     #[must_use]
+    #[allow(deprecated)] // constructs ContentBlock with output: None
     pub fn content_blocks(&self) -> Vec<ContentBlock> {
         if self.content.is_null() {
             return Vec::new();
@@ -293,6 +304,7 @@ pub struct ContentBlock {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input: Option<serde_json::Value>,
     /// Deprecated: use `content` instead.
+    #[deprecated(since = "0.1.0", note = "use `content` field instead")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output: Option<serde_json::Value>,
     /// Inner content for `"tool_result"` blocks (string or array).
@@ -318,6 +330,7 @@ pub struct ContentBlock {
     pub data: Option<String>,
 }
 
+#[allow(deprecated)] // constructors set `output: None` which is the deprecated field
 impl ContentBlock {
     /// Create a text content block with the given string.
     #[must_use]
@@ -454,11 +467,11 @@ impl ContentBlock {
     /// For `"tool_result"` blocks returns `tool_use_id`; for all others
     /// (notably `"tool_use"`) returns `id`.
     #[must_use]
-    pub fn get_tool_id(&self) -> String {
+    pub fn get_tool_id(&self) -> &str {
         if self.r#type == "tool_result" {
-            self.tool_use_id.clone().unwrap_or_default()
+            self.tool_use_id.as_deref().unwrap_or("")
         } else {
-            self.id.clone().unwrap_or_default()
+            self.id.as_deref().unwrap_or("")
         }
     }
 
@@ -490,6 +503,7 @@ impl ContentBlock {
             }
         }
         // Fallback to the deprecated output field.
+        #[allow(deprecated)]
         if let Some(ref val) = self.output {
             if let Some(s) = val.as_str() {
                 return s.to_owned();
@@ -522,16 +536,13 @@ impl Serialize for ContentBlock {
                 map.end()
             }
             "tool_use" => {
-                let input = self
-                    .input
-                    .as_ref()
-                    .cloned()
-                    .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+                let empty_object = serde_json::Value::Object(serde_json::Map::new());
+                let input = self.input.as_ref().unwrap_or(&empty_object);
                 let mut map = serializer.serialize_map(Some(4))?;
                 map.serialize_entry("type", &self.r#type)?;
                 map.serialize_entry("id", self.id.as_deref().unwrap_or(""))?;
                 map.serialize_entry("name", self.name.as_deref().unwrap_or(""))?;
-                map.serialize_entry("input", &input)?;
+                map.serialize_entry("input", input)?;
                 map.end()
             }
             "tool_result" => {
@@ -564,6 +575,11 @@ impl Serialize for ContentBlock {
                 map.end()
             }
             "image" => {
+                // When `source` is `None` we emit an empty ImageSource placeholder.
+                // This produces structurally valid but semantically meaningless JSON.
+                // The `new_image` constructor requires a source, so this branch is only
+                // reachable for blocks constructed with Default or deserialized from
+                // malformed input.
                 let mut map = serializer.serialize_map(Some(2))?;
                 map.serialize_entry("type", &self.r#type)?;
                 map.serialize_entry(
@@ -576,7 +592,13 @@ impl Serialize for ContentBlock {
                 )?;
                 map.end()
             }
-            // Unknown / future block types: serialize all fields.
+            // Unknown / future block types: serialize all non-None fields.
+            //
+            // This clones every field to construct an intermediate `AllFields` struct.
+            // The clone cost is acceptable because (a) unknown block types are rare,
+            // and (b) the approach keeps the Serialize impl maintainable by leveraging
+            // derive rather than a manual `SerializeMap` that conditionally includes
+            // each field.
             _ => {
                 #[derive(Serialize)]
                 struct AllFields {
@@ -610,6 +632,7 @@ impl Serialize for ContentBlock {
                     data: Option<String>,
                 }
 
+                #[allow(deprecated)]
                 let all = AllFields {
                     r#type: self.r#type.clone(),
                     text: self.text.clone(),
@@ -689,6 +712,11 @@ pub struct ToolResult {
 
 /// A response from the Anthropic Messages API.
 ///
+/// This struct is both constructed for client-facing output AND deserialized
+/// from upstream Anthropic SSE events (specifically `message_start` events
+/// contain a full `MessageResponse` snapshot). `Deserialize` is required for
+/// the SSE decode path; `Serialize` is required for the encode path.
+///
 /// Note: `deny_unknown_fields` is intentionally omitted because this is an
 /// outbound-only type -- the proxy constructs it internally and serializes
 /// it to clients. It is never deserialized from external input. Omitting
@@ -723,6 +751,10 @@ pub struct MessageResponse {
 // ---------------------------------------------------------------------------
 
 /// Token usage statistics returned with every response.
+///
+/// Uses `i32` for token counts for consistency with the Anthropic API wire
+/// format (JSON integers) and the core `Usage` type. The ~2.1 billion limit
+/// is well beyond any realistic single request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct Usage {
@@ -763,6 +795,10 @@ pub struct ContentBlockDelta {
 #[non_exhaustive]
 pub struct Delta {
     /// Delta type (e.g. `"text_delta"`, `"thinking_delta"`, `"input_json_delta"`).
+    ///
+    /// Kept as `Option<String>` with `#[serde(default)]` for forward-compatibility
+    /// with future Anthropic delta types. In practice the Anthropic API always
+    /// includes this field; `None` indicates a malformed or unknown delta.
     #[serde(rename = "type", default, skip_serializing_if = "Option::is_none")]
     pub r#type: Option<String>,
     /// Partial text content.
@@ -834,6 +870,7 @@ pub struct ApiError {
 // ===========================================================================
 
 #[cfg(test)]
+#[allow(deprecated)] // tests construct ContentBlock with `output` field
 mod tests {
     use super::*;
 

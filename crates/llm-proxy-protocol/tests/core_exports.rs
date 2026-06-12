@@ -70,3 +70,60 @@ fn cache_control_type_is_exported() {
         r#"{"type":"ephemeral"}"#
     );
 }
+
+/// Verify that CoreEvent variants can be serialized and deserialized.
+#[test]
+fn core_event_round_trips() {
+    let events = vec![
+        CoreEvent::Ping,
+        CoreEvent::TextDelta {
+            index: 0,
+            text: "hello".into(),
+        },
+        CoreEvent::MessageStart {
+            id: Some("msg_123".into()),
+            model: ModelRef {
+                requested: "test-model".into(),
+                upstream: None,
+            },
+        },
+    ];
+    for event in &events {
+        let json = serde_json::to_string(event).expect("CoreEvent should serialize");
+        assert!(!json.is_empty());
+        let back: CoreEvent =
+            serde_json::from_str(&json).expect("CoreEvent should deserialize");
+        assert_eq!(&back, event, "CoreEvent round-trip should be lossless");
+    }
+}
+
+/// Verify that CoreRequest round-trips with full structural equality.
+#[test]
+fn core_request_full_round_trip() {
+    let req = CoreRequest {
+        model: ModelRef {
+            requested: "test-model".into(),
+            upstream: None,
+        },
+        system: vec![CoreContent::Text {
+            text: "be helpful".into(),
+            cache: None,
+        }],
+        messages: vec![CoreMessage {
+            role: CoreRole::User,
+            content: vec![CoreContent::Text {
+                text: "hello".into(),
+                cache: None,
+            }],
+        }],
+        tools: vec![],
+        tool_choice: None,
+        sampling: SamplingOptions::default(),
+        stream: false,
+        metadata: RequestMetadata::default(),
+        provider_hints: ProviderHints::default(),
+    };
+    let json = serde_json::to_string(&req).expect("CoreRequest should serialize");
+    let back: CoreRequest = serde_json::from_str(&json).expect("CoreRequest should deserialize");
+    assert_eq!(req, back, "CoreRequest round-trip should be structurally equal");
+}

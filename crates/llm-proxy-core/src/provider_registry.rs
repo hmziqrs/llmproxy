@@ -75,7 +75,7 @@ pub enum ProviderRouteResolutionError {
 /// `endpoint` is the raw endpoint or URL template from provider TOML. It is
 /// **not** a route-built final URL. Provider adapters own endpoint URL shape,
 /// including Gemini `{model}` expansion.
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ProviderAdapterTargetConfig {
     /// Provider name (identifies the provider config).
@@ -138,7 +138,6 @@ pub struct ProviderRegistry {
 
 impl ProviderRegistry {
     /// Load all provider TOML files from a directory.
-    #[must_use = "load_from_dir returns a Result that must be checked"]
     ///
     /// Reads every `*.toml` file in `path`, parses each as a [`crate::provider_config::ProviderFile`],
     /// and indexes them by provider name. Returns an error if:
@@ -215,25 +214,28 @@ impl ProviderRegistry {
 
             let provider = load_provider_config(&file_path, None)?;
 
-            if providers.contains_key(&provider.name) {
-                let first_path = source_paths
-                    .get(&provider.name)
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_else(|| "(unknown)".to_owned());
-                return Err(CoreError::ProviderResolution {
-                    message: format!(
-                        "duplicate provider name \"{}\": already defined in {}, redefined in {}. \
-                         Provider names must be unique across all config files",
-                        provider.name,
-                        first_path,
-                        file_path.display()
-                    ),
-                    source: None,
-                });
+            match providers.entry(provider.name.clone()) {
+                std::collections::hash_map::Entry::Occupied(e) => {
+                    let first_path = source_paths
+                        .get(e.key())
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| "(unknown)".to_owned());
+                    return Err(CoreError::ProviderResolution {
+                        message: format!(
+                            "duplicate provider name \"{}\": already defined in {}, redefined in {}. \
+                             Provider names must be unique across all config files",
+                            provider.name,
+                            first_path,
+                            file_path.display()
+                        ),
+                        source: None,
+                    });
+                }
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    source_paths.insert(provider.name.clone(), file_path.clone());
+                    e.insert(provider);
+                }
             }
-
-            source_paths.insert(provider.name.clone(), file_path.clone());
-            providers.insert(provider.name.clone(), provider);
         }
 
         Ok(Self { providers })
@@ -249,7 +251,6 @@ impl ProviderRegistry {
     ///
     /// Returns [`CoreError::ProviderResolution`] if duplicate provider names
     /// are found in the input map.
-    #[must_use = "from_providers returns a Result that must be checked"]
     pub fn from_providers(
         providers: impl IntoIterator<Item = ProviderConfig>,
     ) -> Result<Self, CoreError> {
@@ -364,10 +365,14 @@ impl ProviderRegistry {
                 "(none)".to_owned()
             } else {
                 let keys: Vec<&str> = provider.adapters.keys().map(|s| s.as_str()).collect();
-                if keys.len() <= 5 {
+                if keys.len() <= MAX_ADAPTERS_IN_ERROR {
                     keys.join(", ")
                 } else {
-                    format!("{} (+{} more)", keys[..5].join(", "), keys.len() - 5)
+                    format!(
+                        "{} (+{} more)",
+                        keys[..MAX_ADAPTERS_IN_ERROR].join(", "),
+                        keys.len() - MAX_ADAPTERS_IN_ERROR
+                    )
                 }
             };
             ProviderRouteResolutionError::MissingAdapter {
@@ -433,6 +438,18 @@ impl ProviderRegistry {
     }
 }
 
+impl<'a> IntoIterator for &'a ProviderRegistry {
+    type Item = &'a ProviderConfig;
+    type IntoIter = std::collections::hash_map::Values<'a, String, ProviderConfig>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.providers.values()
+    }
+}
+
+/// Maximum number of adapter names shown in error messages before truncation.
+const MAX_ADAPTERS_IN_ERROR: usize = 5;
+
 // ===========================================================================
 // Tests
 // ===========================================================================
@@ -440,7 +457,7 @@ impl ProviderRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{AuthStyle, ProviderAdapterConfig, ProviderRoutesConfig};
+    use crate::{AuthStyle, ProviderAdapterConfig, ProviderCatalogConfig, ProviderRoutesConfig};
 
     #[test]
     fn provider_route_resolves_alias_and_redacts_secrets() {
@@ -632,5 +649,198 @@ chat_completions = "chat"
             ProviderRouteResolutionError::MissingAdapter { provider, adapter, .. }
                 if provider == "broken" && adapter == "nonexistent_adapter"
         ));
+    }
+
+    // -- from_providers duplicate detection -----------------------------------
+
+    #[test]
+    fn from_providers_rejects_duplicate_names() {
+        let provider_a = ProviderConfig {
+            name: "dup".to_owned(),
+            api_key: "key".to_owned(),
+            auth_style: AuthStyle::Bearer,
+            adapters: HashMap::new(),
+            routes: ProviderRoutesConfig::default(),
+            model_aliases: HashMap::new(),
+            discovery: None,
+            catalog: None,
+        };
+        let provider_b = ProviderConfig {
+            name: "dup".to_owned(),
+            api_key: "key2".to_owned(),
+            ..provider_a.clone()
+        };
+        let result = ProviderRegistry::from_providers(vec![provider_a, provider_b]);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, CoreError::ProviderResolution { .. }));
+        assert!(err.to_string().contains("duplicate provider name"));
+    }
+
+    // -- len() / is_empty() / get() -------------------------------------------
+
+    #[test]
+    fn empty_registry_is_empty_and_zero_len() {
+        let registry = ProviderRegistry::from_providers(Vec::new()).expect("registry");
+        assert!(registry.is_empty());
+        assert_eq!(registry.len(), 0);
+        assert!(registry.get("anything").is_none());
+    }
+
+    #[test]
+    fn registry_with_one_provider() {
+        let provider = ProviderConfig {
+            name: "test".to_owned(),
+            api_key: "key".to_owned(),
+            auth_style: AuthStyle::Bearer,
+            adapters: HashMap::new(),
+            routes: ProviderRoutesConfig::default(),
+            model_aliases: HashMap::new(),
+            discovery: None,
+            catalog: None,
+        };
+        let registry = ProviderRegistry::from_providers(vec![provider]).expect("registry");
+        assert!(!registry.is_empty());
+        assert_eq!(registry.len(), 1);
+        assert!(registry.get("test").is_some());
+        assert!(registry.get("nonexistent").is_none());
+    }
+
+    // -- catalog_models() -----------------------------------------------------
+
+    #[test]
+    fn catalog_models_returns_none_for_unknown_provider() {
+        let registry = ProviderRegistry::from_providers(Vec::new()).expect("registry");
+        assert!(registry.catalog_models("missing").is_none());
+    }
+
+    #[test]
+    fn catalog_models_returns_empty_for_provider_without_catalog() {
+        let provider = ProviderConfig {
+            name: "test".to_owned(),
+            api_key: "key".to_owned(),
+            auth_style: AuthStyle::Bearer,
+            adapters: HashMap::new(),
+            routes: ProviderRoutesConfig::default(),
+            model_aliases: HashMap::new(),
+            discovery: None,
+            catalog: None,
+        };
+        let registry = ProviderRegistry::from_providers(vec![provider]).expect("registry");
+        let models = registry.catalog_models("test").expect("provider exists");
+        assert!(models.is_empty());
+    }
+
+    #[test]
+    fn catalog_models_returns_entries_when_configured() {
+        let provider = ProviderConfig {
+            name: "test".to_owned(),
+            api_key: "key".to_owned(),
+            auth_style: AuthStyle::Bearer,
+            adapters: HashMap::new(),
+            routes: ProviderRoutesConfig::default(),
+            model_aliases: HashMap::new(),
+            discovery: None,
+            catalog: Some(ProviderCatalogConfig::default()),
+        };
+        let registry = ProviderRegistry::from_providers(vec![provider]).expect("registry");
+        let models = registry.catalog_models("test").expect("provider exists");
+        // Default catalog has no models.
+        assert!(models.is_empty());
+    }
+
+    // -- resolve without alias (fallback) -------------------------------------
+
+    #[test]
+    fn resolve_without_alias_returns_requested_model() {
+        let provider = ProviderConfig {
+            name: "test".to_owned(),
+            api_key: "key".to_owned(),
+            auth_style: AuthStyle::Bearer,
+            adapters: HashMap::from([(
+                "chat".to_owned(),
+                ProviderAdapterConfig {
+                    protocol: "openai_chat_completions".to_owned(),
+                    endpoint: "https://example.com/v1/chat/completions".to_owned(),
+                    headers: HashMap::new(),
+                },
+            )]),
+            routes: ProviderRoutesConfig {
+                chat_completions: Some("chat".to_owned()),
+                messages: None,
+            },
+            model_aliases: HashMap::new(),
+            discovery: None,
+            catalog: None,
+        };
+        let registry = ProviderRegistry::from_providers(vec![provider]).expect("registry");
+        let target = registry
+            .resolve_provider_route("test", ProviderRouteKind::ChatCompletions, "gpt-4o")
+            .expect("resolve");
+        assert_eq!(target.upstream_model, "gpt-4o");
+        assert_eq!(target.requested_model, "gpt-4o");
+    }
+
+    // -- IntoIterator ---------------------------------------------------------
+
+    #[test]
+    fn into_iterator_works() {
+        let provider_a = ProviderConfig {
+            name: "a".to_owned(),
+            api_key: "key".to_owned(),
+            auth_style: AuthStyle::Bearer,
+            adapters: HashMap::new(),
+            routes: ProviderRoutesConfig::default(),
+            model_aliases: HashMap::new(),
+            discovery: None,
+            catalog: None,
+        };
+        let provider_b = ProviderConfig {
+            name: "b".to_owned(),
+            ..provider_a.clone()
+        };
+        let registry = ProviderRegistry::from_providers(vec![provider_a, provider_b]).expect("registry");
+        let names: Vec<&str> = (&registry).into_iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names.len(), 2);
+        assert!(names.contains(&"a"));
+        assert!(names.contains(&"b"));
+    }
+
+    // -- Adapter list truncation in MissingAdapter error ----------------------
+
+    #[test]
+    fn missing_adapter_error_truncates_long_adapter_list() {
+        // Build a provider with >5 adapters and a route pointing to a non-existent one.
+        let mut adapters = HashMap::new();
+        for i in 0..7 {
+            adapters.insert(
+                format!("adapter-{i}"),
+                ProviderAdapterConfig {
+                    protocol: "openai_chat_completions".to_owned(),
+                    endpoint: format!("https://example.com/v{i}"),
+                    headers: HashMap::new(),
+                },
+            );
+        }
+        let provider = ProviderConfig {
+            name: "truncation-test".to_owned(),
+            api_key: "key".to_owned(),
+            auth_style: AuthStyle::Bearer,
+            adapters,
+            routes: ProviderRoutesConfig {
+                chat_completions: Some("nonexistent".to_owned()),
+                messages: None,
+            },
+            model_aliases: HashMap::new(),
+            discovery: None,
+            catalog: None,
+        };
+        let registry = ProviderRegistry::from_providers(vec![provider]).expect("registry");
+        let error = registry
+            .resolve_provider_route("truncation-test", ProviderRouteKind::ChatCompletions, "model")
+            .expect_err("missing adapter");
+
+        let msg = error.to_string();
+        assert!(msg.contains("+2 more"), "expected truncation message, got: {msg}");
     }
 }

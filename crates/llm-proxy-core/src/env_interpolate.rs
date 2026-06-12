@@ -26,6 +26,14 @@ pub(crate) fn env_var_regex() -> &'static Regex {
 ///
 /// Unset variables are left as-is (the `${VAR}` pattern remains in the output).
 ///
+/// # Trust boundary
+///
+/// Values are substituted as raw text. Callers must ensure environment
+/// variables contain no TOML-breaking characters if the output will be
+/// parsed as TOML. A compromised or misconfigured environment variable
+/// could inject arbitrary TOML structure. This is acceptable because the
+/// process owner controls the environment.
+///
 /// # Whole-file interpolation
 ///
 /// This function operates on the entire raw file content before TOML/JSON
@@ -137,5 +145,96 @@ mod tests {
         // This is documented behavior: the regex allows numeric-only names.
         // If 123 is not set, it stays as-is.
         assert_eq!(result, "key = ${123}");
+    }
+
+    // -- Multiple interpolations in a single string -------------------------
+
+    #[test]
+    fn multiple_vars_in_single_string() {
+        let _lock = crate::test_support::TestEnvLock::acquire();
+        let _a = crate::test_support::EnvVarGuard::set("_LLM_PROXY_TEST_MULTI_A", "hello");
+        let _b = crate::test_support::EnvVarGuard::set("_LLM_PROXY_TEST_MULTI_B", "world");
+        let result = interpolate_env_vars("${_LLM_PROXY_TEST_MULTI_A} and ${_LLM_PROXY_TEST_MULTI_B}");
+        assert_eq!(result, "hello and world");
+    }
+
+    #[test]
+    fn mix_of_resolved_and_unresolved() {
+        let _lock = crate::test_support::TestEnvLock::acquire();
+        let _a = crate::test_support::EnvVarGuard::set("_LLM_PROXY_TEST_MIX_A", "yes");
+        let result = interpolate_env_vars(
+            "${_LLM_PROXY_TEST_MIX_A} ${_LLM_PROXY_NEVER_EXISTS_MIX_B}",
+        );
+        assert_eq!(result, "yes ${_LLM_PROXY_NEVER_EXISTS_MIX_B}");
+    }
+
+    // -- Env var set to empty string -----------------------------------------
+
+    #[test]
+    fn var_set_to_empty_string_replaces_with_empty() {
+        let _lock = crate::test_support::TestEnvLock::acquire();
+        let _guard = crate::test_support::EnvVarGuard::set("_LLM_PROXY_TEST_EMPTY_VAR", "");
+        let result = interpolate_env_vars("key = ${_LLM_PROXY_TEST_EMPTY_VAR}");
+        assert_eq!(result, "key = ");
+    }
+
+    // -- Adjacent and edge-case patterns -------------------------------------
+
+    #[test]
+    fn adjacent_patterns() {
+        let _lock = crate::test_support::TestEnvLock::acquire();
+        let _a = crate::test_support::EnvVarGuard::set("_LLM_PROXY_TEST_ADJ_A", "X");
+        let _b = crate::test_support::EnvVarGuard::set("_LLM_PROXY_TEST_ADJ_B", "Y");
+        let result = interpolate_env_vars("${_LLM_PROXY_TEST_ADJ_A}${_LLM_PROXY_TEST_ADJ_B}");
+        assert_eq!(result, "XY");
+    }
+
+    #[test]
+    fn dollar_sign_near_pattern() {
+        let result = interpolate_env_vars("$$${_LLM_PROXY_NEVER_EXISTS_999}$$");
+        // The inner ${...} is left as-is; surrounding $ characters are literal.
+        // The regex matches ${_LLM_PROXY_NEVER_EXISTS_999} and replaces it with
+        // itself (since it is unresolved), leaving the surrounding $$ intact.
+        assert_eq!(result, "$$${_LLM_PROXY_NEVER_EXISTS_999}$$");
+    }
+
+    // -- find_env_var_refs tests ---------------------------------------------
+
+    #[test]
+    fn find_env_var_refs_multiple_matches() {
+        let _lock = crate::test_support::TestEnvLock::acquire();
+        let _guard_a = crate::test_support::EnvVarGuard::set("_LLM_PROXY_TEST_REFS_A", "val_a");
+        let refs = find_env_var_refs("${_LLM_PROXY_TEST_REFS_A} and ${_LLM_PROXY_TEST_REFS_B}");
+        assert_eq!(refs.len(), 2);
+        assert_eq!(refs[0].0, "_LLM_PROXY_TEST_REFS_A");
+        assert_eq!(refs[0].1, Some("val_a".to_owned()));
+        assert_eq!(refs[1].0, "_LLM_PROXY_TEST_REFS_B");
+        // Not set, so resolved value is None.
+        assert_eq!(refs[1].1, None);
+    }
+
+    #[test]
+    fn find_env_var_refs_empty_var() {
+        let _lock = crate::test_support::TestEnvLock::acquire();
+        let _guard = crate::test_support::EnvVarGuard::set("_LLM_PROXY_TEST_REFS_EMPTY", "");
+        let refs = find_env_var_refs("${_LLM_PROXY_TEST_REFS_EMPTY}");
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].0, "_LLM_PROXY_TEST_REFS_EMPTY");
+        // Set but empty: Some("").
+        assert_eq!(refs[0].1, Some(String::new()));
+    }
+
+    #[test]
+    fn find_env_var_refs_no_matches() {
+        let refs = find_env_var_refs("no patterns here");
+        assert!(refs.is_empty());
+    }
+
+    #[test]
+    fn find_env_var_refs_duplicate_names() {
+        let refs = find_env_var_refs("${DUP} and ${DUP}");
+        assert_eq!(refs.len(), 2);
+        assert_eq!(refs[0].0, "DUP");
+        assert_eq!(refs[1].0, "DUP");
     }
 }

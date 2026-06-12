@@ -80,11 +80,13 @@ fn sanitize_tool_name(name: &str) -> (String, bool) {
         if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
             result.push(ch);
         } else {
-            // Encode as _0xHH_ for each byte of the character.
-            // SAFETY: write! to a String cannot fail (the fmt::Write impl for
-            // String is infallible); the unwrap is safe.
-            #[allow(clippy::expect_used)]
-            for byte in ch.to_string().as_bytes() {
+            // Encode as _0xHH_ for each byte of the character using a
+            // stack-allocated buffer instead of allocating a String.
+            let mut buf = [0u8; 4];
+            let encoded = ch.encode_utf8(&mut buf);
+            for &byte in encoded.as_bytes() {
+                // SAFETY: write! to a String cannot fail (the fmt::Write
+                // impl for String is infallible).
                 write!(result, "_0x{:02x}_", byte).expect("write! to String is infallible");
             }
             changed = true;
@@ -407,20 +409,20 @@ impl ProviderStreamDecoder for AnthropicStreamDecoder {
                 if self.current_block_kind == ContentKind::ToolUse {
                     events.push(CoreEvent::ToolCallStop { index: idx });
                     // Mark this tool block as closed so finish() won't re-emit.
-                    let tool_idx = self
-                        .tool_blocks
-                        .iter()
-                        .position(|&i| i == idx)
-                        .unwrap_or_else(|| {
-                            tracing::warn!(
-                                idx,
-                                "Anthropic: tool block index not found in content_block_stop; \
-                             marking first tool block as closed"
-                            );
-                            0
-                        });
-                    if tool_idx < self.tool_blocks_closed.len() {
-                        self.tool_blocks_closed[tool_idx] = true;
+                    if let Some(tool_idx) = self.tool_blocks.iter().position(|&i| i == idx) {
+                        if tool_idx < self.tool_blocks_closed.len() {
+                            self.tool_blocks_closed[tool_idx] = true;
+                        }
+                    } else {
+                        // Index not found in tracked tool blocks -- the tool call
+                        // was never opened via a content_block_start event, so
+                        // there is nothing to mark as closed.  Log the mismatch
+                        // for observability.
+                        tracing::warn!(
+                            idx,
+                            "Anthropic: tool block index not found in content_block_stop; \
+                             skipping close since tool call was never opened"
+                        );
                     }
                 }
                 self.current_block_index = None;
@@ -709,7 +711,8 @@ impl AnthropicAdapter {
             if !stop.is_empty() {
                 obj.insert(
                     "stop_sequences".to_owned(),
-                    serde_json::to_value(stop).unwrap_or(serde_json::Value::Null),
+                    serde_json::to_value(stop)
+                        .expect("Vec<String> serialization is infallible"),
                 );
             }
         }

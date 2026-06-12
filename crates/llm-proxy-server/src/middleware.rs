@@ -74,6 +74,12 @@ impl RequestDeduplicator {
     ///
     /// Returns `true` if the request is a duplicate (should be rejected),
     /// `false` if it is new (should be processed).
+    ///
+    /// # Deprecation
+    ///
+    /// Prefer [`is_duplicate_with_path`] which includes the request path in the
+    /// hash to distinguish requests to different protocol endpoints.
+    #[deprecated(note = "use is_duplicate_with_path instead")]
     pub fn is_duplicate(&self, body: &[u8]) -> bool {
         self.is_duplicate_with_path("", body)
     }
@@ -193,11 +199,24 @@ pub struct RateLimiter {
 /// allow stale entries to linger longer.
 const PRUNE_INTERVAL: u64 = 128;
 
+/// Idle eviction threshold for per-IP rate-limit buckets (5 minutes).
+///
+/// Buckets whose last refill was more than this duration ago are evicted
+/// during periodic pruning to prevent unbounded memory growth.
+const RATE_LIMITER_IDLE_EVICT_SECS: u64 = 300;
+
 impl RateLimiter {
     /// Create a new rate limiter.
     ///
     /// `max_requests_per_minute` is the maximum number of requests allowed
     /// per client IP per minute. `0` disables rate limiting.
+    ///
+    /// # Panics
+    ///
+    /// Does not panic, but extremely large values (e.g. `u32::MAX`) create
+    /// per-IP buckets with billions of tokens. Operators should choose
+    /// reasonable values (e.g. 100--100_000 RPM) to avoid pathological
+    /// memory usage from unbounded per-IP bucket allocation.
     pub fn new(max_requests_per_minute: u32) -> Self {
         Self {
             buckets: Mutex::new(HashMap::new()),
@@ -223,7 +242,7 @@ impl RateLimiter {
         if self.prune_counter.fetch_add(1, Ordering::Relaxed) % PRUNE_INTERVAL == 0 {
             let now = std::time::Instant::now();
             buckets.retain(|_, bucket| {
-                now.duration_since(bucket.last_refill) < std::time::Duration::from_secs(300)
+                now.duration_since(bucket.last_refill) < std::time::Duration::from_secs(RATE_LIMITER_IDLE_EVICT_SECS)
             });
         }
 
@@ -268,11 +287,25 @@ impl RequestIdGenerator {
     }
 
     /// Generate the next request ID.
+    ///
+    /// The ID format is `req-{unix_seconds}-{monotonic_counter}`.
+    ///
+    /// # Clock fallback
+    ///
+    /// If `SystemTime::now()` is before `UNIX_EPOCH` (nearly impossible on
+    /// modern systems), the timestamp falls back to 0. The monotonic counter
+    /// still guarantees uniqueness within the process.
     pub fn next_id(&self) -> String {
         let unix = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
-            .unwrap_or(0);
+            .unwrap_or_else(|e| {
+                tracing::error!(error = %e, "system clock is before UNIX epoch; using 0 as request ID timestamp");
+                0
+            });
+        // Ordering::Relaxed is sufficient: the counter only needs to be
+        // monotonic within this process. No other memory depends on the
+        // counter value for synchronization.
         let counter = self.counter.fetch_add(1, Ordering::Relaxed);
         format!("req-{unix}-{counter}")
     }
@@ -528,5 +561,57 @@ mod tests {
             dedup.is_duplicate_with_path("/v1/messages", &body_at_cap),
             "body at exactly the cap should still be tracked"
         );
+    }
+
+    // -- Multi-value X-Forwarded-For (finding 24) ------------------------------
+
+    #[test]
+    fn client_ip_multi_value_xff_picks_leftmost() {
+        use axum::http::HeaderMap;
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", "1.2.3.4, 5.6.7.8".parse().unwrap());
+        let connect_info = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
+
+        let ip = super::get_client_ip(&headers, Some(&connect_info), true);
+        assert_eq!(ip, "1.2.3.4", "should pick the leftmost IP from multi-value XFF");
+    }
+
+    // -- get_client_ip returns 'unknown' (finding 26) --------------------------
+
+    #[test]
+    fn client_ip_returns_unknown_when_no_connect_info_and_no_headers() {
+        use axum::http::HeaderMap;
+
+        let headers = HeaderMap::new();
+        let ip = super::get_client_ip(&headers, None, false);
+        assert_eq!(ip, "unknown", "should return 'unknown' when no IP source is available");
+    }
+
+    #[test]
+    fn client_ip_trusted_xff_with_invalid_ip_falls_through() {
+        use axum::http::HeaderMap;
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", "not-an-ip".parse().unwrap());
+        let connect_info = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 8080);
+
+        let ip = super::get_client_ip(&headers, Some(&connect_info), true);
+        assert_eq!(ip, "10.0.0.1", "invalid XFF value should fall through to connect_info");
+    }
+
+    #[test]
+    fn client_ip_x_real_ip_is_used_when_xff_absent() {
+        use axum::http::HeaderMap;
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-real-ip", "9.8.7.6".parse().unwrap());
+        let connect_info = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
+
+        let ip = super::get_client_ip(&headers, Some(&connect_info), true);
+        assert_eq!(ip, "9.8.7.6", "should use X-Real-Ip when XFF is absent");
     }
 }

@@ -172,11 +172,11 @@ impl ProviderAdapter {
         target: &ProviderAdapterTarget,
     ) -> Result<ProxyRequest, ProviderError> {
         // Log non-empty provider_hints so they are not silently ignored.
-        // Per the plan's lossy translation rules, hints with no provider mapping
-        // should be warned at warn level.  No adapter currently forwards any
-        // hint keys, so all non-empty hints are unmapped.
+        // Downgraded to debug since this fires on every request when clients
+        // consistently send hints -- which is expected behavior. If a specific
+        // adapter adds hint support, only truly unsupported hints should warn.
         if !core.provider_hints.raw.is_empty() {
-            tracing::warn!(
+            tracing::debug!(
                 protocol = %target.protocol.name(),
                 "provider_hints present but no adapter currently forwards them"
             );
@@ -225,7 +225,7 @@ impl ProviderAdapter {
 ///
 /// The decoder receives parsed [`SseFrame`] objects from [`SseFramer`](crate::sse::SseFramer).
 /// It must not parse raw network chunks.
-pub trait ProviderStreamDecoder: fmt::Debug {
+pub trait ProviderStreamDecoder: fmt::Debug + Send {
     /// Decode a single SSE frame into zero or more core events.
     fn decode_frame(&mut self, frame: &SseFrame) -> Result<Vec<CoreEvent>, ProviderError>;
 
@@ -309,13 +309,17 @@ pub(crate) fn expand_url_template(
     template: &str,
     target: &ProviderAdapterTarget,
 ) -> Result<String, ProviderError> {
-    if !template.contains("{model}") {
+    let Some(model_pos) = template.find("{model}") else {
         return Ok(template.to_owned());
-    }
+    };
+
     let configured_model = &target.upstream_model;
+    // When the template uses "models/{model}", strip the "models/" prefix
+    // from the configured model name to avoid "models/models/..." in the URL.
+    let has_models_prefix = template[..model_pos].ends_with("models/");
     let model = configured_model
         .strip_prefix("models/")
-        .filter(|_| template.contains("models/{model}"))
+        .filter(|_| has_models_prefix)
         .unwrap_or(configured_model);
     // Reject model names containing path traversal or other unsafe characters.
     // Additionally reject `.` and `..` exactly (path traversal patterns).
@@ -334,7 +338,12 @@ pub(crate) fn expand_url_template(
             model
         )));
     }
-    Ok(template.replace("{model}", model))
+    // Single-pass replacement using the position found above.
+    let mut result = String::with_capacity(template.len() + model.len());
+    result.push_str(&template[..model_pos]);
+    result.push_str(model);
+    result.push_str(&template[model_pos + "{model}".len()..]);
+    Ok(result)
 }
 
 fn is_safe_model_component(model: &str) -> bool {

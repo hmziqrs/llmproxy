@@ -3,6 +3,13 @@
 //! All counters are lock-free ([`std::sync::atomic::AtomicI64`]). The only
 //! mutex-guarded state is the latency ring-buffer (last 1 000 samples) and
 //! the per-provider-model request counter map.
+//!
+//! # Ordering
+//!
+//! All atomic operations use [`Ordering::Relaxed`] which is correct here
+//! because the counters are monotonically increasing, used only for
+//! observability, and no synchronization invariants depend on their
+//! relative ordering.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
@@ -13,7 +20,10 @@ use std::time::Duration;
 const LATENCY_CAP: usize = 1000;
 
 /// Separator used in the composite metrics key: `"{provider}/{model}"`.
-const KEY_SEPARATOR: &str = "/";
+///
+/// The `:` delimiter is chosen because provider names are restricted to
+/// `[a-z0-9_-]+` and model IDs cannot contain `:`, preventing key collisions.
+const KEY_SEPARATOR: &str = ":";
 
 // ---------------------------------------------------------------------------
 // Metrics
@@ -34,8 +44,8 @@ pub struct Metrics {
     deduplicated: AtomicI64,
     /// Ring-buffer holding the last [`LATENCY_CAP`] latency samples.
     latencies: Mutex<VecDeque<Duration>>,
-    /// Per-provider-model request counts. Key format: `"{provider}/{model}"`.
-    model_counts: Mutex<HashMap<String, AtomicI64>>,
+    /// Per-provider-model request counts. Key format: `"{provider}:{model}"`.
+    model_counts: Mutex<HashMap<String, i64>>,
 }
 
 impl Metrics {
@@ -75,23 +85,17 @@ impl Metrics {
         self.upstream_calls.fetch_add(1, Ordering::Relaxed);
 
         // Store latency sample (ring-buffer).
-        if let Ok(mut buf) = self.latencies.lock() {
-            if buf.len() >= LATENCY_CAP {
-                buf.pop_front();
-            }
-            buf.push_back(latency);
+        // Recover from poison to preserve data from panicked threads.
+        let mut buf = self.latencies.lock().unwrap_or_else(|e| e.into_inner());
+        if buf.len() >= LATENCY_CAP {
+            buf.pop_front();
         }
+        buf.push_back(latency);
 
         // Bump per-provider-model counter.
         let key = format!("{provider}{KEY_SEPARATOR}{model}");
-        if let Ok(mut map) = self.model_counts.lock() {
-            if let Some(counter) = map.get(&key) {
-                counter.fetch_add(1, Ordering::Relaxed);
-            } else {
-                let counter = AtomicI64::new(1);
-                map.insert(key, counter);
-            }
-        }
+        let mut map = self.model_counts.lock().unwrap_or_else(|e| e.into_inner());
+        *map.entry(key).or_insert(0) += 1;
     }
 
     /// Record a failed request.
@@ -107,12 +111,17 @@ impl Metrics {
         self.rate_limited.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Record a deduplicated (deduplicated) request.
+    /// Record a deduplicated (cache-hit) request.
     pub fn record_deduplicated(&self) {
         self.deduplicated.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Take a point-in-time snapshot of all counters.
+    /// Take an approximate point-in-time snapshot of all counters.
+    ///
+    /// Individual fields are each loaded atomically, but the overall
+    /// snapshot is **approximately** consistent rather than transactional:
+    /// between loading the first counter and the last, other threads may
+    /// have mutated state. This is acceptable for observability use cases.
     pub fn get_snapshot(&self) -> Snapshot {
         let requests_received = self.requests_received.load(Ordering::Relaxed);
         let requests_streamed = self.requests_streamed.load(Ordering::Relaxed);
@@ -125,18 +134,18 @@ impl Metrics {
         let latencies = self
             .latencies
             .lock()
-            .map(|buf| buf.iter().copied().collect())
-            .unwrap_or_default();
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .copied()
+            .collect();
 
         let model_counts = self
             .model_counts
             .lock()
-            .map(|map| {
-                map.iter()
-                    .map(|(k, v)| (k.clone(), v.load(Ordering::Relaxed)))
-                    .collect()
-            })
-            .unwrap_or_default();
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|(k, &v)| (k.clone(), v))
+            .collect();
 
         Snapshot {
             requests_received,
@@ -162,8 +171,11 @@ impl Default for Metrics {
 // Snapshot
 // ---------------------------------------------------------------------------
 
-/// A point-in-time copy of all metric counters.
-#[derive(Debug, Clone)]
+/// An approximate point-in-time copy of all metric counters.
+///
+/// Individual fields are each loaded atomically but the snapshot as a whole
+/// is not a transactional view. This is acceptable for observability.
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Snapshot {
     /// Total requests received (streaming + non-streaming).
     pub requests_received: i64,
@@ -181,11 +193,21 @@ pub struct Snapshot {
     pub deduplicated: i64,
     /// Collected latency samples (up to 1 000 entries).
     pub latencies: Vec<Duration>,
-    /// Per-provider-model request counts. Key format: `"{provider}/{model}"`.
+    /// Per-provider-model request counts. Key format: `"{provider}:{model}"`.
     pub model_counts: HashMap<String, i64>,
 }
 
 impl Snapshot {
+    /// Compute the latency at an arbitrary percentile (0..=100).
+    ///
+    /// Uses the "exclusive" interpolation method common in monitoring systems:
+    /// `rank = pct/100 * (n + 1)`, then clamped to `[0, n-1]`.
+    ///
+    /// Returns [`Duration::ZERO`] for an empty sample set.
+    pub fn calculate_percentile(&self, pct: f64) -> Duration {
+        percentile(&self.latencies, pct)
+    }
+
     /// Compute the p95 latency from the collected samples.
     ///
     /// Returns [`Duration::ZERO`] when no samples have been recorded.
@@ -212,6 +234,11 @@ impl Snapshot {
 ///
 /// Returns [`Duration::ZERO`] for an empty slice.
 fn percentile(samples: &[Duration], pct: f64) -> Duration {
+    debug_assert!(
+        (0.0..=100.0).contains(&pct),
+        "percentile must be in 0..=100, got {pct}"
+    );
+
     if samples.is_empty() {
         return Duration::ZERO;
     }
@@ -279,8 +306,8 @@ mod tests {
         assert_eq!(snap.requests_success, 3);
         assert_eq!(snap.upstream_calls, 3);
         assert_eq!(snap.latencies.len(), 3);
-        assert_eq!(snap.model_counts.get("openai/gpt-4o"), Some(&2));
-        assert_eq!(snap.model_counts.get("anthropic/claude-3"), Some(&1));
+        assert_eq!(snap.model_counts.get("openai:gpt-4o"), Some(&2));
+        assert_eq!(snap.model_counts.get("anthropic:claude-3"), Some(&1));
     }
 
     #[test]
@@ -290,8 +317,8 @@ mod tests {
         m.record_success("provider-b", "gpt-4o", Duration::from_millis(200));
 
         let snap = m.get_snapshot();
-        assert_eq!(snap.model_counts.get("provider-a/gpt-4o"), Some(&1));
-        assert_eq!(snap.model_counts.get("provider-b/gpt-4o"), Some(&1));
+        assert_eq!(snap.model_counts.get("provider-a:gpt-4o"), Some(&1));
+        assert_eq!(snap.model_counts.get("provider-b:gpt-4o"), Some(&1));
         assert_eq!(snap.model_counts.len(), 2);
     }
 
@@ -335,17 +362,7 @@ mod tests {
 
     #[test]
     fn p95_p99_empty() {
-        let snap = Snapshot {
-            requests_received: 0,
-            requests_streamed: 0,
-            requests_success: 0,
-            requests_failed: 0,
-            upstream_calls: 0,
-            rate_limited: 0,
-            deduplicated: 0,
-            latencies: vec![],
-            model_counts: HashMap::new(),
-        };
+        let snap = Snapshot::default();
         assert_eq!(snap.calculate_p95(), Duration::ZERO);
         assert_eq!(snap.calculate_p99(), Duration::ZERO);
     }
@@ -356,15 +373,8 @@ mod tests {
         let latencies: Vec<Duration> = (0..100).map(Duration::from_millis).collect();
 
         let snap = Snapshot {
-            requests_received: 0,
-            requests_streamed: 0,
-            requests_success: 0,
-            requests_failed: 0,
-            upstream_calls: 0,
-            rate_limited: 0,
-            deduplicated: 0,
             latencies,
-            model_counts: HashMap::new(),
+            ..Snapshot::default()
         };
 
         // p95: rank = 0.95 * (100+1) = 95.95 -> floor 95 -> idx 94 -> 94ms
@@ -428,5 +438,97 @@ mod tests {
         let m = Metrics::default();
         let snap = m.get_snapshot();
         assert_eq!(snap.requests_received, 0);
+    }
+
+    #[test]
+    fn snapshot_default_is_zeroed() {
+        let snap = Snapshot::default();
+        assert_eq!(snap.requests_received, 0);
+        assert_eq!(snap.latencies.len(), 0);
+        assert!(snap.model_counts.is_empty());
+    }
+
+    #[test]
+    fn snapshot_partial_eq_works() {
+        let a = Snapshot::default();
+        let b = Snapshot::default();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn p95_single_sample() {
+        let snap = Snapshot {
+            latencies: vec![Duration::from_millis(42)],
+            ..Snapshot::default()
+        };
+        assert_eq!(snap.calculate_p95(), Duration::from_millis(42));
+        assert_eq!(snap.calculate_p99(), Duration::from_millis(42));
+    }
+
+    #[test]
+    fn p95_two_samples() {
+        let snap = Snapshot {
+            latencies: vec![Duration::from_millis(10), Duration::from_millis(100)],
+            ..Snapshot::default()
+        };
+        // p95: rank = 0.95 * 3 = 2.85 -> floor 2 -> idx 1 -> 100ms
+        assert_eq!(snap.calculate_p95(), Duration::from_millis(100));
+        // p99: rank = 0.99 * 3 = 2.97 -> floor 2 -> idx 1 -> 100ms
+        assert_eq!(snap.calculate_p99(), Duration::from_millis(100));
+    }
+
+    #[test]
+    fn calculate_percentile_public_api() {
+        let snap = Snapshot {
+            latencies: (0..100).map(Duration::from_millis).collect(),
+            ..Snapshot::default()
+        };
+        assert_eq!(snap.calculate_percentile(50.0), Duration::from_millis(49));
+    }
+
+    #[test]
+    fn get_snapshot_concurrent_with_writes() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let m = Arc::new(Metrics::new());
+        let mut handles = vec![];
+
+        for _ in 0..2 {
+            let m = Arc::clone(&m);
+            handles.push(thread::spawn(move || {
+                for i in 0..200 {
+                    m.record_success("p", "model", Duration::from_micros(i));
+                }
+            }));
+        }
+
+        // Reader thread.
+        let m_reader = Arc::clone(&m);
+        let reader = thread::spawn(move || {
+            for _ in 0..100 {
+                let snap = m_reader.get_snapshot();
+                assert!(snap.requests_success >= 0);
+                assert!(snap.latencies.len() <= LATENCY_CAP);
+            }
+        });
+
+        for h in handles {
+            h.join().unwrap();
+        }
+        reader.join().unwrap();
+    }
+
+    #[test]
+    fn key_separator_does_not_collide_with_provider_names() {
+        // Provider names are restricted to [a-z0-9_-]+ so `:` separator
+        // cannot appear in provider or model names.
+        let m = Metrics::new();
+        m.record_success("provider-a", "model-x", Duration::from_millis(10));
+        m.record_success("provider-a", "model-y", Duration::from_millis(20));
+        let snap = m.get_snapshot();
+        assert_eq!(snap.model_counts.len(), 2);
+        assert!(snap.model_counts.contains_key("provider-a:model-x"));
+        assert!(snap.model_counts.contains_key("provider-a:model-y"));
     }
 }

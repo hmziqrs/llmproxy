@@ -51,6 +51,23 @@ fn unix_timestamp_secs() -> i64 {
         .as_secs() as i64
 }
 
+/// Clamp a tool-call index from `usize` to the OpenAI wire `i32` range.
+///
+/// OpenAI represents tool-call indices as `i32` inside JSON chunks.  If a
+/// provider ever emits an index larger than `i32::MAX` we clamp it and emit a
+/// warning so the stream is not broken by an overflow panic.
+fn clamp_tool_index(index: usize) -> i32 {
+    let clamped = index.min(i32::MAX as usize) as i32;
+    if clamped as usize != index {
+        tracing::warn!(
+            original_index = index,
+            clamped_index = clamped,
+            "tool-call index exceeds i32::MAX; clamping"
+        );
+    }
+    clamped
+}
+
 // ---------------------------------------------------------------------------
 // decode_request
 // ---------------------------------------------------------------------------
@@ -240,7 +257,12 @@ pub fn decode_request(req: ChatCompletionRequest) -> Result<CoreRequest, Protoco
                 }
                 stop = Some(result);
             }
-            _ => {}
+            other => {
+                tracing::warn!(
+                    ?other,
+                    "stop field is not a string or array; ignoring during OpenAI decode"
+                );
+            }
         }
     }
 
@@ -471,6 +493,7 @@ pub fn encode_response(resp: CoreResponse) -> Result<ChatCompletionResponse, Pro
             delta: None,
         }],
         usage,
+        extra: serde_json::Map::new(),
     })
 }
 
@@ -501,6 +524,12 @@ fn encode_finish_reason(reason: StopReason) -> String {
     }
 }
 
+/// Encode core [`Usage`] into an OpenAI [`UsageInfo`].
+///
+/// Known limitation: `reasoning_tokens` are dropped because [`UsageInfo`] does not
+/// have a `completion_tokens_details` field. If a provider reports non-zero
+/// reasoning tokens, they are logged as a warning. To fix this, add a
+/// `completion_tokens_details` field to `UsageInfo` mirroring the OpenAI API shape.
 fn encode_usage(usage: &Usage) -> UsageInfo {
     if let Some(rt) = usage.reasoning_tokens {
         if rt != 0 {
@@ -661,6 +690,7 @@ impl StreamEncoder {
             }
 
             CoreEvent::ToolCallStart { index, id, name } => {
+                let clamped = clamp_tool_index(index);
                 chunks.push(self.make_chunk(Choice {
                     index: 0,
                     message: None,
@@ -670,7 +700,7 @@ impl StreamEncoder {
                         content: serde_json::Value::String(String::new()),
                         reasoning_content: None,
                         tool_calls: vec![ToolCall {
-                            index: Some(index.min(i32::MAX as usize) as i32),
+                            index: Some(clamped),
                             id: Some(id),
                             r#type: Some("function".to_owned()),
                             function: Some(FunctionCall {
@@ -687,6 +717,7 @@ impl StreamEncoder {
             }
 
             CoreEvent::ToolCallDelta { index, args_delta } => {
+                let clamped = clamp_tool_index(index);
                 chunks.push(self.make_chunk(Choice {
                     index: 0,
                     message: None,
@@ -696,7 +727,7 @@ impl StreamEncoder {
                         content: serde_json::Value::String(String::new()),
                         reasoning_content: None,
                         tool_calls: vec![ToolCall {
-                            index: Some(index.min(i32::MAX as usize) as i32),
+                            index: Some(clamped),
                             id: None,
                             r#type: None,
                             function: Some(FunctionCall {

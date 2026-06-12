@@ -77,3 +77,70 @@ impl CoreError {
         }
     }
 }
+
+impl From<crate::provider_config::ConfigValidationError> for CoreError {
+    fn from(e: crate::provider_config::ConfigValidationError) -> Self {
+        Self::ConfigValidation {
+            message: e.to_string(),
+            source: Some(Box::new(e)),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::error::Error;
+
+    #[test]
+    fn config_load_display_includes_path() {
+        let err = CoreError::ConfigLoad {
+            path: PathBuf::from("/tmp/test.toml"),
+            source: std::io::Error::new(std::io::ErrorKind::NotFound, "not found"),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("/tmp/test.toml"), "display should contain path");
+        assert!(msg.contains("failed to read config"));
+    }
+
+    #[test]
+    fn config_load_has_source() {
+        let err = CoreError::ConfigLoad {
+            path: PathBuf::from("/tmp/test.toml"),
+            source: std::io::Error::new(std::io::ErrorKind::NotFound, "not found"),
+        };
+        assert!(err.source().is_some(), "ConfigLoad should have a source");
+    }
+
+    #[test]
+    fn config_parse_display() {
+        let err = CoreError::ConfigParse(toml::from_str::<toml::Value>("bad [[[").unwrap_err());
+        let msg = err.to_string();
+        assert!(msg.contains("failed to parse config"));
+    }
+
+    #[test]
+    fn config_validation_from_message() {
+        let err = CoreError::config_validation("test message");
+        let msg = err.to_string();
+        assert!(msg.contains("test message"));
+        assert!(err.source().is_none());
+    }
+
+    #[test]
+    fn config_validation_from_config_validation_error() {
+        let validation_err = crate::provider_config::ConfigValidationError::EmptyProviderName;
+        let core_err: CoreError = validation_err.into();
+        assert!(core_err.source().is_some());
+        let msg = core_err.to_string();
+        assert!(msg.contains("provider name is empty"));
+    }
+
+    #[test]
+    fn provider_resolution_from_message() {
+        let err = CoreError::provider_resolution("something went wrong");
+        let msg = err.to_string();
+        assert!(msg.contains("something went wrong"));
+        assert!(err.source().is_none());
+    }
+}

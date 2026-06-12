@@ -60,14 +60,36 @@ impl PidManager {
     /// Write the current process PID to the PID file.
     ///
     /// Creates the config directory if it does not already exist.
+    /// The PID file is written atomically via a temporary file and rename,
+    /// so readers never see a partial/empty file.
     pub fn write_pid(&self) -> Result<()> {
         std::fs::create_dir_all(&self.config_dir)
             .with_context(|| format!("creating directory {}", self.config_dir.display()))?;
         let pid = std::process::id();
-        let mut f = std::fs::File::create(&self.pid_file)
-            .with_context(|| format!("creating PID file {}", self.pid_file.display()))?;
-        write!(f, "{pid}")
-            .with_context(|| format!("writing PID file {}", self.pid_file.display()))?;
+
+        // Write to a temporary file first, then rename atomically.
+        let tmp_path = self.pid_file.with_extension("pid.tmp");
+        {
+            #[cfg(unix)]
+            let mut f = {
+                use std::os::unix::fs::OpenOptionsExt;
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .mode(0o644)
+                    .open(&tmp_path)
+                    .with_context(|| format!("creating temp PID file {}", tmp_path.display()))?
+            };
+            #[cfg(not(unix))]
+            let mut f = std::fs::File::create(&tmp_path)
+                .with_context(|| format!("creating temp PID file {}", tmp_path.display()))?;
+
+            write!(f, "{pid}")
+                .with_context(|| format!("writing PID file {}", tmp_path.display()))?;
+        }
+        std::fs::rename(&tmp_path, &self.pid_file)
+            .with_context(|| format!("renaming PID file {}", self.pid_file.display()))?;
         Ok(())
     }
 
@@ -88,6 +110,12 @@ impl PidManager {
     /// On Unix this uses `kill(pid, 0)` which only checks process existence
     /// without sending a signal. On non-Unix platforms this always returns
     /// `true` as a conservative fallback.
+    ///
+    /// # Notes
+    ///
+    /// - `EPERM` (permission denied) is treated as "running" because the
+    ///   process exists even though we cannot signal it.
+    /// - `ESRCH` (no such process) is treated as "not running".
     pub fn is_process_running(pid: u32) -> bool {
         #[cfg(unix)]
         {
@@ -178,5 +206,42 @@ mod tests {
             !PidManager::is_process_running(pid),
             "nonexistent PID should not be running"
         );
+    }
+
+    /// TestRemovePID: removing the PID file should delete it from disk.
+    #[test]
+    fn remove_pid_deletes_file() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let mgr = PidManager::new(dir.path());
+
+        // Write then remove.
+        mgr.write_pid().expect("write_pid");
+        assert!(mgr.pid_file().exists(), "PID file should exist after write");
+        mgr.remove_pid().expect("remove_pid");
+        assert!(!mgr.pid_file().exists(), "PID file should be gone after remove");
+    }
+
+    /// TestRemovePID_MissingFile: removing a non-existent PID file should
+    /// succeed silently.
+    #[test]
+    fn remove_pid_succeeds_when_missing() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let mgr = PidManager::new(dir.path());
+        // No PID file was created. remove_pid should succeed.
+        mgr.remove_pid().expect("remove_pid on missing file should succeed");
+    }
+
+    /// TestAtomicWrite: verify the PID file has content immediately after
+    /// write_pid (the temp-file + rename strategy ensures no partial reads).
+    #[test]
+    fn write_pid_is_atomic() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let mgr = PidManager::new(dir.path());
+        mgr.write_pid().expect("write_pid");
+
+        // File should exist and contain the PID.
+        let content = std::fs::read_to_string(mgr.pid_file()).expect("read PID file");
+        let pid: u32 = content.trim().parse().expect("parse PID");
+        assert_eq!(pid, std::process::id());
     }
 }

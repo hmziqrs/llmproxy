@@ -83,6 +83,14 @@ pub fn model_allowed(model: &str, allow: &[String], deny: &[String]) -> bool {
 /// Uses `LazyLock` for thread-safe one-time initialization per unique pattern.
 static GLOB_CACHE: std::sync::Mutex<Vec<(String, Regex)>> = std::sync::Mutex::new(Vec::new());
 
+/// Match `value` against a simple glob `pattern` supporting only `*` and `?`.
+///
+/// Characters that are special in regex (`.`, `+`, `(`, etc.) are escaped
+/// via [`regex::escape`] so they match literally. Invalid patterns silently
+/// return `false`.
+///
+/// Compiled regexes are cached for reuse so the same pattern is only
+/// compiled once per process.
 fn glob_matches(pattern: &str, value: &str) -> bool {
     let mut cache = GLOB_CACHE.lock().unwrap_or_else(|e| e.into_inner());
     // Check if we already compiled this pattern.
@@ -92,13 +100,29 @@ fn glob_matches(pattern: &str, value: &str) -> bool {
     // Compile and cache the new pattern.
     let mut expression = String::with_capacity(pattern.len() + 2);
     expression.push('^');
+    let mut literal_buf = String::new();
+    let flush_literal = |buf: &mut String, out: &mut String| {
+        if !buf.is_empty() {
+            out.push_str(&regex::escape(buf));
+            buf.clear();
+        }
+    };
     for ch in pattern.chars() {
         match ch {
-            '*' => expression.push_str(".*"),
-            '?' => expression.push('.'),
-            other => expression.push_str(&regex::escape(&other.to_string())),
+            '*' => {
+                flush_literal(&mut literal_buf, &mut expression);
+                expression.push_str(".*");
+            }
+            '?' => {
+                flush_literal(&mut literal_buf, &mut expression);
+                expression.push('.');
+            }
+            other => {
+                literal_buf.push(other);
+            }
         }
     }
+    flush_literal(&mut literal_buf, &mut expression);
     expression.push('$');
     let regex = match Regex::new(&expression) {
         Ok(re) => re,
@@ -141,7 +165,18 @@ mod tests {
             &config(ProviderCatalogMode::Hybrid),
             &[model("shared", Some("discovered")), model("other", None)],
         );
-        assert_eq!(merged[1].display_name.as_deref(), Some("static"));
+        // The static entry should override the discovered entry for "shared".
+        let shared = merged
+            .iter()
+            .find(|m| m.id == "shared")
+            .expect("shared model should be present");
+        assert_eq!(shared.display_name.as_deref(), Some("static"));
+        // The discovered-only "other" should also be present.
+        let other = merged
+            .iter()
+            .find(|m| m.id == "other")
+            .expect("other model should be present");
+        assert!(other.display_name.is_none());
     }
 
     #[test]
@@ -201,6 +236,41 @@ mod tests {
         assert_eq!(merged[0].id, "shared");
         // The static display_name should win since only static entries are used.
         assert_eq!(merged[0].display_name.as_deref(), Some("static"));
+    }
+
+    #[test]
+    fn glob_matches_special_regex_characters() {
+        // Dots should be treated literally, not as regex wildcards.
+        assert!(glob_matches("model.v2", "model.v2"));
+        assert!(!glob_matches("model.v2", "modelXv2"));
+        // Plus signs, parentheses should be literal.
+        assert!(glob_matches("model+v2", "model+v2"));
+        assert!(!glob_matches("model+v2", "modelvv2"));
+        // Parentheses.
+        assert!(glob_matches("model(test)", "model(test)"));
+    }
+
+    #[test]
+    fn glob_matches_slashes_in_model_ids() {
+        // Real-world model IDs with slashes and dots.
+        assert!(glob_matches(
+            "accounts/fireworks/models/deepseek-v3p1",
+            "accounts/fireworks/models/deepseek-v3p1"
+        ));
+        assert!(!glob_matches(
+            "accounts/fireworks/models/deepseek-v3p1",
+            "accounts/fireworks/models/other"
+        ));
+    }
+
+    #[test]
+    fn glob_matches_wildcard_patterns() {
+        assert!(glob_matches("*-preview", "model-preview"));
+        assert!(!glob_matches("*-preview", "model-stable"));
+        assert!(glob_matches("model-*", "model-v2"));
+        assert!(glob_matches("*", "anything"));
+        assert!(glob_matches("model-?", "model-v"));
+        assert!(!glob_matches("model-?", "model-v2"));
     }
 
     #[test]

@@ -1068,6 +1068,7 @@ mod tests {
                 prompt_cache_hit_tokens: Some(10),
                 prompt_cache_miss_tokens: Some(20),
             },
+            extra: serde_json::Map::new(),
         };
         let bytes = serde_json::to_vec(&resp).unwrap();
         let adapter = OpenAiChatAdapter;
@@ -1126,6 +1127,7 @@ mod tests {
                 prompt_cache_hit_tokens: None,
                 prompt_cache_miss_tokens: None,
             },
+            extra: serde_json::Map::new(),
         };
         let bytes = serde_json::to_vec(&resp).unwrap();
         let adapter = OpenAiChatAdapter;
@@ -1173,6 +1175,7 @@ mod tests {
                 prompt_cache_hit_tokens: None,
                 prompt_cache_miss_tokens: None,
             },
+            extra: serde_json::Map::new(),
         };
         let bytes = serde_json::to_vec(&resp).unwrap();
         let adapter = OpenAiChatAdapter;
@@ -1336,6 +1339,7 @@ mod tests {
                 prompt_cache_hit_tokens: None,
                 prompt_cache_miss_tokens: None,
             },
+            extra: serde_json::Map::new(),
         };
         let bytes = serde_json::to_vec(&resp).unwrap();
         let adapter = OpenAiChatAdapter;
@@ -1386,6 +1390,7 @@ mod tests {
                 prompt_cache_hit_tokens: None,
                 prompt_cache_miss_tokens: None,
             },
+            extra: serde_json::Map::new(),
         };
         let bytes = serde_json::to_vec(&resp).unwrap();
         let adapter = OpenAiChatAdapter;
@@ -1414,6 +1419,7 @@ mod tests {
                 prompt_cache_hit_tokens: None,
                 prompt_cache_miss_tokens: None,
             },
+            extra: serde_json::Map::new(),
         };
         let bytes = serde_json::to_vec(&resp).unwrap();
         let adapter = OpenAiChatAdapter;
@@ -1618,6 +1624,7 @@ mod tests {
                 prompt_cache_hit_tokens: None,
                 prompt_cache_miss_tokens: None,
             },
+            extra: serde_json::Map::new(),
         };
         let bytes = serde_json::to_vec(&resp).unwrap();
         let adapter = OpenAiChatAdapter;

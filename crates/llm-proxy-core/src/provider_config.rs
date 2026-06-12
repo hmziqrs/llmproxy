@@ -176,6 +176,11 @@ pub struct ProviderAdapterConfig {
     /// Protocol family (e.g. `"openai_chat_completions"`, `"anthropic_messages"`).
     pub protocol: String,
     /// Upstream endpoint URL.
+    ///
+    /// **Warning:** This field may contain sensitive query parameters (e.g. API
+    /// keys passed as URL query strings). Avoid logging or displaying the raw
+    /// value. The [`Debug`](std::fmt::Debug) impl strips query parameters for
+    /// safe display.
     pub endpoint: String,
     /// Static headers to include in upstream requests (e.g. anthropic-version).
     #[serde(default)]
@@ -289,6 +294,10 @@ pub struct ProviderDiscoveryConfig {
     /// Which discovery backend protocol to use.
     pub kind: ProviderDiscoveryKind,
     /// Upstream URL to fetch the model list from.
+    ///
+    /// **Warning:** This field may contain sensitive query parameters. Avoid
+    /// logging or displaying the raw value. The [`Debug`](std::fmt::Debug) impl
+    /// strips query parameters for safe display.
     pub endpoint: String,
     /// Static headers used only for discovery requests.
     #[serde(default)]
@@ -662,9 +671,9 @@ pub fn validate_provider_config(
         return Err(ConfigValidationError::EmptyProviderName);
     }
 
-    // Provider name must be a URL-safe slug.
+    // Provider name must be a URL-safe slug with a maximum length of 64 characters.
     static PROVIDER_NAME_SLUG: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-        regex::Regex::new(r"^[a-z0-9_-]+$").expect("valid provider name slug regex")
+        regex::Regex::new(r"^[a-z0-9_-]{1,64}$").expect("valid provider name slug regex")
     });
     if !PROVIDER_NAME_SLUG.is_match(name) {
         return Err(ConfigValidationError::InvalidProviderNameFormat {
@@ -705,11 +714,8 @@ pub fn validate_provider_config(
             });
         }
         // Reject non-HTTP(S) URL schemes to prevent SSRF via crafted endpoints.
-        // Valid schemes are "http://" and "https://". This prevents endpoints like
-        // "file:///etc/passwd" or other arbitrary schemes.
         let endpoint_trimmed = adapter_cfg.endpoint.trim();
-        let has_valid_scheme =
-            endpoint_trimmed.starts_with("http://") || endpoint_trimmed.starts_with("https://");
+        let has_valid_scheme = has_valid_http_scheme(endpoint_trimmed);
         if !has_valid_scheme {
             return Err(ConfigValidationError::InvalidEndpointScheme {
                 provider: name.clone(),
@@ -739,7 +745,7 @@ pub fn validate_provider_config(
                 adapter: "discovery".to_owned(),
             });
         }
-        if !(endpoint.starts_with("http://") || endpoint.starts_with("https://")) {
+        if !has_valid_http_scheme(endpoint) {
             return Err(ConfigValidationError::InvalidEndpointScheme {
                 provider: name.clone(),
                 adapter: "discovery".to_owned(),
@@ -857,6 +863,14 @@ const FORBIDDEN_HEADERS: &[&str] = &[
     "content-length",
     "transfer-encoding",
 ];
+
+/// Check whether an endpoint URL has a valid HTTP(S) scheme.
+///
+/// Rejects non-HTTP schemes (e.g. `file://`, `ftp://`) to prevent SSRF
+/// attacks via crafted endpoint URLs.
+fn has_valid_http_scheme(endpoint: &str) -> bool {
+    endpoint.starts_with("http://") || endpoint.starts_with("https://")
+}
 
 /// Validate a map of static headers for CRLF injection and forbidden header names.
 ///
@@ -1351,5 +1365,201 @@ id = "models/gemini-2.5-pro"
         .expect("provider config");
 
         assert!(validate_provider_config(&provider.provider, None).is_ok());
+    }
+
+    // -- Adapter header CRLF validation ---------------------------------------
+
+    #[test]
+    fn adapter_rejects_header_with_crlf() {
+        let mut provider: ProviderFile = toml::from_str(
+            r#"
+[provider]
+name = "example"
+api_key = "key"
+auth_style = "bearer"
+
+[provider.adapters.chat]
+protocol = "openai_chat_completions"
+endpoint = "https://example.com/v1/chat/completions"
+
+[provider.routes]
+chat_completions = "chat"
+"#,
+        )
+        .expect("provider config");
+        provider
+            .provider
+            .adapters
+            .get_mut("chat")
+            .unwrap()
+            .headers
+            .insert("x-evil".to_owned(), "value\r\nInjected: true".to_owned());
+        assert!(matches!(
+            validate_provider_config(&provider.provider, None),
+            Err(ConfigValidationError::HeaderContainsCrlf { .. })
+        ));
+    }
+
+    #[test]
+    fn discovery_rejects_header_with_crlf() {
+        let mut provider: ProviderFile = toml::from_str(
+            r#"
+[provider]
+name = "example"
+api_key = "key"
+auth_style = "bearer"
+
+[provider.discovery]
+kind = "openai_compatible_models"
+endpoint = "https://example.com/v1/models"
+"#,
+        )
+        .expect("provider config");
+        provider
+            .provider
+            .discovery
+            .as_mut()
+            .unwrap()
+            .headers
+            .insert("x-evil".to_owned(), "val\nInjected: true".to_owned());
+        assert!(matches!(
+            validate_provider_config(&provider.provider, None),
+            Err(ConfigValidationError::HeaderContainsCrlf { .. })
+        ));
+    }
+
+    // -- Empty adapter name, protocol, model alias key/target -----------------
+
+    #[test]
+    fn validate_rejects_empty_adapter_name() {
+        let provider: ProviderFile = toml::from_str(
+            r#"
+[provider]
+name = "example"
+api_key = "key"
+auth_style = "bearer"
+
+[provider.adapters."" ]
+protocol = "openai_chat_completions"
+endpoint = "https://example.com/v1"
+"#,
+        )
+        .expect("provider config");
+        // The TOML key "" is deserialized as an empty string.
+        assert!(matches!(
+            validate_provider_config(&provider.provider, None),
+            Err(ConfigValidationError::EmptyAdapterName { .. })
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_empty_protocol() {
+        let provider = ProviderConfig {
+            name: "example".to_owned(),
+            api_key: "key".to_owned(),
+            auth_style: AuthStyle::Bearer,
+            adapters: HashMap::from([(
+                "chat".to_owned(),
+                ProviderAdapterConfig {
+                    protocol: String::new(),
+                    endpoint: "https://example.com/v1".to_owned(),
+                    headers: HashMap::new(),
+                },
+            )]),
+            routes: ProviderRoutesConfig::default(),
+            model_aliases: HashMap::new(),
+            discovery: None,
+            catalog: None,
+        };
+        assert!(matches!(
+            validate_provider_config(&provider, None),
+            Err(ConfigValidationError::EmptyProtocol { .. })
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_empty_model_alias_key() {
+        let provider = ProviderConfig {
+            name: "example".to_owned(),
+            api_key: "key".to_owned(),
+            auth_style: AuthStyle::Bearer,
+            adapters: HashMap::from([(
+                "chat".to_owned(),
+                ProviderAdapterConfig {
+                    protocol: "openai_chat_completions".to_owned(),
+                    endpoint: "https://example.com/v1".to_owned(),
+                    headers: HashMap::new(),
+                },
+            )]),
+            routes: ProviderRoutesConfig::default(),
+            model_aliases: HashMap::from([("".to_owned(), "target".to_owned())]),
+            discovery: None,
+            catalog: None,
+        };
+        assert!(matches!(
+            validate_provider_config(&provider, None),
+            Err(ConfigValidationError::EmptyModelAliasKey { .. })
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_empty_model_alias_target() {
+        let provider = ProviderConfig {
+            name: "example".to_owned(),
+            api_key: "key".to_owned(),
+            auth_style: AuthStyle::Bearer,
+            adapters: HashMap::from([(
+                "chat".to_owned(),
+                ProviderAdapterConfig {
+                    protocol: "openai_chat_completions".to_owned(),
+                    endpoint: "https://example.com/v1".to_owned(),
+                    headers: HashMap::new(),
+                },
+            )]),
+            routes: ProviderRoutesConfig::default(),
+            model_aliases: HashMap::from([("alias".to_owned(), "".to_owned())]),
+            discovery: None,
+            catalog: None,
+        };
+        assert!(matches!(
+            validate_provider_config(&provider, None),
+            Err(ConfigValidationError::EmptyModelAliasTarget { .. })
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_provider_name_exceeding_length_limit() {
+        let provider = ProviderConfig {
+            name: "a".repeat(65), // 65 chars exceeds the 64-char limit
+            api_key: "key".to_owned(),
+            auth_style: AuthStyle::Bearer,
+            adapters: HashMap::new(),
+            routes: ProviderRoutesConfig::default(),
+            model_aliases: HashMap::new(),
+            discovery: None,
+            catalog: None,
+        };
+        assert!(matches!(
+            validate_provider_config(&provider, None),
+            Err(ConfigValidationError::InvalidProviderNameFormat { .. })
+        ));
+    }
+
+    #[test]
+    fn validate_accepts_provider_name_at_max_length() {
+        let provider = ProviderConfig {
+            name: "a".repeat(64), // exactly 64 chars
+            api_key: "key".to_owned(),
+            auth_style: AuthStyle::Bearer,
+            adapters: HashMap::new(),
+            routes: ProviderRoutesConfig::default(),
+            model_aliases: HashMap::new(),
+            discovery: None,
+            catalog: None,
+        };
+        // Should not fail on name validation (will fail on empty api_key
+        // if key is empty, but our key is "key").
+        // Actually no adapters/routes means it passes.
+        assert!(validate_provider_config(&provider, None).is_ok());
     }
 }

@@ -208,6 +208,9 @@ impl ProviderError {
                 403 => llm_proxy_protocol::core::CoreStreamErrorKind::Permission,
                 429 => llm_proxy_protocol::core::CoreStreamErrorKind::RateLimit,
                 500 | 502 | 503 => llm_proxy_protocol::core::CoreStreamErrorKind::Upstream,
+                // All remaining status codes (including 4xx not listed above)
+                // are classified as Upstream errors. This is intentional since
+                // ProviderError::Api is only constructed for status >= 400.
                 _ => llm_proxy_protocol::core::CoreStreamErrorKind::Upstream,
             }),
             _ => None,

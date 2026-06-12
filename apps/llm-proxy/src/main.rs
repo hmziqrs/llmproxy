@@ -29,6 +29,16 @@ use tokio::net::TcpListener;
 use tracing::info;
 
 // ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+/// Number of polling iterations when waiting for graceful shutdown.
+const STOP_MAX_POLLS: u32 = 50;
+
+/// Interval between polls when waiting for graceful shutdown.
+const STOP_POLL_INTERVAL_MS: u64 = 200;
+
+// ---------------------------------------------------------------------------
 // CLI definitions
 // ---------------------------------------------------------------------------
 
@@ -221,10 +231,17 @@ messages = "anthropic"
 ///
 /// Falls back to `./.config/llm-proxy/` (relative to current working directory)
 /// when `$HOME` and `$USERPROFILE` are both unset. This is unlikely in practice
-/// but avoids a panic.
+/// but avoids a panic. A warning is emitted to stderr in that case since the
+/// resolved path depends on the current working directory.
 fn config_dir() -> PathBuf {
-    home_env::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
+    let home = home_env::home_dir();
+    if home.is_none() {
+        eprintln!(
+            "warning: HOME and USERPROFILE are both unset; using relative \
+             config path (depends on current working directory)"
+        );
+    }
+    home.unwrap_or_else(|| PathBuf::from("."))
         .join(".config")
         .join("llm-proxy")
 }
@@ -306,13 +323,18 @@ fn pid_manager() -> llm_proxy_core::PidManager {
 
 /// Read the PID from the PID file. Returns `None` if the file does not exist.
 ///
-/// Validates that the parsed PID is non-zero to catch corrupt/stale PID files.
+/// Validates that the parsed PID is non-zero and fits in `i32` to catch
+/// corrupt/stale PID files and prevent undefined behavior when passing the
+/// PID to `libc::kill()`.
 fn read_pid() -> Result<Option<u32>> {
     let mgr = pid_manager();
     let pid = mgr.read_pid()?;
     if let Some(p) = pid {
         if p == 0 {
             bail!("invalid PID 0 in PID file");
+        }
+        if p > i32::MAX as u32 {
+            bail!("PID {p} exceeds i32::MAX -- cannot be a valid process ID");
         }
     }
     Ok(pid)
@@ -329,6 +351,7 @@ fn write_pid() -> Result<()> {
     let dir = config_dir();
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("creating directory {}", dir.display()))?;
+    set_private_dir_permissions(&dir)?;
     let path = pid_file_path();
     let pid = std::process::id();
     let mut f = std::fs::OpenOptions::new()
@@ -351,6 +374,7 @@ fn write_pid_value(pid: u32) -> Result<()> {
     let dir = config_dir();
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("creating directory {}", dir.display()))?;
+    set_private_dir_permissions(&dir)?;
     let path = pid_file_path();
     let mut f = std::fs::OpenOptions::new()
         .write(true)
@@ -370,8 +394,13 @@ fn remove_pid() -> Result<()> {
 
 /// Check if a process with the given PID is running.
 ///
-/// Delegates to [`PidManager::is_process_running`].
+/// Delegates to [`PidManager::is_process_running`]. Returns `false` for
+/// PID 0 (which would otherwise signal the entire process group on Unix)
+/// and on non-Unix platforms where process signaling is unavailable.
 fn is_process_running(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
     llm_proxy_core::PidManager::is_process_running(pid)
 }
 
@@ -448,12 +477,16 @@ async fn cmd_serve(
     background: bool,
     daemonize: bool,
 ) -> Result<()> {
+    // Initialize tracing before the daemonization check so that the parent
+    // process can log during spawn_daemon(). The daemon child reinitializes
+    // its own subscriber; calling init_tracing twice is safe (the second
+    // call is a no-op since the global subscriber is already set).
+    init_tracing();
+
     // If background mode requested, spawn self as child with --daemonize.
     if background && !daemonize {
         return spawn_daemon(config_path, port_override);
     }
-
-    init_tracing();
 
     // Resolve config file path.
     let path = resolve_config(config_path.as_deref());
@@ -463,6 +496,10 @@ async fn cmd_serve(
     // Build shared infrastructure.
     let adapter_registry = ProviderAdapterRegistry::builtin();
     let proxy_client = ProxyClient::new();
+
+    // Load TOML config and build state before writing the PID file. This
+    // ensures a bad config does not leave a stale PID file on disk.
+    let state = load_toml_state(&path, adapter_registry, proxy_client, port_override)?;
 
     // Attempt atomic PID file creation. If it fails because the file already
     // exists, check whether the existing owner is still alive before removing
@@ -491,15 +528,11 @@ async fn cmd_serve(
     }
 
     // Ensure PID file is cleaned up on shutdown.
-    let pid_path = pid_file_path();
     let cleanup = async move {
-        if let Err(e) = std::fs::remove_file(&pid_path) {
+        if let Err(e) = remove_pid() {
             tracing::warn!(error = %e, "failed to remove PID file during shutdown");
         }
     };
-
-    // Load TOML config and build state (consumes adapter_registry and proxy_client).
-    let state = load_toml_state(&path, adapter_registry, proxy_client, port_override)?;
 
     let bind_addr = state.bind_address();
     let app = build_router(state);
@@ -554,6 +587,9 @@ fn spawn_daemon(config_path: Option<PathBuf>, port_override: Option<u16>) -> Res
         use std::os::unix::process::CommandExt;
         cmd.process_group(0);
         // Redirect stdout/stderr to a log file.
+        // NOTE: The log file grows unbounded. For long-running daemons, set up
+        // external log rotation (e.g., logrotate on Linux, newsyslog on macOS)
+        // or pipe to a log aggregation service.
         let log_path = config_dir().join("llm-proxy.log");
         let log_file = std::fs::File::options()
             .create(true)
@@ -641,22 +677,24 @@ fn cmd_stop() -> Result<()> {
                         err.raw_os_error().unwrap_or(0)
                     );
                 }
+                println!("sent SIGTERM to PID {pid}");
             }
 
-            println!("sent SIGTERM to PID {pid}");
-
-            // Wait up to 10 seconds for graceful shutdown (50 iterations x 200ms).
-            for _ in 0..50 {
+            // Wait up to 10 seconds for graceful shutdown (STOP_MAX_POLLS x STOP_POLL_INTERVAL_MS).
+            for _ in 0..STOP_MAX_POLLS {
                 if !is_process_running(pid) {
                     remove_pid()?;
                     println!("server stopped");
                     return Ok(());
                 }
-                std::thread::sleep(std::time::Duration::from_millis(200));
+                std::thread::sleep(std::time::Duration::from_millis(STOP_POLL_INTERVAL_MS));
             }
 
             // Force kill if still running after graceful period.
-            println!("WARNING: PID {pid} did not exit within 10 seconds, escalating to SIGKILL");
+            println!(
+                "WARNING: PID {pid} did not exit within {} seconds, escalating to SIGKILL",
+                (STOP_MAX_POLLS * STOP_POLL_INTERVAL_MS as u32) / 1000
+            );
 
             #[cfg(unix)]
             {
@@ -682,6 +720,10 @@ fn cmd_stop() -> Result<()> {
 }
 
 /// Run the `status` command.
+///
+/// Note: The listen address is read from the default config path. If the server
+/// was started with `--config` or `LLM_PROXY_CONFIG` pointing to a different
+/// file, the displayed address may not match the actual bind address.
 fn cmd_status() -> Result<()> {
     match read_pid()? {
         Some(pid) => {
@@ -730,13 +772,10 @@ fn cmd_init() -> Result<()> {
     let dir = config_dir();
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("creating directory {}", dir.display()))?;
+    set_private_dir_permissions(&dir)?;
 
     // Write main config.toml with restrictive permissions (contains env var references).
-    let mut f = std::fs::File::create(&config_path)
-        .with_context(|| format!("creating {}", config_path.display()))?;
-    f.write_all(DEFAULT_CONFIG_TOML.as_bytes())
-        .with_context(|| format!("writing {}", config_path.display()))?;
-    set_private_permissions(&config_path)?;
+    create_private_file(&config_path, DEFAULT_CONFIG_TOML.as_bytes())?;
     println!("created config at {}", config_path.display());
 
     // Create providers directory.
@@ -746,20 +785,12 @@ fn cmd_init() -> Result<()> {
 
     // Write opencode-go provider with restrictive permissions.
     let go_path = providers_dir.join("opencode-go.toml");
-    let mut f = std::fs::File::create(&go_path)
-        .with_context(|| format!("creating {}", go_path.display()))?;
-    f.write_all(DEFAULT_PROVIDER_OPENCODE_GO.as_bytes())
-        .with_context(|| format!("writing {}", go_path.display()))?;
-    set_private_permissions(&go_path)?;
+    create_private_file(&go_path, DEFAULT_PROVIDER_OPENCODE_GO.as_bytes())?;
     println!("created provider config at {}", go_path.display());
 
     // Write opencode-zen provider with restrictive permissions.
     let zen_path = providers_dir.join("opencode-zen.toml");
-    let mut f = std::fs::File::create(&zen_path)
-        .with_context(|| format!("creating {}", zen_path.display()))?;
-    f.write_all(DEFAULT_PROVIDER_OPENCODE_ZEN.as_bytes())
-        .with_context(|| format!("writing {}", zen_path.display()))?;
-    set_private_permissions(&zen_path)?;
+    create_private_file(&zen_path, DEFAULT_PROVIDER_OPENCODE_ZEN.as_bytes())?;
     println!("created provider config at {}", zen_path.display());
 
     println!();
@@ -1006,7 +1037,7 @@ async fn cmd_models(
                                     source: "live".to_owned(),
                                     generated_at: time::OffsetDateTime::now_utc()
                                         .format(&time::format_description::well_known::Rfc3339)
-                                        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_owned()),
+                                        .expect("Rfc3339 formatting is infallible for a valid OffsetDateTime"),
                                     models: discovered,
                                 },
                             },
@@ -1064,7 +1095,7 @@ fn cmd_autostart_enable(config_path: Option<PathBuf>, port: Option<u16>) -> Resu
 
     #[cfg(target_os = "macos")]
     {
-        let plist_content = format_plist(&args.join(" "));
+        let plist_content = format_plist(&args);
         let plist_path = launchd_plist_path();
 
         let plist_dir = plist_path
@@ -1084,7 +1115,7 @@ fn cmd_autostart_enable(config_path: Option<PathBuf>, port: Option<u16>) -> Resu
 
     #[cfg(target_os = "linux")]
     {
-        let desktop_content = format_desktop_entry(&args.join(" "));
+        let desktop_content = format_desktop_entry(&args);
         let autostart_dir = linux_autostart_dir();
         std::fs::create_dir_all(&autostart_dir)
             .with_context(|| format!("creating {}", autostart_dir.display()))?;
@@ -1113,9 +1144,22 @@ fn cmd_autostart_disable() -> Result<()> {
         let plist_path = launchd_plist_path();
 
         if plist_path.exists() {
-            let _ = std::process::Command::new("launchctl")
+            let unload_result = std::process::Command::new("launchctl")
                 .args(["unload", &plist_path.to_string_lossy()])
                 .output();
+            match unload_result {
+                Ok(output) if !output.status.success() => {
+                    eprintln!(
+                        "warning: launchctl unload failed (exit {:?}): {}",
+                        output.status.code(),
+                        String::from_utf8_lossy(&output.stderr).trim()
+                    );
+                }
+                Err(e) => {
+                    eprintln!("warning: failed to run launchctl unload: {e}");
+                }
+                _ => {}
+            }
             std::fs::remove_file(&plist_path)
                 .with_context(|| format!("removing {}", plist_path.display()))?;
             println!("removed launchd plist");
@@ -1185,9 +1229,19 @@ fn cmd_autostart_status() -> Result<()> {
 ///
 /// The `command` string is XML-escaped to prevent malformed plists when the
 /// executable path contains XML special characters (<, >, &, ", ').
+/// Generate a macOS launchd plist for auto-start.
+///
+/// Each argument is placed in its own `<string>` element in the
+/// `ProgramArguments` array, avoiding shell interpretation entirely.
+/// Argument values are XML-escaped to prevent malformed plists when the
+/// executable path contains XML special characters (<, >, &, ", ').
 #[cfg(target_os = "macos")]
-fn format_plist(command: &str) -> String {
-    let escaped_command = xml_escape(command);
+fn format_plist(args: &[String]) -> String {
+    let arg_elements: String = args
+        .iter()
+        .map(|a| format!("        <string>{}</string>", xml_escape(a)))
+        .collect::<Vec<_>>()
+        .join("\n");
     let log_path = config_dir().join("llm-proxy.log").display().to_string();
     let escaped_log = xml_escape(&log_path);
     format!(
@@ -1199,9 +1253,7 @@ fn format_plist(command: &str) -> String {
     <string>com.llm-proxy</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/bin/bash</string>
-        <string>-c</string>
-        <string>{escaped_command}</string>
+{arg_elements}
     </array>
     <key>RunAtLoad</key>
     <true/>
@@ -1219,23 +1271,69 @@ fn format_plist(command: &str) -> String {
 
 /// Generate a Linux XDG desktop entry for auto-start.
 ///
-/// The `command` string is desktop-entry-escaped for the Exec key.
+/// Each argument is individually escaped per the Desktop Entry Specification
+/// for the `Exec` key, then joined with spaces. This avoids shell injection
+/// by properly handling spaces, quotes, dollar signs, backticks, backslashes,
+/// and other shell metacharacters in paths.
 #[cfg(target_os = "linux")]
-fn format_desktop_entry(command: &str) -> String {
-    // Desktop entry Exec values need minimal escaping per the spec.
-    // In practice, the command is built from paths that rarely contain
-    // special characters, but we still escape newlines to prevent
-    // multi-line injection.
-    let escaped = command.replace('\\', "\\\\").replace('\n', "\\n");
+fn format_desktop_entry(args: &[String]) -> String {
+    let escaped_args: String = args
+        .iter()
+        .map(|a| desktop_exec_escape(a))
+        .collect::<Vec<_>>()
+        .join(" ");
     format!(
         r#"[Desktop Entry]
 Type=Application
 Name=LLM Proxy
-Exec={escaped}
+Exec={escaped_args}
 X-GNOME-Autostart-enabled=true
 Hidden=false
 "#
     )
+}
+
+/// Escape a single argument for use in a Desktop Entry `Exec` key.
+///
+/// Per the XDG Desktop Entry Specification, the following characters must be
+/// escaped in Exec values: space, tab, newline, backslash, double-quote,
+/// single-quote, dollar, backtick, tilde, hash, percent, ampersand, asterisk,
+/// parentheses, vertical bar, semicolon, less-than, greater-than, question mark,
+/// square brackets, curly braces.
+#[cfg(target_os = "linux")]
+fn desktop_exec_escape(arg: &str) -> String {
+    let mut out = String::with_capacity(arg.len());
+    for ch in arg.chars() {
+        match ch {
+            ' ' => out.push_str("\\s"),
+            '\t' => out.push_str("\\t"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\'' => out.push_str("\\\'"),
+            '$' => out.push_str("\\$"),
+            '`' => out.push_str("\\`"),
+            '~' => out.push_str("\\~"),
+            '#' => out.push_str("\\#"),
+            '%' => out.push_str("\\%"),
+            '&' => out.push_str("\\&"),
+            '*' => out.push_str("\\*"),
+            '(' => out.push_str("\\("),
+            ')' => out.push_str("\\)"),
+            '|' => out.push_str("\\|"),
+            ';' => out.push_str("\\;"),
+            '<' => out.push_str("\\<"),
+            '>' => out.push_str("\\>"),
+            '?' => out.push_str("\\?"),
+            '[' => out.push_str("\\["),
+            ']' => out.push_str("\\]"),
+            '{' => out.push_str("\\{"),
+            '}' => out.push_str("\\}"),
+            _ => out.push(ch),
+        }
+    }
+    out
 }
 
 /// Escape a string for safe inclusion in XML content.
@@ -1362,6 +1460,12 @@ fn build_info() -> BuildInfo {
     }
 }
 
+/// Initialize the tracing subscriber.
+///
+/// Uses `RUST_LOG` env var with fallback to "info". The `log_level` field in
+/// the TOML config file is intentionally not used here because the subscriber
+/// must be initialized before the config is loaded (tracing is needed during
+/// config loading itself). To control log verbosity, set `RUST_LOG` instead.
 fn init_tracing() {
     use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
     // Fallback to "info" level when RUST_LOG is not set. "info" is a known-valid
@@ -1414,6 +1518,53 @@ fn set_private_permissions(path: &std::path::Path) -> Result<()> {
     #[cfg(not(unix))]
     {
         let _ = path;
+    }
+    Ok(())
+}
+
+/// Set owner-only permissions (0700) on a directory.
+///
+/// Used for the config directory which contains provider TOML files with
+/// API key references. On non-Unix platforms this is a no-op.
+fn set_private_dir_permissions(path: &std::path::Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("setting permissions on {}", path.display()))?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
+}
+
+/// Create a new file with restrictive permissions (0600) and write `content`.
+///
+/// On Unix, uses `OpenOptions` with `mode(0o600)` to set permissions atomically
+/// at creation time, avoiding a window where the file exists with default umask
+/// permissions. Falls back to create-then-chmod on non-Unix.
+fn create_private_file(path: &std::path::Path, content: &[u8]) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+            .with_context(|| format!("creating {}", path.display()))?;
+        f.write_all(content)
+            .with_context(|| format!("writing {}", path.display()))?;
+    }
+    #[cfg(not(unix))]
+    {
+        let mut f = std::fs::File::create(path)
+            .with_context(|| format!("creating {}", path.display()))?;
+        f.write_all(content)
+            .with_context(|| format!("writing {}", path.display()))?;
+        set_private_permissions(path)?;
     }
     Ok(())
 }
@@ -1716,8 +1867,13 @@ auth_style = "bearer"
     #[cfg(target_os = "macos")]
     #[test]
     fn format_plist_basic() {
-        let plist = format_plist("/usr/bin/llm-proxy serve");
-        assert!(plist.contains("<string>/usr/bin/llm-proxy serve</string>"));
+        let args: Vec<String> = ["/usr/bin/llm-proxy", "serve"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let plist = format_plist(&args);
+        assert!(plist.contains("<string>/usr/bin/llm-proxy</string>"));
+        assert!(plist.contains("<string>serve</string>"));
         assert!(plist.contains("<?xml version=\"1.0\""));
         assert!(plist.contains("com.llm-proxy"));
     }
@@ -1725,7 +1881,11 @@ auth_style = "bearer"
     #[cfg(target_os = "macos")]
     #[test]
     fn format_plist_escapes_special_chars() {
-        let plist = format_plist("/path/with<special>&chars\"'");
+        let args: Vec<String> = ["/path/with<special>&chars\"'"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let plist = format_plist(&args);
 
         assert!(plist.contains("&lt;"));
         assert!(plist.contains("&amp;"));
@@ -1738,7 +1898,11 @@ auth_style = "bearer"
     #[cfg(target_os = "macos")]
     #[test]
     fn format_plist_malformed_path() {
-        let plist = format_plist("/path/with spaces/and<special>");
+        let args: Vec<String> = ["/path/with spaces/and<special>"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let plist = format_plist(&args);
 
         // XML special characters in the path should be escaped.
         assert!(!plist.contains("<special>"));
@@ -1914,6 +2078,63 @@ auth_style = "bearer"
     fn is_process_running_nonexistent_pid() {
         // PID 299999999 is extremely unlikely to exist.
         assert!(!is_process_running(299_999_999));
+    }
+
+    #[test]
+    fn is_process_running_rejects_pid_zero() {
+        // PID 0 should always return false to avoid signaling the entire
+        // process group on Unix.
+        assert!(!is_process_running(0));
+    }
+
+    // --- desktop_exec_escape tests ---
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn desktop_exec_escape_spaces() {
+        assert_eq!(desktop_exec_escape("/path/with spaces"), "/path/with\\sspaces");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn desktop_exec_escape_shell_metacharacters() {
+        let escaped = desktop_exec_escape("$HOME/`echo test`");
+        assert!(!escaped.contains('$'));
+        assert!(!escaped.contains('`'));
+        assert!(escaped.contains("\\$"));
+        assert!(escaped.contains("\\`"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn desktop_exec_escape_no_special_chars() {
+        assert_eq!(desktop_exec_escape("/usr/bin/llm-proxy"), "/usr/bin/llm-proxy");
+    }
+
+    // --- create_private_file tests ---
+
+    #[test]
+    fn create_private_file_writes_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.toml");
+        create_private_file(&path, b"hello world").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello world");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = path.metadata().unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+    }
+
+    #[test]
+    fn create_private_file_rejects_existing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.toml");
+        std::fs::write(&path, "existing").unwrap();
+        let result = create_private_file(&path, b"new content");
+        assert!(result.is_err());
     }
 
     // --- is_toml_config ---

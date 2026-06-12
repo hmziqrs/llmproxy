@@ -13,12 +13,24 @@ use serde::{Deserialize, Serialize};
 
 /// Cache-control directive attached to a message or content block.
 ///
+/// This is a separate type from [`crate::core::CacheControl`] by design:
+/// the OpenAI wire format uses a plain string for the `type` field, while
+/// the core type uses a proper [`CacheControlType`](crate::core::CacheControlType)
+/// enum with an `Other(String)` catch-all. The two modules represent different
+/// layers (wire format vs. canonical internal representation) and duplicating
+/// the struct keeps the serde concerns cleanly separated.
+///
 /// Anthropic models accept `cache_control` on messages; the proxy
 /// preserves the annotation when translating between formats.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CacheControl {
     /// Discriminator – typically `"ephemeral"`.
     pub r#type: String,
+}
+
+impl CacheControl {
+    /// The known cache-control type value used by Anthropic.
+    pub const EPHEMERAL: &str = "ephemeral";
 }
 
 // ---------------------------------------------------------------------------
@@ -26,7 +38,7 @@ pub struct CacheControl {
 // ---------------------------------------------------------------------------
 
 /// Controls extra metadata returned alongside streaming chunks.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StreamOptions {
     /// When `true`, the final chunk includes a [`UsageInfo`] object.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -38,16 +50,20 @@ pub struct StreamOptions {
 // ---------------------------------------------------------------------------
 
 /// A tool (function) that the model may invoke during generation.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolDef {
     /// Always `"function"` for function-calling tools.
+    ///
+    /// Kept as a bare `String` for serde round-tripping with providers that may
+    /// introduce new tool types in the future. The adapter does not validate this
+    /// value; callers that need to enforce `"function"` should check at decode time.
     pub r#type: String,
     /// Schema of the function the model can call.
     pub function: FunctionDef,
 }
 
 /// Describes a callable function, including its JSON-schema parameters.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FunctionDef {
     /// Name the model uses to reference this function.
     pub name: String,
@@ -67,9 +83,14 @@ pub struct FunctionDef {
 ///
 /// In streaming delta chunks both `id` and `function` may be absent;
 /// the server sends partial `ToolCall`s that the client merges by `index`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolCall {
     /// Position inside the `tool_calls` array (streaming deltas only).
+    ///
+    /// Uses `i32` to match the OpenAI wire format (JSON integers). The OpenAI
+    /// spec defines this as a non-negative integer; negative values are
+    /// semantically meaningless. The stream encoder clamps `usize` core indices
+    /// to `i32::MAX` when converting. See `clamp_tool_index` in the adapter.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub index: Option<i32>,
     /// Stable identifier for this tool call (absent in deltas).
@@ -84,7 +105,12 @@ pub struct ToolCall {
 }
 
 /// Name + arguments of a function call.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// Both fields are `Option<String>` to accommodate streaming deltas where the
+/// server sends partial `ToolCall`s that the client merges by `index`. For
+/// non-streaming (complete) responses, callers should validate that `name` and
+/// `arguments` are present.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FunctionCall {
     /// The function name chosen by the model.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -107,11 +133,13 @@ pub struct FunctionCall {
 /// Note: `deny_unknown_fields` is intentionally omitted because this struct is
 /// used in streaming deltas where fields may vary between providers. Unknown
 /// fields are silently ignored rather than causing parse failures.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChatMessage {
     /// `"system"`, `"user"`, `"assistant"`, or `"tool"`.
     ///
     /// Defaults to empty when absent (streaming deltas often omit this).
+    /// Validation of known role values happens at decode time in the adapter
+    /// rather than at the type level, to tolerate provider-specific extensions.
     #[serde(default)]
     pub role: String,
     /// The content body of the message.
@@ -218,7 +246,7 @@ fn default_content() -> serde_json::Value {
 /// outbound provider calls (via `transform_request()`). Unknown fields from
 /// clients are captured via the `extra` flattened map rather than silently
 /// dropped.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChatCompletionRequest {
     /// Model identifier (e.g. `"gpt-4o"`, `"glm-5.1"`).
     pub model: String,
@@ -238,6 +266,10 @@ pub struct ChatCompletionRequest {
     /// OpenAI renamed `max_tokens` to `max_completion_tokens` in later API
     /// versions.  Both names are accepted via the serde alias; the canonical
     /// field name follows the newer convention.
+    ///
+    /// Uses `i32` for consistency with provider wire formats. Negative values
+    /// are semantically invalid; the adapter should validate `max_tokens >= 0`
+    /// during decode.
     #[serde(
         rename = "max_completion_tokens",
         alias = "max_tokens",
@@ -257,6 +289,11 @@ pub struct ChatCompletionRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<serde_json::Value>,
     /// Stop sequences (string or array of strings).
+    ///
+    /// Kept as `Option<serde_json::Value>` (rather than `Option<Vec<String>>`)
+    /// to preserve the raw OpenAI wire format for passthrough. The decode
+    /// function in `openai_chat::decode_request` normalises this into
+    /// `SamplingOptions.stop` using the same logic as `core::deserialize_stop`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stop: Option<serde_json::Value>,
     /// Extra streaming metadata flags.
@@ -269,6 +306,12 @@ pub struct ChatCompletionRequest {
     pub user: Option<String>,
     /// Catch-all for unrecognized client fields, preserved in
     /// `RequestMetadata.raw` during decode so nothing is silently dropped.
+    ///
+    /// Because `#[serde(flatten)]` and `#[serde(deny_unknown_fields)]` are
+    /// mutually exclusive, this struct cannot use `deny_unknown_fields`.
+    /// Fields that look like typos of known fields (e.g. `"temperatur"` instead
+    /// of `"temperature"`) will end up here silently. The decode function
+    /// should warn on such cases if desired.
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
 }
@@ -283,13 +326,17 @@ pub struct ChatCompletionRequest {
 /// return additional usage fields (e.g. `prompt_tokens_details`) that the
 /// proxy does not model. Unknown fields are silently ignored rather than
 /// causing parse failures.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UsageInfo {
     /// Tokens consumed by the prompt.
     pub prompt_tokens: i32,
     /// Tokens produced by the completion.
     pub completion_tokens: i32,
     /// `prompt_tokens + completion_tokens`.
+    ///
+    /// The proxy recomputes this via `saturating_add` during encoding rather than
+    /// passing through the provider's value, ensuring consistency. If a provider
+    /// reports a different total, the proxy's computed value takes precedence.
     pub total_tokens: i32,
     /// Prompt tokens served from a cache (Anthropic / provider-specific).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -304,7 +351,12 @@ pub struct UsageInfo {
 // ---------------------------------------------------------------------------
 
 /// A single completion alternative inside a response or chunk.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// The `message` and `delta` fields are mutually exclusive in practice:
+/// non-streaming responses use `message`, streaming chunks use `delta`.
+/// This is not enforced at the type level to keep the struct compatible with
+/// both streaming and non-streaming JSON shapes.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Choice {
     /// Position of this choice in the array.
     pub index: i32,
@@ -331,7 +383,7 @@ pub struct Choice {
 /// are silently ignored during deserialization rather than causing a parse
 /// failure that would surface as a 502 to the client. Request types retain
 /// `deny_unknown_fields` for strict inbound validation.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChatCompletionResponse {
     /// Unique completion identifier.
     pub id: String,
@@ -345,6 +397,13 @@ pub struct ChatCompletionResponse {
     pub choices: Vec<Choice>,
     /// Token usage for this request.
     pub usage: UsageInfo,
+    /// Catch-all for provider-specific response fields (e.g. `service_tier`,
+    /// `system_fingerprint`) that the proxy does not model explicitly.
+    ///
+    /// Because this struct uses `#[serde(flatten)]` here, `deny_unknown_fields`
+    /// cannot also be applied. Unknown fields are captured rather than rejected.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 // ---------------------------------------------------------------------------
@@ -359,7 +418,7 @@ pub struct ChatCompletionResponse {
 /// to be silently dropped. Without it, unknown fields are simply ignored,
 /// avoiding silent data loss. Request types (e.g. `ChatCompletionRequest`)
 /// retain `deny_unknown_fields` because the proxy controls their construction.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChatCompletionChunk {
     /// Unique completion identifier (stable across all chunks).
     pub id: String,
@@ -381,14 +440,14 @@ pub struct ChatCompletionChunk {
 // ---------------------------------------------------------------------------
 
 /// Top-level error envelope returned by OpenAI-compatible APIs.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ErrorResponse {
     /// Nested error details.
     pub error: ErrorDetails,
 }
 
 /// Detailed error information inside an [`ErrorResponse`].
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ErrorDetails {
     /// Machine-readable error category (e.g. `"invalid_request_error"`).
     #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
@@ -398,4 +457,104 @@ pub struct ErrorDetails {
     /// Optional error code (e.g. `"invalid_api_key"`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub code: Option<String>,
+}
+
+// ===========================================================================
+// Tests
+// ===========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cache_control_round_trip() {
+        let cc = CacheControl {
+            r#type: "ephemeral".into(),
+        };
+        let json = serde_json::to_string(&cc).unwrap();
+        assert_eq!(json, r#"{"type":"ephemeral"}"#);
+        let back: CacheControl = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, cc);
+    }
+
+    #[test]
+    fn error_response_round_trip() {
+        let err = ErrorResponse {
+            error: ErrorDetails {
+                r#type: Some("invalid_request_error".into()),
+                message: "model is required".into(),
+                code: Some("invalid_api_key".into()),
+            },
+        };
+        let json = serde_json::to_string(&err).unwrap();
+        let back: ErrorResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, err);
+    }
+
+    #[test]
+    fn tool_def_round_trip() {
+        let tool = ToolDef {
+            r#type: "function".into(),
+            function: FunctionDef {
+                name: "get_weather".into(),
+                description: Some("Get the weather".into()),
+                parameters: Some(serde_json::json!({"type": "object"})),
+            },
+        };
+        let json = serde_json::to_string(&tool).unwrap();
+        let back: ToolDef = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, tool);
+    }
+
+    #[test]
+    fn chat_message_reasoning_alias() {
+        // Verify that the "reasoning" alias deserializes into reasoning_content.
+        let json = r#"{"role":"assistant","reasoning":"thinking..."}"#;
+        let msg: ChatMessage = serde_json::from_str(json).unwrap();
+        assert_eq!(msg.reasoning_content.as_deref(), Some("thinking..."));
+    }
+
+    #[test]
+    fn usage_info_round_trip() {
+        let usage = UsageInfo {
+            prompt_tokens: 100,
+            completion_tokens: 50,
+            total_tokens: 150,
+            prompt_cache_hit_tokens: Some(10),
+            prompt_cache_miss_tokens: None,
+        };
+        let json = serde_json::to_string(&usage).unwrap();
+        let back: UsageInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, usage);
+    }
+
+    #[test]
+    fn chat_completion_request_accepts_unknown_fields() {
+        let json = r#"{"model":"gpt-4o","messages":[],"future_field":"value"}"#;
+        let req: ChatCompletionRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.extra.get("future_field").unwrap().as_str(), Some("value"));
+    }
+
+    #[test]
+    fn choice_round_trip() {
+        let choice = Choice {
+            index: 0,
+            message: Some(ChatMessage {
+                role: "assistant".into(),
+                content: serde_json::Value::String("hello".into()),
+                reasoning_content: None,
+                tool_calls: vec![],
+                name: None,
+                tool_call_id: None,
+                cache_control: None,
+                refusal: None,
+            }),
+            finish_reason: Some("stop".into()),
+            delta: None,
+        };
+        let json = serde_json::to_string(&choice).unwrap();
+        let back: Choice = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, choice);
+    }
 }

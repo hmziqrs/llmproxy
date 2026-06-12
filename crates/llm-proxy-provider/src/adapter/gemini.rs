@@ -150,7 +150,7 @@ impl ProviderStreamDecoder for GeminiStreamDecoder {
                             tracing::warn!(error = %e, "Gemini: failed to serialize function_call args, falling back to empty object");
                             "{}".to_owned()
                         });
-                    if !args_str.is_empty() && args_str != "null" {
+                    if args_str != "null" {
                         events.push(CoreEvent::ToolCallDelta {
                             index: block_idx,
                             args_delta: args_str,
@@ -267,6 +267,8 @@ impl GeminiAdapter {
                 // messages with functionResponse parts.  This is the canonical
                 // mapping per Gemini's documentation.
                 CoreRole::Tool => "user",
+                // Future CoreRole variants are mapped to "user" as a safe default.
+                // Update this match when new variants are added to CoreRole.
                 _ => "user",
             };
 
@@ -349,8 +351,10 @@ impl GeminiAdapter {
             }
 
             if !parts.is_empty() {
-                let val = serde_json::json!({"role": role, "parts": parts});
-                contents.push(serde_json::from_value(val)?);
+                contents.push(llm_proxy_protocol::zen::GeminiContent {
+                    role: role.to_owned(),
+                    parts,
+                });
             }
         }
 
@@ -383,15 +387,29 @@ impl GeminiAdapter {
                     CoreContent::Text { text, .. } => Some(text.as_str()),
                     _ => None,
                 })
-                .collect::<Vec<_>>()
-                .join("\n");
+                .fold(String::new(), |mut acc, s| {
+                    if !acc.is_empty() {
+                        acc.push('\n');
+                    }
+                    acc.push_str(s);
+                    acc
+                });
             if !system_text.is_empty() {
-                let sys_val = serde_json::json!({"role": "user", "parts": [{"text": system_text}]});
-                contents.insert(0, serde_json::from_value(sys_val)?);
+                contents.insert(
+                    0,
+                    llm_proxy_protocol::zen::GeminiContent {
+                        role: "user".to_owned(),
+                        parts: vec![GeminiPart::text(system_text)],
+                    },
+                );
                 // Synthetic model acknowledgment (see NOTE above).
-                let ack_val =
-                    serde_json::json!({"role": "model", "parts": [{"text": "Understood."}]});
-                contents.insert(1, serde_json::from_value(ack_val)?);
+                contents.insert(
+                    1,
+                    llm_proxy_protocol::zen::GeminiContent {
+                        role: "model".to_owned(),
+                        parts: vec![GeminiPart::text("Understood.".to_owned())],
+                    },
+                );
             }
         }
 
@@ -438,7 +456,7 @@ impl GeminiAdapter {
         // omission is safe but potentially impactful.
         if core.tool_choice.is_some() {
             tracing::warn!(
-                tool_choice = ?core.tool_choice.as_ref().map(|_| "set"),
+                tool_choice = ?core.tool_choice,
                 "Gemini: tool_choice specified but not yet forwarded to upstream; \
                  the model will use its default tool calling behavior"
             );

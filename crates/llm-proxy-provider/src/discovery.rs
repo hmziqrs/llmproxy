@@ -231,12 +231,23 @@ fn next_page(kind: ProviderDiscoveryKind, value: &Value) -> Option<(&'static str
             .and_then(Value::as_str)
             .filter(|token| !token.is_empty())
             .map(|token| ("pageToken", token.to_owned())),
-        ProviderDiscoveryKind::AnthropicModels => value
-            .get("has_more")
-            .and_then(Value::as_bool)
-            .filter(|has_more| *has_more)
-            .and_then(|_| value.get("last_id").and_then(Value::as_str))
-            .map(|token| ("after_id", token.to_owned())),
+        ProviderDiscoveryKind::AnthropicModels => {
+            let has_more = value
+                .get("has_more")
+                .and_then(Value::as_bool)
+                .is_some_and(|b| b);
+            if !has_more {
+                return None;
+            }
+            let token = value.get("last_id").and_then(Value::as_str);
+            if token.is_none() {
+                tracing::warn!(
+                    "Anthropic discovery: has_more is true but last_id is missing; \
+                     pagination will stop early"
+                );
+            }
+            token.map(|t| ("after_id", t.to_owned()))
+        }
         ProviderDiscoveryKind::FireworksAccountModels => value
             .get("nextPageToken")
             .or_else(|| value.get("next_page_token"))

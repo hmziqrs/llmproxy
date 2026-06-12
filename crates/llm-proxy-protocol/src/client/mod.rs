@@ -36,6 +36,15 @@ pub mod openai_chat;
 /// `ProtocolError` does not carry an HTTP status code directly because the
 /// route handler may need to override the status based on context (e.g.
 /// streaming vs non-streaming, request-phase vs response-phase).
+///
+/// # Error source chain
+///
+/// `ProtocolError` variants hold only `String` messages, not source errors.
+/// This is intentional: the protocol adapter layer consumes underlying
+/// serde/JSON errors during translation and converts them to human-readable
+/// strings. The original error type information and backtraces are lost at
+/// this boundary. If richer error chains are needed in the future, consider
+/// wrapping the source error with `#[source]` or using `Box<dyn std::error::Error>`.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum ProtocolError {

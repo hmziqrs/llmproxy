@@ -116,6 +116,17 @@ async fn count_tokens_inner(
                     _ => None,
                 })
                 .collect();
+            // Non-text content blocks (images, tool_use, thinking) produce
+            // empty text here. This is a known limitation of the heuristic
+            // counter. Log at debug level so operators can detect requests
+            // where the estimate may be significantly off.
+            if text.is_empty() && !msg.content.is_empty() {
+                tracing::debug!(
+                    role = ?msg.role,
+                    blocks = msg.content.len(),
+                    "message has content blocks but no extractable text; token estimate will be zero for this message"
+                );
+            }
             let role_name = match msg.role {
                 llm_proxy_protocol::core::CoreRole::User => "user",
                 llm_proxy_protocol::core::CoreRole::Assistant => "assistant",

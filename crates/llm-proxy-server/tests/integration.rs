@@ -628,3 +628,178 @@ async fn toml_count_tokens_returns_estimate() {
     .unwrap();
     assert!(resp_body["input_tokens"].as_u64().unwrap() > 0);
 }
+
+// ---------------------------------------------------------------------------
+// Additional integration tests for edge cases (findings 113, 114, 115, 117, 119)
+// ---------------------------------------------------------------------------
+
+/// GET on POST-only messages route returns 405 (finding 115).
+#[tokio::test]
+async fn get_on_messages_route_returns_405() {
+    let app = build_router(state_with_provider());
+    let req = Request::builder()
+        .method("GET")
+        .uri("/providers/mock-provider/v1/messages")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+}
+
+/// GET on POST-only chat completions route returns 405 (finding 115).
+#[tokio::test]
+async fn get_on_chat_completions_route_returns_405() {
+    let app = build_router(state_with_provider());
+    let req = Request::builder()
+        .method("GET")
+        .uri("/providers/mock-provider/v1/chat/completions")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+}
+
+/// POST on GET-only health route returns 405 (finding 115).
+#[tokio::test]
+async fn post_on_health_route_returns_405() {
+    let app = build_router(state());
+    let req = Request::builder()
+        .method("POST")
+        .uri("/health")
+        .body(Body::from("{}"))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+}
+
+/// Invalid provider name on messages route returns 400 (finding 113).
+#[tokio::test]
+async fn invalid_provider_name_on_messages_returns_400() {
+    let app = build_router(state());
+    let body = json!({
+        "model": "claude-sonnet-4-6",
+        "messages": [{ "role": "user", "content": "hi" }],
+        "max_tokens": 64
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/providers/..%2F..%2Fetc/v1/messages")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    // axum URL-decodes the path, so "../.." becomes the actual path segment.
+    // Either way it should be rejected.
+    assert!(
+        resp.status() == StatusCode::BAD_REQUEST || resp.status() == StatusCode::NOT_FOUND,
+        "expected 400 or 404 for path traversal provider name, got {}",
+        resp.status()
+    );
+}
+
+/// count_tokens with invalid JSON returns 400 (finding 114).
+#[tokio::test]
+async fn count_tokens_invalid_json_returns_400() {
+    let app = build_router(state_with_provider());
+    let req = Request::builder()
+        .method("POST")
+        .uri("/providers/mock-provider/v1/messages/count_tokens")
+        .header("content-type", "application/json")
+        .body(Body::from("{ not valid json"))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+/// count_tokens with empty body returns 400 (finding 114).
+#[tokio::test]
+async fn count_tokens_empty_body_returns_400() {
+    let app = build_router(state_with_provider());
+    let req = Request::builder()
+        .method("POST")
+        .uri("/providers/mock-provider/v1/messages/count_tokens")
+        .header("content-type", "application/json")
+        .body(Body::from(""))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+/// count_tokens with unknown provider returns 404 (finding 114).
+#[tokio::test]
+async fn count_tokens_unknown_provider_returns_404() {
+    let app = build_router(state());
+    let body = json!({
+        "model": "claude-sonnet-4-6",
+        "messages": [{ "role": "user", "content": "hi" }],
+        "max_tokens": 64
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/providers/nonexistent/v1/messages/count_tokens")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+/// Health endpoint includes metrics sub-object (finding 117).
+#[tokio::test]
+async fn health_includes_metrics_sub_object() {
+    let app = build_router(state());
+    let req = Request::builder()
+        .uri("/health")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: Value = serde_json::from_slice(
+        &axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(body["metrics"].is_object(), "health response must include 'metrics' sub-object");
+    let metrics = &body["metrics"];
+    // Verify the expected counter fields exist.
+    assert!(metrics["requests_received"].is_number());
+    assert!(metrics["requests_streamed"].is_number());
+    assert!(metrics["requests_success"].is_number());
+    assert!(metrics["requests_failed"].is_number());
+    assert!(metrics["upstream_calls"].is_number());
+    assert!(metrics["rate_limited"].is_number());
+    assert!(metrics["deduplicated"].is_number());
+}
+
+/// count_tokens response has correct JSON shape (finding 119).
+#[tokio::test]
+async fn count_tokens_response_has_correct_shape() {
+    let app = build_router(state_with_provider());
+    let body = json!({
+        "model": "claude-sonnet-4-6",
+        "messages": [{ "role": "user", "content": "hello world" }],
+        "max_tokens": 1024
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/providers/mock-provider/v1/messages/count_tokens")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    // Verify Content-Type is application/json.
+    let ct = resp.headers().get("content-type").expect("content-type header");
+    assert!(ct.to_str().unwrap().contains("application/json"));
+    let resp_body: Value = serde_json::from_slice(
+        &axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(resp_body["input_tokens"].is_number());
+    assert!(resp_body["input_tokens"].as_u64().unwrap() > 0);
+    // Verify only the expected field is present.
+    assert!(resp_body.as_object().unwrap().len() == 1, "count_tokens response should only have input_tokens field");
+}

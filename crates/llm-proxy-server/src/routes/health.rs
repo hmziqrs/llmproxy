@@ -67,9 +67,11 @@ pub(crate) struct ReadyBody {
 /// later phase.
 ///
 /// This is currently a tautology (always returns "ready") because the proxy
-/// has no external dependencies to check at startup. Future readiness checks
-/// may include: verifying provider catalog cache freshness, confirming at
-/// least one provider is configured, or checking downstream connectivity.
+/// has no external dependencies to check at startup.
+///
+/// TODO(future): Add actual readiness checks such as verifying provider
+/// catalog cache freshness, confirming at least one provider is configured,
+/// or checking downstream connectivity.
 pub async fn ready() -> (StatusCode, Json<ReadyBody>) {
     (StatusCode::OK, Json(ReadyBody { status: "ready" }))
 }
@@ -86,9 +88,11 @@ pub(crate) struct VersionBody {
     git_sha: &'static str,
 }
 
-/// Build metadata for ops/debugging. `name` comes from config so
-/// operators can distinguish deployments; the rest is compile-time
-/// build info.
+/// Build metadata for ops/debugging. `name` comes from `config.server_name`
+/// (via `state.server_name()`) so operators can distinguish deployments; the
+/// rest is compile-time build info. `BuildInfo.name` (the Cargo package name)
+/// is not used here because it is a static constant that does not vary between
+/// deployments.
 pub async fn version(State(state): State<AppState>) -> (StatusCode, Json<VersionBody>) {
     let build = state.build_info();
     (
