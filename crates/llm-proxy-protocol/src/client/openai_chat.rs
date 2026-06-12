@@ -75,24 +75,26 @@ pub fn decode_request(req: ChatCompletionRequest) -> Result<CoreRequest, Protoco
     for msg in req.messages {
         match msg.role.as_str() {
             "system" => {
+                let text = msg.content_text();
                 let cache = msg.cache_control.map(|cc| CacheControl {
                     r#type: CacheControlType::from(cc.r#type),
                 });
-                if !msg.content.is_empty() || cache.is_some() {
+                if !text.is_empty() || cache.is_some() {
                     system.push(CoreContent::Text {
-                        text: msg.content,
+                        text,
                         cache,
                     });
                 }
             }
             "user" => {
+                let text = msg.content_text();
                 let cache = msg.cache_control.map(|cc| CacheControl {
                     r#type: CacheControlType::from(cc.r#type),
                 });
                 let mut content = Vec::new();
-                if !msg.content.is_empty() || cache.is_some() {
+                if !text.is_empty() || cache.is_some() {
                     content.push(CoreContent::Text {
-                        text: msg.content,
+                        text,
                         cache,
                     });
                 }
@@ -107,6 +109,10 @@ pub fn decode_request(req: ChatCompletionRequest) -> Result<CoreRequest, Protoco
                 // fields with no defined ordering. This ordering is a
                 // deterministic choice that puts thinking before tool calls
                 // and text content.
+                //
+                // Read content_text before other fields are moved so the borrow
+                // checker is satisfied.
+                let assistant_text = msg.content_text();
                 let mut content = Vec::new();
                 if let Some(thinking) = msg.reasoning_content {
                     // OpenAI returns Some("") for reasoning_content on non-reasoning
@@ -154,9 +160,9 @@ pub fn decode_request(req: ChatCompletionRequest) -> Result<CoreRequest, Protoco
                         input: tc_args,
                     });
                 }
-                if !msg.content.is_empty() {
+                if !assistant_text.is_empty() {
                     content.push(CoreContent::Text {
-                        text: msg.content,
+                        text: assistant_text,
                         cache: None,
                     });
                 }
@@ -172,16 +178,17 @@ pub fn decode_request(req: ChatCompletionRequest) -> Result<CoreRequest, Protoco
                 // does not capture unknown fields (it lacks #[serde(flatten)]).
                 // Adding a flattened extra Map to ChatMessage would enable this.
                 let is_error = false;
+                let tool_text = msg.content_text();
                 let tool_use_id = msg.tool_call_id.ok_or_else(|| {
                     ProtocolError::InvalidRequest(
                         "tool_call_id is required on tool messages".into(),
                     )
                 })?;
-                let inner_content = if msg.content.is_empty() {
+                let inner_content = if tool_text.is_empty() {
                     vec![]
                 } else {
                     vec![CoreContent::Text {
-                        text: msg.content,
+                        text: tool_text,
                         cache: None,
                     }]
                 };
@@ -436,7 +443,7 @@ pub fn encode_response(resp: CoreResponse) -> Result<ChatCompletionResponse, Pro
 
     let message = ChatMessage {
         role: "assistant".to_owned(),
-        content: content_text,
+        content: serde_json::Value::String(content_text),
         reasoning_content: reasoning,
         tool_calls,
         name: None,
@@ -589,7 +596,7 @@ impl StreamEncoder {
                     finish_reason: None,
                     delta: Some(ChatMessage {
                         role: "assistant".to_owned(),
-                        content: String::new(),
+                        content: serde_json::Value::String(String::new()),
                         reasoning_content: None,
                         tool_calls: vec![],
                         name: None,
@@ -624,7 +631,7 @@ impl StreamEncoder {
                     finish_reason: None,
                     delta: Some(ChatMessage {
                         role: String::new(),
-                        content: text,
+                        content: serde_json::Value::String(text),
                         reasoning_content: None,
                         tool_calls: vec![],
                         name: None,
@@ -642,7 +649,7 @@ impl StreamEncoder {
                     finish_reason: None,
                     delta: Some(ChatMessage {
                         role: String::new(),
-                        content: String::new(),
+                        content: serde_json::Value::String(String::new()),
                         reasoning_content: Some(text),
                         tool_calls: vec![],
                         name: None,
@@ -660,7 +667,7 @@ impl StreamEncoder {
                     finish_reason: None,
                     delta: Some(ChatMessage {
                         role: String::new(),
-                        content: String::new(),
+                        content: serde_json::Value::String(String::new()),
                         reasoning_content: None,
                         tool_calls: vec![ToolCall {
                             index: Some(index.min(i32::MAX as usize) as i32),
@@ -686,7 +693,7 @@ impl StreamEncoder {
                     finish_reason: None,
                     delta: Some(ChatMessage {
                         role: String::new(),
-                        content: String::new(),
+                        content: serde_json::Value::String(String::new()),
                         reasoning_content: None,
                         tool_calls: vec![ToolCall {
                             index: Some(index.min(i32::MAX as usize) as i32),
@@ -722,7 +729,7 @@ impl StreamEncoder {
                     finish_reason: Some(finish),
                     delta: Some(ChatMessage {
                         role: String::new(),
-                        content: String::new(),
+                        content: serde_json::Value::String(String::new()),
                         reasoning_content: None,
                         tool_calls: vec![],
                         name: None,
@@ -803,7 +810,7 @@ impl StreamEncoder {
             finish_reason: Some("stop".to_owned()),
             delta: Some(ChatMessage {
                 role: String::new(),
-                content: String::new(),
+                content: serde_json::Value::String(String::new()),
                 reasoning_content: None,
                 tool_calls: vec![],
                 name: None,
@@ -871,7 +878,7 @@ mod tests {
             model: "gpt-4o".into(),
             messages: vec![ChatMessage {
                 role: "user".into(),
-                content: "hello".into(),
+                content: serde_json::Value::String("hello".into()),
                 reasoning_content: None,
                 tool_calls: vec![],
                 name: None,
@@ -934,7 +941,7 @@ mod tests {
             0,
             ChatMessage {
                 role: "system".into(),
-                content: "You are helpful".into(),
+                content: serde_json::Value::String("You are helpful".into()),
                 reasoning_content: None,
                 tool_calls: vec![],
                 name: None,
@@ -959,7 +966,7 @@ mod tests {
         let mut req = make_openai_request();
         req.messages.push(ChatMessage {
             role: "assistant".into(),
-            content: String::new(),
+            content: serde_json::Value::String(String::new()),
             reasoning_content: None,
             tool_calls: vec![ToolCall {
                 index: Some(0),
@@ -992,7 +999,7 @@ mod tests {
         let mut req = make_openai_request();
         req.messages.push(ChatMessage {
             role: "tool".into(),
-            content: "72F and sunny".into(),
+            content: serde_json::Value::String("72F and sunny".into()),
             reasoning_content: None,
             tool_calls: vec![],
             name: None,
@@ -1020,7 +1027,7 @@ mod tests {
         let mut req = make_openai_request();
         req.messages.push(ChatMessage {
             role: "assistant".into(),
-            content: String::new(),
+            content: serde_json::Value::String(String::new()),
             reasoning_content: Some("let me think...".into()),
             tool_calls: vec![],
             name: None,
@@ -1119,7 +1126,7 @@ mod tests {
         let mut req = make_openai_request();
         req.messages.push(ChatMessage {
             role: "assistant".into(),
-            content: "hi there".into(),
+            content: serde_json::Value::String("hi there".into()),
             reasoning_content: None,
             tool_calls: vec![],
             name: None,
@@ -1129,7 +1136,7 @@ mod tests {
         });
         req.messages.push(ChatMessage {
             role: "user".into(),
-            content: "how are you?".into(),
+            content: serde_json::Value::String("how are you?".into()),
             reasoning_content: None,
             tool_calls: vec![],
             name: None,
@@ -1162,7 +1169,7 @@ mod tests {
         let mut req = make_openai_request();
         req.messages.push(ChatMessage {
             role: "unknown_role".into(),
-            content: "test".into(),
+            content: serde_json::Value::String("test".into()),
             reasoning_content: None,
             tool_calls: vec![],
             name: None,
@@ -1179,7 +1186,7 @@ mod tests {
         // When a user message has empty content but carries cache_control,
         // the cache_control must not be silently dropped.
         let mut req = make_openai_request();
-        req.messages[0].content = String::new();
+        req.messages[0].content = serde_json::Value::String(String::new());
         req.messages[0].cache_control = Some(OpenAICacheControl {
             r#type: "ephemeral".into(),
         });
@@ -1211,7 +1218,7 @@ mod tests {
             0,
             ChatMessage {
                 role: "system".into(),
-                content: String::new(),
+                content: serde_json::Value::String(String::new()),
                 reasoning_content: None,
                 tool_calls: vec![],
                 name: None,
@@ -1288,7 +1295,7 @@ mod tests {
         assert_eq!(out.choices.len(), 1);
         assert_eq!(out.choices[0].finish_reason.as_deref(), Some("stop"));
         let msg = out.choices[0].message.as_ref().unwrap();
-        assert_eq!(msg.content, "hello there");
+        assert_eq!(msg.content, serde_json::Value::String("hello there".into()));
         assert_eq!(msg.role, "assistant");
     }
 
@@ -1376,7 +1383,7 @@ mod tests {
         let out = encode_response(resp).unwrap();
         let msg = out.choices[0].message.as_ref().unwrap();
         assert_eq!(msg.reasoning_content.as_deref(), Some("let me think..."));
-        assert_eq!(msg.content, "answer");
+        assert_eq!(msg.content, serde_json::Value::String("answer".into()));
     }
 
     // -- streaming encode tests ---------------------------------------------
@@ -1393,7 +1400,7 @@ mod tests {
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].object, "chat.completion.chunk");
         let delta = chunks[0].choices[0].delta.as_ref().unwrap();
-        assert_eq!(delta.content, "hello");
+        assert_eq!(delta.content, serde_json::Value::String("hello".into()));
     }
 
     #[test]
@@ -1667,7 +1674,7 @@ mod tests {
         };
         let out = encode_response(resp).unwrap();
         let msg = out.choices[0].message.as_ref().unwrap();
-        assert!(msg.content.is_empty());
+        assert!(msg.content_is_empty());
         assert!(msg.tool_calls.is_empty());
     }
 
@@ -1691,7 +1698,7 @@ mod tests {
         let msg = out.choices[0].message.as_ref().unwrap();
         // Refusal text goes into the native refusal field, not content.
         assert_eq!(msg.refusal.as_deref(), Some("I cannot help"));
-        assert!(msg.content.is_empty());
+        assert!(msg.content_is_empty());
     }
 
     #[test]
@@ -1712,7 +1719,7 @@ mod tests {
         };
         let out = encode_response(resp).unwrap();
         let msg = out.choices[0].message.as_ref().unwrap();
-        assert!(msg.content.is_empty());
+        assert!(msg.content_is_empty());
     }
 
     #[test]
@@ -1733,7 +1740,7 @@ mod tests {
         };
         let out = encode_response(resp).unwrap();
         let msg = out.choices[0].message.as_ref().unwrap();
-        assert!(msg.content.is_empty());
+        assert!(msg.content_is_empty());
     }
 
     #[test]
@@ -1754,7 +1761,7 @@ mod tests {
         };
         let out = encode_response(resp).unwrap();
         let msg = out.choices[0].message.as_ref().unwrap();
-        assert!(msg.content.is_empty());
+        assert!(msg.content_is_empty());
     }
 
     #[test]
@@ -1777,7 +1784,7 @@ mod tests {
         };
         let out = encode_response(resp).unwrap();
         let msg = out.choices[0].message.as_ref().unwrap();
-        assert!(msg.content.is_empty());
+        assert!(msg.content_is_empty());
     }
 
     // -- metadata / provider hints ------------------------------------------
@@ -1843,7 +1850,7 @@ mod tests {
         let out = encode_response(resp).unwrap();
         // RedactedThinking is skipped (not an error), so content is empty.
         let msg = out.choices[0].message.as_ref().unwrap();
-        assert!(msg.content.is_empty());
+        assert!(msg.content_is_empty());
     }
 
     #[test]
@@ -1871,7 +1878,7 @@ mod tests {
         let out = encode_response(resp).unwrap();
         let msg = out.choices[0].message.as_ref().unwrap();
         // Prior Text block is preserved even though RedactedThinking follows.
-        assert_eq!(msg.content, "hello");
+        assert_eq!(msg.content, serde_json::Value::String("hello".into()));
     }
 
     #[test]
@@ -1890,7 +1897,7 @@ mod tests {
         };
         let out = encode_response(resp).unwrap();
         let msg = out.choices[0].message.as_ref().unwrap();
-        assert!(msg.content.is_empty());
+        assert!(msg.content_is_empty());
         assert!(msg.tool_calls.is_empty());
     }
 
@@ -2066,7 +2073,7 @@ mod tests {
         };
         let out = encode_response(resp).unwrap();
         let msg = out.choices[0].message.as_ref().unwrap();
-        assert_eq!(msg.content, large_text);
+        assert_eq!(msg.content, serde_json::Value::String(large_text));
     }
 
     #[test]
@@ -2094,7 +2101,7 @@ mod tests {
         let mut req = make_openai_request();
         req.messages.push(ChatMessage {
             role: "assistant".into(),
-            content: String::new(),
+            content: serde_json::Value::String(String::new()),
             reasoning_content: None,
             tool_calls: vec![ToolCall {
                 index: Some(0),
@@ -2127,7 +2134,7 @@ mod tests {
         let mut req = make_openai_request();
         req.messages.push(ChatMessage {
             role: "assistant".into(),
-            content: String::new(),
+            content: serde_json::Value::String(String::new()),
             reasoning_content: None,
             tool_calls: vec![ToolCall {
                 index: Some(0),
@@ -2157,7 +2164,7 @@ mod tests {
         let mut req = make_openai_request();
         req.messages.push(ChatMessage {
             role: "assistant".into(),
-            content: String::new(),
+            content: serde_json::Value::String(String::new()),
             reasoning_content: None,
             tool_calls: vec![ToolCall {
                 index: Some(0),
@@ -2190,7 +2197,7 @@ mod tests {
         let mut req = make_openai_request();
         req.messages.push(ChatMessage {
             role: "tool".into(),
-            content: "result".into(),
+            content: serde_json::Value::String("result".into()),
             reasoning_content: None,
             tool_calls: vec![],
             name: None,
@@ -2215,7 +2222,7 @@ mod tests {
         let mut req = make_openai_request();
         req.messages.push(ChatMessage {
             role: "assistant".into(),
-            content: String::new(),
+            content: serde_json::Value::String(String::new()),
             reasoning_content: None,
             tool_calls: vec![ToolCall {
                 index: Some(0),

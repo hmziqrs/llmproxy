@@ -452,4 +452,121 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(count.load(Ordering::SeqCst), 1);
     }
+
+    // -- load_disk_cache validation edge cases ---------------------------------
+
+    fn minimal_provider(name: &str) -> ProviderConfig {
+        ProviderConfig {
+            name: name.to_owned(),
+            api_key: String::new(),
+            auth_style: AuthStyle::Bearer,
+            adapters: HashMap::new(),
+            routes: ProviderRoutesConfig::default(),
+            model_aliases: HashMap::new(),
+            discovery: None,
+            catalog: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn load_disk_cache_rejects_symlink() {
+        let directory = temp_dir();
+        std::fs::create_dir_all(&directory).unwrap();
+
+        // Write a real cache file, then replace it with a symlink.
+        let real = directory.join("real.toml");
+        std::fs::write(&real, "not used").unwrap();
+        let link = directory.join("symlink-provider.toml");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let service = ModelCatalogService::new(Some(directory.clone()));
+        let provider = minimal_provider("symlink-provider");
+        let result = service.load_disk_cache(&provider).await;
+
+        assert!(result.is_err(), "symlinked cache files must be rejected");
+        let msg = format!("{result:?}");
+        assert!(
+            msg.contains("non-symlink"),
+            "error should mention symlink requirement, got: {msg}"
+        );
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn load_disk_cache_rejects_non_regular_file() {
+        let directory = temp_dir();
+        std::fs::create_dir_all(&directory).unwrap();
+
+        // Create a FIFO (named pipe) which is neither a regular file nor a symlink.
+        let fifo = directory.join("fifo-provider.toml");
+        #[cfg(unix)]
+        {
+            use std::process::Command;
+            Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .expect("mkfifo must be available");
+        }
+
+        let service = ModelCatalogService::new(Some(directory.clone()));
+        let provider = minimal_provider("fifo-provider");
+        let result = service.load_disk_cache(&provider).await;
+
+        assert!(result.is_err(), "non-regular files must be rejected");
+        let msg = format!("{result:?}");
+        assert!(
+            msg.contains("non-symlink") || msg.contains("regular"),
+            "error should mention file type requirement, got: {msg}"
+        );
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn load_disk_cache_rejects_provider_name_mismatch() {
+        let directory = temp_dir();
+        std::fs::create_dir_all(&directory).unwrap();
+
+        // Write a cache file whose internal provider name differs from the filename.
+        let mut file = catalog_file("2026-06-10T00:00:00Z");
+        file.catalog.provider = "other-provider".to_owned();
+        let raw = toml::to_string_pretty(&file).unwrap();
+        std::fs::write(directory.join("test-provider.toml"), &raw).unwrap();
+
+        let service = ModelCatalogService::new(Some(directory.clone()));
+        let provider = minimal_provider("test-provider");
+        let result = service.load_disk_cache(&provider).await;
+
+        assert!(result.is_err(), "provider name mismatch must be rejected");
+        let msg = format!("{result:?}");
+        assert!(
+            msg.contains("mismatch"),
+            "error should mention mismatch, got: {msg}"
+        );
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn load_disk_cache_rejects_malformed_toml() {
+        let directory = temp_dir();
+        std::fs::create_dir_all(&directory).unwrap();
+
+        std::fs::write(directory.join("bad-toml.toml"), "this is not {{{ valid toml").unwrap();
+
+        let service = ModelCatalogService::new(Some(directory.clone()));
+        let provider = minimal_provider("bad-toml");
+        let result = service.load_disk_cache(&provider).await;
+
+        assert!(result.is_err(), "malformed TOML must be rejected");
+        let msg = format!("{result:?}");
+        assert!(
+            msg.contains("parse"),
+            "error should mention parsing, got: {msg}"
+        );
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 }

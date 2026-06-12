@@ -90,7 +90,14 @@ impl PidManager {
         {
             // SAFETY: kill(pid, 0) just checks if the process exists; it does
             // not send a signal on any Unix platform.
-            unsafe { libc::kill(pid as i32, 0) == 0 }
+            let ret = unsafe { libc::kill(pid as i32, 0) };
+            if ret == 0 {
+                true
+            } else {
+                let err = std::io::Error::last_os_error();
+                // EPERM means the process exists but we lack permission.
+                err.raw_os_error() != Some(libc::ESRCH)
+            }
         }
         #[cfg(not(unix))]
         {

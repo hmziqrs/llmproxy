@@ -332,14 +332,22 @@ fn read_pid() -> Result<Option<u32>> {
     Ok(Some(pid))
 }
 
-/// Write the current PID to the PID file.
+/// Atomically create the PID file with exclusive ownership.
+///
+/// Uses `create_new(true)` so the file is created exclusively -- if another
+/// process already created it, the call fails and we return the OS error.
+/// This eliminates the TOCTOU race between checking for a stale PID and
+/// writing the new one.
 fn write_pid() -> Result<()> {
     let dir = config_dir();
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("creating directory {}", dir.display()))?;
     let path = pid_file_path();
     let pid = std::process::id();
-    let mut f = std::fs::File::create(&path)
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
         .with_context(|| format!("creating PID file {}", path.display()))?;
     write!(f, "{pid}").with_context(|| format!("writing PID file {}", path.display()))?;
     info!(pid, "wrote PID file");
@@ -479,21 +487,31 @@ async fn cmd_serve(
     let adapter_registry = ProviderAdapterRegistry::builtin();
     let proxy_client = ProxyClient::new();
 
-    // Check if already running.
-    if let Some(pid) = read_pid()? {
-        if is_process_running(pid) {
-            bail!(
-                "server already running with PID {} (PID file: {})",
-                pid,
-                pid_file_path().display()
-            );
+    // Attempt atomic PID file creation. If it fails because the file already
+    // exists, check whether the existing owner is still alive before removing
+    // the stale file and retrying. This closes the TOCTOU window between the
+    // stale-check and the write.
+    if let Err(first_err) = write_pid() {
+        // Atomic create_new failed -- file exists. Check if the owner is stale.
+        if let Some(existing_pid) = read_pid()? {
+            if is_process_running(existing_pid) {
+                bail!(
+                    "server already running with PID {} (PID file: {})",
+                    existing_pid,
+                    pid_file_path().display()
+                );
+            }
+            info!("stale PID file found (PID {}), cleaning up", existing_pid);
         }
-        info!("stale PID file found, cleaning up");
         remove_pid()?;
+        // Retry -- this time the file is gone so create_new should succeed.
+        write_pid().with_context(|| {
+            format!(
+                "failed to create PID file after removing stale entry: {}",
+                first_err
+            )
+        })?;
     }
-
-    // Write PID file.
-    write_pid()?;
 
     // Ensure PID file is cleaned up on shutdown.
     let pid_path = pid_file_path();
@@ -601,6 +619,11 @@ fn spawn_daemon(config_path: Option<PathBuf>, port_override: Option<u16>) -> Res
 
 /// Run the `stop` command.
 fn cmd_stop() -> Result<()> {
+    #[cfg(not(unix))]
+    {
+        bail!("error: stop is not supported on this platform");
+    }
+
     match read_pid()? {
         Some(pid) => {
             if !is_process_running(pid) {

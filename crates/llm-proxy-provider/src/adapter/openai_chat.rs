@@ -145,7 +145,7 @@ impl ProviderStreamDecoder for OpenAiChatStreamDecoder {
         // usage are handled in separate code paths, so this truthy check does not
         // drop meaningful events.
         if let Some(ref delta) = choice.delta {
-            if !delta.content.is_empty() {
+            if !delta.content_is_empty() {
                 self.close_reasoning_if_open();
                 if !self.content_started {
                     self.content_started = true;
@@ -156,7 +156,7 @@ impl ProviderStreamDecoder for OpenAiChatStreamDecoder {
                 }
                 events.push(CoreEvent::TextDelta {
                     index: self.content_index,
-                    text: delta.content.clone(),
+                    text: delta.content_text(),
                 });
             }
         }
@@ -338,7 +338,7 @@ impl OpenAiChatAdapter {
                     if !text.is_empty() {
                         messages.push(ChatMessage {
                             role: "system".to_owned(),
-                            content: text.clone(),
+                            content: serde_json::Value::String(text.clone()),
                             reasoning_content: None,
                             tool_calls: Vec::new(),
                             name: None,
@@ -365,7 +365,7 @@ impl OpenAiChatAdapter {
                     if !text.is_empty() {
                         messages.push(ChatMessage {
                             role: "user".to_owned(),
-                            content: text,
+                            content: serde_json::Value::String(text),
                             reasoning_content: None,
                             tool_calls: Vec::new(),
                             name: None,
@@ -386,7 +386,7 @@ impl OpenAiChatAdapter {
                             let result_text = collect_text(result_content);
                             messages.push(ChatMessage {
                                 role: "tool".to_owned(),
-                                content: result_text,
+                                content: serde_json::Value::String(result_text),
                                 reasoning_content: None,
                                 tool_calls: Vec::new(),
                                 name: None,
@@ -448,7 +448,7 @@ impl OpenAiChatAdapter {
 
                     messages.push(ChatMessage {
                         role: "assistant".to_owned(),
-                        content: text,
+                        content: serde_json::Value::String(text),
                         reasoning_content,
                         tool_calls,
                         name: None,
@@ -462,7 +462,7 @@ impl OpenAiChatAdapter {
                     if !text.is_empty() {
                         messages.push(ChatMessage {
                             role: "system".to_owned(),
-                            content: text,
+                            content: serde_json::Value::String(text),
                             reasoning_content: None,
                             tool_calls: Vec::new(),
                             name: None,
@@ -491,7 +491,7 @@ impl OpenAiChatAdapter {
                     }
                     messages.push(ChatMessage {
                         role: "tool".to_owned(),
-                        content: text,
+                        content: serde_json::Value::String(text),
                         reasoning_content: None,
                         tool_calls: Vec::new(),
                         name: None,
@@ -506,7 +506,7 @@ impl OpenAiChatAdapter {
                     if !text.is_empty() {
                         messages.push(ChatMessage {
                             role: "user".to_owned(),
-                            content: text,
+                            content: serde_json::Value::String(text),
                             reasoning_content: None,
                             tool_calls: Vec::new(),
                             name: None,
@@ -640,9 +640,9 @@ impl OpenAiChatAdapter {
         }
 
         // Text content (may appear before or after tool calls).
-        if !msg.content.is_empty() {
+        if !msg.content_is_empty() {
             content.push(CoreContent::Text {
-                text: msg.content.clone(),
+                text: msg.content_text(),
                 cache: None,
             });
         }
@@ -831,7 +831,7 @@ mod tests {
         assert_eq!(body.model, "gpt-4o-2024-08-06");
         assert_eq!(body.messages.len(), 1);
         assert_eq!(body.messages[0].role, "user");
-        assert_eq!(body.messages[0].content, "Hello");
+        assert_eq!(body.messages[0].content, serde_json::Value::String("Hello".into()));
     }
 
     #[test]
@@ -853,7 +853,7 @@ mod tests {
 
         let body: ChatCompletionRequest = serde_json::from_slice(&proxy_req.body).unwrap();
         assert_eq!(body.messages[0].role, "system");
-        assert_eq!(body.messages[0].content, "You are helpful");
+        assert_eq!(body.messages[0].content, serde_json::Value::String("You are helpful".into()));
     }
 
     #[test]
@@ -938,7 +938,7 @@ mod tests {
         assert_eq!(body.messages[1].tool_calls.len(), 1);
         assert_eq!(body.messages[2].role, "tool");
         assert_eq!(body.messages[2].tool_call_id, Some("call_1".to_owned()));
-        assert_eq!(body.messages[2].content, "72F sunny");
+        assert_eq!(body.messages[2].content, serde_json::Value::String("72F sunny".into()));
     }
 
     #[test]
@@ -1046,7 +1046,7 @@ mod tests {
                 index: 0,
                 message: Some(ChatMessage {
                     role: "assistant".into(),
-                    content: "hello world".into(),
+                    content: serde_json::Value::String("hello world".into()),
                     reasoning_content: None,
                     tool_calls: vec![],
                     name: None,
@@ -1096,7 +1096,7 @@ mod tests {
                 index: 0,
                 message: Some(ChatMessage {
                     role: "assistant".into(),
-                    content: String::new(),
+                    content: serde_json::Value::String(String::new()),
                     reasoning_content: None,
                     tool_calls: vec![ToolCall {
                         index: None,
@@ -1151,7 +1151,7 @@ mod tests {
                 index: 0,
                 message: Some(ChatMessage {
                     role: "assistant".into(),
-                    content: "hi".into(),
+                    content: serde_json::Value::String("hi".into()),
                     reasoning_content: None,
                     tool_calls: vec![],
                     name: None,
@@ -1314,7 +1314,7 @@ mod tests {
                 index: 0,
                 message: Some(ChatMessage {
                     role: "assistant".into(),
-                    content: "answer".into(),
+                    content: serde_json::Value::String("answer".into()),
                     reasoning_content: Some("Let me think...".into()),
                     tool_calls: vec![],
                     name: None,
@@ -1364,7 +1364,7 @@ mod tests {
                 index: 0,
                 message: Some(ChatMessage {
                     role: "assistant".into(),
-                    content: String::new(),
+                    content: serde_json::Value::String(String::new()),
                     reasoning_content: None,
                     tool_calls: vec![],
                     name: None,
@@ -1596,7 +1596,7 @@ mod tests {
                 index: 0,
                 message: Some(ChatMessage {
                     role: "assistant".into(),
-                    content: "answer".into(),
+                    content: serde_json::Value::String("answer".into()),
                     reasoning_content: Some("thoughts".into()),
                     tool_calls: vec![],
                     name: None,

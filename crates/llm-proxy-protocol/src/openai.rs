@@ -114,11 +114,17 @@ pub struct ChatMessage {
     /// Defaults to empty when absent (streaming deltas often omit this).
     #[serde(default)]
     pub role: String,
-    /// The text body of the message.
+    /// The content body of the message.
     ///
-    /// Defaults to empty when absent (streaming deltas often omit this).
-    #[serde(default)]
-    pub content: String,
+    /// OpenAI allows `content` to be either a plain string or an array of
+    /// structured content parts (e.g. `[{"type":"text","text":"..."},
+    /// {"type":"image_url","image_url":{...}}]`).  Using `serde_json::Value`
+    /// lets us accept both forms without rejecting multimodal requests.
+    ///
+    /// Defaults to `Value::String("")` when absent (streaming deltas often
+    /// omit this).
+    #[serde(default = "default_content")]
+    pub content: serde_json::Value,
     /// Chain-of-thought text emitted by reasoning models.
     ///
     /// Some OpenAI-compatible providers (e.g. DeepSeek) use the `reasoning`
@@ -142,6 +148,63 @@ pub struct ChatMessage {
     /// the model refuses to answer).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub refusal: Option<String>,
+}
+
+impl ChatMessage {
+    /// Extract the text content as a `String`.
+    ///
+    /// Handles both forms accepted by the OpenAI Chat Completions API:
+    /// - `Value::String(s)` — returned directly.
+    /// - `Value::Array(parts)` — concatenates all `"type":"text"` parts' `"text"`
+    ///   fields. Non-text parts (e.g. `image_url`) are silently skipped.
+    /// - `Value::Null` — returns an empty string.
+    ///
+    /// Any other value type returns an empty string with a warning.
+    pub fn content_text(&self) -> String {
+        match &self.content {
+            serde_json::Value::String(s) => s.clone(),
+            serde_json::Value::Array(parts) => {
+                let mut out = String::new();
+                for part in parts {
+                    if let serde_json::Value::Object(map) = part {
+                        if map.get("type").and_then(|v| v.as_str()) == Some("text") {
+                            if let Some(text) = map.get("text").and_then(|v| v.as_str()) {
+                                out.push_str(text);
+                            }
+                        }
+                    }
+                }
+                out
+            }
+            serde_json::Value::Null => String::new(),
+            other => {
+                tracing::warn!(
+                    ?other,
+                    "ChatMessage::content_text: unexpected content type, returning empty string"
+                );
+                String::new()
+            }
+        }
+    }
+
+    /// Returns `true` when `content` is semantically empty.
+    ///
+    /// This is `true` when the value is `Null`, an empty string (`""`), or an
+    /// empty array. It is the replacement for the old `msg.content.is_empty()`
+    /// checks used throughout the codebase.
+    pub fn content_is_empty(&self) -> bool {
+        match &self.content {
+            serde_json::Value::String(s) => s.is_empty(),
+            serde_json::Value::Array(a) => a.is_empty(),
+            serde_json::Value::Null => true,
+            _ => false,
+        }
+    }
+}
+
+/// Default value for [`ChatMessage::content`]: an empty JSON string.
+fn default_content() -> serde_json::Value {
+    serde_json::Value::String(String::new())
 }
 
 // ---------------------------------------------------------------------------

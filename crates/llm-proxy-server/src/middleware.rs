@@ -18,6 +18,10 @@ use sha2::{Digest, Sha256};
 // RequestDeduplicator
 // ---------------------------------------------------------------------------
 
+/// Maximum number of in-flight deduplication entries. Prevents unbounded
+/// memory growth from unique-body requests.
+const MAX_DEDUP_ENTRIES: usize = 10_000;
+
 /// Deduplicates requests based on a SHA-256 hash of the request path and body.
 ///
 /// Tracks in-flight request hashes with a configurable deduplication window.
@@ -90,7 +94,10 @@ impl RequestDeduplicator {
             return true;
         }
 
-        map.insert(hash, now);
+        // Skip dedup tracking when at capacity to bound memory usage.
+        if map.len() < MAX_DEDUP_ENTRIES {
+            map.insert(hash, now);
+        }
         false
     }
 
@@ -112,6 +119,10 @@ impl Default for RequestDeduplicator {
 // ---------------------------------------------------------------------------
 // RateLimiter
 // ---------------------------------------------------------------------------
+
+/// Maximum number of per-IP rate-limit buckets. Prevents unbounded memory
+/// growth from spoofed or diverse source IPs.
+const MAX_RATE_LIMIT_BUCKETS: usize = 100_000;
 
 /// Per-client token bucket for rate limiting.
 #[derive(Debug)]
@@ -197,6 +208,11 @@ impl RateLimiter {
         // Refill rate: tokens per second.
         let refill_rate = self.max_requests_per_minute / 60.0;
 
+        // Reject new entries when at capacity to bound memory usage.
+        if !buckets.contains_key(client_ip) && buckets.len() >= MAX_RATE_LIMIT_BUCKETS {
+            return false;
+        }
+
         let bucket = buckets
             .entry(client_ip.to_owned())
             .or_insert_with(|| ClientTokenBucket::new(self.max_requests_per_minute));
@@ -273,6 +289,12 @@ where
 }
 
 /// Extract the client IP from trusted forwarding headers or connection info.
+///
+/// When `trust_forwarded_headers` is true, the leftmost value from
+/// `X-Forwarded-For` or the value from `X-Real-Ip` is used, but only after
+/// validating it parses as a legitimate [`std::net::IpAddr`]. Invalid or
+/// spoofed values are silently ignored and the connection-info fallback is
+/// used instead.
 pub fn get_client_ip(
     headers: &axum::http::HeaderMap,
     connect_info: Option<&SocketAddr>,
@@ -284,7 +306,7 @@ pub fn get_client_ip(
             if let Ok(val) = xff.to_str() {
                 if let Some(ip) = val.split(',').next() {
                     let trimmed = ip.trim();
-                    if !trimmed.is_empty() {
+                    if trimmed.parse::<std::net::IpAddr>().is_ok() {
                         return trimmed.to_owned();
                     }
                 }
@@ -295,7 +317,7 @@ pub fn get_client_ip(
         if let Some(xri) = headers.get("x-real-ip") {
             if let Ok(val) = xri.to_str() {
                 let trimmed = val.trim();
-                if !trimmed.is_empty() {
+                if trimmed.parse::<std::net::IpAddr>().is_ok() {
                     return trimmed.to_owned();
                 }
             }
