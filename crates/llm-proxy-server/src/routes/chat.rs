@@ -9,14 +9,15 @@
 //! endpoint classification, fallback routing, or provider-specific streaming.
 
 use axum::body::Body;
-use axum::extract::{Path, State};
-use axum::http::{HeaderMap, Response};
+use axum::extract::{Extension, Path, State};
+use axum::http::{HeaderMap, Response, header};
+use axum::Json;
 use llm_proxy_core::ProviderRouteKind;
 use llm_proxy_protocol::client::openai_chat;
 use llm_proxy_protocol::openai::ChatCompletionRequest;
 use tracing::{info, warn};
 
-use crate::middleware::OptionalConnectInfo;
+use crate::middleware::{OptionalConnectInfo, RequestId};
 use crate::state::AppState;
 
 use super::core_pipeline;
@@ -29,11 +30,12 @@ use super::error_response::{ClientProtocol, RouteError, route_error_response};
 pub async fn handle_chat_completions(
     State(state): State<AppState>,
     Path(provider): Path<String>,
+    Extension(req_id): Extension<RequestId>,
     OptionalConnectInfo(connect_info): OptionalConnectInfo,
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response<Body> {
-    match handle_chat_completions_inner(state, provider, connect_info, headers, body).await {
+    match handle_chat_completions_inner(state, req_id, provider, connect_info, headers, body).await {
         Ok(response) => response,
         Err(error) => {
             warn!(error = %error, "request failed");
@@ -45,27 +47,40 @@ pub async fn handle_chat_completions(
 /// Inner handler that returns `Result` so errors can be mapped uniformly.
 async fn handle_chat_completions_inner(
     state: AppState,
+    req_id: RequestId,
     provider: String,
     connect_info: Option<std::net::SocketAddr>,
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<Response<Body>, RouteError> {
-    // Pre-flight: rate limit, dedup, request ID.
-    // Note: prepare_request takes a &[u8] reference (non-consuming) so the
-    // body bytes remain available for the second parse below. The body bytes
-    // are hashed for dedup, then deserialized as ChatCompletionRequest.
+    // Input validation gates, ordered cheapest-first to avoid charging
+    // rate-limit/dedup budget for malformed requests. Mirrors the ordering
+    // established in `token_count.rs`: provider name -> existence ->
+    // content-type -> rate-limit/dedup -> JSON parse.
+    core_pipeline::validate_provider_name(&provider)?;
+    if state.providers().get(&provider).is_none() {
+        return Err(RouteError::UnknownProvider(provider.clone()));
+    }
+    validate_json_content_type(&headers)?;
+
     let request_path = format!("/providers/{provider}/v1/chat/completions");
     let ctx = core_pipeline::prepare_request(
         &state,
+        req_id.0,
         &headers,
         connect_info.as_ref(),
         &body,
         &request_path,
     )?;
 
-    // Parse the OpenAI ChatCompletionRequest.
-    let req: ChatCompletionRequest = serde_json::from_slice(&body)
-        .map_err(|e| RouteError::InvalidRequest(format!("invalid JSON: {e}")))?;
+    // Parse the OpenAI ChatCompletionRequest via axum's `Json` helper so the
+    // `JsonRejection` taxonomy (syntax vs data error) is preserved and mapped
+    // to a precise 400 body, rather than collapsing both into one opaque
+    // "invalid JSON" string.
+    let req: ChatCompletionRequest = match Json::<ChatCompletionRequest>::from_bytes(&body) {
+        Ok(Json(value)) => value,
+        Err(rejection) => return Err(json_rejection_to_route_error(rejection)),
+    };
 
     // Decode the OpenAI Chat request into a core request.
     // Note: ChatCompletionRequest does not have a separate validate() method
@@ -103,6 +118,54 @@ async fn handle_chat_completions_inner(
             ClientProtocol::OpenAiChat,
         )
         .await
+    }
+}
+
+/// Reject requests whose `Content-Type` is present but not a JSON media type.
+///
+/// Handlers accept `axum::body::Bytes` (so the raw body can be hashed for
+/// dedup), which bypasses the `Json` extractor's built-in content-type check.
+/// This restores the spirit of that check: a body that is not advertised as
+/// JSON should not be reported as a misleading "invalid JSON" parse error.
+/// A missing `Content-Type` is tolerated for backwards compatibility, matching
+/// the prior behaviour.
+fn validate_json_content_type(headers: &HeaderMap) -> Result<(), RouteError> {
+    let Some(value) = headers.get(header::CONTENT_TYPE) else {
+        return Ok(());
+    };
+    let Ok(ct) = value.to_str() else {
+        return Ok(());
+    };
+    // Accept `application/json` and any `+json` suffix (e.g.
+    // `application/vnd.api+json`). Strip any `; charset=...` parameters first.
+    let essence = ct.split(';').next().unwrap_or(ct).trim().to_ascii_lowercase();
+    let is_json = essence == "application/json" || essence.ends_with("+json");
+    if !is_json {
+        return Err(RouteError::InvalidRequest(format!(
+            "expected application/json Content-Type, got {ct}"
+        )));
+    }
+    Ok(())
+}
+
+/// Map an axum `JsonRejection` to a `RouteError`, preserving the distinction
+/// between a syntactically invalid JSON body and a body that is valid JSON but
+/// does not fit the target type.
+fn json_rejection_to_route_error(rejection: axum::extract::rejection::JsonRejection) -> RouteError {
+    use axum::extract::rejection::JsonRejection;
+    match rejection {
+        JsonRejection::JsonSyntaxError(e) => {
+            RouteError::InvalidRequest(format!("invalid JSON syntax: {e}"))
+        }
+        JsonRejection::JsonDataError(e) => {
+            RouteError::InvalidRequest(format!("JSON body did not match expected type: {e}"))
+        }
+        JsonRejection::MissingJsonContentType(_) => {
+            RouteError::InvalidRequest("missing application/json Content-Type".to_owned())
+        }
+        // BytesRejection and any future non_exhaustive variant: surface a
+        // generic but informative invalid-request body.
+        other => RouteError::InvalidRequest(format!("could not read request body: {other}")),
     }
 }
 

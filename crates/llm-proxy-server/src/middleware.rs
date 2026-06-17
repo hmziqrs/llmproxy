@@ -50,8 +50,10 @@ const MAX_DEDUP_BODY_SIZE: usize = 64 * 1024;
 /// held across `.await` points.
 #[derive(Debug)]
 pub struct RequestDeduplicator {
-    /// SHA-256 hex digest -> insertion time.
-    in_flight: Mutex<HashMap<String, Instant>>,
+    /// SHA-256 raw digest -> insertion time. Keyed on the 32-byte digest
+    /// (`[u8; 32]` is `Copy + Eq + Hash`) rather than a 64-char hex `String`
+    /// to avoid a per-request allocation and formatting pass (audit LOW-8).
+    in_flight: Mutex<HashMap<[u8; 32], Instant>>,
     /// Deduplication window in milliseconds.
     window_ms: u64,
 }
@@ -77,7 +79,7 @@ impl RequestDeduplicator {
     ///
     /// # Deprecation
     ///
-    /// Prefer [`is_duplicate_with_path`] which includes the request path in the
+    /// Prefer [`Self::is_duplicate_with_path`] which includes the request path in the
     /// hash to distinguish requests to different protocol endpoints.
     #[deprecated(note = "use is_duplicate_with_path instead")]
     pub fn is_duplicate(&self, body: &[u8]) -> bool {
@@ -119,12 +121,17 @@ impl RequestDeduplicator {
         false
     }
 
-    /// Compute the SHA-256 hex digest of the request path and body.
-    fn hash_path_body(path: &str, body: &[u8]) -> String {
+    /// Compute the SHA-256 digest of the request path and body.
+    ///
+    /// Returns the raw 32-byte digest directly (rather than a 64-char hex
+    /// `String`) since `[u8; 32]` is `Copy + Eq + Hash` and serves as the
+    /// `in_flight` key without any formatting pass or heap allocation
+    /// (audit LOW-8).
+    fn hash_path_body(path: &str, body: &[u8]) -> [u8; 32] {
         let mut hasher = Sha256::new();
         hasher.update(path.as_bytes());
         hasher.update(body);
-        format!("{:x}", hasher.finalize())
+        hasher.finalize().into()
     }
 }
 
@@ -249,8 +256,18 @@ impl RateLimiter {
         // Refill rate: tokens per second.
         let refill_rate = self.max_requests_per_minute / 60.0;
 
-        // Reject new entries when at capacity to bound memory usage.
-        if !buckets.contains_key(client_ip) && buckets.len() >= MAX_RATE_LIMIT_BUCKETS {
+        // Single-lookup hot path: for a known IP we mutate the existing bucket
+        // in place without allocating a key `String`. Only on a miss do we
+        // perform the capacity check and a second (entry) probe that allocates.
+        // This avoids the redundant `contains_key` + `entry` double hash probe
+        // and the unconditional `to_owned()` on every call (audit LOW-6).
+        if let Some(bucket) = buckets.get_mut(client_ip) {
+            return bucket.try_consume(refill_rate);
+        }
+
+        // New IP: reject if inserting it would exceed the bucket cap. Bounds
+        // memory growth from spoofed or diverse source IPs.
+        if buckets.len() >= MAX_RATE_LIMIT_BUCKETS {
             return false;
         }
 
@@ -314,6 +331,22 @@ impl RequestIdGenerator {
 impl Default for RequestIdGenerator {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Typed request identifier carried in request extensions.
+///
+/// Inserted by an outermost `middleware::from_fn` layer so that the
+/// `TraceLayer` span (`make_span_with`) and the route handler share a single
+/// id. This keeps the id that appears in the `x-request-id` response header and
+/// in handler log events identical to the id stamped on the request's tracing
+/// span, restoring end-to-end span/event correlation (audit MEDIUM-1).
+#[derive(Debug, Clone)]
+pub struct RequestId(pub String);
+
+impl std::fmt::Display for RequestId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
     }
 }
 
@@ -400,21 +433,21 @@ mod tests {
     #[test]
     fn dedup_new_request_is_not_duplicate() {
         let dedup = RequestDeduplicator::new();
-        assert!(!dedup.is_duplicate(b"hello"));
+        assert!(!dedup.is_duplicate_with_path("", b"hello"));
     }
 
     #[test]
     fn dedup_same_body_is_duplicate() {
         let dedup = RequestDeduplicator::new();
-        assert!(!dedup.is_duplicate(b"hello"));
-        assert!(dedup.is_duplicate(b"hello"));
+        assert!(!dedup.is_duplicate_with_path("", b"hello"));
+        assert!(dedup.is_duplicate_with_path("", b"hello"));
     }
 
     #[test]
     fn dedup_different_body_is_not_duplicate() {
         let dedup = RequestDeduplicator::new();
-        assert!(!dedup.is_duplicate(b"hello"));
-        assert!(!dedup.is_duplicate(b"world"));
+        assert!(!dedup.is_duplicate_with_path("", b"hello"));
+        assert!(!dedup.is_duplicate_with_path("", b"world"));
     }
 
     #[test]
@@ -474,15 +507,27 @@ mod tests {
     #[test]
     fn dedup_custom_window() {
         let dedup = RequestDeduplicator::with_window_ms(1000);
-        assert!(!dedup.is_duplicate(b"hello"));
-        assert!(dedup.is_duplicate(b"hello"));
+        assert!(!dedup.is_duplicate_with_path("", b"hello"));
+        assert!(dedup.is_duplicate_with_path("", b"hello"));
     }
 
     #[test]
     fn dedup_zero_window_is_disabled() {
         let dedup = RequestDeduplicator::with_window_ms(0);
+        assert!(!dedup.is_duplicate_with_path("", b"hello"));
+        assert!(!dedup.is_duplicate_with_path("", b"hello"));
+    }
+
+    /// Exercise the deprecated path-less shim so the public entry point cannot
+    /// break silently. `#[expect(deprecated)]` (rather than `#[allow]`) surfaces
+    /// an `unfulfilled_lint_expectation` warning the day the shim is removed.
+    #[test]
+    #[expect(deprecated, reason = "is_duplicate shim is exercised directly here")]
+    fn dedup_path_less_shim_still_works() {
+        let dedup = RequestDeduplicator::new();
         assert!(!dedup.is_duplicate(b"hello"));
-        assert!(!dedup.is_duplicate(b"hello"));
+        // Identical body seen twice under the empty path is still a duplicate.
+        assert!(dedup.is_duplicate(b"hello"));
     }
 
     // -- get_client_ip ---------------------------------------------------------

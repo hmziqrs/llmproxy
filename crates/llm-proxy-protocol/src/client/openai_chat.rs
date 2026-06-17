@@ -16,11 +16,13 @@
 //! The `transformer/` module was removed in Phase 11; the guard test at the
 //! bottom of this file remains as a regression safety net.
 
+use std::sync::Arc;
+
 use crate::client::ProtocolError;
 use crate::core::{
     CacheControl, CacheControlType, ContentKind, CoreContent, CoreEvent, CoreMessage, CoreRequest,
     CoreResponse, CoreRole, CoreTool, CoreToolChoice, ModelRef, ProviderHints, RequestMetadata,
-    SamplingOptions, StopReason, Usage,
+    SamplingOptions, StopReason, Usage, json_type_name,
 };
 #[cfg(test)]
 use crate::core::{CoreStreamError, CoreStreamErrorKind};
@@ -164,7 +166,7 @@ pub fn decode_request(req: ChatCompletionRequest) -> Result<CoreRequest, Protoco
                                 }
                                 parsed.ok()
                             })
-                            .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+                            .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
                         (name, args)
                     } else {
                         return Err(ProtocolError::InvalidRequest(
@@ -233,7 +235,7 @@ pub fn decode_request(req: ChatCompletionRequest) -> Result<CoreRequest, Protoco
             input_schema: t
                 .function
                 .parameters
-                .unwrap_or(serde_json::Value::Object(serde_json::Map::new())),
+                .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new())),
         })
         .collect();
 
@@ -241,27 +243,42 @@ pub fn decode_request(req: ChatCompletionRequest) -> Result<CoreRequest, Protoco
 
     let mut stop = None;
     if let Some(s) = req.stop {
+        // Converge with the canonical `core::deserialize_stop` (audit GAP-LOW-8):
+        // `null`/missing => no stop; a non-string item in a stop array, or a
+        // top-level stop value that is not a string/array/null, is a client
+        // error (rejected) rather than silently dropped. Previously this path
+        // warn-logged and kept the surviving items, and treated an empty array
+        // as `Some(vec![])` instead of `None` — both divergences from the core
+        // wire-format rule. The shared `json_type_name` helper yields
+        // byte-identical error messages to `deserialize_stop`.
         match s {
+            serde_json::Value::Null => {}
             serde_json::Value::String(st) => stop = Some(vec![st]),
             serde_json::Value::Array(arr) => {
-                let mut result = Vec::new();
+                let mut result = Vec::with_capacity(arr.len());
                 for item in arr {
-                    if let serde_json::Value::String(st) = item {
-                        result.push(st);
-                    } else {
-                        tracing::warn!(
-                            ?item,
-                            "non-string item in stop array ignored during OpenAI decode"
-                        );
+                    match item {
+                        serde_json::Value::String(st) => result.push(st),
+                        other => {
+                            return Err(ProtocolError::InvalidRequest(format!(
+                                "stop array must contain only strings, found {}",
+                                json_type_name(&other)
+                            )));
+                        }
                     }
                 }
-                stop = Some(result);
+                // Empty stop array == no stop, matching `deserialize_stop`.
+                if result.is_empty() {
+                    stop = None;
+                } else {
+                    stop = Some(result);
+                }
             }
             other => {
-                tracing::warn!(
-                    ?other,
-                    "stop field is not a string or array; ignoring during OpenAI decode"
-                );
+                return Err(ProtocolError::InvalidRequest(format!(
+                    "stop must be a string, array of strings, or null, found {}",
+                    json_type_name(&other)
+                )));
             }
         }
     }
@@ -517,8 +534,11 @@ fn encode_finish_reason(reason: StopReason) -> String {
             tracing::warn!("StopReason::Error mapped to 'stop' in OpenAI finish_reason");
             "stop".to_owned()
         }
-        StopReason::Unknown => {
-            tracing::warn!("StopReason::Unknown mapped to 'stop' in OpenAI finish_reason");
+        StopReason::Unknown(original) => {
+            tracing::warn!(
+                original_finish_reason = %original,
+                "StopReason::Unknown mapped to 'stop' in OpenAI finish_reason"
+            );
             "stop".to_owned()
         }
     }
@@ -571,12 +591,17 @@ fn encode_usage(usage: &Usage) -> UsageInfo {
 /// The encoder is constructed with a stable completion `id`, `model`,
 /// `created` timestamp, and the `include_usage` flag (from stream_options).
 /// Every `chat.completion.chunk` reuses that `id`/`model`/`created`.
+///
+/// `id` and `model` are stored as `Arc<str>` rather than `String` so that
+/// cloning the encoder (and any future sharing of these values) is a cheap
+/// refcount bump instead of a heap allocation. The per-chunk owned `String`
+/// required by [`ChatCompletionChunk`] is materialised once in `Self::make_chunk`.
 #[derive(Debug)]
 pub struct StreamEncoder {
     /// Stable completion ID across all chunks.
-    id: String,
+    id: Arc<str>,
     /// Model name.
-    model: String,
+    model: Arc<str>,
     /// Unix timestamp.
     created: i64,
     /// Whether to emit the usage chunk at the end.
@@ -594,8 +619,8 @@ impl StreamEncoder {
     /// and the decoded request.
     pub fn new(id: String, model: String, created: i64, include_usage: bool) -> Self {
         Self {
-            id,
-            model,
+            id: id.into(),
+            model: model.into(),
             created,
             include_usage,
             finished: false,
@@ -779,14 +804,7 @@ impl StreamEncoder {
                         prompt_cache_hit_tokens: None,
                         prompt_cache_miss_tokens: None,
                     });
-                    chunks.push(ChatCompletionChunk {
-                        id: self.id.clone(),
-                        object: "chat.completion.chunk".to_owned(),
-                        created: self.created,
-                        model: self.model.clone(),
-                        choices: vec![],
-                        usage: Some(usage),
-                    });
+                    chunks.push(self.make_usage_chunk(usage));
                 }
 
                 self.finished = true;
@@ -860,14 +878,7 @@ impl StreamEncoder {
                 prompt_cache_hit_tokens: None,
                 prompt_cache_miss_tokens: None,
             });
-            chunks.push(ChatCompletionChunk {
-                id: self.id.clone(),
-                object: "chat.completion.chunk".to_owned(),
-                created: self.created,
-                model: self.model.clone(),
-                choices: vec![],
-                usage: Some(usage),
-            });
+            chunks.push(self.make_usage_chunk(usage));
         }
 
         Ok(chunks)
@@ -875,12 +886,35 @@ impl StreamEncoder {
 
     fn make_chunk(&self, choice: Choice) -> ChatCompletionChunk {
         ChatCompletionChunk {
-            id: self.id.clone(),
+            // `id`/`model` are `Arc<str>` on the encoder; materialise the owned
+            // `String` required by `ChatCompletionChunk` once per chunk. This is
+            // the single unavoidable allocation per chunk: `ChatCompletionChunk`
+            // is ALSO a deserialized input type (provider SSE chunks are decoded
+            // into it at `adapter/openai_chat.rs`), so its `id`/`model` must stay
+            // owned `String`. Making them `Arc<str>` would require serde's `rc`
+            // feature workspace-wide — a deliberate footgun (transparent
+            // `Arc`/`Rc` deserialization) avoided here. Splitting input/output
+            // chunk types to break that constraint is not worth the parallel type.
+            id: self.id.to_string(),
             object: "chat.completion.chunk".to_owned(),
             created: self.created,
-            model: self.model.clone(),
+            model: self.model.to_string(),
             choices: vec![choice],
             usage: None,
+        }
+    }
+
+    /// Build the terminal usage-only chunk. Shares the same `id`/`model`
+    /// materialisation path as `Self::make_chunk` to keep the two chunk
+    /// shapes consistent.
+    fn make_usage_chunk(&self, usage: UsageInfo) -> ChatCompletionChunk {
+        ChatCompletionChunk {
+            id: self.id.to_string(),
+            object: "chat.completion.chunk".to_owned(),
+            created: self.created,
+            model: self.model.to_string(),
+            choices: vec![],
+            usage: Some(usage),
         }
     }
 
@@ -1365,7 +1399,10 @@ mod tests {
         assert_eq!(encode_finish_reason(StopReason::MaxTokens), "length");
         assert_eq!(encode_finish_reason(StopReason::EndTurn), "stop");
         assert_eq!(encode_finish_reason(StopReason::StopSequence), "stop");
-        assert_eq!(encode_finish_reason(StopReason::Unknown), "stop");
+        assert_eq!(
+            encode_finish_reason(StopReason::Unknown("test-unknown".to_owned())),
+            "stop"
+        );
         assert_eq!(encode_finish_reason(StopReason::Refusal), "content_filter");
         assert_eq!(encode_finish_reason(StopReason::Error), "stop");
     }
@@ -2294,22 +2331,52 @@ mod tests {
     }
 
     #[test]
-    fn stop_as_non_string_non_array_is_dropped() {
+    fn stop_as_null_decodes_to_none() {
+        // Converges with core::deserialize_stop: explicit null means "no stop".
         let mut req = make_openai_request();
-        req.stop = Some(serde_json::json!(42));
+        req.stop = Some(serde_json::Value::Null);
         let core = decode_request(req).unwrap();
         assert_eq!(core.sampling.stop, None);
     }
 
     #[test]
-    fn stop_array_with_non_string_items_filters_them() {
+    fn stop_as_empty_array_decodes_to_none() {
+        // Converges with core::deserialize_stop: an empty stop array is "no
+        // stop", not Some(vec![]).
+        let mut req = make_openai_request();
+        req.stop = Some(serde_json::json!([]));
+        let core = decode_request(req).unwrap();
+        assert_eq!(core.sampling.stop, None);
+    }
+
+    #[test]
+    fn stop_as_non_string_non_array_is_rejected() {
+        // GAP-LOW-8: a top-level stop value that is not a string/array/null is
+        // a client error (matching core::deserialize_stop), not silently
+        // dropped as it was before.
+        let mut req = make_openai_request();
+        req.stop = Some(serde_json::json!(42));
+        let err = decode_request(req).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("stop must be a string, array of strings, or null"),
+            "expected stop-type rejection, got: {msg}"
+        );
+        assert!(msg.contains("number"), "expected type name in message: {msg}");
+    }
+
+    #[test]
+    fn stop_array_with_non_string_items_is_rejected() {
+        // GAP-LOW-8: a non-string item in a stop array is a client error
+        // (matching core::deserialize_stop), not filtered out as it was before.
         let mut req = make_openai_request();
         req.stop = Some(serde_json::json!(["STOP", 123, "END"]));
-        let core = decode_request(req).unwrap();
-        // Non-string items should be filtered out with a warning.
-        assert_eq!(
-            core.sampling.stop,
-            Some(vec!["STOP".to_owned(), "END".to_owned()])
+        let err = decode_request(req).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("stop array must contain only strings"),
+            "expected stop-array rejection, got: {msg}"
         );
+        assert!(msg.contains("number"), "expected type name in message: {msg}");
     }
 }

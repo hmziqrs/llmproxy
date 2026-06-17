@@ -1,4 +1,5 @@
-//! Provider protocol adapters: [`CoreRequest`] -> provider wire format and back.
+//! Provider protocol adapters:
+//! [`llm_proxy_protocol::core::CoreRequest`] -> provider wire format and back.
 //!
 //! Each adapter handles exactly one provider protocol:
 //!
@@ -7,22 +8,25 @@
 //! - [`ResponsesAdapter`]  -- OpenAI Responses API
 //! - [`GeminiAdapter`]     -- Google Gemini GenerateContent API
 //!
-//! Adapters translate between the normalized core types ([`CoreRequest`],
-//! [`CoreResponse`], [`CoreEvent`]) and the provider-specific wire types. They
-//! never import client adapters, route handlers, or server state.
+//! Adapters translate between the normalized core types
+//! ([`llm_proxy_protocol::core::CoreRequest`],
+//! [`llm_proxy_protocol::core::CoreResponse`],
+//! [`llm_proxy_protocol::core::CoreEvent`]) and the provider-specific wire
+//! types. They never import client adapters, route handlers, or server state.
 
 pub mod anthropic;
 pub mod gemini;
 pub mod openai_chat;
 pub mod responses;
 
-pub use anthropic::AnthropicAdapter;
-pub use gemini::GeminiAdapter;
-pub use openai_chat::OpenAiChatAdapter;
-pub use responses::ResponsesAdapter;
+pub use anthropic::{AnthropicAdapter, AnthropicStreamDecoder};
+pub use gemini::{GeminiAdapter, GeminiStreamDecoder};
+pub use openai_chat::{OpenAiChatAdapter, OpenAiChatStreamDecoder};
+pub use responses::{ResponsesAdapter, ResponsesStreamDecoder};
 
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::Arc;
 
 use llm_proxy_core::AuthStyle;
 use llm_proxy_protocol::core::{
@@ -111,7 +115,12 @@ pub struct ProviderAdapterTarget {
     /// The model to send upstream (may differ due to aliasing).
     pub upstream_model: String,
     /// Optional static headers from the adapter config (e.g. `anthropic-version`).
-    pub headers: std::collections::HashMap<String, String>,
+    ///
+    /// `Arc`-shared from the registry so constructing this target is a refcount
+    /// bump, not a `HashMap` clone (LOW-5). Mutation (defaulting the
+    /// `anthropic-version` header) materializes an owned copy via
+    /// `(*target.headers).clone()` in `build_proxy_request`.
+    pub headers: Arc<std::collections::HashMap<String, String>>,
 }
 
 impl fmt::Debug for ProviderAdapterTarget {
@@ -204,15 +213,26 @@ impl ProviderAdapter {
     }
 
     /// Create a new stream decoder for this adapter.
+    ///
+    /// Returns a stack-resident [`ProviderStreamDecoderKind`] enum rather than
+    /// a boxed trait object: the decoder set is closed (4 impls), so an enum
+    /// avoids the per-stream heap allocation and lets `decode_frame`/`finish`
+    /// static-dispatch instead of going through a vtable per frame (GAP-LOW-1).
     pub fn new_stream_decoder(
         &self,
         target: &ProviderAdapterTarget,
-    ) -> Box<dyn ProviderStreamDecoder + Send> {
+    ) -> ProviderStreamDecoderKind {
         match self {
-            Self::OpenAiChat(a) => a.new_stream_decoder(target),
-            Self::Anthropic(a) => a.new_stream_decoder(target),
-            Self::Responses(a) => a.new_stream_decoder(target),
-            Self::Gemini(a) => a.new_stream_decoder(target),
+            Self::OpenAiChat(a) => {
+                ProviderStreamDecoderKind::OpenAiChat(a.new_stream_decoder(target))
+            }
+            Self::Anthropic(a) => {
+                ProviderStreamDecoderKind::Anthropic(a.new_stream_decoder(target))
+            }
+            Self::Responses(a) => {
+                ProviderStreamDecoderKind::Responses(a.new_stream_decoder(target))
+            }
+            Self::Gemini(a) => ProviderStreamDecoderKind::Gemini(a.new_stream_decoder(target)),
         }
     }
 }
@@ -231,6 +251,45 @@ pub trait ProviderStreamDecoder: fmt::Debug + Send {
 
     /// Flush any remaining buffered state at stream end.
     fn finish(&mut self) -> Result<Vec<CoreEvent>, ProviderError>;
+}
+
+/// Owned, stack-resident stream decoder covering the closed 4-adapter set.
+///
+/// Replaces `Box<dyn ProviderStreamDecoder + Send>` so that a provider stream
+/// no longer heap-allocates its decoder and so `decode_frame`/`finish` calls
+/// static-dispatch (and inline) instead of going through a vtable on every
+/// SSE frame (GAP-LOW-1). [`ProviderAdapter::new_stream_decoder`] constructs
+/// the appropriate variant directly.
+#[derive(Debug)]
+pub enum ProviderStreamDecoderKind {
+    /// OpenAI Chat Completions stream decoder.
+    OpenAiChat(OpenAiChatStreamDecoder),
+    /// Anthropic Messages stream decoder.
+    Anthropic(AnthropicStreamDecoder),
+    /// OpenAI Responses stream decoder.
+    Responses(ResponsesStreamDecoder),
+    /// Google Gemini stream decoder.
+    Gemini(GeminiStreamDecoder),
+}
+
+impl ProviderStreamDecoder for ProviderStreamDecoderKind {
+    fn decode_frame(&mut self, frame: &SseFrame) -> Result<Vec<CoreEvent>, ProviderError> {
+        match self {
+            Self::OpenAiChat(d) => d.decode_frame(frame),
+            Self::Anthropic(d) => d.decode_frame(frame),
+            Self::Responses(d) => d.decode_frame(frame),
+            Self::Gemini(d) => d.decode_frame(frame),
+        }
+    }
+
+    fn finish(&mut self) -> Result<Vec<CoreEvent>, ProviderError> {
+        match self {
+            Self::OpenAiChat(d) => d.finish(),
+            Self::Anthropic(d) => d.finish(),
+            Self::Responses(d) => d.finish(),
+            Self::Gemini(d) => d.finish(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -362,7 +421,9 @@ pub(crate) fn map_openai_finish_reason(reason: &str) -> StopReason {
         "length" => StopReason::MaxTokens,
         "tool_calls" | "tool_use" => StopReason::ToolUse,
         "content_filter" => StopReason::Refusal,
-        _ => StopReason::Unknown,
+        // Preserve the unmapped provider value so it is visible in diagnostics
+        // (the encoder logs it) rather than silently discarded.
+        _ => StopReason::Unknown(reason.to_owned()),
     }
 }
 
@@ -377,7 +438,7 @@ pub(crate) fn map_gemini_finish_reason(reason: &str) -> StopReason {
         "STOP" => StopReason::EndTurn,
         "MAX_TOKENS" => StopReason::MaxTokens,
         "SAFETY" | "RECITATION" => StopReason::Refusal,
-        _ => StopReason::Unknown,
+        _ => StopReason::Unknown(reason.to_owned()),
     }
 }
 
@@ -410,7 +471,10 @@ pub(crate) fn build_proxy_request(
     stream: bool,
     url: String,
 ) -> ProxyRequest {
-    let mut extra_headers = target.headers.clone();
+    // Materialize an owned copy of the shared adapter headers so we can default
+    // `anthropic-version`; this is the only per-request clone of the headers map
+    // (the registry → target hand-off is an `Arc` refcount bump, LOW-5).
+    let mut extra_headers = (*target.headers).clone();
     if target.protocol == ProviderProtocol::AnthropicMessages
         && !extra_headers
             .keys()
@@ -673,7 +737,7 @@ mod tests {
             api_key: "sk-test-super-secret-key-1234567890".into(),
             requested_model: "gpt-4o".into(),
             upstream_model: "gpt-4o".into(),
-            headers: std::collections::HashMap::new(),
+            headers: Arc::new(std::collections::HashMap::new()),
         };
         let debug = format!("{:?}", target);
         assert!(
@@ -699,7 +763,11 @@ mod tests {
             map_openai_finish_reason("content_filter"),
             StopReason::Refusal
         );
-        assert_eq!(map_openai_finish_reason("unknown"), StopReason::Unknown);
+        // Unmapped values are preserved in Unknown(String) (GAP-LOW-9).
+        assert_eq!(
+            map_openai_finish_reason("unknown"),
+            StopReason::Unknown("unknown".to_owned())
+        );
     }
 
     #[test]
@@ -711,7 +779,11 @@ mod tests {
         );
         assert_eq!(map_gemini_finish_reason("SAFETY"), StopReason::Refusal);
         assert_eq!(map_gemini_finish_reason("RECITATION"), StopReason::Refusal);
-        assert_eq!(map_gemini_finish_reason("other"), StopReason::Unknown);
+        // Unmapped values are preserved in Unknown(String) (GAP-LOW-9).
+        assert_eq!(
+            map_gemini_finish_reason("other"),
+            StopReason::Unknown("other".to_owned())
+        );
     }
 
     // -- Usage building ------------------------------------------------------
@@ -752,7 +824,7 @@ mod tests {
             api_key: "key".into(),
             requested_model: "gpt-4o".into(),
             upstream_model: "gpt-4o".into(),
-            headers: std::collections::HashMap::new(),
+            headers: Arc::new(std::collections::HashMap::new()),
         };
         let mr = response_model_ref(&target);
         assert_eq!(mr.requested, "gpt-4o");
@@ -770,7 +842,7 @@ mod tests {
             api_key: "key".into(),
             requested_model: "my-alias".into(),
             upstream_model: "gpt-4o-2024-08-06".into(),
-            headers: std::collections::HashMap::new(),
+            headers: Arc::new(std::collections::HashMap::new()),
         };
         let mr = response_model_ref(&target);
         assert_eq!(mr.requested, "my-alias");
@@ -843,8 +915,7 @@ mod tests {
     #[test]
     fn anthropic_requests_preserve_configured_version_header() {
         let mut target = make_target(ProviderProtocol::AnthropicMessages);
-        target
-            .headers
+        Arc::make_mut(&mut target.headers)
             .insert("Anthropic-Version".to_owned(), "2024-01-01".to_owned());
         let request = build_proxy_request(Vec::new(), &target, false, target.endpoint.clone());
 
@@ -886,7 +957,7 @@ mod tests {
             api_key: "test-key".into(),
             requested_model: "gpt-4o".into(),
             upstream_model: "gemini-2.5-pro".into(),
-            headers: std::collections::HashMap::new(),
+            headers: Arc::new(std::collections::HashMap::new()),
         }
     }
 }

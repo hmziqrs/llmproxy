@@ -12,12 +12,14 @@
 
 use std::fmt;
 use std::pin::Pin;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use bytes::Bytes;
 use futures::Stream;
 use futures::TryStreamExt;
 use llm_proxy_core::AuthStyle;
+use tokio::time::Sleep;
 
 use crate::error::ProviderError;
 
@@ -72,6 +74,16 @@ pub struct ProxyRequest {
     /// correct method: [`ProxyClient::send`] for non-streaming requests and
     /// [`ProxyClient::send_stream`] for streaming requests. This field exists
     /// solely for structured logging and future metrics.
+    ///
+    /// LOW-1 (evaluated, deferred by design): the audit's softened analysis
+    /// confirms the two production call sites (`core_pipeline.rs`) pick
+    /// `send`/`send_stream` statically from routing — there is no runtime
+    /// `if req.stream` dispatch, so the field cannot cause a wrong-method call.
+    /// Promoting the documented invariant to a compile-time one would require
+    /// type-state (`ProxyRequest<Streaming>` / `<NonStreaming>`) or an enum
+    /// return, but `core.stream` is a *runtime* `bool`, so pure type-state is
+    /// infeasible without splitting the encode path too. Rated low-impact /
+    /// high-churn by the audit itself; the documentation invariant is retained.
     pub stream: bool,
     /// Static adapter headers from config (e.g. `anthropic-version`).
     ///
@@ -101,6 +113,15 @@ pub(crate) fn endpoint_without_query(endpoint: &str) -> &str {
 // ProxyClient
 // ---------------------------------------------------------------------------
 
+/// Default per-chunk idle read timeout for streaming upstream responses.
+///
+/// Legitimate SSE providers send heartbeats / keep-alive bytes (e.g.
+/// Anthropic's `event: ping`, OpenAI's immediate first chunk) well within this
+/// window, so a stream that yields no byte for longer than this is a dead or
+/// wedged upstream. A stalled provider can no longer hold the connection open
+/// indefinitely (audit GAP-MED-2).
+pub const DEFAULT_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// Protocol-neutral HTTP client for upstream LLM providers.
 ///
 /// Owns a connection-pooled [`reqwest::Client`] and sends [`ProxyRequest`]
@@ -109,6 +130,10 @@ pub(crate) fn endpoint_without_query(endpoint: &str) -> &str {
 #[must_use = "ProxyClient does nothing until send/send_stream is called"]
 pub struct ProxyClient {
     http: reqwest::Client,
+    /// Per-chunk idle read timeout applied to streaming responses. If the
+    /// upstream yields no body byte within this window the stream errors so a
+    /// stalled provider cannot hold the connection open (audit GAP-MED-2).
+    stream_idle_timeout: Duration,
 }
 
 impl Default for ProxyClient {
@@ -125,6 +150,20 @@ impl ProxyClient {
     /// validation at build time) makes `reqwest::Client::build()` infallible
     /// in practice. If a future configuration change makes this fallible,
     /// callers should switch to [`Self::try_new`].
+    ///
+    /// # Lint suppression (audit LOW-2)
+    ///
+    /// The `expect` below is deliberate: this is the documented infallible-in-
+    /// practice convenience constructor, with [`Self::try_new`] offered as the
+    /// fallible alternative. The `#[allow(clippy::expect_used)]` annotation is
+    /// intentionally retained even though `clippy::expect_used` (a
+    /// `clippy::restriction` lint, not part of `clippy::all`) is currently
+    /// disabled in `[workspace.lints.clippy]` and so suppresses nothing today.
+    /// It is a defensive guard: if the workspace later enables the restriction
+    /// group, this intentional `.expect` site stays acknowledged instead of
+    /// surfacing as a fresh diagnostic. Converting to `#[expect(...)]` would
+    /// *activate* the lint here and emit the real "used `expect` on `Ok`
+    /// value" warning (per the LOW-2 verifier note), which is not desired.
     #[allow(clippy::expect_used)]
     pub fn new() -> Self {
         Self::try_new().expect("failed to build reqwest client with default configuration")
@@ -142,7 +181,21 @@ impl ProxyClient {
             .connect_timeout(Duration::from_secs(10))
             .build()?;
 
-        Ok(Self { http })
+        Ok(Self {
+            http,
+            stream_idle_timeout: DEFAULT_STREAM_IDLE_TIMEOUT,
+        })
+    }
+
+    /// Override the per-chunk idle read timeout applied to streaming responses.
+    ///
+    /// Returns the client for chaining. The default is
+    /// [`DEFAULT_STREAM_IDLE_TIMEOUT`] (60 s); legitimate SSE providers
+    /// heartbeat well within that window. Raise it only if a specific upstream
+    /// is known to pause longer between bytes (audit GAP-MED-2).
+    pub fn with_stream_idle_timeout(mut self, idle: Duration) -> Self {
+        self.stream_idle_timeout = idle;
+        self
     }
 
     /// Sends a non-streaming request and returns the response body bytes.
@@ -219,7 +272,88 @@ impl ProxyClient {
         // consumer.
         let stream = resp.bytes_stream();
         let mapped = stream.map_err(ProviderError::from);
-        Ok(Box::pin(mapped))
+        // Wrap with a per-chunk idle read timeout so a stalled upstream (one
+        // that opens the connection but then sends no bytes) cannot hold the
+        // proxy's connection open indefinitely (audit GAP-MED-2).
+        let inner: Pin<Box<dyn Stream<Item = Result<Bytes, ProviderError>> + Send>> =
+            Box::pin(mapped);
+        Ok(Box::pin(IdleTimeoutStream::new(
+            inner,
+            self.stream_idle_timeout,
+        )))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// IdleTimeoutStream
+// ---------------------------------------------------------------------------
+
+/// A byte-stream wrapper enforcing a per-chunk idle read timeout.
+///
+/// If the inner stream does not yield an item within `idle` of the previous one
+/// (or of subscription, for the first chunk), the next poll returns
+/// [`ProviderError::Http`] with `timeout: true` so the consumer can close the
+/// connection. This prevents a stalled upstream — one that opens the
+/// connection then sends no bytes — from holding the proxy's connection open
+/// forever (audit GAP-MED-2).
+///
+/// An *idle* (not *overall*) timeout is used deliberately: a legitimate long
+/// LLM token stream can run for minutes and must not be killed merely for
+/// being long, only for going silent. Legitimate SSE providers heartbeat
+/// within the idle window.
+struct IdleTimeoutStream {
+    inner: Pin<Box<dyn Stream<Item = Result<Bytes, ProviderError>> + Send>>,
+    /// Timer armed for `idle` after the most recent chunk (or at construction).
+    /// `Sleep` is `!Unpin`, so it is boxed; `Pin<Box<_>>` is `Unpin`, keeping
+    /// the whole wrapper `Unpin` and the manual `Stream` impl safe.
+    sleep: Pin<Box<Sleep>>,
+    idle: Duration,
+}
+
+impl IdleTimeoutStream {
+    fn new(
+        inner: Pin<Box<dyn Stream<Item = Result<Bytes, ProviderError>> + Send>>,
+        idle: Duration,
+    ) -> Self {
+        Self {
+            inner,
+            sleep: Box::pin(tokio::time::sleep(idle)),
+            idle,
+        }
+    }
+}
+
+impl Stream for IdleTimeoutStream {
+    type Item = Result<Bytes, ProviderError>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        // Every field is a `Pin<Box<_>>` or `Duration` (all `Unpin`), so the
+        // wrapper itself is `Unpin` and `Pin<&mut Self>::get_mut` is sound.
+        let this = self.get_mut();
+
+        match this.inner.as_mut().poll_next(cx) {
+            Poll::Ready(Some(item)) => {
+                // Restart the idle window for the next chunk.
+                this.sleep = Box::pin(tokio::time::sleep(this.idle));
+                Poll::Ready(Some(item))
+            }
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => {
+                // No chunk yet — is the idle window elapsed?
+                match this.sleep.as_mut().poll(cx) {
+                    Poll::Ready(()) => Poll::Ready(Some(Err(ProviderError::Http {
+                        message: format!(
+                            "upstream stream stalled: no data within {}s \
+                             (stream idle timeout); aborting to avoid an \
+                             open-ended stall (audit GAP-MED-2)",
+                            this.idle.as_secs()
+                        ),
+                        timeout: true,
+                    }))),
+                    Poll::Pending => Poll::Pending,
+                }
+            }
+        }
     }
 }
 
@@ -422,7 +556,26 @@ mod tests {
         )
     }
 
-    /// Spin up an ephemeral axum server, return its base URL.
+    /// Wait for a test server to be ready by polling its TCP port.
+    ///
+    /// Replaces the previous fixed `tokio::time::sleep(Duration::from_millis(50))`
+    /// with a deterministic readiness check that retries until the server
+    /// accepts a connection or the deadline elapses (audit LOW-19). This is the
+    /// same pattern used in `tests/chat_completions.rs` and `tests/core_pipeline.rs`.
+    async fn wait_for_ready(addr: std::net::SocketAddr) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if tokio::net::TcpStream::connect(addr).await.is_ok() {
+                return;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!("test server at {addr} did not become ready within 5 s");
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// Spin up an ephemeral axum server, return its base URL once it is ready.
     async fn start_test_server(routes: Router) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -432,8 +585,9 @@ mod tests {
             axum::serve(listener, routes).await.unwrap();
         });
 
-        // Give the server a moment to start accepting connections.
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // Wait deterministically for the server to accept connections instead
+        // of a fixed sleep (audit LOW-19).
+        wait_for_ready(addr).await;
 
         base
     }
@@ -911,16 +1065,105 @@ mod tests {
             // Stream is dropped here when it goes out of scope.
         }
 
-        // Wait a bit for the server to notice the disconnect.
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        // Poll the counter until it stabilizes (two consecutive identical
+        // samples) so the assertion sees the post-abort steady state instead
+        // of racing the handler's last in-flight chunk. Replaces the previous
+        // fixed 200 ms sleep + timing-dependent `count < 50` assertion with a
+        // deterministic wait and a deterministic property (audit LOW-19).
+        let mut count = counter.load(Ordering::SeqCst);
+        let poll_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let next = counter.load(Ordering::SeqCst);
+            if next == count {
+                break;
+            }
+            count = next;
+            if tokio::time::Instant::now() >= poll_deadline {
+                // Still incrementing after 5 s — the abort did not propagate;
+                // fall through to the assertion which will then fail loudly.
+                break;
+            }
+        }
 
-        // The counter should be well below 100 since we dropped early.
-        let count = counter.load(Ordering::SeqCst);
+        // The deterministic property: aborting the stream must stop the
+        // handler short of its 100-chunk limit. The handler stops emitting at
+        // `i >= 100`, so reaching 100 means the stream ran to completion and
+        // the drop did NOT abort upstream. Any value < 100 proves the abort
+        // took effect (the exact count depends on scheduling and is not
+        // itself the property under test).
         assert!(
-            count < 50,
-            "Dropping the stream should abort upstream; counter was {}",
+            count < 100,
+            "Dropping the stream should abort upstream before it runs to \
+             completion; counter was {}",
             count
         );
+    }
+
+    /// Handler that yields one chunk then stalls (sends no further byte and
+    /// keeps the connection open) to exercise the per-chunk idle timeout.
+    async fn stalling_handler() -> axum::response::Response {
+        let stream = futures::stream::unfold(false, |sent| async move {
+            if !sent {
+                Some((
+                    Ok::<_, std::convert::Infallible>(bytes::Bytes::from("data: first\n\n")),
+                    true,
+                ))
+            } else {
+                // Stall far longer than any reasonable idle timeout.
+                tokio::time::sleep(Duration::from_secs(120)).await;
+                None
+            }
+        });
+        (
+            StatusCode::OK,
+            [("Content-Type", "text/event-stream")],
+            Body::from_stream(stream),
+        )
+            .into_response()
+    }
+
+    #[tokio::test]
+    async fn stalled_upstream_triggers_idle_timeout() {
+        let app = Router::new().route("/test", post(stalling_handler));
+        let base = start_test_server(app).await;
+
+        let client = ProxyClient::new().with_stream_idle_timeout(Duration::from_millis(100));
+        let req = ProxyRequest {
+            url: format!("{}/test", base),
+            auth: AuthHeaders {
+                style: AuthStyle::Bearer,
+                api_key: "key".to_owned(),
+            },
+            body: vec![],
+            stream: true,
+            extra_headers: std::collections::HashMap::new(),
+        };
+
+        let mut stream = client.send_stream(req).await.unwrap();
+
+        // First chunk arrives promptly (well within the idle window).
+        let first = stream
+            .next()
+            .await
+            .expect("first chunk should arrive");
+        assert!(first.is_ok(), "first chunk should be Ok: {:?}", first);
+
+        // Bound the test so a regression (timeout never fires) fails fast
+        // instead of hanging the suite.
+        let second = tokio::time::timeout(Duration::from_secs(5), stream.next()).await;
+        match second {
+            Ok(Some(Err(e))) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("stalled") || msg.contains("idle"),
+                    "expected idle-timeout error, got: {msg}"
+                );
+            }
+            Ok(Some(Ok(_))) => panic!("expected idle-timeout error, got another data chunk"),
+            Ok(None) => panic!("expected idle-timeout error, stream ended cleanly instead"),
+            Err(_) => panic!("idle timeout did not fire within 5s"),
+        }
     }
 
     // -----------------------------------------------------------------------

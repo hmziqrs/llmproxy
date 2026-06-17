@@ -5,7 +5,8 @@
 //! representation.
 
 use axum::body::Body;
-use axum::extract::{Path, State};
+use axum::extract::{Extension, Path, State};
+use axum::extract::rejection::JsonRejection;
 use axum::http::{HeaderMap, Response};
 use axum::response::IntoResponse;
 use llm_proxy_core::MessageContent;
@@ -13,7 +14,7 @@ use llm_proxy_protocol::anthropic::MessageRequest;
 use llm_proxy_protocol::client::anthropic;
 use serde::Serialize;
 
-use crate::middleware::OptionalConnectInfo;
+use crate::middleware::{OptionalConnectInfo, RequestId};
 use crate::state::AppState;
 
 use super::core_pipeline;
@@ -44,33 +45,64 @@ pub(crate) struct TokenCountResponse {
 pub async fn count_tokens(
     State(state): State<AppState>,
     Path(provider): Path<String>,
+    Extension(req_id): Extension<RequestId>,
     OptionalConnectInfo(connect_info): OptionalConnectInfo,
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response<Body> {
-    match count_tokens_inner(&state, &provider, connect_info.as_ref(), &headers, body).await {
+    match count_tokens_inner(&state, req_id, &provider, connect_info.as_ref(), &headers, body).await
+    {
         Ok(response) => response,
-        Err(error) => route_error_response(ClientProtocol::Anthropic, error),
+        Err(error) => {
+            tracing::warn!(error = %error, "request failed");
+            route_error_response(ClientProtocol::Anthropic, error)
+        }
+    }
+}
+
+/// Render an axum [`JsonRejection`] as a human-readable message, preserving
+/// the distinction between a syntactically invalid JSON body and a body that is
+/// valid JSON but does not fit the target type (audit LOW-28).
+fn json_rejection_message(rejection: &JsonRejection) -> String {
+    use axum::extract::rejection::JsonRejection;
+    match rejection {
+        JsonRejection::JsonSyntaxError(e) => format!("invalid JSON syntax: {e}"),
+        JsonRejection::JsonDataError(e) => format!("JSON body did not match expected type: {e}"),
+        JsonRejection::MissingJsonContentType(_) => {
+            "missing application/json Content-Type".to_owned()
+        }
+        other => format!("could not read request body: {other}"),
     }
 }
 
 async fn count_tokens_inner(
     state: &AppState,
+    req_id: RequestId,
     provider: &str,
     connect_info: Option<&std::net::SocketAddr>,
     headers: &HeaderMap,
     body: axum::body::Bytes,
-) -> Result<Response<Body>, RouteError> {
-    // Pre-flight: rate limit, dedup, request ID.
+) -> Result<Response<Body>, RouteError> {    // Pre-flight: rate limit, dedup, request ID.
     core_pipeline::validate_provider_name(provider)?;
     if state.providers().get(provider).is_none() {
         return Err(RouteError::UnknownProvider(provider.to_owned()));
     }
     let request_path = format!("/providers/{provider}/v1/messages/count_tokens");
-    let ctx = core_pipeline::prepare_request(state, headers, connect_info, &body, &request_path)?;
+    let ctx =
+        core_pipeline::prepare_request(state, req_id.0, headers, connect_info, &body, &request_path)?;
     // Parse and validate the Anthropic MessageRequest.
-    let req: MessageRequest = serde_json::from_slice(&body)
-        .map_err(|e| RouteError::InvalidRequest(format!("invalid JSON: {e}")))?;
+    //
+    // Go through `axum::Json::from_bytes` (rather than `serde_json::from_slice`)
+    // so the `JsonRejection` taxonomy is preserved: syntax errors and data
+    // (deserialization) errors are surfaced with distinct messages instead of
+    // being collapsed into a single opaque "invalid JSON" string.
+    let req: MessageRequest =
+        match axum::Json::<MessageRequest>::from_bytes(&body) {
+            Ok(axum::Json(value)) => value,
+            Err(rejection) => {
+                return Err(RouteError::InvalidRequest(json_rejection_message(&rejection)));
+            }
+        };
 
     req.validate()
         .map_err(|e| RouteError::InvalidRequest(e.to_string()))?;

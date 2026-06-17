@@ -18,7 +18,8 @@ pub mod transport;
 
 pub use adapter::{
     AnthropicAdapter, GeminiAdapter, OpenAiChatAdapter, ProviderAdapter, ProviderAdapterRegistry,
-    ProviderAdapterTarget, ProviderProtocol, ProviderStreamDecoder, ResponsesAdapter,
+    ProviderAdapterTarget, ProviderProtocol, ProviderStreamDecoder, ProviderStreamDecoderKind,
+    ResponsesAdapter,
 };
 pub use discovery::DiscoveryClient;
 pub use error::ProviderError;

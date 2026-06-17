@@ -113,6 +113,17 @@ fn state_with_provider(
     adapter_name: &str,
     _model_name: &str,
 ) -> AppState {
+    state_with_provider_timeout(mock_endpoint, protocol, adapter_name, _model_name, Duration::from_secs(300))
+}
+
+/// Like [`state_with_provider`] but with a configurable `request_timeout`.
+fn state_with_provider_timeout(
+    mock_endpoint: &str,
+    protocol: &str,
+    adapter_name: &str,
+    _model_name: &str,
+    request_timeout: Duration,
+) -> AppState {
     // Build routes based on protocol so the provider-based routing can resolve.
     // Anthropic providers also support chat_completions for cross-protocol tests.
     let routes = if protocol == "anthropic_messages" {
@@ -138,7 +149,7 @@ fn state_with_provider(
                 ProviderAdapterConfig {
                     protocol: protocol.to_owned(),
                     endpoint: mock_endpoint.to_owned(),
-                    headers: HashMap::new(),
+                    headers: std::sync::Arc::new(HashMap::new()),
                 },
             );
             m
@@ -154,7 +165,8 @@ fn state_with_provider(
     let app_config = AppConfig {
         server: ServerConfig {
             bind: "127.0.0.1:3456".parse().unwrap(),
-            request_timeout: Duration::from_secs(300),
+            request_timeout,
+            shutdown_timeout: Duration::from_secs(30),
             log_level: "info".to_owned(),
             hot_reload: false,
             server_name: "test-proxy".to_owned(),
@@ -224,6 +236,26 @@ async fn spawn_mock_openai_chat_non_stream() -> String {
 /// Spawn a local mock axum server returning OpenAI Chat tool call response.
 async fn spawn_mock_openai_chat_tool_call() -> String {
     spawn_mock_server(openai_chat_tool_call_response(), "application/json").await
+}
+
+/// Spawn a mock server that accepts the connection but never responds, holding
+/// the upstream call open so the proxy's per-route `TimeoutLayer` fires. Used to
+/// exercise the 408 normalisation path (audit MEDIUM-7).
+async fn spawn_hanging_mock() -> String {
+    let app = Router::new().route(
+        "/{*path}",
+        post(|| async move {
+            // Sleep well past any short test timeout so the caller's
+            // TimeoutLayer always fires first.
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            StatusCode::OK
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    wait_for_ready(addr).await;
+    format!("http://{addr}/providers/mock-provider/v1/chat/completions")
 }
 
 /// Spawn a mock server returning OpenAI Chat streaming SSE events.
@@ -326,6 +358,7 @@ fn empty_state() -> AppState {
         server: ServerConfig {
             bind: "127.0.0.1:3456".parse().unwrap(),
             request_timeout: Duration::from_secs(300),
+            shutdown_timeout: Duration::from_secs(30),
             log_level: "info".to_owned(),
             hot_reload: false,
             server_name: "test-proxy".to_owned(),
@@ -335,6 +368,71 @@ fn empty_state() -> AppState {
         },
     };
     let registry = ProviderRegistry::from_providers(vec![]).expect("empty registry");
+    AppState::new(
+        app_config,
+        registry,
+        ProviderAdapterRegistry::builtin(),
+        ProxyClient::new(),
+        BuildInfo {
+            name: "test",
+            version: "0.0.0",
+            target: "test",
+            git_sha: "test",
+        },
+    )
+}
+
+/// A state that registers `mock-provider` (with an unreachable adapter) for
+/// validation-path tests.
+///
+/// Tests that assert a malformed body or a missing-field request yields an
+/// OpenAI-shaped 400 (`empty_body_*`, `wrong_field_types_*`,
+/// `missing_model_*`, `missing_messages_*`, `invalid_utf8_body_*`) must reach
+/// the JSON-parsing/decode path. Since LOW-29 reordered the handler to run the
+/// provider-existence gate *before* JSON parsing, these requests now need a
+/// registered provider to get past that gate — `empty_state()` (no providers)
+/// would instead surface `UnknownProvider` (404). The adapter endpoint below is
+/// never contacted: every one of these requests fails at validation, well
+/// before any upstream dispatch.
+fn state_with_mock_provider_no_upstream() -> AppState {
+    let provider = ProviderConfig {
+        name: "mock-provider".to_owned(),
+        api_key: "test-key".to_owned(),
+        auth_style: AuthStyle::Bearer,
+        adapters: {
+            let mut m = HashMap::new();
+            m.insert(
+                "openai-chat".to_owned(),
+                ProviderAdapterConfig {
+                    protocol: "openai_chat".to_owned(),
+                    endpoint: "http://0.0.0.0:1/unreachable".to_owned(),
+                    headers: std::sync::Arc::new(HashMap::new()),
+                },
+            );
+            m
+        },
+        routes: llm_proxy_core::ProviderRoutesConfig {
+            chat_completions: Some("openai-chat".to_owned()),
+            messages: None,
+        },
+        model_aliases: HashMap::new(),
+        discovery: None,
+        catalog: None,
+    };
+    let registry = ProviderRegistry::from_providers(vec![provider]).expect("registry");
+    let app_config = AppConfig {
+        server: ServerConfig {
+            bind: "127.0.0.1:3456".parse().unwrap(),
+            request_timeout: Duration::from_secs(300),
+            shutdown_timeout: Duration::from_secs(30),
+            log_level: "info".to_owned(),
+            hot_reload: false,
+            server_name: "test-proxy".to_owned(),
+            rate_limit_rpm: 100,
+            trust_forwarded_headers: false,
+            dedup_window: Duration::from_millis(500),
+        },
+    };
     AppState::new(
         app_config,
         registry,
@@ -1212,7 +1310,7 @@ async fn not_found_anthropic_path_returns_anthropic_shaped_error() {
 /// empty request body returns OpenAI-shaped 400
 #[tokio::test]
 async fn empty_body_returns_openai_shaped_400() {
-    let app = build_router(empty_state());
+    let app = build_router(state_with_mock_provider_no_upstream());
     let req = Request::builder()
         .method("POST")
         .uri("/providers/mock-provider/v1/chat/completions")
@@ -1238,7 +1336,7 @@ async fn empty_body_returns_openai_shaped_400() {
 /// request with wrong field types returns OpenAI-shaped 400
 #[tokio::test]
 async fn wrong_field_types_returns_openai_shaped_400() {
-    let app = build_router(empty_state());
+    let app = build_router(state_with_mock_provider_no_upstream());
     let req = Request::builder()
         .method("POST")
         .uri("/providers/mock-provider/v1/chat/completions")
@@ -1266,7 +1364,7 @@ async fn wrong_field_types_returns_openai_shaped_400() {
 /// request missing required 'model' field returns OpenAI-shaped 400
 #[tokio::test]
 async fn missing_model_returns_openai_shaped_400() {
-    let app = build_router(empty_state());
+    let app = build_router(state_with_mock_provider_no_upstream());
     let req = Request::builder()
         .method("POST")
         .uri("/providers/mock-provider/v1/chat/completions")
@@ -1300,7 +1398,7 @@ async fn missing_model_returns_openai_shaped_400() {
 /// request missing required 'messages' field returns OpenAI-shaped 400
 #[tokio::test]
 async fn missing_messages_returns_openai_shaped_400() {
-    let app = build_router(empty_state());
+    let app = build_router(state_with_mock_provider_no_upstream());
     let req = Request::builder()
         .method("POST")
         .uri("/providers/mock-provider/v1/chat/completions")
@@ -1332,7 +1430,7 @@ async fn missing_messages_returns_openai_shaped_400() {
 /// request with invalid UTF-8 bytes returns OpenAI-shaped 400
 #[tokio::test]
 async fn invalid_utf8_body_returns_openai_shaped_400() {
-    let app = build_router(empty_state());
+    let app = build_router(state_with_mock_provider_no_upstream());
     let req = Request::builder()
         .method("POST")
         .uri("/providers/mock-provider/v1/chat/completions")
@@ -1395,6 +1493,73 @@ async fn chat_completions_oversized_body_returns_payload_too_large() {
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+    // MEDIUM-7: the 413 is normalised into an OpenAI-shaped JSON envelope
+    // (not plain text) and carries `x-request-id`.
+    assert_eq!(
+        resp.headers().get("content-type").unwrap(),
+        "application/json"
+    );
+    assert!(resp.headers().get("x-request-id").is_some());
+    let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["error"]["type"], "invalid_request_error");
+    assert!(
+        json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("too large")
+    );
+    assert!(json["error"]["code"].is_null());
+}
+
+/// MEDIUM-7: a request that exceeds the per-route timeout returns a JSON 408
+/// (not an empty body) carrying an `x-request-id`, matching the protocol schema.
+#[tokio::test]
+async fn timeout_returns_normalised_json_408() {
+    let mock_url = spawn_hanging_mock().await;
+    // 50 ms timeout: the hanging upstream holds the handler past it.
+    let state = state_with_provider_timeout(
+        &mock_url,
+        "openai_chat_completions",
+        "chat",
+        "gpt-4o",
+        Duration::from_millis(50),
+    );
+    let app = build_router(state);
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/providers/mock-provider/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({
+                "model": "gpt-4o",
+                "messages": [{"role": "user", "content": "hi"}],
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::REQUEST_TIMEOUT);
+    assert_eq!(
+        resp.headers().get("content-type").unwrap(),
+        "application/json"
+    );
+    assert!(
+        resp.headers().get("x-request-id").is_some(),
+        "408 must carry x-request-id after normalisation"
+    );
+    let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["error"]["type"], "timeout_error");
+    assert!(
+        json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("timed out")
+    );
+    assert!(json["error"]["code"].is_null());
 }
 
 /// streaming error after first byte emits in-band OpenAI-shaped error event + [DONE]
@@ -1703,7 +1868,7 @@ async fn same_model_routes_to_different_providers() {
         ProviderAdapterConfig {
             protocol: "openai_chat_completions".to_owned(),
             endpoint: "https://provider-a.example.com/v1/chat/completions".to_owned(),
-            headers: HashMap::new(),
+            headers: std::sync::Arc::new(HashMap::new()),
         },
     );
     let provider_a = ProviderConfig {
@@ -1726,7 +1891,7 @@ async fn same_model_routes_to_different_providers() {
         ProviderAdapterConfig {
             protocol: "openai_chat_completions".to_owned(),
             endpoint: "https://provider-b.example.com/v1/chat/completions".to_owned(),
-            headers: HashMap::new(),
+            headers: std::sync::Arc::new(HashMap::new()),
         },
     );
     let provider_b = ProviderConfig {
@@ -1749,6 +1914,7 @@ async fn same_model_routes_to_different_providers() {
             server: ServerConfig {
                 bind: "127.0.0.1:3456".parse().unwrap(),
                 request_timeout: Duration::from_secs(30),
+                shutdown_timeout: Duration::from_secs(30),
                 log_level: "info".to_owned(),
                 hot_reload: false,
                 server_name: "test".to_owned(),

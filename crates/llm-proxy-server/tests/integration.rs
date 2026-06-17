@@ -23,6 +23,7 @@ fn state() -> AppState {
         server: ServerConfig {
             bind: "127.0.0.1:3456".parse().unwrap(),
             request_timeout: Duration::from_secs(300),
+            shutdown_timeout: Duration::from_secs(30),
             log_level: "info".to_owned(),
             hot_reload: false,
             server_name: "test-proxy".to_owned(),
@@ -62,7 +63,7 @@ fn state_with_provider() -> AppState {
                 ProviderAdapterConfig {
                     protocol: "anthropic_messages".to_owned(),
                     endpoint: "https://127.0.0.1:0/v1/messages".to_owned(),
-                    headers: HashMap::new(),
+                    headers: std::sync::Arc::new(HashMap::new()),
                 },
             );
             m
@@ -81,6 +82,7 @@ fn state_with_provider() -> AppState {
             server: ServerConfig {
                 bind: "127.0.0.1:3456".parse().unwrap(),
                 request_timeout: Duration::from_secs(300),
+                shutdown_timeout: Duration::from_secs(30),
                 log_level: "info".to_owned(),
                 hot_reload: false,
                 server_name: "test-proxy".to_owned(),
@@ -273,7 +275,7 @@ async fn messages_valid_json_parses_and_validates() {
 /// 400 with invalid_request_error (bad JSON parse).
 #[tokio::test]
 async fn messages_invalid_json_returns_bad_request() {
-    let app = build_router(state());
+    let app = build_router(state_with_provider());
     let req = Request::builder()
         .method("POST")
         .uri("/providers/mock-provider/v1/messages")
@@ -302,7 +304,7 @@ async fn messages_invalid_json_returns_bad_request() {
 /// fields (no messages) returns 400 with invalid_request_error.
 #[tokio::test]
 async fn messages_valid_json_missing_fields_returns_validation_error() {
-    let app = build_router(state());
+    let app = build_router(state_with_provider());
     let body = json!({
         "model": "claude-sonnet-4-6",
         "max_tokens": 64
@@ -391,7 +393,7 @@ async fn not_found_returns_json_error_envelope() {
 /// as a string) returns 400 with invalid_request_error.
 #[tokio::test]
 async fn messages_wrong_field_type_returns_bad_request() {
-    let app = build_router(state());
+    let app = build_router(state_with_provider());
     let body = json!({
         "model": "claude-sonnet-4-6",
         "messages": [{ "role": "user", "content": "hello" }],
@@ -418,7 +420,7 @@ async fn messages_wrong_field_type_returns_bad_request() {
 /// MessageRequest now uses deny_unknown_fields.
 #[tokio::test]
 async fn messages_unknown_fields_returns_bad_request() {
-    let app = build_router(state());
+    let app = build_router(state_with_provider());
     let body = json!({
         "model": "claude-sonnet-4-6",
         "messages": [{ "role": "user", "content": "hello" }],
@@ -466,7 +468,7 @@ async fn messages_invalid_utf8_returns_bad_request() {
 /// Phase 0: POST /v1/messages with empty body (0 bytes) returns 400.
 #[tokio::test]
 async fn messages_empty_body_returns_bad_request() {
-    let app = build_router(state());
+    let app = build_router(state_with_provider());
     let req = Request::builder()
         .method("POST")
         .uri("/providers/mock-provider/v1/messages")
@@ -498,6 +500,28 @@ async fn messages_oversized_body_returns_payload_too_large() {
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+    // MEDIUM-7: the body-limit 413 is normalised into a protocol-shaped JSON
+    // envelope (not axum's default plain-text rejection) and carries an
+    // `x-request-id` header, matching every handler-produced error.
+    assert_eq!(
+        resp.headers().get("content-type").unwrap(),
+        "application/json"
+    );
+    assert!(
+        resp.headers().get("x-request-id").is_some(),
+        "413 must carry x-request-id after normalisation"
+    );
+    let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["type"], "error");
+    assert_eq!(json["error"]["type"], "invalid_request_error");
+    assert!(
+        json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("too large")
+    );
 }
 
 // -- TOML mode integration tests -------------------------------------------
@@ -744,9 +768,39 @@ async fn count_tokens_unknown_provider_returns_404() {
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
-/// Health endpoint includes metrics sub-object (finding 117).
+/// Health endpoint includes metrics sub-object when opted in via `?metrics=true`
+/// (finding 117 / LOW-13).
 #[tokio::test]
 async fn health_includes_metrics_sub_object() {
+    let app = build_router(state());
+    let req = Request::builder()
+        .uri("/health?metrics=true")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: Value = serde_json::from_slice(
+        &axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(body["metrics"].is_object(), "health response with ?metrics=true must include 'metrics' sub-object");
+    let metrics = &body["metrics"];
+    // Verify the expected counter fields exist.
+    assert!(metrics["requests_received"].is_number());
+    assert!(metrics["requests_streamed"].is_number());
+    assert!(metrics["requests_success"].is_number());
+    assert!(metrics["requests_failed"].is_number());
+    assert!(metrics["upstream_calls"].is_number());
+    assert!(metrics["rate_limited"].is_number());
+    assert!(metrics["deduplicated"].is_number());
+}
+
+/// Health endpoint omits operational metrics by default (LOW-13): the route is
+/// unauthenticated, so a bare probe must not leak operational counters.
+#[tokio::test]
+async fn health_omits_metrics_by_default() {
     let app = build_router(state());
     let req = Request::builder()
         .uri("/health")
@@ -760,16 +814,13 @@ async fn health_includes_metrics_sub_object() {
             .unwrap(),
     )
     .unwrap();
-    assert!(body["metrics"].is_object(), "health response must include 'metrics' sub-object");
-    let metrics = &body["metrics"];
-    // Verify the expected counter fields exist.
-    assert!(metrics["requests_received"].is_number());
-    assert!(metrics["requests_streamed"].is_number());
-    assert!(metrics["requests_success"].is_number());
-    assert!(metrics["requests_failed"].is_number());
-    assert!(metrics["upstream_calls"].is_number());
-    assert!(metrics["rate_limited"].is_number());
-    assert!(metrics["deduplicated"].is_number());
+    assert!(
+        body.get("metrics").is_none(),
+        "bare /health must not include 'metrics' (unauthenticated endpoint); got: {body}"
+    );
+    // The minimal body still carries status + service.
+    assert_eq!(body["status"], "ok");
+    assert!(body["service"].is_string());
 }
 
 /// count_tokens response has correct JSON shape (finding 119).

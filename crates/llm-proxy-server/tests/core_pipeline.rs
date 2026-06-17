@@ -171,7 +171,7 @@ fn state_with_provider(
                 ProviderAdapterConfig {
                     protocol: protocol.to_owned(),
                     endpoint: mock_endpoint.to_owned(),
-                    headers: HashMap::new(),
+                    headers: std::sync::Arc::new(HashMap::new()),
                 },
             );
             m
@@ -188,6 +188,7 @@ fn state_with_provider(
         server: ServerConfig {
             bind: "127.0.0.1:3456".parse().unwrap(),
             request_timeout: Duration::from_secs(300),
+            shutdown_timeout: Duration::from_secs(30),
             log_level: "info".to_owned(),
             hot_reload: false,
             server_name: "test-proxy".to_owned(),
@@ -786,9 +787,24 @@ async fn gemini_provider_returns_anthropic_response() {
 // Streaming tests: Anthropic provider
 // ===========================================================================
 
-/// stream:true Anthropic provider returns Anthropic-shaped SSE text deltas
+/// Collect the full SSE response body as a UTF-8 string for an Anthropic
+/// streaming request against the given mock URL. Shared by the focused
+/// streaming tests below so each test can assert a single behavior.
+async fn collect_anthropic_stream_body(mock_url: &str) -> String {
+    let state = state_with_anthropic_provider(mock_url);
+    let app = build_router(state);
+    let body = make_messages_body("claude-sonnet-4-6", true);
+    let resp = app.oneshot(messages_request(&body)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    String::from_utf8(bytes.to_vec()).unwrap()
+}
+
+/// stream:true Anthropic provider returns HTTP 200 with an SSE content-type
 #[tokio::test]
-async fn stream_anthropic_provider_returns_sse_text_deltas() {
+async fn stream_anthropic_provider_returns_sse_content_type() {
     let mock_url = spawn_mock_anthropic_stream().await;
     let state = state_with_anthropic_provider(&mock_url);
     let app = build_router(state);
@@ -807,20 +823,34 @@ async fn stream_anthropic_provider_returns_sse_text_deltas() {
         ct.contains("text/event-stream"),
         "expected SSE content-type, got: {ct}"
     );
+}
+
+/// stream:true Anthropic provider includes an x-request-id header on the
+/// stream response
+#[tokio::test]
+async fn stream_anthropic_provider_includes_request_id() {
+    let mock_url = spawn_mock_anthropic_stream().await;
+    let state = state_with_anthropic_provider(&mock_url);
+    let app = build_router(state);
+
+    let body = make_messages_body("claude-sonnet-4-6", true);
+    let resp = app.oneshot(messages_request(&body)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
 
     let request_id = resp.headers().get("x-request-id");
     assert!(
         request_id.is_some(),
         "x-request-id must be present on stream response"
     );
+}
 
-    // Collect the SSE body and parse events.
-    let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
-        .await
-        .unwrap();
-    let text = String::from_utf8(bytes.to_vec()).unwrap();
+/// stream:true Anthropic provider emits the core SSE protocol events
+/// (message_start, content_block_delta, message_stop)
+#[tokio::test]
+async fn stream_anthropic_provider_emits_sse_protocol_events() {
+    let mock_url = spawn_mock_anthropic_stream().await;
+    let text = collect_anthropic_stream_body(&mock_url).await;
 
-    // Verify key SSE events appear in the stream.
     assert!(
         text.contains("event: message_start"),
         "missing message_start event"
@@ -833,8 +863,14 @@ async fn stream_anthropic_provider_returns_sse_text_deltas() {
         text.contains("event: message_stop"),
         "missing message_stop event"
     );
+}
 
-    // Verify text content came through.
+/// stream:true Anthropic provider forwards the translated text delta
+#[tokio::test]
+async fn stream_anthropic_provider_forwards_text_delta() {
+    let mock_url = spawn_mock_anthropic_stream().await;
+    let text = collect_anthropic_stream_body(&mock_url).await;
+
     assert!(
         text.contains("Hi!"),
         "expected text delta 'Hi!' in SSE output"
@@ -845,9 +881,23 @@ async fn stream_anthropic_provider_returns_sse_text_deltas() {
 // Streaming tests: OpenAI Chat provider
 // ===========================================================================
 
-/// stream:true OpenAI Chat provider returns Anthropic-shaped SSE text deltas
+/// Collect the full SSE response body for an OpenAI Chat streaming request
+/// against the given mock URL. Shared by the focused streaming tests below.
+async fn collect_openai_chat_stream_body(mock_url: &str) -> String {
+    let state = state_with_openai_chat_provider(mock_url);
+    let app = build_router(state);
+    let body = make_messages_body("gpt-4o", true);
+    let resp = app.oneshot(messages_request(&body)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    String::from_utf8(bytes.to_vec()).unwrap()
+}
+
+/// stream:true OpenAI Chat provider returns HTTP 200 with an SSE content-type
 #[tokio::test]
-async fn stream_openai_chat_provider_returns_anthropic_sse_deltas() {
+async fn stream_openai_chat_provider_returns_sse_content_type() {
     let mock_url = spawn_mock_openai_chat_stream().await;
     let state = state_with_openai_chat_provider(&mock_url);
     let app = build_router(state);
@@ -866,11 +916,14 @@ async fn stream_openai_chat_provider_returns_anthropic_sse_deltas() {
         ct.contains("text/event-stream"),
         "expected SSE content-type, got: {ct}"
     );
+}
 
-    let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
-        .await
-        .unwrap();
-    let text = String::from_utf8(bytes.to_vec()).unwrap();
+/// stream:true OpenAI Chat provider emits Anthropic-shaped SSE protocol
+/// events (message_start, message_stop)
+#[tokio::test]
+async fn stream_openai_chat_provider_emits_sse_protocol_events() {
+    let mock_url = spawn_mock_openai_chat_stream().await;
+    let text = collect_openai_chat_stream_body(&mock_url).await;
 
     // The output must be Anthropic-shaped SSE events.
     assert!(
@@ -881,6 +934,13 @@ async fn stream_openai_chat_provider_returns_anthropic_sse_deltas() {
         text.contains("event: message_stop"),
         "missing message_stop event"
     );
+}
+
+/// stream:true OpenAI Chat provider forwards the translated text delta
+#[tokio::test]
+async fn stream_openai_chat_provider_forwards_translated_text_delta() {
+    let mock_url = spawn_mock_openai_chat_stream().await;
+    let text = collect_openai_chat_stream_body(&mock_url).await;
 
     // Verify text content was translated from OpenAI to Anthropic SSE format.
     assert!(
@@ -893,9 +953,24 @@ async fn stream_openai_chat_provider_returns_anthropic_sse_deltas() {
 // Streaming tests: OpenAI Responses provider
 // ===========================================================================
 
-/// stream:true Responses provider returns Anthropic-shaped SSE text deltas
+/// Collect the full SSE response body for an OpenAI Responses streaming
+/// request against the given mock URL. Shared by the focused streaming tests
+/// below.
+async fn collect_openai_responses_stream_body(mock_url: &str) -> String {
+    let state = state_with_openai_responses_provider(mock_url);
+    let app = build_router(state);
+    let body = make_messages_body("gpt-4o-responses", true);
+    let resp = app.oneshot(messages_request(&body)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    String::from_utf8(bytes.to_vec()).unwrap()
+}
+
+/// stream:true Responses provider returns HTTP 200 with an SSE content-type
 #[tokio::test]
-async fn stream_openai_responses_provider_returns_anthropic_sse_deltas() {
+async fn stream_openai_responses_provider_returns_sse_content_type() {
     let mock_url = spawn_mock_openai_responses_stream().await;
     let state = state_with_openai_responses_provider(&mock_url);
     let app = build_router(state);
@@ -914,11 +989,14 @@ async fn stream_openai_responses_provider_returns_anthropic_sse_deltas() {
         ct.contains("text/event-stream"),
         "expected SSE content-type, got: {ct}"
     );
+}
 
-    let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
-        .await
-        .unwrap();
-    let text = String::from_utf8(bytes.to_vec()).unwrap();
+/// stream:true Responses provider emits Anthropic-shaped SSE protocol events
+/// (message_start, message_stop)
+#[tokio::test]
+async fn stream_openai_responses_provider_emits_sse_protocol_events() {
+    let mock_url = spawn_mock_openai_responses_stream().await;
+    let text = collect_openai_responses_stream_body(&mock_url).await;
 
     // The output must be Anthropic-shaped SSE events.
     assert!(
@@ -929,6 +1007,13 @@ async fn stream_openai_responses_provider_returns_anthropic_sse_deltas() {
         text.contains("event: message_stop"),
         "missing message_stop event"
     );
+}
+
+/// stream:true Responses provider forwards the translated text delta
+#[tokio::test]
+async fn stream_openai_responses_provider_forwards_translated_text_delta() {
+    let mock_url = spawn_mock_openai_responses_stream().await;
+    let text = collect_openai_responses_stream_body(&mock_url).await;
 
     // Verify text content was translated.
     assert!(
@@ -941,9 +1026,23 @@ async fn stream_openai_responses_provider_returns_anthropic_sse_deltas() {
 // Streaming tests: Gemini provider
 // ===========================================================================
 
-/// stream:true Gemini provider returns Anthropic-shaped SSE text deltas
+/// Collect the full SSE response body for a Gemini streaming request against
+/// the given mock URL. Shared by the focused streaming tests below.
+async fn collect_gemini_stream_body(mock_url: &str) -> String {
+    let state = state_with_gemini_provider(mock_url);
+    let app = build_router(state);
+    let body = make_messages_body("gemini-2.5-pro", true);
+    let resp = app.oneshot(messages_request(&body)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    String::from_utf8(bytes.to_vec()).unwrap()
+}
+
+/// stream:true Gemini provider returns HTTP 200 with an SSE content-type
 #[tokio::test]
-async fn stream_gemini_provider_returns_anthropic_sse_deltas() {
+async fn stream_gemini_provider_returns_sse_content_type() {
     let mock_url = spawn_mock_gemini_stream().await;
     let state = state_with_gemini_provider(&mock_url);
     let app = build_router(state);
@@ -962,11 +1061,14 @@ async fn stream_gemini_provider_returns_anthropic_sse_deltas() {
         ct.contains("text/event-stream"),
         "expected SSE content-type, got: {ct}"
     );
+}
 
-    let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
-        .await
-        .unwrap();
-    let text = String::from_utf8(bytes.to_vec()).unwrap();
+/// stream:true Gemini provider emits Anthropic-shaped SSE protocol events
+/// (message_start, message_stop)
+#[tokio::test]
+async fn stream_gemini_provider_emits_sse_protocol_events() {
+    let mock_url = spawn_mock_gemini_stream().await;
+    let text = collect_gemini_stream_body(&mock_url).await;
 
     // The output must be Anthropic-shaped SSE events.
     assert!(
@@ -977,6 +1079,13 @@ async fn stream_gemini_provider_returns_anthropic_sse_deltas() {
         text.contains("event: message_stop"),
         "missing message_stop event"
     );
+}
+
+/// stream:true Gemini provider forwards the translated text delta
+#[tokio::test]
+async fn stream_gemini_provider_forwards_translated_text_delta() {
+    let mock_url = spawn_mock_gemini_stream().await;
+    let text = collect_gemini_stream_body(&mock_url).await;
 
     // Verify text content was translated.
     assert!(
@@ -1184,7 +1293,7 @@ async fn rate_limited_request_returns_429() {
                 ProviderAdapterConfig {
                     protocol: "anthropic_messages".to_owned(),
                     endpoint: mock_url,
-                    headers: HashMap::new(),
+                    headers: std::sync::Arc::new(HashMap::new()),
                 },
             );
             m
@@ -1203,6 +1312,7 @@ async fn rate_limited_request_returns_429() {
             server: ServerConfig {
                 bind: "127.0.0.1:3456".parse().unwrap(),
                 request_timeout: Duration::from_secs(300),
+                shutdown_timeout: Duration::from_secs(30),
                 log_level: "info".to_owned(),
                 hot_reload: false,
                 server_name: "test-proxy".to_owned(),
@@ -1288,7 +1398,7 @@ async fn duplicate_request_returns_409() {
                 ProviderAdapterConfig {
                     protocol: "anthropic_messages".to_owned(),
                     endpoint: mock_url,
-                    headers: HashMap::new(),
+                    headers: std::sync::Arc::new(HashMap::new()),
                 },
             );
             m
@@ -1307,6 +1417,7 @@ async fn duplicate_request_returns_409() {
             server: ServerConfig {
                 bind: "127.0.0.1:3456".parse().unwrap(),
                 request_timeout: Duration::from_secs(300),
+                shutdown_timeout: Duration::from_secs(30),
                 log_level: "info".to_owned(),
                 hot_reload: false,
                 server_name: "test-proxy".to_owned(),
@@ -1612,7 +1723,7 @@ fn state_for_validation_tests() -> AppState {
                 ProviderAdapterConfig {
                     protocol: "anthropic_messages".to_owned(),
                     endpoint: "https://127.0.0.1:0/v1/messages".to_owned(),
-                    headers: HashMap::new(),
+                    headers: std::sync::Arc::new(HashMap::new()),
                 },
             );
             m
@@ -1631,6 +1742,7 @@ fn state_for_validation_tests() -> AppState {
             server: ServerConfig {
                 bind: "127.0.0.1:3456".parse().unwrap(),
                 request_timeout: Duration::from_secs(300),
+                shutdown_timeout: Duration::from_secs(30),
                 log_level: "info".to_owned(),
                 hot_reload: false,
                 server_name: "test-proxy".to_owned(),

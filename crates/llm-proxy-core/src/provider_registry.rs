@@ -20,6 +20,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::Arc;
 
 use crate::error::CoreError;
 use crate::provider_config::{
@@ -95,7 +96,12 @@ pub struct ProviderAdapterTargetConfig {
     /// The model name to send to the upstream provider.
     pub upstream_model: String,
     /// Optional static headers from the adapter config (e.g. `anthropic-version`).
-    pub headers: HashMap<String, String>,
+    ///
+    /// `Arc`-shared with the source [`crate::provider_config::ProviderAdapterConfig`] so producing a
+    /// resolved target per request is a refcount bump, not a `HashMap` clone
+    /// (LOW-5). Downstream code that needs to mutate (e.g. defaulting the
+    /// `anthropic-version` header) materializes an owned copy.
+    pub headers: Arc<HashMap<String, String>>,
 }
 
 impl std::fmt::Debug for ProviderAdapterTargetConfig {
@@ -398,7 +404,7 @@ impl ProviderRegistry {
             api_key: provider.api_key.clone(),
             requested_model: requested_model.to_owned(),
             upstream_model: upstream_model.to_owned(),
-            headers: adapter_cfg.headers.clone(),
+            headers: Arc::clone(&adapter_cfg.headers),
         })
     }
 
@@ -470,7 +476,7 @@ mod tests {
                 ProviderAdapterConfig {
                     protocol: "openai_chat_completions".to_owned(),
                     endpoint: "https://example.com/v1/chat/completions?key=query-secret".to_owned(),
-                    headers: HashMap::from([("x-secret".to_owned(), "header-secret".to_owned())]),
+                    headers: Arc::new(HashMap::from([("x-secret".to_owned(), "header-secret".to_owned())])),
                 },
             )]),
             routes: ProviderRoutesConfig {
@@ -762,7 +768,7 @@ chat_completions = "chat"
                 ProviderAdapterConfig {
                     protocol: "openai_chat_completions".to_owned(),
                     endpoint: "https://example.com/v1/chat/completions".to_owned(),
-                    headers: HashMap::new(),
+                    headers: Arc::new(HashMap::new()),
                 },
             )]),
             routes: ProviderRoutesConfig {
@@ -818,7 +824,7 @@ chat_completions = "chat"
                 ProviderAdapterConfig {
                     protocol: "openai_chat_completions".to_owned(),
                     endpoint: format!("https://example.com/v{i}"),
-                    headers: HashMap::new(),
+                    headers: Arc::new(HashMap::new()),
                 },
             );
         }

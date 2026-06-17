@@ -23,13 +23,17 @@ pub(crate) fn pid_manager() -> llm_proxy_core::PidManager {
     llm_proxy_core::PidManager::new(config_dir())
 }
 
-/// Read the PID from the PID file. Returns `None` if the file does not exist.
+/// Read the PID from the PID file via the given manager.
 ///
-/// Validates that the parsed PID is non-zero and fits in `i32` to catch
-/// corrupt/stale PID files and prevent undefined behavior when passing the
-/// PID to `libc::kill()`.
-pub fn read_pid() -> Result<Option<u32>> {
-    let mgr = pid_manager();
+/// Returns `None` if the file does not exist. Validates that the parsed PID
+/// is non-zero and fits in `i32` to catch corrupt/stale PID files and prevent
+/// undefined behavior when passing the PID to `libc::kill()`.
+///
+/// This is the injectable variant: callers that already hold a [`llm_proxy_core::PidManager`]
+/// (e.g. `cmd_stop`/`cmd_status` operating on a tempdir-backed manager) use it
+/// directly instead of rebuilding one from the global config dir (audit
+/// MEDIUM-6).
+pub fn read_pid_from(mgr: &llm_proxy_core::PidManager) -> Result<Option<u32>> {
     let pid = mgr.read_pid()?;
     if let Some(p) = pid {
         if p == 0 {
@@ -40,6 +44,15 @@ pub fn read_pid() -> Result<Option<u32>> {
         }
     }
     Ok(pid)
+}
+
+/// Read the PID from the PID file. Returns `None` if the file does not exist.
+///
+/// Validates that the parsed PID is non-zero and fits in `i32` to catch
+/// corrupt/stale PID files and prevent undefined behavior when passing the
+/// PID to `libc::kill()`.
+pub fn read_pid() -> Result<Option<u32>> {
+    read_pid_from(&pid_manager())
 }
 
 /// Atomically create the PID file with exclusive ownership.
@@ -91,7 +104,10 @@ pub fn write_pid_value(pid: u32) -> Result<()> {
 
 /// Remove the PID file.
 pub fn remove_pid() -> Result<()> {
-    pid_manager().remove_pid()
+    // `PidManager::remove_pid` returns a typed `Result<(), PidError>`; convert
+    // into the app layer's `anyhow::Result` via `?` (anyhow implements
+    // `From<PidError>` because `PidError: std::error::Error + Send + Sync`).
+    Ok(pid_manager().remove_pid()?)
 }
 
 /// Check if a process with the given PID is running.

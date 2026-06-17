@@ -11,7 +11,7 @@ use axum::http::{HeaderValue, Response, StatusCode, header};
 use axum::response::IntoResponse;
 use llm_proxy_provider::ProviderError;
 use serde::Serialize;
-use tracing::info;
+use tracing::warn;
 
 use crate::state::AppState;
 
@@ -96,7 +96,7 @@ pub async fn handle_models(
     match handle_models_inner(&state, &provider, refresh_live).await {
         Ok(response) => response,
         Err(error) => {
-            info!(error = %error, "models request failed");
+            warn!(error = %error, "models request failed");
             route_error_response(ClientProtocol::OpenAiChat, error)
         }
     }
@@ -121,24 +121,25 @@ async fn handle_models_inner(
         .map_err(map_catalog_error)?;
 
     // Build model cards from static entries.
-    // Extract first/last IDs from entries (before building ModelCards) to
-    // avoid cloning from the already-owned Vec.
+    // `entries` is fully owned (returned by value), so derive the pagination
+    // IDs from the owned Vec first, then consume it with `into_iter()` so
+    // every per-entry field moves into its `ModelCard` with zero clones.
     let first_id = entries.first().map(|m| m.id.clone());
     let last_id = entries.last().map(|m| m.id.clone());
 
     let data: Vec<ModelCard> = entries
-        .iter()
+        .into_iter()
         .map(|entry| ModelCard {
-            id: entry.id.clone(),
+            id: entry.id,
             object: "model",
             created: 0,
             owned_by: provider.name.clone(),
             model_type: "model",
-            display_name: entry.display_name.clone(),
+            display_name: entry.display_name,
             created_at: None,
             supports: entry
                 .supports
-                .iter()
+                .into_iter()
                 .map(|k| match k {
                     llm_proxy_core::ProviderRouteKind::ChatCompletions => "chat_completions",
                     llm_proxy_core::ProviderRouteKind::Messages => "messages",
@@ -264,6 +265,7 @@ mod tests {
                 server: llm_proxy_core::ServerConfig {
                     bind: "127.0.0.1:3456".parse().unwrap(),
                     request_timeout: std::time::Duration::from_secs(300),
+                    shutdown_timeout: std::time::Duration::from_secs(30),
                     log_level: "info".to_owned(),
                     hot_reload: false,
                     server_name: "test".to_owned(),
@@ -304,6 +306,7 @@ mod tests {
                 server: llm_proxy_core::ServerConfig {
                     bind: "127.0.0.1:3456".parse().unwrap(),
                     request_timeout: std::time::Duration::from_secs(300),
+                    shutdown_timeout: std::time::Duration::from_secs(30),
                     log_level: "info".to_owned(),
                     hot_reload: false,
                     server_name: "test".to_owned(),

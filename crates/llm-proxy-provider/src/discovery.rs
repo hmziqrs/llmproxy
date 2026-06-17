@@ -4,9 +4,10 @@ use std::time::Duration;
 
 use futures::TryStreamExt;
 use llm_proxy_core::{
-    AuthStyle, ProviderConfig, ProviderDiscoveryKind, ProviderRouteKind, StaticModelCatalogEntry,
+    AuthStyle, ProviderConfig, ProviderDiscoveryConfig, ProviderDiscoveryKind, ProviderRouteKind,
+    StaticModelCatalogEntry,
 };
-use reqwest::{Client, Url};
+use reqwest::{Client, RequestBuilder, Url};
 use serde_json::Value;
 
 use crate::ProviderError;
@@ -64,10 +65,11 @@ impl DiscoveryClient {
             ProviderError::InvalidConfig(format!("invalid discovery endpoint: {error}"))
         })?;
         let mut models = Vec::new();
+        let mut dropped = 0usize;
 
         for _ in 0..discovery.max_pages {
             let value = self.fetch_page(provider, &url).await?;
-            parse_models(discovery.kind, &value, &mut models)?;
+            dropped += parse_models(discovery.kind, &value, &mut models)?;
             if models.len() > discovery.max_models {
                 return Err(ProviderError::InvalidConfig(format!(
                     "provider \"{}\" discovery exceeded {} models",
@@ -78,6 +80,18 @@ impl DiscoveryClient {
             let Some((name, token)) = next_page(discovery.kind, &value) else {
                 models.sort_by(|a, b| a.id.cmp(&b.id));
                 models.dedup_by(|a, b| a.id == b.id);
+                // Surface the aggregate count of records dropped across all
+                // pages so a silently partial catalog is observable in the
+                // success path (GAP-LOW-6). Logged at `info!` only when
+                // non-zero to avoid noise on clean responses.
+                if dropped > 0 {
+                    tracing::info!(
+                        provider = %provider.name,
+                        kept = models.len(),
+                        dropped,
+                        "discovery completed with malformed or filtered model records",
+                    );
+                }
                 return Ok(models);
             };
             set_query_parameter(&mut url, name, &token);
@@ -97,6 +111,72 @@ impl DiscoveryClient {
         let discovery = provider.discovery.as_ref().ok_or_else(|| {
             ProviderError::InvalidConfig("missing discovery configuration".to_owned())
         })?;
+
+        // Bounded retry with fixed backoff for transient failures (GAP-LOW-4):
+        // a single 5xx or transport hiccup (TLS reset, connection reset,
+        // timeout) mid-pagination would otherwise abort the whole catalog
+        // refresh for a provider. Only server-side / transport errors are
+        // retried — 4xx and parse errors are surfaced immediately. The total
+        // extra wall-clock is bounded by `MAX_TRANSIENT_RETRIES * BACKOFF`.
+        let mut last_error = None;
+        for attempt in 0..=Self::MAX_TRANSIENT_RETRIES {
+            if attempt > 0 {
+                tokio::time::sleep(Self::RETRY_BACKOFF).await;
+            }
+            let request = self.build_request(provider, discovery, url);
+            match self.send_once(request, discovery.max_response_bytes).await {
+                Ok(value) => return Ok(value),
+                Err(error) if Self::is_transient(&error) => {
+                    tracing::warn!(
+                        provider = %provider.name,
+                        attempt,
+                        max_attempts = Self::MAX_TRANSIENT_RETRIES,
+                        error = %error,
+                        "transient discovery failure; retrying",
+                    );
+                    last_error = Some(error);
+                    continue;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        // All retries exhausted; surface the last transient error.
+        Err(last_error.expect("retry loop ran at least once"))
+    }
+
+    /// Upper bound on the number of retries after the first attempt for a
+    /// transient discovery failure.
+    ///
+    /// Exposed (`pub`) so callers and tests can reason about the total
+    /// worst-case probe count for a persistently-failing endpoint, which is
+    /// `1 + MAX_TRANSIENT_RETRIES`.
+    pub const MAX_TRANSIENT_RETRIES: u32 = 2;
+
+    /// Fixed backoff applied before each retry of a transient discovery
+    /// failure. Intentionally constant (no jitter) because discovery is an
+    /// infrequent background refresh, not a fan-out request hot path.
+    const RETRY_BACKOFF: Duration = Duration::from_millis(500);
+
+    /// Classify a [`ProviderError`] as transient (worth retrying).
+    ///
+    /// Returns `true` for transport-level failures (`Http`, including TLS
+    /// resets, connection resets, and timeouts) and `Api` responses with a
+    /// server-side 5xx status code. Client-side 4xx errors, parse failures,
+    /// and configuration errors are non-transient.
+    fn is_transient(error: &ProviderError) -> bool {
+        match error {
+            ProviderError::Http { .. } => true,
+            ProviderError::Api { status, .. } => (500..600).contains(status),
+            _ => false,
+        }
+    }
+
+    fn build_request(
+        &self,
+        provider: &ProviderConfig,
+        discovery: &ProviderDiscoveryConfig,
+        url: &Url,
+    ) -> RequestBuilder {
         let mut request = self.http.get(url.clone());
         request = match provider.auth_style {
             AuthStyle::Bearer => request.bearer_auth(&provider.api_key),
@@ -117,7 +197,16 @@ impl DiscoveryClient {
         for (name, value) in &discovery.headers {
             request = request.header(name, value);
         }
+        request
+    }
 
+    /// Execute a single discovery request attempt: send, validate status, and
+    /// stream the body up to `max_response_bytes`, then parse as JSON.
+    async fn send_once(
+        &self,
+        request: RequestBuilder,
+        max_response_bytes: usize,
+    ) -> Result<Value, ProviderError> {
         let response = request.send().await?;
         let status = response.status();
         if !status.is_success() {
@@ -135,10 +224,10 @@ impl DiscoveryClient {
         let mut stream = response.bytes_stream();
         let mut bytes = Vec::new();
         while let Some(chunk) = stream.try_next().await? {
-            if bytes.len() + chunk.len() > discovery.max_response_bytes {
+            if bytes.len() + chunk.len() > max_response_bytes {
                 return Err(ProviderError::InvalidConfig(format!(
                     "discovery response exceeded {} bytes",
-                    discovery.max_response_bytes
+                    max_response_bytes
                 )));
             }
             bytes.extend_from_slice(&chunk);
@@ -151,7 +240,7 @@ fn parse_models(
     kind: ProviderDiscoveryKind,
     value: &Value,
     output: &mut Vec<StaticModelCatalogEntry>,
-) -> Result<(), ProviderError> {
+) -> Result<usize, ProviderError> {
     let records = match kind {
         ProviderDiscoveryKind::GeminiModels => value.get("models"),
         ProviderDiscoveryKind::FireworksAccountModels => {
@@ -166,12 +255,17 @@ fn parse_models(
             "discovery response has an invalid top-level model list".to_owned(),
         ));
     };
+    // Count of records dropped this page (no id / empty id, or a Gemini model
+    // lacking generateContent support). Surfaced as an aggregate by `discover`
+    // in the success path so a silent partial catalog is observable (GAP-LOW-6).
+    let mut dropped = 0usize;
     for record in records {
         let id = record
             .get("id")
             .or_else(|| record.get("name"))
             .and_then(Value::as_str);
         let Some(id) = id.filter(|id| !id.trim().is_empty()) else {
+            dropped += 1;
             tracing::warn!("ignoring malformed discovery model record without an id");
             continue;
         };
@@ -182,6 +276,7 @@ fn parse_models(
                 .and_then(Value::as_array)
                 .is_some_and(|actions| actions.iter().any(|action| action == "generateContent"));
             if !supports_generate {
+                dropped += 1;
                 tracing::debug!(
                     model = id,
                     "ignoring Gemini model without generateContent support"
@@ -207,10 +302,24 @@ fn parse_models(
                 .and_then(|value| u32::try_from(value).ok()),
         });
     }
-    Ok(())
+    Ok(dropped)
 }
 
 fn set_query_parameter(url: &mut Url, name: &str, value: &str) {
+    // Rebuild the query without the `name` pair, then append the new value.
+    //
+    // The decoded pairs are owned (`into_owned`) before the mutable
+    // `query_pairs_mut` borrow begins: `query_pairs()` yields `Cow<str>`
+    // borrowed from `url`'s internal buffer while `query_pairs_mut` requires
+    // `&mut url`, so the pairs must be detached from the read borrow first.
+    //
+    // NOTE (GAP-LOW-5, deferred): the double `into_owned` per pair is the named
+    // smell, but fully eliminating it requires rebuilding the query through a
+    // percent-encoder (e.g. `url::form_urlencoded::Serializer`) and writing it
+    // back with `set_query(Some(&encoded))` — a single-pass, allocation-free
+    // path. That encoder is not reachable here because the `url` crate is not a
+    // direct dependency of `llm-proxy-provider` (only re-exported as
+    // `reqwest::Url`), and adding it is outside this finding's owned file.
     let existing: Vec<(String, String)> = url
         .query_pairs()
         .filter(|(key, _)| key != name)
@@ -447,7 +556,7 @@ mod tests {
     #[test]
     fn openai_records_are_sorted_and_malformed_records_are_skipped() {
         let mut models = Vec::new();
-        parse_models(
+        let dropped = parse_models(
             ProviderDiscoveryKind::OpenAiCompatibleModels,
             &json!({"data": [{"id": "z"}, {"missing": "id"}, {"id": "a"}]}),
             &mut models,
@@ -461,6 +570,9 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["a", "z"]
         );
+        // GAP-LOW-6: the aggregate dropped-count must be surfaced from the
+        // success path; the malformed `{"missing": "id"}` record is counted.
+        assert_eq!(dropped, 1);
     }
 
     #[test]

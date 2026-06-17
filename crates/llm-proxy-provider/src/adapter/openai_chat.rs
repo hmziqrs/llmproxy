@@ -703,7 +703,9 @@ impl OpenAiChatAdapter {
             .finish_reason
             .as_deref()
             .map(map_openai_finish_reason)
-            .unwrap_or(StopReason::Unknown);
+            // Provider omitted `finish_reason`; record that it was absent
+            // rather than unmapped so the diagnostic is unambiguous.
+            .unwrap_or(StopReason::Unknown("absent".to_owned()));
 
         let usage = build_usage_from_openai(
             resp.usage.prompt_tokens,
@@ -724,11 +726,8 @@ impl OpenAiChatAdapter {
     }
 
     /// Create a new stream decoder.
-    pub fn new_stream_decoder(
-        &self,
-        target: &ProviderAdapterTarget,
-    ) -> Box<dyn ProviderStreamDecoder + Send> {
-        Box::new(OpenAiChatStreamDecoder {
+    pub fn new_stream_decoder(&self, target: &ProviderAdapterTarget) -> OpenAiChatStreamDecoder {
+        OpenAiChatStreamDecoder {
             model_ref: response_model_ref(target),
             started: false,
             content_index: 0,
@@ -736,7 +735,7 @@ impl OpenAiChatAdapter {
             reasoning_started: false,
             tool_blocks: HashMap::new(),
             stop_sent: false,
-        })
+        }
     }
 }
 
@@ -795,7 +794,7 @@ mod tests {
             api_key: "test-key".into(),
             requested_model: "gpt-4o".into(),
             upstream_model: "gpt-4o-2024-08-06".into(),
-            headers: std::collections::HashMap::new(),
+            headers: std::sync::Arc::new(std::collections::HashMap::new()),
         }
     }
 

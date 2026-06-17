@@ -22,6 +22,7 @@ use llm_proxy_protocol::client::openai_chat::StreamEncoder as OpenAiStreamEncode
 use llm_proxy_protocol::core::{CoreEvent, CoreRequest};
 use llm_proxy_provider::adapter::{
     ProviderAdapter, ProviderAdapterTarget, ProviderProtocol, ProviderStreamDecoder,
+    ProviderStreamDecoderKind,
 };
 use llm_proxy_provider::sse::SseFramer;
 use llm_proxy_provider::transport::ProxyRequest;
@@ -216,14 +217,18 @@ pub(crate) struct RequestContext {
 /// Returns `Err(RouteError)` early for rate-limited or duplicate requests so
 /// the handler can immediately produce an error response without entering the
 /// core pipeline.
+///
+/// `request_id` is minted by the outermost `inject_request_id` layer and passed
+/// in by the handler so the id attached to the `x-request-id` header matches
+/// the id stamped on the request's tracing span (audit MEDIUM-1).
 pub(crate) fn prepare_request(
     state: &AppState,
+    request_id: String,
     headers: &HeaderMap,
     connect_info: Option<&std::net::SocketAddr>,
     body: &[u8],
     path: &str,
 ) -> Result<RequestContext, RouteError> {
-    let request_id = state.request_id_gen.next_id();
     let trust_forwarded_headers = state.trust_forwarded_headers();
     let client_ip = get_client_ip(headers, connect_info, trust_forwarded_headers);
     // Security: loopback bypass is intentional for local development and testing.
@@ -365,7 +370,12 @@ async fn resolve_target(
                 adapter_target_config.protocol
             ))
         })?
-        .clone(); // ProviderAdapter is Arc-like: clone is a cheap reference count increment, not a deep copy.
+        // ProviderAdapter variants are zero-sized unit structs; clone is a
+        // trivial copy. (The Arc sits one level out, on
+        // `provider_adapters: Arc<ProviderAdapterRegistry>`; `get()` returns a
+        // borrowed `&ProviderAdapter`, and this `.clone()` copies only the
+        // zero-sized enum value out from under the borrow — no refcount bump.)
+        .clone();
 
     let provider_target = ProviderAdapterTarget {
         provider_name: adapter_target_config.provider_name,
@@ -764,7 +774,7 @@ struct StreamMetrics {
 /// `build_sse_output_stream`, reducing the function's parameter count from 9
 /// to a single struct plus the byte stream.
 struct StreamContext {
-    provider_decoder: Box<dyn ProviderStreamDecoder + Send>,
+    provider_decoder: ProviderStreamDecoderKind,
     sse_framer: SseFramer,
     client_encoder: ClientStreamEncoder,
     client_protocol: ClientProtocol,
@@ -794,14 +804,20 @@ impl StreamContext {
                 // handler timed out). The failure is unactionable because the
                 // handler has already returned, so we just record the metric
                 // and stop the stream task.
-                self.stream_metrics.metrics.record_failure();
+                //
+                // Client-initiated disconnect, not an upstream failure:
+                // record a cancellation so it does not inflate the error-rate
+                // SLO (audit MEDIUM-5).
+                self.stream_metrics.metrics.record_client_cancel();
                 return false;
             }
         } else if tx.send(event).await.is_err() {
             // Channel receiver dropped -- the SSE handler task has exited
             // (client disconnect or timeout). No further events can be
             // delivered, so stop the stream task.
-            self.stream_metrics.metrics.record_failure();
+            //
+            // Client disconnect, not an upstream failure (audit MEDIUM-5).
+            self.stream_metrics.metrics.record_client_cancel();
             return false;
         }
         true
@@ -855,8 +871,11 @@ fn build_sse_output_stream(
         'outer: loop {
             tokio::select! {
                 _ = cancel_clone.cancelled() => {
-                    // Client disconnected; abort upstream stream.
-                    ctx.stream_metrics.metrics.record_failure();
+                    // Client disconnected; abort upstream stream. This is a
+                    // client-initiated cancellation, not an upstream failure:
+                    // record it as a cancellation so it does not inflate the
+                    // error-rate SLO (audit MEDIUM-5).
+                    ctx.stream_metrics.metrics.record_client_cancel();
                     if !ctx.first_byte_sent {
                         ctx.send_pre_stream_error(
                             RouteError::Internal("client disconnected before first byte".to_owned()),
@@ -952,7 +971,12 @@ fn build_sse_output_stream(
                                     map_provider_error(e),
                                 );
                             } else {
-                                let sanitized = sanitize_upstream_error_body(&e.to_string());
+                                // In-band stream error: run through the full
+                                // sanitizer (key-redact + URL-redact + truncate)
+                                // so a future error string carrying an API key
+                                // is redacted, matching the `Api` HTTP path
+                                // (audit GAP-LOW-2).
+                                let sanitized = fully_sanitize_upstream_error(&e.to_string());
                                 emit_stream_error(
                                     &mut ctx.client_encoder,
                                     &tx,
@@ -1193,9 +1217,11 @@ async fn emit_stream_error(
 ///
 /// Upstream error bodies are sanitized before being forwarded to clients:
 /// - `Api` variants: already sanitized at construction time.
-/// - Non-`Api` variants (Http, Serialize, etc.): sanitized here to strip
-///   upstream hostnames, URL paths, and potential secrets from reqwest error
-///   messages before they reach the client.
+/// - Non-`Api` variants (Http, Serialize, etc.): run through
+///   [`fully_sanitize_upstream_error`], which applies the canonical
+///   key-redacting sanitizer (via [`ProviderError::api`]) followed by URL
+///   redaction and truncation, so neither API keys nor upstream hostnames/URL
+///   paths leak to the client (audit GAP-LOW-2).
 pub(crate) fn map_provider_error(e: llm_proxy_provider::error::ProviderError) -> RouteError {
     match &e {
         llm_proxy_provider::error::ProviderError::Api { status, body } => {
@@ -1215,12 +1241,14 @@ pub(crate) fn map_provider_error(e: llm_proxy_provider::error::ProviderError) ->
             // Check for reqwest timeout specifically so we can return 504
             // instead of the generic 502 Bad Gateway.
             if e.is_timeout() {
-                let sanitized = sanitize_upstream_error_body(&e.to_string());
+                let sanitized = fully_sanitize_upstream_error(&e.to_string());
                 return RouteError::UpstreamTimeout(sanitized);
             }
-            // Sanitize non-Api error messages to prevent leaking upstream
-            // hostnames, URL paths, or connection details in the response body.
-            let sanitized = sanitize_upstream_error_body(&e.to_string());
+            // Sanitize non-Api error messages through the full sanitizer
+            // (key-redact + URL-redact + truncate) so a future error string
+            // carrying an API key is redacted, matching the `Api` branch above
+            // (audit GAP-LOW-2).
+            let sanitized = fully_sanitize_upstream_error(&e.to_string());
             RouteError::Upstream {
                 status: StatusCode::BAD_GATEWAY,
                 body: sanitized,
@@ -1256,6 +1284,49 @@ pub(super) fn sanitize_upstream_error_body(msg: &str) -> String {
     URL_REDACT_REGEX
         .replace_all(&truncated, "[url-redacted]")
         .into_owned()
+}
+
+/// Sanitize a raw non-`Api` upstream error string through the **full** sanitizer
+/// pipeline: the canonical key-redacting sanitizer plus URL redaction and
+/// truncation.
+///
+/// This is the defense-in-depth counterpart to `sanitize_upstream_error_body`:
+/// that function only redacts URLs and truncates, so a future error string that
+/// happens to carry an API key (e.g. a provider echoing a `Bearer` token or an
+/// `sk-...` value in a transport message) would reach the client un-redacted.
+/// Routing the divergent error paths (streaming in-band errors and non-`Api`
+/// HTTP errors) through this function keeps them consistent with the `Api`
+/// branch, which is already key-redacted at construction time
+/// (`ProviderError::api` → `sanitize_api_error_body`).
+///
+/// # Implementation
+///
+/// The canonical key-redacting sanitizer lives in
+/// `llm_proxy_provider::error::sanitize_api_error_body` and is `pub(crate)` to
+/// the provider crate, so it cannot be called directly. Its only public entry
+/// point is the [`ProviderError::api`] constructor, whose doc comment states it
+/// "encapsulates the sanitization call so callers never need to remember to
+/// call the internal `sanitize_api_error_body` function manually." We therefore
+/// round-trip the message through that constructor (with a sentinel status that
+/// is never surfaced — only the `body` is read back) to obtain a key-redacted,
+/// truncated string, then run the result through [`sanitize_upstream_error_body`]
+/// for URL redaction. Both truncation passes are idempotent (the second is a
+/// no-op because the body is already within `MAX_SANITIZE_LEN`).
+pub(super) fn fully_sanitize_upstream_error(msg: &str) -> String {
+    // Apply the canonical key-redaction + truncation via the public `api`
+    // constructor. The status code is a sentinel: only the sanitized `body`
+    // field is extracted below, and this function never produces a `RouteError`
+    // whose status depends on it.
+    let key_redacted = match llm_proxy_provider::error::ProviderError::api(0, msg.to_owned()) {
+        llm_proxy_provider::error::ProviderError::Api { body, .. } => body,
+        // `api()` is guaranteed to construct the `Api` variant, but
+        // `ProviderError` is `#[non_exhaustive]`, so a catch-all keeps the
+        // match exhaustive against future variants without silently changing
+        // behaviour. Fall back to the URL+truncate sanitizer.
+        _ => return sanitize_upstream_error_body(msg),
+    };
+    // Layer URL redaction on top (truncation is idempotent here).
+    sanitize_upstream_error_body(&key_redacted)
 }
 
 /// Map a [`ProtocolError`](llm_proxy_protocol::client::ProtocolError) to a
@@ -1296,6 +1367,7 @@ mod tests {
             server: llm_proxy_core::ServerConfig {
                 bind: "127.0.0.1:3456".parse().unwrap(),
                 request_timeout: std::time::Duration::from_secs(60),
+                shutdown_timeout: Duration::from_secs(30),
                 log_level: "info".to_owned(),
                 hot_reload: false,
                 rate_limit_rpm,
@@ -1353,8 +1425,8 @@ mod tests {
         let headers = HeaderMap::new();
         let address = "127.0.0.1:12345".parse().unwrap();
 
-        assert!(prepare_request(&state, &headers, Some(&address), b"one", "/test").is_ok());
-        assert!(prepare_request(&state, &headers, Some(&address), b"two", "/test").is_ok());
+        assert!(prepare_request(&state, "req-test".to_owned(), &headers, Some(&address), b"one", "/test").is_ok());
+        assert!(prepare_request(&state, "req-test".to_owned(), &headers, Some(&address), b"two", "/test").is_ok());
     }
 
     #[test]
@@ -1366,9 +1438,9 @@ mod tests {
         let mut second_headers = HeaderMap::new();
         second_headers.insert("x-forwarded-for", "203.0.113.2".parse().unwrap());
 
-        assert!(prepare_request(&state, &first_headers, Some(&address), b"one", "/test").is_ok());
+        assert!(prepare_request(&state, "req-test".to_owned(), &first_headers, Some(&address), b"one", "/test").is_ok());
         assert!(matches!(
-            prepare_request(&state, &second_headers, Some(&address), b"two", "/test"),
+            prepare_request(&state, "req-test".to_owned(), &second_headers, Some(&address), b"two", "/test"),
             Err(RouteError::RateLimited)
         ));
     }
@@ -1456,6 +1528,7 @@ mod tests {
             server: ServerConfig {
                 bind: "127.0.0.1:3456".parse().unwrap(),
                 request_timeout: std::time::Duration::from_secs(60),
+                shutdown_timeout: Duration::from_secs(30),
                 log_level: "info".to_owned(),
                 hot_reload: false,
                 server_name: "test".to_owned(),
@@ -1522,6 +1595,7 @@ mod tests {
             server: ServerConfig {
                 bind: "127.0.0.1:3456".parse().unwrap(),
                 request_timeout: std::time::Duration::from_secs(60),
+                shutdown_timeout: Duration::from_secs(30),
                 log_level: "info".to_owned(),
                 hot_reload: false,
                 server_name: "test".to_owned(),
@@ -1619,6 +1693,54 @@ mod tests {
     fn sanitize_preserves_short_messages_without_urls() {
         let msg = "connection reset by peer";
         let sanitized = sanitize_upstream_error_body(msg);
+        assert_eq!(sanitized, msg);
+    }
+
+    // -- fully_sanitize_upstream_error tests (audit GAP-LOW-2) ------------------
+    //
+    // The divergent error paths (streaming in-band, non-Api timeout/generic)
+    // used to run only `sanitize_upstream_error_body` (URL-redact + truncate),
+    // which never strips API-key patterns. `fully_sanitize_upstream_error`
+    // routes them through the canonical key-redacting sanitizer as well.
+
+    #[test]
+    fn fully_sanitize_redacts_api_key_patterns() {
+        // A long sk-ant-... value (40 trailing token chars) is a real key shape.
+        let msg = "upstream auth failed for key sk-ant-api03-ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcd";
+        let sanitized = fully_sanitize_upstream_error(msg);
+        assert!(
+            !sanitized.contains("sk-ant-api03-"),
+            "API key prefix must be redacted, got: {sanitized}"
+        );
+        assert!(
+            !sanitized.contains("ABCDEFGHIJKLMNOP"),
+            "key material must be redacted, got: {sanitized}"
+        );
+        assert!(
+            sanitized.contains("***"),
+            "key should be replaced with the redaction marker"
+        );
+    }
+
+    #[test]
+    fn fully_sanitize_redacts_urls() {
+        // URL redaction (from sanitize_upstream_error_body) must still apply.
+        let msg = "connection refused to https://api.openai.com/v1/chat/completions";
+        let sanitized = fully_sanitize_upstream_error(msg);
+        assert!(
+            !sanitized.contains("api.openai.com"),
+            "URL host must be redacted, got: {sanitized}"
+        );
+        assert!(
+            sanitized.contains("[url-redacted]"),
+            "should contain URL redaction placeholder"
+        );
+    }
+
+    #[test]
+    fn fully_sanitize_preserves_short_clean_messages() {
+        let msg = "connection reset by peer";
+        let sanitized = fully_sanitize_upstream_error(msg);
         assert_eq!(sanitized, msg);
     }
 }

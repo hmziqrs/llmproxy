@@ -222,7 +222,7 @@ impl ProviderStreamDecoder for ResponsesStreamDecoder {
                 // Extract stop reason from output if present, falling back to
                 // saw_tool_call for streams where function_call output items
                 // may not be present on the response.completed event.
-                let stop_reason = self.infer_stop_reason(chunk.output.as_ref());
+                let stop_reason = self.infer_stop_reason(chunk.output.as_deref());
 
                 if !self.stop_sent {
                     self.stop_sent = true;
@@ -243,7 +243,7 @@ impl ProviderStreamDecoder for ResponsesStreamDecoder {
 
                 if !self.stop_sent {
                     self.stop_sent = true;
-                    let stop_reason = self.infer_stop_reason(chunk.output.as_ref());
+                    let stop_reason = self.infer_stop_reason(chunk.output.as_deref());
                     events.push(CoreEvent::MessageStop {
                         stop_reason,
                         stop_sequence: None,
@@ -332,7 +332,7 @@ impl ResponsesStreamDecoder {
     ///
     /// Checks for `function_call` output items in the chunk. If none are found,
     /// falls back to the `saw_tool_call` flag that was set during streaming.
-    fn infer_stop_reason(&self, outputs: Option<&Vec<ResponsesOutput>>) -> StopReason {
+    fn infer_stop_reason(&self, outputs: Option<&[ResponsesOutput]>) -> StopReason {
         if let Some(outs) = outputs {
             if outs.iter().any(|o| o.r#type == "function_call") {
                 return StopReason::ToolUse;
@@ -696,11 +696,8 @@ impl ResponsesAdapter {
     }
 
     /// Create a new stream decoder.
-    pub fn new_stream_decoder(
-        &self,
-        target: &ProviderAdapterTarget,
-    ) -> Box<dyn ProviderStreamDecoder + Send> {
-        Box::new(ResponsesStreamDecoder {
+    pub fn new_stream_decoder(&self, target: &ProviderAdapterTarget) -> ResponsesStreamDecoder {
+        ResponsesStreamDecoder {
             model_ref: response_model_ref(target),
             started: false,
             content_index: 0,
@@ -708,7 +705,7 @@ impl ResponsesAdapter {
             tool_call_started: false,
             saw_tool_call: false,
             stop_sent: false,
-        })
+        }
     }
 }
 
@@ -749,7 +746,7 @@ mod tests {
             api_key: "test-key".into(),
             requested_model: "gpt-4o".into(),
             upstream_model: "gpt-4o-2024-08-06".into(),
-            headers: std::collections::HashMap::new(),
+            headers: std::sync::Arc::new(std::collections::HashMap::new()),
         }
     }
 

@@ -8,6 +8,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -42,6 +43,18 @@ pub struct ServerConfig {
     /// Maximum request duration before timeout.
     #[serde(with = "humantime_serde")]
     pub request_timeout: Duration,
+    /// Hard deadline for graceful shutdown.
+    ///
+    /// After receiving SIGINT/SIGTERM the server stops accepting new
+    /// connections and waits this long for in-flight requests to drain.
+    /// Because the proxy serves long-lived streaming responses that an
+    /// upstream can hold open arbitrarily, an unbounded drain would let a
+    /// single stuck stream pin the process indefinitely. If the deadline
+    /// elapses the process force-exits so orchestrators (Kubernetes/LB)
+    /// can recycle the pod. `0s` disables the hard deadline (drain
+    /// forever) but is strongly discouraged.
+    #[serde(default = "default_shutdown_timeout", with = "humantime_serde")]
+    pub shutdown_timeout: Duration,
     /// Log level: `"trace"`, `"debug"`, `"info"`, `"warn"`, `"error"`.
     pub log_level: String,
     /// Reserved hot-reload flag. Configuration loading rejects `true`.
@@ -62,6 +75,14 @@ pub struct ServerConfig {
 
 const fn default_rate_limit_rpm() -> u32 {
     100
+}
+
+/// Default graceful-shutdown hard deadline (30 seconds).
+///
+/// Chosen to comfortably exceed the maximum upstream request timeout while
+/// bounding how long a stuck streaming connection can delay process recycle.
+const fn default_shutdown_timeout() -> Duration {
+    Duration::from_secs(30)
 }
 
 const fn default_dedup_window() -> Duration {
@@ -167,6 +188,29 @@ pub enum AuthStyle {
 // ProviderAdapterConfig
 // ---------------------------------------------------------------------------
 
+/// Serialize an `Arc<HashMap<String, String>>` by value (LOW-5).
+///
+/// serde only implements `Serialize`/`Deserialize` for `Arc<T>` behind its `rc`
+/// feature, which this crate deliberately leaves OFF (it is a footgun: it
+/// deserializes `Rc`/`Arc` by reference-sharing). These helpers give the shared
+/// headers map ordinary by-value (de)serialization without enabling that feature.
+fn serialize_arc_headers<S>(headers: &Arc<HashMap<String, String>>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    use serde::Serialize;
+    headers.as_ref().serialize(serializer)
+}
+
+/// Deserialize a headers map into a fresh `Arc` (by value, not reference-shared).
+fn deserialize_arc_headers<'de, D>(deserializer: D) -> Result<Arc<HashMap<String, String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    HashMap::<String, String>::deserialize(deserializer).map(Arc::new)
+}
+
 /// A single adapter entry within a provider.
 ///
 /// Maps a protocol name to an upstream endpoint URL.
@@ -183,8 +227,18 @@ pub struct ProviderAdapterConfig {
     /// safe display.
     pub endpoint: String,
     /// Static headers to include in upstream requests (e.g. anthropic-version).
-    #[serde(default)]
-    pub headers: HashMap<String, String>,
+    ///
+    /// Wrapped in [`Arc`] because adapter headers are fixed at config-load time
+    /// and shared across every request that resolves to this adapter; resolving
+    /// a route then bumps the refcount instead of deep-cloning the map (LOW-5).
+    /// Serde deserializes this by value (wrapping the parsed `HashMap` in
+    /// `Arc::new`) without the `rc` feature.
+    #[serde(
+        default,
+        serialize_with = "serialize_arc_headers",
+        deserialize_with = "deserialize_arc_headers"
+    )]
+    pub headers: Arc<HashMap<String, String>>,
 }
 
 impl std::fmt::Debug for ProviderAdapterConfig {
@@ -455,7 +509,7 @@ impl Default for ProviderCatalogConfig {
 ///
 /// This enum is `#[non_exhaustive]` so validation can evolve without breaking
 /// downstream `match` expressions.
-#[derive(Debug, Clone, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum ConfigValidationError {
     /// An adapter `endpoint` URL is empty.
@@ -660,6 +714,63 @@ pub enum ConfigValidationError {
 /// env vars in `api_key`, empty `api_key`, adapter names/protocols/endpoints/headers,
 /// protocol-name membership, route adapter references,
 /// and model alias validation.
+///
+/// # Examples
+///
+/// A minimal, well-formed provider validates cleanly:
+///
+/// ```
+/// use std::collections::HashMap;
+/// use std::sync::Arc;
+/// use llm_proxy_core::provider_config::{
+///     AuthStyle, ProviderAdapterConfig, ProviderConfig, ProviderRoutesConfig,
+///     validate_provider_config,
+/// };
+///
+/// let provider = ProviderConfig {
+///     name: "example".to_owned(),
+///     api_key: "secret".to_owned(),
+///     auth_style: AuthStyle::Bearer,
+///     adapters: HashMap::from([(
+///         "chat".to_owned(),
+///         ProviderAdapterConfig {
+///             protocol: "openai_chat_completions".to_owned(),
+///             endpoint: "https://example.com/v1/chat/completions".to_owned(),
+///             headers: Arc::new(HashMap::new()),
+///         },
+///     )]),
+///     routes: ProviderRoutesConfig::default(),
+///     model_aliases: HashMap::new(),
+///     discovery: None,
+///     catalog: None,
+/// };
+/// assert!(validate_provider_config(&provider, None).is_ok());
+/// ```
+///
+/// An empty provider name is rejected with [`ConfigValidationError::EmptyProviderName`]:
+///
+/// ```
+/// use std::collections::HashMap;
+/// use llm_proxy_core::provider_config::{
+///     AuthStyle, ConfigValidationError, ProviderConfig, ProviderRoutesConfig,
+///     validate_provider_config,
+/// };
+///
+/// let provider = ProviderConfig {
+///     name: "   ".to_owned(), // whitespace-only is treated as empty
+///     api_key: "secret".to_owned(),
+///     auth_style: AuthStyle::Bearer,
+///     adapters: HashMap::new(),
+///     routes: ProviderRoutesConfig::default(),
+///     model_aliases: HashMap::new(),
+///     discovery: None,
+///     catalog: None,
+/// };
+/// assert_eq!(
+///     validate_provider_config(&provider, None),
+///     Err(ConfigValidationError::EmptyProviderName),
+/// );
+/// ```
 pub fn validate_provider_config(
     provider: &ProviderConfig,
     known_protocols: Option<&[&str]>,
@@ -989,6 +1100,24 @@ pub fn load_app_config(path: impl AsRef<Path>) -> Result<AppConfig, CoreError> {
             source: None,
         });
     }
+    // Reject a zero or sub-second request timeout. tower-http's `TimeoutLayer`
+    // builds `tokio::time::sleep(self.timeout)` on every call; `sleep(ZERO)` is
+    // immediately ready, so `request_timeout = "0s"` would return 408 for every
+    // API request before any handler runs. A sub-second timeout is almost
+    // always a misconfiguration (e.g. mistyped units) and silently bricks the
+    // API the same way. Require at least one second. (HIGH-2 / LOW-10.)
+    const MIN_REQUEST_TIMEOUT: Duration = Duration::from_secs(1);
+    if cfg.server.request_timeout < MIN_REQUEST_TIMEOUT {
+        return Err(CoreError::ConfigValidation {
+            message: format!(
+                "server.request_timeout must be at least 1 second, but is {:?}; \
+                 a zero or sub-second timeout makes every API request return 408 \
+                 before any handler runs",
+                cfg.server.request_timeout
+            ),
+            source: None,
+        });
+    }
     Ok(cfg)
 }
 
@@ -1115,6 +1244,26 @@ server_name = "test"
         assert_eq!(config.server.rate_limit_rpm, 100);
         assert!(!config.server.trust_forwarded_headers);
         assert_eq!(config.server.dedup_window, Duration::ZERO);
+        // shutdown_timeout omits from the TOML above and must default to 30s (HIGH-1).
+        assert_eq!(config.server.shutdown_timeout, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn app_config_accepts_explicit_shutdown_timeout() {
+        // Operators may override the 30s default; the value round-trips verbatim.
+        let config: AppConfig = toml::from_str(
+            r#"
+[server]
+bind = "127.0.0.1:3456"
+request_timeout = "300s"
+shutdown_timeout = "10s"
+log_level = "info"
+hot_reload = false
+server_name = "test"
+"#,
+        )
+        .expect("app config");
+        assert_eq!(config.server.shutdown_timeout, Duration::from_secs(10));
     }
 
     #[test]
@@ -1140,6 +1289,60 @@ server_name = "test"
             error
                 .to_string()
                 .contains("hot_reload=true is not supported")
+        );
+    }
+
+    #[test]
+    fn load_app_config_rejects_zero_request_timeout() {
+        // HIGH-2: a zero timeout makes every API request 408 before any handler.
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[server]
+bind = "127.0.0.1:3456"
+request_timeout = "0s"
+log_level = "info"
+hot_reload = false
+server_name = "test"
+"#,
+        )
+        .unwrap();
+
+        let error = load_app_config(&path).expect_err("zero timeout must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("server.request_timeout must be at least 1 second"),
+            "got: {error}"
+        );
+    }
+
+    #[test]
+    fn load_app_config_rejects_subsecond_request_timeout() {
+        // Sub-second timeouts are almost always a mistyped unit and brick the API.
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[server]
+bind = "127.0.0.1:3456"
+request_timeout = "500ms"
+log_level = "info"
+hot_reload = false
+server_name = "test"
+"#,
+        )
+        .unwrap();
+
+        let error = load_app_config(&path).expect_err("sub-second timeout must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("server.request_timeout must be at least 1 second"),
+            "got: {error}"
         );
     }
 
@@ -1387,13 +1590,11 @@ chat_completions = "chat"
 "#,
         )
         .expect("provider config");
-        provider
-            .provider
-            .adapters
-            .get_mut("chat")
-            .unwrap()
-            .headers
-            .insert("x-evil".to_owned(), "value\r\nInjected: true".to_owned());
+        let headers = &mut provider.provider.adapters.get_mut("chat").unwrap().headers;
+        Arc::make_mut(headers).insert(
+            "x-evil".to_owned(),
+            "value\r\nInjected: true".to_owned(),
+        );
         assert!(matches!(
             validate_provider_config(&provider.provider, None),
             Err(ConfigValidationError::HeaderContainsCrlf { .. })
@@ -1463,7 +1664,7 @@ endpoint = "https://example.com/v1"
                 ProviderAdapterConfig {
                     protocol: String::new(),
                     endpoint: "https://example.com/v1".to_owned(),
-                    headers: HashMap::new(),
+                    headers: Arc::new(HashMap::new()),
                 },
             )]),
             routes: ProviderRoutesConfig::default(),
@@ -1488,7 +1689,7 @@ endpoint = "https://example.com/v1"
                 ProviderAdapterConfig {
                     protocol: "openai_chat_completions".to_owned(),
                     endpoint: "https://example.com/v1".to_owned(),
-                    headers: HashMap::new(),
+                    headers: Arc::new(HashMap::new()),
                 },
             )]),
             routes: ProviderRoutesConfig::default(),
@@ -1513,7 +1714,7 @@ endpoint = "https://example.com/v1"
                 ProviderAdapterConfig {
                     protocol: "openai_chat_completions".to_owned(),
                     endpoint: "https://example.com/v1".to_owned(),
-                    headers: HashMap::new(),
+                    headers: Arc::new(HashMap::new()),
                 },
             )]),
             routes: ProviderRoutesConfig::default(),

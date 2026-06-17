@@ -12,7 +12,7 @@ use llm_proxy_protocol::core::{
 };
 use llm_proxy_provider::{
     AnthropicAdapter, GeminiAdapter, OpenAiChatAdapter, ProviderAdapter, ProviderAdapterTarget,
-    ProviderProtocol, ResponsesAdapter, SseFrame,
+    ProviderProtocol, ProviderStreamDecoder, ResponsesAdapter, SseFrame,
 };
 
 use std::fs;
@@ -91,7 +91,7 @@ fn make_target(protocol: ProviderProtocol) -> ProviderAdapterTarget {
         api_key: "test-key".into(),
         requested_model: model.clone(),
         upstream_model: model,
-        headers: std::collections::HashMap::new(),
+        headers: std::sync::Arc::new(std::collections::HashMap::new()),
     }
 }
 

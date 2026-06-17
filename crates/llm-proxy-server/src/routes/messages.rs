@@ -9,14 +9,15 @@
 //! endpoint classification, fallback routing, or provider-specific streaming.
 
 use axum::body::Body;
-use axum::extract::{Path, State};
+use axum::extract::{Extension, Path, State};
 use axum::http::{HeaderMap, Response};
+use axum::Json;
 use llm_proxy_core::ProviderRouteKind;
 use llm_proxy_protocol::anthropic::MessageRequest;
 use llm_proxy_protocol::client::anthropic;
-use tracing::info;
+use tracing::{info, warn};
 
-use crate::middleware::OptionalConnectInfo;
+use crate::middleware::{OptionalConnectInfo, RequestId};
 use crate::state::AppState;
 
 use super::core_pipeline;
@@ -29,14 +30,15 @@ use super::error_response::{ClientProtocol, RouteError, route_error_response};
 pub async fn handle_messages(
     State(state): State<AppState>,
     Path(provider): Path<String>,
+    Extension(req_id): Extension<RequestId>,
     OptionalConnectInfo(connect_info): OptionalConnectInfo,
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response<Body> {
-    match handle_messages_inner(state, provider, connect_info, headers, body).await {
+    match handle_messages_inner(state, req_id, provider, connect_info, headers, body).await {
         Ok(response) => response,
         Err(error) => {
-            info!(error = %error, "request failed");
+            warn!(error = %error, "request failed");
             route_error_response(ClientProtocol::Anthropic, error)
         }
     }
@@ -45,24 +47,41 @@ pub async fn handle_messages(
 /// Inner handler that returns `Result` so errors can be mapped uniformly.
 async fn handle_messages_inner(
     state: AppState,
+    req_id: RequestId,
     provider: String,
     connect_info: Option<std::net::SocketAddr>,
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<Response<Body>, RouteError> {
+    // Input validation gate (mirrors token_count.rs): validate the provider
+    // name and confirm the provider exists BEFORE charging rate-limit/dedup
+    // counters in `prepare_request`. This ensures malformed probes (bad path,
+    // unknown provider) receive an immediate 400/404 without burning rate-limit
+    // budget or surfacing as a misleading 429/409 (audit LOW-29).
+    core_pipeline::validate_provider_name(&provider)?;
+    if state.providers().get(&provider).is_none() {
+        return Err(RouteError::UnknownProvider(provider.clone()));
+    }
+
     // Pre-flight: rate limit, dedup, request ID.
     let request_path = format!("/providers/{provider}/v1/messages");
     let ctx = core_pipeline::prepare_request(
         &state,
+        req_id.0,
         &headers,
         connect_info.as_ref(),
         &body,
         &request_path,
     )?;
 
-    // Parse and validate the Anthropic MessageRequest.
-    let req: MessageRequest = serde_json::from_slice(&body)
-        .map_err(|e| RouteError::InvalidRequest(format!("invalid JSON: {e}")))?;
+    // Parse the Anthropic MessageRequest via the axum Json helper so that
+    // syntax-vs-data parse failures are distinguished into precise messages
+    // instead of collapsing both into one opaque "invalid JSON" string
+    // (audit LOW-28).
+    let req: MessageRequest = match Json::<MessageRequest>::from_bytes(&body) {
+        Ok(json) => json.0,
+        Err(rejection) => return Err(json_rejection_to_route_error(rejection)),
+    };
 
     // Defense-in-depth: validate() checks for empty model/messages before
     // decode_request also validates the same fields. This catches issues
@@ -103,6 +122,28 @@ async fn handle_messages_inner(
             ClientProtocol::Anthropic,
         )
         .await
+    }
+}
+
+/// Map an axum [`JsonRejection`] into a [`RouteError::InvalidRequest`] with a
+/// distinct message for syntax errors (malformed JSON) versus data errors
+/// (well-formed JSON that failed deserialization).
+///
+/// `from_bytes` cannot produce `MissingJsonContentType` (the content-type
+/// header is only inspected by the `FromRequest` extractor), and `BytesRejection`
+/// only arises from the request extraction path — neither is reachable here, so
+/// the wildcard arm covers any future `#[non_exhaustive]` variant defensively.
+fn json_rejection_to_route_error(
+    rejection: axum::extract::rejection::JsonRejection,
+) -> RouteError {
+    match rejection {
+        axum::extract::rejection::JsonRejection::JsonSyntaxError(e) => {
+            RouteError::InvalidRequest(format!("invalid JSON: {e}"))
+        }
+        axum::extract::rejection::JsonRejection::JsonDataError(e) => {
+            RouteError::InvalidRequest(format!("invalid request body: {e}"))
+        }
+        other => RouteError::InvalidRequest(format!("invalid JSON: {other}")),
     }
 }
 

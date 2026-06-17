@@ -91,41 +91,59 @@ fn truncate_with_suffix(s: &str, max_len: usize, suffix: &str) -> String {
 
 /// Redaction patterns compiled once via `LazyLock`.
 ///
-/// Each pattern matches a known API-key prefix followed by enough alphanumeric
-/// characters to be a real key (20+). This avoids false positives on short
+/// Each pattern matches a known API-key prefix followed by enough token
+/// characters to be a real key (10–20+). This avoids false positives on short
 /// substrings like `sk-` that appear in ordinary words (e.g. "desk-area").
 static REDACTION_PATTERNS: std::sync::LazyLock<Vec<regex::Regex>> =
     std::sync::LazyLock::new(|| {
-        // Order matters: longer/more-specific patterns first.
+        // Character class covering the URL/JSON-safe punctuation real tokens
+        // carry: `.` (dotted OpenAI restricted keys, JWT segment separators),
+        // `-`, `_`, `/`, `+`, `=` (base64). Delimiters — quotes, braces,
+        // brackets, commas, whitespace — are deliberately excluded so a
+        // trailing delimiter adjacent to the token is never consumed into the
+        // redaction. Prior to GAP-MED-1 this class stopped at `.`/`/`/`+`/`=`,
+        // so a dotted key or JWT was only redacted up to its first dot and the
+        // secret-bearing suffix leaked to the client.
+        const C: &str = r"A-Za-z0-9_.\-/+=";
+        // Order matters only for intent-documentation: every pattern runs a
+        // full `replace_all` pass over the body, and `***` is inert, so the
+        // final output is the union of all matches regardless of order.
+        // Longer/more-specific patterns are listed first.
         [
+            // OpenAI restricted (dotted) keys: sk-proj-XXXX.YYYY
+            format!(r"sk-proj-[{C}]{{10,}}"),
             // Anthropic keys: sk-ant-api03-XXXXX
-            r"sk-ant-api03-[A-Za-z0-9_-]{10,}",
+            format!(r"sk-ant-api03-[{C}]{{10,}}"),
             // Anthropic keys: sk-ant-XXXXX
-            r"sk-ant-[A-Za-z0-9_-]{10,}",
+            format!(r"sk-ant-[{C}]{{10,}}"),
             // OpenAI keys: sk-live-XXXXX (hyphen form)
-            r"sk-live-[A-Za-z0-9_-]{10,}",
+            format!(r"sk-live-[{C}]{{10,}}"),
             // OpenAI keys: sk-test-XXXXX (hyphen form)
-            r"sk-test-[A-Za-z0-9_-]{10,}",
+            format!(r"sk-test-[{C}]{{10,}}"),
             // OpenAI keys: sk_live_XXXXX (underscore form)
-            r"sk_live_[A-Za-z0-9_-]{10,}",
+            format!(r"sk_live_[{C}]{{10,}}"),
             // OpenAI keys: sk_test_XXXXX (underscore form)
-            r"sk_test_[A-Za-z0-9_-]{10,}",
+            format!(r"sk_test_[{C}]{{10,}}"),
             // Generic sk- prefix with enough trailing chars to look like a key
-            r"sk-[A-Za-z0-9_-]{20,}",
-            // Google API keys: AIza followed by 30+ alphanumeric chars
-            r"AIza[A-Za-z0-9_-]{30,}",
+            format!(r"sk-[{C}]{{20,}}"),
+            // Google API keys: AIza followed by 30+ token chars
+            format!(r"AIza[{C}]{{30,}}"),
             // Generic key- prefix with enough trailing chars
-            r"key-[A-Za-z0-9_-]{20,}",
+            format!(r"key-[{C}]{{20,}}"),
+            // JWT-shaped Bearer tokens: Bearer eyJ....body.sig (lowered bar so
+            // even a partially-echoed JWT fragment is caught).
+            format!(r"Bearer eyJ[{C}]{{10,}}"),
             // Bearer token values echoed in error responses
-            r"Bearer [A-Za-z0-9_-]{20,}",
+            format!(r"Bearer [{C}]{{20,}}"),
             // Generic key= assignment patterns (key=VALUE with 20+ chars)
-            r"(?i)key=[A-Za-z0-9_-]{20,}",
+            format!(r"(?i)key=[{C}]{{20,}}"),
             // Generic token= assignment patterns (token=VALUE with 20+ chars)
-            r"(?i)token=[A-Za-z0-9_-]{20,}",
+            format!(r"(?i)token=[{C}]{{20,}}"),
         ]
         .iter()
-        // SAFETY: all patterns are static string literals known at compile time,
-        // so regex::Regex::new cannot fail here.
+        // SAFETY: every pattern is built from a static string literal (via
+        // format! with a compile-time constant char class), so the resulting
+        // regex is known valid and `Regex::new` cannot fail here.
         .map(|pat| regex::Regex::new(pat).expect("invalid redaction regex"))
         .collect()
     });
@@ -148,13 +166,18 @@ static REDACTION_PATTERNS: std::sync::LazyLock<Vec<regex::Regex>> =
 /// # Covered patterns
 ///
 /// - OpenAI keys: `sk-live-...`, `sk-test-...`, `sk_live_...`, `sk_test_...`,
-///   generic `sk-...` (only when followed by 20+ alphanumeric chars).
+///   `sk-proj-...` (dotted restricted keys), generic `sk-...` (only when
+///   followed by 20+ token chars).
 /// - Anthropic keys: `sk-ant-api03-...`, `sk-ant-...`
 /// - Google API keys: `AIza...` (only when followed by 30+ chars)
 /// - Generic key prefixes: `key-...` (only when followed by 20+ chars)
 /// - Generic assignment patterns: `key=...`, `token=...` (case-insensitive,
 ///   only when followed by 20+ chars)
-/// - Bearer token values: `Bearer ...` (only when followed by 20+ chars)
+/// - Bearer token values: `Bearer ...` (only when followed by 20+ chars) and
+///   JWT-shaped `Bearer eyJ....body.sig`
+///
+/// The token character class includes `.`/`/`/`+`/`=` so dotted keys and JWTs
+/// are redacted whole rather than only up to their first `.` (audit GAP-MED-1).
 ///
 /// Uses regex-based matching to avoid false-positive redaction of short
 /// substrings like `sk-` or `key-` that appear in ordinary words.
@@ -426,6 +449,73 @@ mod tests {
         // the LazyLock would panic at first use in production. This test
         // exercises the initialization path explicitly.
         let _ = &*REDACTION_PATTERNS;
+    }
+
+    // -----------------------------------------------------------------------
+    // GAP-MED-1: dotted keys / JWTs must redact whole (no suffix leak)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn sanitize_redacts_dotted_openai_proj_key_with_no_suffix_leak() {
+        // OpenAI restricted key echoed in a dotted format. The pre-GAP-MED-1
+        // char class stopped at `.` so only `sk-proj-AbCd...` matched and the
+        // `.T3BlbkFJ...` suffix leaked. The whole token must now redact.
+        let body = "invalid key: sk-proj-AbCdEfGh1234567890.T3BlbkFJabc123def456".to_owned();
+        let result = sanitize_api_error_body(body);
+        assert!(
+            !result.contains("T3BlbkFJ") && !result.contains("AbCdEfGh"),
+            "dotted key suffix must not leak: {result}"
+        );
+        assert!(result.contains("***"));
+    }
+
+    #[test]
+    fn sanitize_redacts_jwt_bearer_token_with_no_suffix_leak() {
+        // A `Bearer <JWT>` is three dot-separated base64url segments. The
+        // pre-GAP-MED-1 class stopped at `.` so only the header segment
+        // matched and the payload + signature leaked.
+        let jwt = concat!(
+            "Bearer eyJhbGciOiJIUzI1NiJ9.",
+            "eyJzdWIiOiIxMjM0NTY3ODkwIn0.",
+            "SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c",
+        );
+        let result = sanitize_api_error_body(jwt.to_owned());
+        assert_eq!(
+            result, "***",
+            "the entire JWT (payload + signature) must redact, got: {result}"
+        );
+    }
+
+    #[test]
+    fn sanitize_redacts_legacy_dotted_key_with_no_suffix_leak() {
+        // A legacy dotted key (no recognized prefix) is still caught by the
+        // broadened generic `key=` / `sk-` patterns as long as it carries a
+        // known prefix; here the `key=` assignment form redacts the dotted
+        // value whole.
+        let body = "error: key=abCdEf.1234567890abcdefghij.KLuMnO".to_owned();
+        let result = sanitize_api_error_body(body);
+        assert!(
+            !result.contains("KLuMnO") && !result.contains("1234567890abcdefghij"),
+            "dotted key= value must redact whole: {result}"
+        );
+        assert!(result.contains("***"));
+    }
+
+    #[test]
+    fn sanitize_does_not_consume_trailing_delimiter_after_token() {
+        // A token immediately followed by a quote/brace must redact the token
+        // but leave the delimiter in place — the char class excludes `"` `}`
+        // etc. so the suffix cannot be swallowed.
+        let body = r#"{"error":"key sk-ant-abc123def456ghi789jkl012mno345pqr"}"#.to_owned();
+        let result = sanitize_api_error_body(body);
+        assert!(
+            !result.contains("abc123def456ghi789"),
+            "token body must be redacted: {result}"
+        );
+        assert!(
+            result.contains("\"}"),
+            "trailing quote/brace must be preserved, got: {result}"
+        );
     }
 
     #[tokio::test]

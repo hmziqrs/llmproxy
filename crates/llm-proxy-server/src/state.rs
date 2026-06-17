@@ -26,8 +26,9 @@ pub struct BuildInfo {
 
 /// Application state shared with every handler.
 ///
-/// Cheap to clone: all fields are `Arc`-wrapped so cloning only bumps
-/// reference counts. Required by axum's `State` extractor.
+/// Cheap to clone: nearly all fields are `Arc`-wrapped so cloning only bumps
+/// reference counts (the lone exception is `token_counter`, a zero-sized
+/// `Counter` stored inline). Required by axum's `State` extractor.
 ///
 /// # Security note
 ///
@@ -61,7 +62,12 @@ pub struct AppState {
     /// Build identifier reported by `/version`.
     pub(crate) build: Arc<BuildInfo>,
     /// Token counter for estimating token usage.
-    pub(crate) token_counter: Arc<Counter>,
+    ///
+    /// `Counter` is a zero-sized unit struct (its `count_tokens`/`count_messages`
+    /// methods are pure functions of their arguments and read no `self` state), so
+    /// it is stored inline rather than wrapped in `Arc`. `AppState: Clone` makes a
+    /// trivial ZST copy at zero cost, and there is no shared mutable state to lose.
+    pub(crate) token_counter: Counter,
     /// Runtime metrics collector.
     pub(crate) metrics: Arc<Metrics>,
     /// Per-IP rate limiter.
@@ -141,7 +147,7 @@ impl AppState {
             provider_adapters: Arc::new(provider_adapters),
             proxy_client: Arc::new(proxy_client),
             build: Arc::new(build),
-            token_counter: Arc::new(Counter::new()),
+            token_counter: Counter::new(),
             metrics: Arc::new(Metrics::new()),
             rate_limiter: Arc::new(RateLimiter::new(rate_limit_rpm)),
             request_dedup: Arc::new(RequestDeduplicator::with_window_ms(dedup_window_ms)),
@@ -153,6 +159,14 @@ impl AppState {
     /// Request timeout duration from app config.
     pub fn request_timeout(&self) -> Duration {
         self.app_config.server.request_timeout
+    }
+
+    /// Graceful-shutdown hard deadline from app config.
+    ///
+    /// `Duration::ZERO` means "no hard deadline" (drain indefinitely); every
+    /// other value bounds how long in-flight connections may delay shutdown.
+    pub fn shutdown_timeout(&self) -> Duration {
+        self.app_config.server.shutdown_timeout
     }
 
     /// Server name for responses and version endpoints.
@@ -204,6 +218,7 @@ mod tests {
             server: ServerConfig {
                 bind: "127.0.0.1:3456".parse().unwrap(),
                 request_timeout: Duration::from_secs(300),
+                shutdown_timeout: Duration::from_secs(30),
                 log_level: "info".to_owned(),
                 hot_reload: false,
                 server_name: "test-proxy".to_owned(),
@@ -241,6 +256,7 @@ mod tests {
         );
         assert_eq!(state.server_name(), "test-proxy");
         assert_eq!(state.request_timeout(), Duration::from_secs(300));
+        assert_eq!(state.shutdown_timeout(), Duration::from_secs(30));
     }
 
     // -- Helper methods -------------------------------------------------------
@@ -374,7 +390,7 @@ mod tests {
                     ProviderAdapterConfig {
                         protocol: "openai_chat_completions".to_owned(),
                         endpoint: "https://example.com/v1".to_owned(),
-                        headers: HashMap::new(),
+                        headers: std::sync::Arc::new(HashMap::new()),
                     },
                 );
                 m.insert(
@@ -382,7 +398,7 @@ mod tests {
                     ProviderAdapterConfig {
                         protocol: "anthropic_messages".to_owned(),
                         endpoint: "https://example.com/v1/messages".to_owned(),
-                        headers: HashMap::new(),
+                        headers: std::sync::Arc::new(HashMap::new()),
                     },
                 );
                 m
@@ -417,7 +433,7 @@ mod tests {
                     ProviderAdapterConfig {
                         protocol: "not_a_real_protocol".to_owned(),
                         endpoint: "https://example.com".to_owned(),
-                        headers: HashMap::new(),
+                        headers: std::sync::Arc::new(HashMap::new()),
                     },
                 );
                 m
@@ -504,13 +520,12 @@ mod tests {
             "cloned AppState should share the same Arc<Metrics>"
         );
         assert!(
-            Arc::ptr_eq(&state.token_counter, &cloned.token_counter),
-            "cloned AppState should share the same Arc<Counter>"
-        );
-        assert!(
             Arc::ptr_eq(&state.build, &cloned.build),
             "cloned AppState should share the same Arc<BuildInfo>"
         );
+        // NOTE: `token_counter` is an inline `Counter` (zero-sized unit struct),
+        // not `Arc<Counter>`, so there is no shared reference to compare. It is
+        // intentionally excluded from the Arc-sharing assertions above.
     }
 
     // -- Multi-provider TOML validation --------------------------------------
@@ -533,7 +548,7 @@ mod tests {
                     ProviderAdapterConfig {
                         protocol: "openai_chat_completions".to_owned(),
                         endpoint: "https://example.com/v1".to_owned(),
-                        headers: HashMap::new(),
+                        headers: std::sync::Arc::new(HashMap::new()),
                     },
                 );
                 m
@@ -556,7 +571,7 @@ mod tests {
                     ProviderAdapterConfig {
                         protocol: "not_real".to_owned(),
                         endpoint: "https://example.com".to_owned(),
-                        headers: HashMap::new(),
+                        headers: std::sync::Arc::new(HashMap::new()),
                     },
                 );
                 m
@@ -580,6 +595,12 @@ mod tests {
 
     #[test]
     fn zero_duration_timeout_is_returned() {
+        // AppState is a dependency-injection container: request_timeout() is a
+        // pure passthrough accessor and performs no validation. Zero/sub-second
+        // timeouts are rejected earlier, at config load, in `load_app_config`
+        // (see `llm-proxy-core` `validate_*` — HIGH-2 / LOW-10). This test
+        // documents the accessor's faithfulness to whatever ServerConfig it is
+        // handed, not an endorsement of `request_timeout = "0s"` as valid config.
         let mut cfg = make_app_config();
         cfg.server.request_timeout = Duration::ZERO;
         let state = AppState::new(

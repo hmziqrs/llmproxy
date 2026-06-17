@@ -613,7 +613,12 @@ where
 }
 
 /// Returns a human-readable name for a JSON value type.
-fn json_type_name(val: &serde_json::Value) -> &'static str {
+///
+/// `pub(crate)` so the per-provider client decoders (e.g. OpenAI Chat's
+/// `decode_request`) can produce byte-identical stop-array error messages to
+/// the canonical `deserialize_stop`, keeping the two wire-format rules from
+/// diverging again (audit GAP-LOW-8).
+pub(crate) fn json_type_name(val: &serde_json::Value) -> &'static str {
     match val {
         serde_json::Value::Null => "null",
         serde_json::Value::Bool(_) => "bool",
@@ -781,7 +786,7 @@ impl fmt::Debug for CoreResponse {
 
 /// Why the model stopped generating.
 #[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StopReason {
     /// The model finished its turn naturally.
     EndTurn,
@@ -795,13 +800,16 @@ pub enum StopReason {
     Refusal,
     /// An error occurred.
     Error,
-    /// The stop reason is not recognised.
+    /// The stop reason was not recognised by the adapter's finish-reason map.
     ///
-    /// Serializes to `"Unknown"`. If preserving the original provider value is
-    /// needed (similar to `CacheControlType::Other(String)`), this variant can
-    /// be changed to `Unknown(String)` in a future version. Currently the
-    /// original value is lost during normalization.
-    Unknown,
+    /// The original provider value is carried in the inner string so it
+    /// survives the normalize → core → encode pipeline and remains available in
+    /// diagnostics: the encoder logs it when mapping to a native finish reason.
+    /// This mirrors [`CacheControlType::Other`], which solves the same
+    /// problem for cache-control types. The sentinel `"absent"` indicates the
+    /// provider omitted the finish-reason field entirely rather than sending an
+    /// unmapped value.
+    Unknown(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -1953,7 +1961,7 @@ mod tests {
             StopReason::StopSequence,
             StopReason::Refusal,
             StopReason::Error,
-            StopReason::Unknown,
+            StopReason::Unknown("provider_specific".to_owned()),
         ];
         for variant in &variants {
             let json = serde_json::to_string(&variant).unwrap();

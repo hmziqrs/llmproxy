@@ -12,7 +12,6 @@ use tracing::info;
 
 use crate::config_validation::validate_toml_extension;
 use crate::paths::{config_dir, resolve_config};
-use crate::permissions::set_private_permissions;
 use crate::pid::{is_process_running, read_pid, remove_pid, write_pid, write_pid_value};
 use crate::state::{init_tracing, load_toml_state};
 
@@ -43,7 +42,12 @@ pub async fn cmd_serve(
 
     // Build shared infrastructure.
     let adapter_registry = ProviderAdapterRegistry::builtin();
-    let proxy_client = ProxyClient::new();
+    // Build the HTTP client fallibly. `reqwest::Client::builder().build()` can
+    // fail at startup on an invalid `HTTP_PROXY`/`HTTPS_PROXY` env value or a
+    // TLS-init failure; using `try_new` (audit GAP-LOW-13) lets us surface that
+    // as a contextualized error instead of panicking the daemon.
+    let proxy_client = ProxyClient::try_new()
+        .with_context(|| "building proxy HTTP client (check HTTP_PROXY/HTTPS_PROXY and TLS config)")?;
 
     // Load TOML config and build state before writing the PID file. This
     // ensures a bad config does not leave a stale PID file on disk.
@@ -83,24 +87,50 @@ pub async fn cmd_serve(
     };
 
     let bind_addr = state.bind_address();
+    let shutdown_deadline = state.shutdown_timeout();
     let app = build_router(state);
 
-    let listener = TcpListener::bind(bind_addr)
-        .await
-        .with_context(|| format!("binding to {bind_addr}"))?;
+    let listener = bind_listener(bind_addr).await?;
     info!(
         addr = %listener.local_addr()?,
         version = env!("CARGO_PKG_VERSION"),
         "llm-proxy listening"
     );
 
-    // Serve with graceful shutdown.
-    let result = axum::serve(
+    // Serve with graceful shutdown bounded by a hard deadline.
+    //
+    // axum 0.8's `with_graceful_shutdown` waits indefinitely for in-flight
+    // connections to drain. Because the proxy serves long-lived streaming
+    // responses an upstream can hold open arbitrarily, one stuck stream could
+    // otherwise pin the process forever on SIGTERM/SIGINT. We wrap the serve
+    // future in `tokio::time::timeout`: once the deadline elapses after the
+    // signal, stuck connections are dropped and we force-exit so an
+    // orchestrator (Kubernetes/LB) can recycle the pod. `shutdown_timeout == 0`
+    // disables the deadline (drain forever) for operators who want that.
+    let serve = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown_signal())
-    .await;
+    .with_graceful_shutdown(shutdown_signal());
+
+    let result = if shutdown_deadline.is_zero() {
+        serve.await
+    } else {
+        match tokio::time::timeout(shutdown_deadline, serve).await {
+            Ok(r) => r,
+            Err(_) => {
+                tracing::error!(
+                    deadline = ?shutdown_deadline,
+                    "graceful-shutdown deadline elapsed; forcing exit with in-flight connections dropped"
+                );
+                // Run PID cleanup best-effort, then exit. The deadline exists
+                // precisely to escape stuck connections, so we do not wait for
+                // them; remove_pid is fast, synchronous filesystem I/O.
+                cleanup.await;
+                std::process::exit(1);
+            }
+        }
+    };
 
     cleanup.await;
 
@@ -113,6 +143,62 @@ pub async fn cmd_serve(
             tracing::error!(error = %e, "server error");
             Err(anyhow::anyhow!("server error: {}", e))
         }
+    }
+}
+
+/// Bind the listening TCP socket with connection-hardening options.
+///
+/// On Unix the socket is created via `socket2` so we can enable `SO_KEEPALIVE`
+/// with a bounded idle interval: half-open or stalled peers (a dropped VPN, a
+/// NAT timeout, an idle slowloris connection) are probed and reaped instead of
+/// pinning a connection forever. Accepted connections inherit the listener's
+/// keepalive setting on Linux and macOS.
+///
+/// `SO_REUSEADDR` is set so a quick restart after a crash can rebind while the
+/// previous socket is in `TIME_WAIT`.
+///
+/// # Slowloris note
+///
+/// TCP keepalive does not by itself stop a client that drip-feeds request
+/// *headers* one byte at a time: `TimeoutLayer` only bounds the fully-buffered
+/// handler body, and axum 0.8 exposes no per-connection read-header timeout.
+/// For internet-facing deployments, place this proxy behind a reverse proxy
+/// (nginx, envoy, a cloud LB) that imposes a read-header timeout and
+/// connection cap. For the typical loopback / developer-facing deployment the
+/// risk is negligible.
+async fn bind_listener(bind_addr: std::net::SocketAddr) -> Result<TcpListener> {
+    #[cfg(unix)]
+    {
+        use socket2::{Domain, Protocol, Socket, TcpKeepalive};
+        let domain = Domain::for_address(bind_addr);
+        let socket = Socket::new(domain, socket2::Type::STREAM, Some(Protocol::TCP))
+            .with_context(|| format!("creating socket for {bind_addr}"))?;
+        socket
+            .set_reuse_address(true)
+            .with_context(|| "setting SO_REUSEADDR")?;
+        let keepalive = TcpKeepalive::new().with_time(std::time::Duration::from_secs(60));
+        socket
+            .set_tcp_keepalive(&keepalive)
+            .with_context(|| "enabling TCP keepalive")?;
+        socket
+            .bind(&bind_addr.into())
+            .with_context(|| format!("binding to {bind_addr}"))?;
+        socket
+            .listen(1024)
+            .with_context(|| format!("listening on {bind_addr}"))?;
+        // tokio's I/O driver requires a non-blocking socket.
+        socket
+            .set_nonblocking(true)
+            .with_context(|| "setting nonblocking on listener")?;
+        // Convert the configured socket2 socket into a tokio listener.
+        let std_listener = std::net::TcpListener::from(socket);
+        Ok(TcpListener::from_std(std_listener)?)
+    }
+    #[cfg(not(unix))]
+    {
+        TcpListener::bind(bind_addr)
+            .await
+            .with_context(|| format!("binding to {bind_addr}"))
     }
 }
 
@@ -139,13 +225,13 @@ fn spawn_daemon(config_path: Option<PathBuf>, port_override: Option<u16>) -> Res
         // external log rotation (e.g., logrotate on Linux, newsyslog on macOS)
         // or pipe to a log aggregation service.
         let log_path = config_dir().join("llm-proxy.log");
-        let log_file = std::fs::File::options()
-            .create(true)
-            .append(true)
-            .open(&log_path)
+        // Open the log file born-private (0600) via `open_private_append`,
+        // avoiding the create-then-chmod TOCTOU window where the file briefly
+        // existed world-readable under the process umask. Daemon logs may
+        // reference requests/config and (per GAP-MED-1) redaction can leak key
+        // suffixes, so the file must never be readable by other local users.
+        let log_file = crate::permissions::open_private_append(&log_path)
             .with_context(|| format!("opening log file {}", log_path.display()))?;
-        // Set restrictive permissions on the log file.
-        set_private_permissions(&log_path)?;
         cmd.stdout(
             log_file
                 .try_clone()

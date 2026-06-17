@@ -25,6 +25,53 @@ pub fn config_dir() -> PathBuf {
         .join("llm-proxy")
 }
 
+/// Injectable path bundle used by the `stop`/`status` commands (audit
+/// MEDIUM-6).
+///
+/// Carries the [`llm_proxy_core::PidManager`] that resolves the PID file plus the config file
+/// path that `status` reads for the `listen` address. Bundling them lets the
+/// full command branching — stale-file cleanup, "no PID file found", and the
+/// complete SIGTERM→poll→SIGKILL escalation — be exercised against a
+/// tempdir-backed manager in tests instead of the process-global `config_dir`.
+#[derive(Debug, Clone)]
+pub struct CommandPaths {
+    pid_manager: llm_proxy_core::PidManager,
+    config_path: PathBuf,
+}
+
+impl CommandPaths {
+    /// Build a [`CommandPaths`] from an explicit PID manager and config path.
+    #[must_use]
+    pub fn new(pid_manager: llm_proxy_core::PidManager, config_path: PathBuf) -> Self {
+        Self {
+            pid_manager,
+            config_path,
+        }
+    }
+
+    /// The PID file manager backing `stop`/`status`.
+    #[must_use]
+    pub fn pid_manager(&self) -> &llm_proxy_core::PidManager {
+        &self.pid_manager
+    }
+
+    /// The config file `status` reads for the `listen` address.
+    #[must_use]
+    pub fn config_path(&self) -> &Path {
+        &self.config_path
+    }
+}
+
+/// Build [`CommandPaths`] for the default config directory + default config
+/// path (the values used by the real CLI).
+#[must_use]
+pub fn default_command_paths() -> CommandPaths {
+    CommandPaths::new(
+        llm_proxy_core::PidManager::new(config_dir()),
+        default_config_path(),
+    )
+}
+
 /// Config file path: `~/.config/llm-proxy/config.toml`.
 pub fn default_config_path() -> PathBuf {
     config_dir().join("config.toml")

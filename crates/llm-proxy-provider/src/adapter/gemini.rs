@@ -548,7 +548,9 @@ impl GeminiAdapter {
             .unwrap_or(if has_tool_use {
                 StopReason::ToolUse
             } else {
-                StopReason::Unknown
+                // Provider omitted `finish_reason`; record that it was absent
+                // rather than unmapped so the diagnostic is unambiguous.
+                StopReason::Unknown("absent".to_owned())
             });
 
         let usage = resp
@@ -569,11 +571,8 @@ impl GeminiAdapter {
     }
 
     /// Create a new stream decoder.
-    pub fn new_stream_decoder(
-        &self,
-        target: &ProviderAdapterTarget,
-    ) -> Box<dyn ProviderStreamDecoder + Send> {
-        Box::new(GeminiStreamDecoder {
+    pub fn new_stream_decoder(&self, target: &ProviderAdapterTarget) -> GeminiStreamDecoder {
+        GeminiStreamDecoder {
             model_ref: response_model_ref(target),
             started: false,
             content_index: 0,
@@ -582,7 +581,7 @@ impl GeminiAdapter {
             tool_blocks_closed: Vec::new(),
             tool_id_counter: 0,
             stop_sent: false,
-        })
+        }
     }
 }
 
@@ -639,7 +638,7 @@ mod tests {
             api_key: "test-key".into(),
             requested_model: "gemini-2.5-pro".into(),
             upstream_model: "gemini-2.5-pro".into(),
-            headers: std::collections::HashMap::new(),
+            headers: std::sync::Arc::new(std::collections::HashMap::new()),
         }
     }
 

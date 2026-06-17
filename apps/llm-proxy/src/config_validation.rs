@@ -58,12 +58,30 @@ mod tests {
         assert!(result.is_err());
     }
 
+    // `is_toml_config` matrix, split into one assertion per test so a single
+    // regression points at the exact input shape that broke (see LOW-20).
     #[test]
-    fn is_toml_config_various() {
+    fn is_toml_config_accepts_lowercase_toml() {
         assert!(is_toml_config(Path::new("a.toml")));
+    }
+
+    #[test]
+    fn is_toml_config_accepts_uppercase_toml() {
         assert!(is_toml_config(Path::new("a.TOML")));
+    }
+
+    #[test]
+    fn is_toml_config_rejects_json() {
         assert!(!is_toml_config(Path::new("a.json")));
+    }
+
+    #[test]
+    fn is_toml_config_rejects_missing_extension() {
         assert!(!is_toml_config(Path::new("a")));
+    }
+
+    #[test]
+    fn is_toml_config_rejects_double_extension() {
         assert!(!is_toml_config(Path::new("a.toml.bak")));
     }
 }

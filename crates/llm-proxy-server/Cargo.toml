@@ -18,7 +18,7 @@ tokio = { workspace = true, features = ["fs"] }
 tokio-stream = "0.1"
 tokio-util = { workspace = true }
 tower = { workspace = true }
-tower-http = { version = "0.6", features = ["trace", "timeout"] }
+tower-http = { version = "0.6", features = ["trace", "timeout", "catch-panic", "set-header", "cors"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

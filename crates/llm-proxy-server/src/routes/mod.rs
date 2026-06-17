@@ -1,13 +1,21 @@
+use std::sync::Arc;
+
 use axum::{
-    Router,
-    extract::{DefaultBodyLimit, Request},
-    http::StatusCode,
-    response::IntoResponse,
+    Json, Router,
+    extract::{DefaultBodyLimit, Request, State},
+    http::{HeaderValue, StatusCode, header},
+    middleware::{Next, from_fn, from_fn_with_state},
+    response::{IntoResponse, Response},
     routing::{get, post},
 };
 use tower::ServiceBuilder;
-use tower_http::{timeout::TimeoutLayer, trace::TraceLayer};
+use tower_http::{
+    catch_panic::CatchPanicLayer, cors::CorsLayer, set_header::SetResponseHeaderLayer,
+    timeout::TimeoutLayer, trace::TraceLayer,
+};
+use tracing::info_span;
 
+use crate::middleware::{RequestId, RequestIdGenerator};
 use crate::state::AppState;
 
 mod chat;
@@ -66,25 +74,51 @@ const NOT_FOUND_BODY_DRAIN_LIMIT: usize = 1024;
 /// streaming response body, this layer no longer times subsequent SSE events.
 pub fn router(state: AppState) -> Router {
     let timeout = state.request_timeout();
+    // Clone the shared request-id generator before `state` is moved into the
+    // router. The outermost `inject_request_id` layer generates one id per
+    // request and stamps it into extensions so the tracing span, the handler,
+    // and the `x-request-id` header all share a single id (audit MEDIUM-1).
+    let id_gen = state.request_id_gen.clone();
 
-    // Lightweight routes: tracing only, no timeout or body limit.
+    // Span factory shared by both routers: it reads the id injected by the
+    // outermost layer so every request span carries `request_id`, matching the
+    // id that later appears in handler log events and the response header.
+    let trace = TraceLayer::new_for_http().make_span_with(make_request_span);
+
+    // Lightweight routes: request-id injection + tracing only.
     let lightweight = Router::new()
         .route("/health", get(health))
         .route("/ready", get(ready))
         .route("/version", get(version))
-        .layer(TraceLayer::new_for_http());
+        .layer(
+            ServiceBuilder::new()
+                .layer(from_fn_with_state(id_gen.clone(), inject_request_id))
+                .layer(trace.clone()),
+        );
 
-    // API routes: body limit + tracing + timeout.
+    // API routes: request-id injection, error normalisation, body limit,
+    // tracing, timeout.
     //
-    // ServiceBuilder applies layers in reverse order (innermost first), so
-    // listing DefaultBodyLimit first makes it the outermost layer: the body
-    // size check runs immediately before the timeout starts ticking. This
-    // ensures a very large upload on a slow connection gets a 413 Payload Too
-    // Large response rather than a 408 Request Timeout.
+    // Layer order (outermost first):
+    //   1. `inject_request_id` -- generates the id and stamps it into extensions
+    //      so the span (step 4) and the handler see the same id.
+    //   2. `normalize_error_responses` -- rewrites the 408 (timeout) and 413
+    //      (body-limit) rejections emitted by layers below into protocol-shaped
+    //      JSON envelopes carrying `x-request-id` (audit MEDIUM-7). It runs
+    //      outside the body-limit/timeout layers so their rejections pass
+    //      through it on the way out.
+    //   3. `DefaultBodyLimit` -- caps the body the JSON extractors can buffer.
+    //   4. `TraceLayer` -- opens the request span (carrying the request id).
+    //   5. `TimeoutLayer` -- cancels handler work exceeding `request_timeout`.
     //
+    // Because the timeout and body-limit layers emit non-JSON, header-less
+    // rejections, step 2 normalises their final responses into the same
+    // Anthropic/OpenAI-shaped JSON schema every handler uses.
     let api_middleware = ServiceBuilder::new()
+        .layer(from_fn_with_state(id_gen, inject_request_id))
+        .layer(from_fn(normalize_error_responses))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
-        .layer(TraceLayer::new_for_http())
+        .layer(trace)
         .layer(TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,
             timeout,
@@ -107,7 +141,126 @@ pub fn router(state: AppState) -> Router {
         .merge(lightweight)
         .merge(api)
         .fallback(not_found)
+        // Protocol-aware 405: shape method-not-allowed responses through the
+        // same error envelope as 404/408/413 instead of axum's empty body
+        // (audit LOW-27).
+        .method_not_allowed_fallback(method_not_allowed)
+        // Global middleware (audit LOW-11, LOW-12) -- outermost wraps applied
+        // to the merged router so they cover every route and both fallbacks.
+        //   1. `CorsLayer::very_permissive()` -- explicit cross-origin policy
+        //      (LOW-12). The proxy is server-to-server; this documents the
+        //      implicit same-origin default as permissive and overridable.
+        //   2. `SetResponseHeaderLayer` -- `X-Content-Type-Options: nosniff`
+        //      on every response so JSON error bodies are not MIME-sniffed
+        //      into executable types (LOW-12).
+        //   3. `CatchPanicLayer` -- outermost (LOW-11): converts a panic in
+        //      any inner layer or handler into a 500 instead of dropping the
+        //      connection (which would otherwise present as a reset to the
+        //      client and bypass `TraceLayer`'s response-span logging).
+        .layer(CorsLayer::very_permissive())
+        .layer(SetResponseHeaderLayer::if_not_present(
+            header::X_CONTENT_TYPE_OPTIONS,
+            HeaderValue::from_static("nosniff"),
+        ))
+        .layer(CatchPanicLayer::new())
         .with_state(state)
+}
+
+/// Outermost middleware: mint one request id per request and store it in
+/// extensions as a [`RequestId`].
+///
+/// Running this before `TraceLayer` lets [`make_request_span`] stamp the same
+/// id onto the span that the handler later emits in events and attaches to the
+/// `x-request-id` header, restoring end-to-end correlation (audit MEDIUM-1).
+async fn inject_request_id(
+    State(id_gen): State<Arc<RequestIdGenerator>>,
+    mut req: Request,
+    next: Next,
+) -> Response {
+    let id = id_gen.next_id();
+    req.extensions_mut().insert(RequestId(id));
+    next.run(req).await
+}
+
+/// Build the per-request tracing span, carrying the injected request id.
+///
+/// `make_span_with` runs after [`inject_request_id`] has stamped the id into
+/// extensions, so the span records the same id that flows to the handler. If
+/// the id is somehow absent (e.g. a request that bypassed the injection
+/// layer), the span still opens with an empty id rather than panicking.
+///
+/// Only the request **path** is recorded, never the full URI (audit GAP-LOW-3).
+/// Several LLM SDKs fall back to authenticating via `?api_key=`/`?key=` query
+/// parameters; logging the full URI would leak those secrets into the tracing
+/// span and any downstream log sink. `req.uri().path()` strips the query.
+fn make_request_span(req: &Request) -> tracing::Span {
+    let id = req.extensions().get::<RequestId>();
+    info_span!(
+        "request",
+        request_id = %id.cloned().unwrap_or_else(|| RequestId(String::new())),
+        method = %req.method(),
+        path = %req.uri().path(),
+    )
+}
+
+/// Normalise the non-JSON error bodies emitted by the timeout and body-limit
+/// layers into protocol-shaped JSON (audit MEDIUM-7).
+///
+/// `TimeoutLayer` returns a bare 408 with an empty body, and `DefaultBodyLimit`
+/// surfaces a 413 as a plain-text `BytesRejection` from the extractors. Neither
+/// carries the `x-request-id` header (that is attached inside the handlers).
+/// This layer intercepts both statuses, rebuilds them via
+/// [`error_response::route_error_response`] with the correct protocol envelope,
+/// and stamps the `x-request-id` header from extensions so the 408/413 paths
+/// match the schema every handler returns.
+async fn normalize_error_responses(req: Request, next: Next) -> Response {
+    // Capture everything we need before the request is consumed by `next`.
+    let protocol = protocol_for_path(req.uri().path());
+    let request_id = req.extensions().get::<RequestId>().cloned();
+    let response = next.run(req).await;
+    let status = response.status();
+
+    if status != StatusCode::REQUEST_TIMEOUT && status != StatusCode::PAYLOAD_TOO_LARGE {
+        return response;
+    }
+
+    // Drain the (empty or small) layer-produced body so the connection is not
+    // left half-written; the replacement body is what the client sees.
+    if let Err(e) = axum::body::to_bytes(response.into_body(), NOT_FOUND_BODY_DRAIN_LIMIT).await {
+        tracing::trace!(error = %e, "draining layer rejection body failed");
+    }
+
+    let error = if status == StatusCode::REQUEST_TIMEOUT {
+        error_response::RouteError::RequestTimeout
+    } else {
+        error_response::RouteError::PayloadTooLarge
+    };
+
+    let mut rewritten = error_response::route_error_response(protocol, error);
+    if let Some(id) = request_id {
+        if let Ok(value) = id.0.parse() {
+            rewritten.headers_mut().insert("x-request-id", value);
+        }
+    }
+    rewritten
+}
+
+/// Select the client protocol for a request path, reusing the same prefix
+/// heuristic as [`not_found`].
+///
+/// The timeout / body-limit layers sit above routing, so on rejection they
+/// cannot know which protocol's envelope to render. This helper mirrors the
+/// 404 heuristic (`/v1/chat/...` -> OpenAI, otherwise Anthropic) so the
+/// normalised 408/413 bodies stay consistent with the handler the request
+/// *would* have reached.
+fn protocol_for_path(path: &str) -> error_response::ClientProtocol {
+    let is_openai_chat_path = path.contains("/v1/chat/completions")
+        || path.contains("/v1/chat/edits");
+    if is_openai_chat_path {
+        error_response::ClientProtocol::OpenAiChat
+    } else {
+        error_response::ClientProtocol::Anthropic
+    }
 }
 
 async fn not_found(req: Request) -> impl IntoResponse {
@@ -136,22 +289,77 @@ async fn not_found(req: Request) -> impl IntoResponse {
         tracing::trace!(error = %e, "body drain in 404 handler failed");
     }
 
-    // Match `/v1/chat/completions` and `/providers/{provider}/v1/chat/completions`
-    // more specifically to avoid false positives on unrelated `/v1/chat/` paths.
-    // The heuristic checks for the full `chat/completions` segment to reduce
-    // the chance of matching future non-OpenAI routes under `/v1/chat/`.
-    let is_openai_chat_path = path.contains("/v1/chat/completions")
-        || path.contains("/v1/chat/edits");
+    let protocol = protocol_for_path(&path);
+    error_response::route_error_response(
+        protocol,
+        error_response::RouteError::NotFound,
+    )
+}
 
-    if is_openai_chat_path {
-        error_response::route_error_response(
-            error_response::ClientProtocol::OpenAiChat,
-            error_response::RouteError::NotFound,
-        )
-    } else {
-        error_response::route_error_response(
-            error_response::ClientProtocol::Anthropic,
-            error_response::RouteError::NotFound,
-        )
+/// Protocol-aware 405 Method Not Allowed fallback (audit LOW-27).
+///
+/// A request that hits a registered path with a disallowed method (e.g. GET to
+/// a POST-only route) does **not** reach [`not_found`] -- axum's per-route
+/// `MethodRouter` returns a stock 405 with an empty body. Without this
+/// fallback the client receives an inconsistent, non-protocol-shaped response.
+///
+/// This handler mirrors [`not_found`]: it drains the body, selects the client
+/// protocol via the same path-prefix heuristic, and renders a
+/// protocol-shaped 405 envelope. Axum still sets the `Allow` header
+/// automatically unless the response sets it, which it does not, so the
+/// header is preserved.
+///
+/// NOTE on partial implementation: the ideal fix adds a
+/// `RouteError::MethodNotAllowed` variant to `error_response.rs` and reuses
+/// [`error_response::route_error_response`]. That file is owned by another
+/// agent in this pass, so this handler builds the same Anthropic/OpenAI
+/// envelope shapes inline. A follow-up should consolidate this into a
+/// `MethodNotAllowed` variant so all error paths share one encoder.
+async fn method_not_allowed(req: Request) -> impl IntoResponse {
+    let path = req.uri().path().to_owned();
+
+    // Drain the body for the same connection-cleanup reason as [`not_found`].
+    if let Err(e) = axum::body::to_bytes(req.into_body(), NOT_FOUND_BODY_DRAIN_LIMIT).await {
+        tracing::trace!(error = %e, "body drain in 405 handler failed");
     }
+
+    let protocol = protocol_for_path(&path);
+    method_not_allowed_response(protocol)
+}
+
+/// Encode the 405 body in the client protocol's envelope shape.
+///
+/// Mirrors the Anthropic `{"type":"error","error":{...}}` and OpenAI
+/// `{"error":{"message":...,"type":...,"code":null}}` shapes produced by
+/// `error_response` for the other status codes. Kept as a standalone helper so
+/// the shape construction is readable and testable in isolation.
+fn method_not_allowed_response(protocol: error_response::ClientProtocol) -> Response {
+    let status = StatusCode::METHOD_NOT_ALLOWED;
+    let mut response = match protocol {
+        error_response::ClientProtocol::Anthropic => {
+            let body = serde_json::json!({
+                "type": "error",
+                "error": {
+                    "type": "invalid_request_error",
+                    "message": "method not allowed",
+                },
+            });
+            (status, Json(body)).into_response()
+        }
+        error_response::ClientProtocol::OpenAiChat => {
+            let body = serde_json::json!({
+                "error": {
+                    "message": "method not allowed",
+                    "type": "invalid_request_error",
+                    "code": serde_json::Value::Null,
+                },
+            });
+            (status, Json(body)).into_response()
+        }
+    };
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    response
 }

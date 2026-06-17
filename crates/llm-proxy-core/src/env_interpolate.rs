@@ -1,6 +1,6 @@
 //! Shared environment-variable interpolation for configuration files.
 //!
-//! Provides a single [`interpolate_env_vars`] function and the compiled regex
+//! Provides a single [`crate::env_interpolate::interpolate_env_vars`] function and the compiled regex
 //! used by the TOML provider config ([`crate::provider_config`]).
 
 use regex::Regex;

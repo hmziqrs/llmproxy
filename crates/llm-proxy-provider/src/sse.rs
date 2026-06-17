@@ -31,27 +31,66 @@ pub struct SseFrame {
 // SseFramer
 // ---------------------------------------------------------------------------
 
+/// Default ceiling on the framer's internal byte buffer and on the size of a
+/// single in-progress frame's accumulated `data:` payload.
+///
+/// A real SSE line or frame is tiny (a JSON event is at most a few KiB). The
+/// framer drains complete lines as they arrive, so `buffer` only holds bytes
+/// between newlines; if a single line (no `\n`) exceeds this cap the upstream
+/// is dribbling non-terminated bytes and we fail fast instead of growing the
+/// buffer toward OOM. Likewise a `data:` frame that accumulates beyond this cap
+/// without a blank-line boundary is rejected. See audit GAP-MED-2.
+pub const DEFAULT_MAX_BUFFER_BYTES: usize = 1024 * 1024; // 1 MiB
+
 /// Buffered SSE frame parser.
 ///
 /// Call [`SseFramer::push_chunk`] with raw bytes as they arrive from the
 /// upstream. Call [`SseFramer::finish`] when the stream ends to emit any
 /// trailing partial frame.
-#[derive(Debug, Default)]
+///
+/// Both the raw byte buffer and an in-progress frame's `data:` payload are
+/// capped at `max_buffer_bytes` (default [`DEFAULT_MAX_BUFFER_BYTES`]); an
+/// upstream that would grow either beyond the cap yields
+/// [`ProviderError::SseFraming`] instead of unbounded allocation (audit
+/// GAP-MED-2).
+#[derive(Debug)]
 pub struct SseFramer {
     /// Buffered raw bytes. Stores partial UTF-8 sequences that arrived split
     /// across TCP chunks so that multi-byte characters (CJK, emoji) are not
     /// rejected by an intermediate `str::from_utf8` call.
     buffer: Vec<u8>,
+    /// Ceiling on `buffer` and on the accumulated `data:` frame payload.
+    max_buffer_bytes: usize,
     /// Current frame being assembled.
     current_event: Option<String>,
     current_id: Option<String>,
     current_data_lines: Vec<String>,
+    /// Running byte length of the strings in `current_data_lines` (the join
+    /// separators are negligible against `max_buffer_bytes`). Reset whenever a
+    /// frame is taken.
+    current_data_bytes: usize,
 }
 
 impl SseFramer {
-    /// Create a new empty framer.
+    /// Create a new empty framer with the default buffer cap
+    /// ([`DEFAULT_MAX_BUFFER_BYTES`]).
     pub fn new() -> Self {
-        Self::default()
+        Self::with_max_buffer_bytes(DEFAULT_MAX_BUFFER_BYTES)
+    }
+
+    /// Create a new empty framer with a custom buffer/frame cap.
+    ///
+    /// `max_buffer_bytes` bounds both a single unterminated line (the raw
+    /// buffer) and the accumulated `data:` payload of a single frame.
+    pub fn with_max_buffer_bytes(max_buffer_bytes: usize) -> Self {
+        Self {
+            buffer: Vec::new(),
+            max_buffer_bytes,
+            current_event: None,
+            current_id: None,
+            current_data_lines: Vec::new(),
+            current_data_bytes: 0,
+        }
     }
 
     /// Feed a raw byte chunk and return any completed frames.
@@ -60,9 +99,17 @@ impl SseFramer {
     /// Completed frames are emitted only when a blank line boundary is
     /// encountered. Returns an error if the accumulated buffer (after appending
     /// the chunk) contains invalid UTF-8 that cannot be explained by a partial
-    /// multi-byte sequence at the tail.
+    /// multi-byte sequence at the tail, or if the buffer exceeds
+    /// `max_buffer_bytes` (a misbehaving upstream dribbling non-newline bytes).
     pub fn push_chunk(&mut self, chunk: &[u8]) -> Result<Vec<SseFrame>, ProviderError> {
         self.buffer.extend_from_slice(chunk);
+        if self.buffer.len() > self.max_buffer_bytes {
+            return Err(ProviderError::SseFraming(format!(
+                "SSE input exceeded the {}-byte line buffer without a newline \
+                 (max_buffer_bytes); aborting to avoid unbounded growth",
+                self.max_buffer_bytes
+            )));
+        }
         self.drain_buffer()
     }
 
@@ -90,7 +137,7 @@ impl SseFramer {
                             frames.push(frame);
                         }
                     } else {
-                        self.process_line(trimmed);
+                        self.process_line(trimmed)?;
                     }
                 }
             }
@@ -100,7 +147,7 @@ impl SseFramer {
                 let text = str::from_utf8(&self.buffer).map_err(ProviderError::from)?;
                 let line = text.trim_end_matches('\r').to_owned();
                 self.buffer.clear();
-                self.process_line(&line);
+                self.process_line(&line)?;
             }
         }
 
@@ -150,7 +197,7 @@ impl SseFramer {
                     frames.push(frame);
                 }
             } else {
-                self.process_line(&line);
+                self.process_line(&line)?;
             }
         }
 
@@ -158,10 +205,10 @@ impl SseFramer {
     }
 
     /// Process a single non-blank SSE line.
-    fn process_line(&mut self, line: &str) {
+    fn process_line(&mut self, line: &str) -> Result<(), ProviderError> {
         // Ignore comments.
         if line.starts_with(':') {
-            return;
+            return Ok(());
         }
 
         // Parse field:value or field: value (space after colon is optional).
@@ -179,7 +226,7 @@ impl SseFramer {
                     self.current_id = Some(value.to_owned());
                 }
                 "data" => {
-                    self.current_data_lines.push(value.to_owned());
+                    self.push_data(value)?;
                 }
                 // Ignore unknown fields per spec.
                 _ => {}
@@ -195,16 +242,36 @@ impl SseFramer {
                     self.current_id = Some(String::new());
                 }
                 "data" => {
-                    self.current_data_lines.push(String::new());
+                    self.push_data("")?;
                 }
                 _ => {}
             }
         }
+        Ok(())
+    }
+
+    /// Append a `data:` value to the in-progress frame, enforcing the frame
+    /// cap so a misbehaving upstream emitting an unbounded multi-line `data:`
+    /// frame (no blank-line boundary) cannot grow the frame without bound.
+    fn push_data(&mut self, value: &str) -> Result<(), ProviderError> {
+        let next = self.current_data_bytes.saturating_add(value.len());
+        if next > self.max_buffer_bytes {
+            return Err(ProviderError::SseFraming(format!(
+                "SSE frame exceeded the {}-byte data payload cap without a \
+                 blank-line boundary (max_buffer_bytes); aborting to avoid \
+                 unbounded growth",
+                self.max_buffer_bytes
+            )));
+        }
+        self.current_data_bytes = next;
+        self.current_data_lines.push(value.to_owned());
+        Ok(())
     }
 
     /// Take the current accumulated frame if it has any data.
     fn take_current_frame(&mut self) -> Option<SseFrame> {
         let data_lines = std::mem::take(&mut self.current_data_lines);
+        self.current_data_bytes = 0;
         if data_lines.is_empty() && self.current_event.is_none() && self.current_id.is_none() {
             return None;
         }
@@ -215,6 +282,12 @@ impl SseFramer {
             id: self.current_id.take(),
             data,
         })
+    }
+}
+
+impl Default for SseFramer {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -588,6 +661,75 @@ mod tests {
         let frames = framer.push_chunk(b"data: second\n\n").unwrap();
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].data, "second");
+    }
+
+    // -----------------------------------------------------------------------
+    // Bounded-buffer / bounded-frame protections (audit GAP-MED-2)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn sse_framer_rejects_unterminated_line_exceeding_cap() {
+        // A single unterminated line (no newline) larger than the cap must
+        // error instead of growing the buffer without bound.
+        let mut framer = SseFramer::with_max_buffer_bytes(64);
+        let big = b"x".repeat(65);
+        let err = framer.push_chunk(&big).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("line buffer") && msg.contains("64"),
+            "expected line-buffer cap error mentioning 64, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn sse_framer_rejects_oversized_data_frame_exceeding_cap() {
+        // Many `data:` lines without a blank-line boundary must trip the frame
+        // cap rather than accumulating without bound.
+        let mut framer = SseFramer::with_max_buffer_bytes(64);
+        // Each line is "data: aaa..." (8 bytes of payload) repeated until the
+        // accumulated frame payload exceeds 64 bytes.
+        let line = b"data: aaaaaaaa\n"; // 8 payload bytes, no blank line
+        let mut last_ok = true;
+        for _ in 0..16 {
+            // 8 * 16 = 128 > 64, so this must eventually error.
+            let res = framer.push_chunk(line);
+            match res {
+                Ok(_) => last_ok = true,
+                Err(e) => {
+                    let msg = e.to_string();
+                    assert!(
+                        msg.contains("data payload cap") && msg.contains("64"),
+                        "expected frame cap error mentioning 64, got: {msg}"
+                    );
+                    last_ok = false;
+                    break;
+                }
+            }
+        }
+        assert!(
+            !last_ok,
+            "expected the frame cap to trip before 16 lines, but it never did"
+        );
+    }
+
+    #[test]
+    fn sse_framer_resets_data_byte_counter_after_frame_boundary() {
+        // After a blank-line boundary the per-frame byte counter resets, so a
+        // stream of many small legitimate frames (each under the cap) parses
+        // fine even though their total exceeds the cap.
+        let mut framer = SseFramer::with_max_buffer_bytes(32);
+        for i in 0..50 {
+            let chunk = format!("data: item{i}\n\n");
+            let frames = framer.push_chunk(chunk.as_bytes()).unwrap();
+            assert_eq!(frames.len(), 1, "frame {i} should emit");
+            assert_eq!(frames[0].data, format!("item{i}"));
+        }
+    }
+
+    #[test]
+    fn sse_framer_default_cap_is_one_mebibyte() {
+        // Sanity: the public default matches the documented constant.
+        assert_eq!(DEFAULT_MAX_BUFFER_BYTES, 1024 * 1024);
     }
 
     // -----------------------------------------------------------------------

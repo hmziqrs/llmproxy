@@ -6,7 +6,7 @@
 //!
 //! # Ordering
 //!
-//! All atomic operations use [`Ordering::Relaxed`] which is correct here
+//! All atomic operations use [`std::sync::atomic::Ordering::Relaxed`] which is correct here
 //! because the counters are monotonically increasing, used only for
 //! observability, and no synchronization invariants depend on their
 //! relative ordering.
@@ -42,6 +42,7 @@ pub struct Metrics {
     upstream_calls: AtomicI64,
     rate_limited: AtomicI64,
     deduplicated: AtomicI64,
+    client_cancelled: AtomicI64,
     /// Ring-buffer holding the last [`LATENCY_CAP`] latency samples.
     latencies: Mutex<VecDeque<Duration>>,
     /// Per-provider-model request counts. Key format: `"{provider}:{model}"`.
@@ -60,6 +61,7 @@ impl Metrics {
             upstream_calls: AtomicI64::new(0),
             rate_limited: AtomicI64::new(0),
             deduplicated: AtomicI64::new(0),
+            client_cancelled: AtomicI64::new(0),
             latencies: Mutex::new(VecDeque::with_capacity(LATENCY_CAP)),
             model_counts: Mutex::new(HashMap::new()),
         }
@@ -93,17 +95,52 @@ impl Metrics {
         buf.push_back(latency);
 
         // Bump per-provider-model counter.
-        let key = format!("{provider}{KEY_SEPARATOR}{model}");
+        //
+        // The composite key is built into a thread-local reusable buffer so no
+        // fresh `String` is heap-allocated per call. On the hot path (provider/
+        // model pair already tracked) the buffer is only borrowed for a `get`
+        // lookup; the cold insert path clones the buffer contents into an owned
+        // key exactly once per distinct pair (audit LOW-7).
+        thread_local! {
+            static KEY_BUF: std::cell::RefCell<String> =
+                std::cell::RefCell::new(String::with_capacity(64));
+        }
         let mut map = self.model_counts.lock().unwrap_or_else(|e| e.into_inner());
-        *map.entry(key).or_insert(0) += 1;
+        KEY_BUF.with(|buf| {
+            let mut buf = buf.borrow_mut();
+            buf.clear();
+            use std::fmt::Write;
+            let _ = write!(buf, "{provider}{KEY_SEPARATOR}{model}");
+            if let Some(count) = map.get_mut(buf.as_str()) {
+                *count += 1;
+            } else {
+                // Cold path: first sighting of this pair — pay for one owned key.
+                *map.entry(buf.clone()).or_insert(0) += 1;
+            }
+        });
     }
 
     /// Record a failed request.
     ///
     /// Increments `requests_failed` and `upstream_calls`.
+    ///
+    /// Reserve this for genuine upstream/decode failures. A client-initiated
+    /// disconnect (the client went away mid-stream, or the timeout layer tore
+    /// the connection down) is **not** a failure of the upstream call and must
+    /// be recorded via [`Metrics::record_client_cancel`] instead, so that the
+    /// error-rate SLO is not corrupted by users pressing "stop" (audit MEDIUM-5).
     pub fn record_failure(&self) {
         self.requests_failed.fetch_add(1, Ordering::Relaxed);
         self.upstream_calls.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a client-initiated cancellation.
+    ///
+    /// Distinct from [`Metrics::record_failure`]: this does not touch
+    /// `requests_failed` or `upstream_calls`, so client "stop" presses and
+    /// timeout teardowns do not inflate the error-rate SLO (audit MEDIUM-5).
+    pub fn record_client_cancel(&self) {
+        self.client_cancelled.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Record a rate-limited request.
@@ -130,6 +167,7 @@ impl Metrics {
         let upstream_calls = self.upstream_calls.load(Ordering::Relaxed);
         let rate_limited = self.rate_limited.load(Ordering::Relaxed);
         let deduplicated = self.deduplicated.load(Ordering::Relaxed);
+        let client_cancelled = self.client_cancelled.load(Ordering::Relaxed);
 
         let latencies = self
             .latencies
@@ -155,6 +193,7 @@ impl Metrics {
             upstream_calls,
             rate_limited,
             deduplicated,
+            client_cancelled,
             latencies,
             model_counts,
         }
@@ -191,6 +230,10 @@ pub struct Snapshot {
     pub rate_limited: i64,
     /// Requests that were deduplicated before reaching upstream.
     pub deduplicated: i64,
+    /// Requests whose client disconnected (or were torn down by the timeout
+    /// layer) mid-stream. Tracked separately from `requests_failed` so client
+    /// "stop" actions do not corrupt the error-rate SLO (audit MEDIUM-5).
+    pub client_cancelled: i64,
     /// Collected latency samples (up to 1 000 entries).
     pub latencies: Vec<Duration>,
     /// Per-provider-model request counts. Key format: `"{provider}:{model}"`.
@@ -273,6 +316,7 @@ mod tests {
         assert_eq!(snap.upstream_calls, 0);
         assert_eq!(snap.rate_limited, 0);
         assert_eq!(snap.deduplicated, 0);
+        assert_eq!(snap.client_cancelled, 0);
         assert!(snap.latencies.is_empty());
         assert!(snap.model_counts.is_empty());
     }
@@ -330,6 +374,21 @@ mod tests {
         let snap = m.get_snapshot();
         assert_eq!(snap.requests_failed, 2);
         assert_eq!(snap.upstream_calls, 2);
+    }
+
+    #[test]
+    fn record_client_cancel_is_distinct_from_failure() {
+        let m = Metrics::new();
+        m.record_client_cancel();
+        m.record_client_cancel();
+        m.record_failure();
+        let snap = m.get_snapshot();
+        assert_eq!(snap.client_cancelled, 2);
+        assert_eq!(snap.requests_failed, 1);
+        assert_eq!(
+            snap.upstream_calls, 1,
+            "client cancellation must NOT inflate upstream_calls / error-rate SLO"
+        );
     }
 
     #[test]

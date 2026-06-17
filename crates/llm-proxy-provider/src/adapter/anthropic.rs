@@ -39,7 +39,6 @@ const ANTHROPIC_DEFAULT_MAX_TOKENS: i32 = 4096;
 /// (`{ ... }`), so this unwrap is safe.  The function exists so the safety
 /// argument is documented in one place rather than repeated at each site.
 #[inline]
-#[allow(clippy::expect_used)]
 fn json_object(val: &mut serde_json::Value) -> &mut serde_json::Map<String, serde_json::Value> {
     val.as_object_mut()
         .expect("json! macro with {{...}} always produces a JSON object")
@@ -53,7 +52,6 @@ fn json_object(val: &mut serde_json::Value) -> &mut serde_json::Map<String, serd
 // Anthropic `tool_use_id` must match `^[A-Za-z0-9_]{0,256}$`.
 // SAFETY: The regex pattern is a compile-time constant that is syntactically
 // valid. This cannot fail at runtime.
-#[allow(clippy::expect_used)]
 static INVALID_TOOL_USE_ID_CHAR: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"[^A-Za-z0-9_]").expect("valid regex"));
 
@@ -814,7 +812,9 @@ impl AnthropicAdapter {
             .stop_reason
             .as_deref()
             .map(map_anthropic_stop_reason)
-            .unwrap_or(StopReason::Unknown);
+            // Provider omitted `stop_reason`; record that it was absent rather
+            // than unmapped so the diagnostic is unambiguous.
+            .unwrap_or(StopReason::Unknown("absent".to_owned()));
 
         let usage = build_anthropic_usage(
             resp.usage.input_tokens,
@@ -839,11 +839,8 @@ impl AnthropicAdapter {
     }
 
     /// Create a new stream decoder.
-    pub fn new_stream_decoder(
-        &self,
-        target: &ProviderAdapterTarget,
-    ) -> Box<dyn ProviderStreamDecoder + Send> {
-        Box::new(AnthropicStreamDecoder {
+    pub fn new_stream_decoder(&self, target: &ProviderAdapterTarget) -> AnthropicStreamDecoder {
+        AnthropicStreamDecoder {
             model_ref: response_model_ref(target),
             started: false,
             current_block_index: None,
@@ -851,7 +848,7 @@ impl AnthropicAdapter {
             tool_blocks: Vec::new(),
             tool_blocks_closed: Vec::new(),
             stop_sent: false,
-        })
+        }
     }
 }
 
@@ -867,7 +864,7 @@ fn map_anthropic_stop_reason(reason: &str) -> StopReason {
         "tool_use" => StopReason::ToolUse,
         "stop_sequence" => StopReason::StopSequence,
         "refusal" => StopReason::Refusal,
-        _ => StopReason::Unknown,
+        _ => StopReason::Unknown(reason.to_owned()),
     }
 }
 
@@ -1021,7 +1018,7 @@ mod tests {
             api_key: "test-key".into(),
             requested_model: "claude-sonnet-4-20250514".into(),
             upstream_model: "claude-sonnet-4-20250514".into(),
-            headers: std::collections::HashMap::new(),
+            headers: std::sync::Arc::new(std::collections::HashMap::new()),
         }
     }
 
@@ -1600,7 +1597,11 @@ mod tests {
             StopReason::StopSequence
         );
         assert_eq!(map_anthropic_stop_reason("refusal"), StopReason::Refusal);
-        assert_eq!(map_anthropic_stop_reason("unknown"), StopReason::Unknown);
+        // Unmapped values are preserved in Unknown(String) (GAP-LOW-9).
+        assert_eq!(
+            map_anthropic_stop_reason("unknown"),
+            StopReason::Unknown("unknown".to_owned())
+        );
     }
 
     // -- Missing tests: encode stop sequences, input_schema coercion ----------

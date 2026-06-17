@@ -447,7 +447,16 @@ mod tests {
         for task in tasks {
             assert!(task.await.unwrap().is_err());
         }
-        assert_eq!(count.load(Ordering::SeqCst), 1);
+        // GAP-LOW-4: discovery retries transient (5xx/transport) failures up to
+        // `MAX_TRANSIENT_RETRIES` times after the first attempt, so a
+        // persistently-failing endpoint is probed `1 + MAX_TRANSIENT_RETRIES`
+        // times. Single-flight still holds — only one refresh actually reaches
+        // `discover`; the others reuse the cached failure outcome — so the
+        // count is exactly the per-call probe budget, not 8× it.
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            1 + DiscoveryClient::MAX_TRANSIENT_RETRIES as usize
+        );
     }
 
     #[tokio::test]
@@ -459,7 +468,16 @@ mod tests {
         let models = service.catalog(&provider(endpoint), true).await.unwrap();
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].id, "cached-model");
-        assert_eq!(count.load(Ordering::SeqCst), 1);
+        // GAP-LOW-4: discovery retries transient (5xx/transport) failures up to
+        // `MAX_TRANSIENT_RETRIES` times after the first attempt, so a
+        // persistently-failing endpoint is probed `1 + MAX_TRANSIENT_RETRIES`
+        // times. Single-flight still holds — only one refresh actually reaches
+        // `discover`; the others reuse the cached failure outcome — so the
+        // count is exactly the per-call probe budget, not 8× it.
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            1 + DiscoveryClient::MAX_TRANSIENT_RETRIES as usize
+        );
         std::fs::remove_dir_all(directory).unwrap();
     }
 
@@ -478,7 +496,16 @@ mod tests {
         let result = service.catalog(&provider, true).await;
 
         assert!(result.is_err());
-        assert_eq!(count.load(Ordering::SeqCst), 1);
+        // GAP-LOW-4: discovery retries transient (5xx/transport) failures up to
+        // `MAX_TRANSIENT_RETRIES` times after the first attempt, so a
+        // persistently-failing endpoint is probed `1 + MAX_TRANSIENT_RETRIES`
+        // times. Single-flight still holds — only one refresh actually reaches
+        // `discover`; the others reuse the cached failure outcome — so the
+        // count is exactly the per-call probe budget, not 8× it.
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            1 + DiscoveryClient::MAX_TRANSIENT_RETRIES as usize
+        );
     }
 
     // -- load_disk_cache validation edge cases ---------------------------------

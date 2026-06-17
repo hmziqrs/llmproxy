@@ -5,9 +5,36 @@
 //! configurable so that tests can point at a temporary directory.
 
 use std::io::Write;
+use std::num::ParseIntError;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+/// Errors returned by [`PidManager`] operations.
+///
+/// Typed (rather than `anyhow::Error`) so that callers of this public library
+/// API can inspect or branch on the failure mode. Each variant carries the
+/// filesystem path involved so the error stays actionable without the caller
+/// having to supply that context (GAP-LOW-14).
+#[derive(Debug, thiserror::Error)]
+pub enum PidError {
+    /// A filesystem I/O error occurred while reading, writing, or removing a
+    /// PID file, or while creating its parent directory.
+    #[error("PID file I/O failed at {path}: {source}")]
+    Io {
+        /// The filesystem path involved in the failed operation.
+        path: PathBuf,
+        /// The underlying I/O error. (Named `source` so thiserror uses it as the
+        /// [`std::error::Error::source`] chain root.)
+        source: std::io::Error,
+    },
+    /// The PID file contents could not be parsed as a `u32`.
+    #[error("invalid PID contents in {path}: {source}")]
+    Parse {
+        /// The PID file path whose contents were unparseable.
+        path: PathBuf,
+        /// The underlying parse error.
+        source: ParseIntError,
+    },
+}
 
 /// Manages a PID file for daemon process tracking.
 #[derive(Debug, Clone)]
@@ -42,18 +69,21 @@ impl PidManager {
     }
 
     /// Read the PID from the PID file. Returns `None` if the file does not exist.
-    pub fn read_pid(&self) -> Result<Option<u32>> {
+    pub fn read_pid(&self) -> Result<Option<u32>, PidError> {
         let content = match std::fs::read_to_string(&self.pid_file) {
             Ok(c) => c,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => {
-                return Err(e).with_context(|| format!("reading PID file {}", self.pid_file.display()));
+                return Err(PidError::Io {
+                    path: self.pid_file.clone(),
+                    source: e,
+                });
             }
         };
-        let pid: u32 = content
-            .trim()
-            .parse()
-            .with_context(|| format!("parsing PID from {}", self.pid_file.display()))?;
+        let pid: u32 = content.trim().parse().map_err(|source| PidError::Parse {
+            path: self.pid_file.clone(),
+            source,
+        })?;
         Ok(Some(pid))
     }
 
@@ -62,9 +92,11 @@ impl PidManager {
     /// Creates the config directory if it does not already exist.
     /// The PID file is written atomically via a temporary file and rename,
     /// so readers never see a partial/empty file.
-    pub fn write_pid(&self) -> Result<()> {
-        std::fs::create_dir_all(&self.config_dir)
-            .with_context(|| format!("creating directory {}", self.config_dir.display()))?;
+    pub fn write_pid(&self) -> Result<(), PidError> {
+        std::fs::create_dir_all(&self.config_dir).map_err(|source| PidError::Io {
+            path: self.config_dir.clone(),
+            source,
+        })?;
         let pid = std::process::id();
 
         // Write to a temporary file first, then rename atomically.
@@ -79,29 +111,40 @@ impl PidManager {
                     .truncate(true)
                     .mode(0o644)
                     .open(&tmp_path)
-                    .with_context(|| format!("creating temp PID file {}", tmp_path.display()))?
+                    .map_err(|source| PidError::Io {
+                        path: tmp_path.clone(),
+                        source,
+                    })?
             };
             #[cfg(not(unix))]
-            let mut f = std::fs::File::create(&tmp_path)
-                .with_context(|| format!("creating temp PID file {}", tmp_path.display()))?;
+            let mut f = std::fs::File::create(&tmp_path).map_err(|source| PidError::Io {
+                path: tmp_path.clone(),
+                source,
+            })?;
 
-            write!(f, "{pid}")
-                .with_context(|| format!("writing PID file {}", tmp_path.display()))?;
+            write!(f, "{pid}").map_err(|source| PidError::Io {
+                path: tmp_path.clone(),
+                source,
+            })?;
         }
-        std::fs::rename(&tmp_path, &self.pid_file)
-            .with_context(|| format!("renaming PID file {}", self.pid_file.display()))?;
+        std::fs::rename(&tmp_path, &self.pid_file).map_err(|source| PidError::Io {
+            path: self.pid_file.clone(),
+            source,
+        })?;
         Ok(())
     }
 
     /// Remove the PID file.
     ///
     /// Silently succeeds if the file does not exist.
-    pub fn remove_pid(&self) -> Result<()> {
+    pub fn remove_pid(&self) -> Result<(), PidError> {
         match std::fs::remove_file(&self.pid_file) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(e)
-                .with_context(|| format!("removing PID file {}", self.pid_file.display())),
+            Err(e) => Err(PidError::Io {
+                path: self.pid_file.clone(),
+                source: e,
+            }),
         }
     }
 
@@ -144,7 +187,7 @@ impl PidManager {
 
 #[cfg(test)]
 mod tests {
-    use super::PidManager;
+    use super::{PidError, PidManager};
 
     /// TestWritePIDAndGetPID_RoundTrip: writing a PID and reading it back
     /// should return the same value.
@@ -172,7 +215,8 @@ mod tests {
     }
 
     /// TestGetPID_InvalidContent: reading a PID file with non-numeric content
-    /// should return an error.
+    /// should return a typed [`PidError::Parse`] carrying the offending path
+    /// (GAP-LOW-14: the error is inspectable, not erased into `anyhow::Error`).
     #[test]
     fn read_pid_invalid_content() {
         let dir = tempfile::tempdir().expect("create temp dir");
@@ -181,8 +225,33 @@ mod tests {
         // Write garbage to the PID file.
         std::fs::write(mgr.pid_file(), "not-a-number").expect("write garbage");
 
-        let result = mgr.read_pid();
-        assert!(result.is_err(), "expected error for invalid PID content");
+        match mgr.read_pid() {
+            Err(PidError::Parse { path, source }) => {
+                assert_eq!(path, *mgr.pid_file(), "typed error should carry the PID file path");
+                let _ = source; // ParseIntError present; not asserting its exact wording
+            }
+            other => panic!("expected PidError::Parse, got {other:?}"),
+        }
+    }
+
+    /// TestReadPID_IoErrorVariant: a read failure other than "not found" should
+    /// surface as a typed [`PidError::Io`] with the path, so callers can branch
+    /// on the failure mode (GAP-LOW-14).
+    #[test]
+    fn read_pid_io_error_is_typed() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let mgr = PidManager::new(dir.path());
+
+        // Replace the expected PID file path with a directory, so reading it as
+        // a file yields an I/O error (not NotFound).
+        std::fs::create_dir(mgr.pid_file()).expect("create dir at pid path");
+
+        match mgr.read_pid() {
+            Err(PidError::Io { path, .. }) => {
+                assert_eq!(path, *mgr.pid_file(), "typed Io error should carry the PID file path");
+            }
+            other => panic!("expected PidError::Io, got {other:?}"),
+        }
     }
 
     /// TestIsProcessRunning_CurrentProcess: the current process PID should be

@@ -1,10 +1,10 @@
 //! Integration tests for the `validate` command.
 //!
-//! Covers valid TOML, invalid TOML, wrong extension, and edge cases.
+//! Covers end-to-end `cmd_validate` behaviour: valid TOML, invalid TOML, and
+//! the wrong-extension error surfacing through the command. The pure extension
+//! accept/reject matrix is exercised as per-case unit tests in
+//! `src/config_validation.rs` (see LOW-20).
 
-use std::path::Path;
-
-use llm_proxy_app::config_validation::{is_toml_config, validate_toml_extension};
 use llm_proxy_app::defaults::DEFAULT_CONFIG_TOML;
 use llm_proxy_app::commands::cmd_validate;
 
@@ -41,30 +41,4 @@ fn validate_rejects_json_extension() {
         msg.contains("unsupported") || msg.contains("extension"),
         "error should mention unsupported extension: {msg}"
     );
-}
-
-#[test]
-fn validate_rejects_no_extension() {
-    let result = validate_toml_extension(Path::new("config"));
-    assert!(result.is_err());
-}
-
-#[test]
-fn validate_accepts_uppercase_toml() {
-    let dir = tempfile::tempdir().unwrap();
-    let config = dir.path().join("config.TOML");
-    std::fs::write(&config, DEFAULT_CONFIG_TOML).unwrap();
-
-    // Extension check should pass.
-    assert!(is_toml_config(&config));
-    assert!(validate_toml_extension(&config).is_ok());
-}
-
-#[test]
-fn is_toml_config_various() {
-    assert!(is_toml_config(Path::new("a.toml")));
-    assert!(is_toml_config(Path::new("a.TOML")));
-    assert!(!is_toml_config(Path::new("a.json")));
-    assert!(!is_toml_config(Path::new("a")));
-    assert!(!is_toml_config(Path::new("a.toml.bak")));
 }

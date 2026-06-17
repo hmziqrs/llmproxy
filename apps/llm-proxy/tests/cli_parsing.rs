@@ -100,9 +100,20 @@ fn parse_autostart_enable() {
         "llm-proxy", "autostart", "enable", "--config", "c.toml", "-p", "8080",
     ]).unwrap();
     let Commands::Autostart { action } = cli.command else { panic!("expected autostart") };
-    let AutostartAction::Enable { config, port } = action else { panic!("expected enable") };
+    let AutostartAction::Enable { config, port, force } = action else { panic!("expected enable") };
     assert_eq!(config.unwrap().to_str(), Some("c.toml"));
     assert_eq!(port, Some(8080));
+    assert!(!force, "--force should default to false");
+}
+
+#[test]
+fn parse_autostart_enable_force() {
+    let cli = Cli::try_parse_from([
+        "llm-proxy", "autostart", "enable", "--force",
+    ]).unwrap();
+    let Commands::Autostart { action } = cli.command else { panic!("expected autostart") };
+    let AutostartAction::Enable { force, .. } = action else { panic!("expected enable") };
+    assert!(force, "--force must parse to true");
 }
 
 #[test]

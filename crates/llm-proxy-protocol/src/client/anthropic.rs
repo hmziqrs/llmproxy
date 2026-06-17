@@ -223,7 +223,7 @@ fn decode_content_block(block: ContentBlock) -> Result<CoreContent, ProtocolErro
                 name,
                 input: block
                     .input
-                    .unwrap_or(serde_json::Value::Object(serde_json::Map::new())),
+                    .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new())),
             })
         }
         "tool_result" => {
@@ -562,7 +562,13 @@ fn encode_stop_reason(reason: StopReason) -> String {
             );
             "end_turn".to_owned()
         }
-        StopReason::Unknown => "end_turn".to_owned(),
+        StopReason::Unknown(original) => {
+            tracing::warn!(
+                original_stop_reason = %original,
+                "StopReason::Unknown mapped to 'end_turn' in Anthropic stop_reason"
+            );
+            "end_turn".to_owned()
+        }
     }
 }
 
@@ -1339,7 +1345,7 @@ mod tests {
             (StopReason::StopSequence, "stop_sequence"),
             (StopReason::Refusal, "end_turn"),
             (StopReason::Error, "end_turn"),
-            (StopReason::Unknown, "end_turn"),
+            (StopReason::Unknown("test-unknown".to_owned()), "end_turn"),
         ];
         for (reason, expected) in cases {
             assert_eq!(encode_stop_reason(reason), expected);

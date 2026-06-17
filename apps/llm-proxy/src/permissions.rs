@@ -72,6 +72,38 @@ pub fn create_private_file(path: &std::path::Path, content: &[u8]) -> Result<()>
     Ok(())
 }
 
+/// Open a file for appending, creating it if absent, with owner-only (0600)
+/// permissions.
+///
+/// Unlike [`create_private_file`] this uses `create(true)` (not `create_new`)
+/// so it is suitable for append-mode sinks such as the daemon log file. On
+/// Unix the 0600 mode is applied atomically at creation via `OpenOptionsExt`,
+/// avoiding the create-then-chmod TOCTOU window where the file briefly exists
+/// under the process umask (typically 0644, world-readable). On non-Unix it
+/// falls back to create-then-chmod.
+pub fn open_private_append(path: &std::path::Path) -> Result<std::fs::File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(path)
+            .with_context(|| format!("opening {}", path.display()))
+    }
+    #[cfg(not(unix))]
+    {
+        let f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .with_context(|| format!("opening {}", path.display()))?;
+        set_private_permissions(path)?;
+        Ok(f)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -98,5 +130,29 @@ mod tests {
         std::fs::write(&path, "existing").unwrap();
         let result = create_private_file(&path, b"new content");
         assert!(result.is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_private_append_creates_with_0600() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("daemon.log");
+        // New file: must be created owner-only (no umask window).
+        {
+            let mut f = open_private_append(&path).unwrap();
+            writeln!(f, "first line").unwrap();
+        }
+        let mode = path.metadata().unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "log file must be born 0600");
+        // Re-open (append to existing): must still succeed and keep appending.
+        {
+            let mut f = open_private_append(&path).unwrap();
+            writeln!(f, "second line").unwrap();
+        }
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert!(contents.contains("first line"));
+        assert!(contents.contains("second line"));
     }
 }

@@ -54,7 +54,7 @@ pub use catalog::{
 };
 pub use error::CoreError;
 pub use metrics::{Metrics, Snapshot};
-pub use pid::PidManager;
+pub use pid::{PidError, PidManager};
 pub use provider_config::{
     AppConfig, AuthStyle, ConfigValidationError, ProviderAdapterConfig, ProviderCatalogConfig,
     ProviderCatalogMode, ProviderConfig, ProviderDiscoveryConfig, ProviderDiscoveryKind,

@@ -1,7 +1,5 @@
 //! Provider model catalog types, merging, and filtering.
 
-use std::collections::BTreeMap;
-
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
@@ -31,24 +29,79 @@ pub struct CatalogFile {
 }
 
 /// Parse a persisted catalog cache file.
+///
+/// Returns [`CoreError::ConfigParse`] when the input is not valid TOML or does
+/// not match the on-disk catalog schema.
+///
+/// ```
+/// use llm_proxy_core::parse_catalog_file;
+///
+/// let raw = r#"
+/// [catalog]
+/// provider = "example"
+/// source = "live"
+/// generated_at = "2026-06-09T00:00:00Z"
+///
+/// [[catalog.models]]
+/// id = "gpt-4"
+/// "#;
+/// let file = parse_catalog_file(raw).expect("valid catalog TOML");
+/// assert_eq!(file.catalog.provider, "example");
+/// assert_eq!(file.catalog.models.len(), 1);
+/// assert_eq!(file.catalog.models[0].id, "gpt-4");
+/// ```
 pub fn parse_catalog_file(raw: &str) -> Result<CatalogFile, CoreError> {
     toml::from_str(raw).map_err(CoreError::ConfigParse)
 }
 
 /// Merge static and discovered catalog entries according to provider config.
+///
+/// In `Hybrid` mode, static entries override discovered entries that share the
+/// same `id` (static metadata wins). Each input is borrowed, so each retained
+/// entry is cloned exactly once — no second clone of the `id` for a throwaway
+/// map key.
+///
+/// ```
+/// use std::time::Duration;
+/// use llm_proxy_core::{ProviderCatalogConfig, ProviderCatalogMode, StaticModelCatalogEntry, merge_catalog};
+/// use llm_proxy_core::ProviderRouteKind;
+///
+/// let cfg = ProviderCatalogConfig {
+///     mode: ProviderCatalogMode::Discovered,
+///     enforce: false,
+///     cache_ttl: Duration::from_secs(60),
+///     allow: vec!["*".to_owned()],
+///     deny: Vec::new(),
+///     models: Vec::new(),
+/// };
+/// let discovered = vec![StaticModelCatalogEntry {
+///     id: "gpt-4".to_owned(),
+///     display_name: None,
+///     supports: vec![ProviderRouteKind::ChatCompletions],
+///     context_length: None,
+/// }];
+/// let merged = merge_catalog(&cfg, &discovered);
+/// assert_eq!(merged.len(), 1);
+/// assert_eq!(merged[0].id, "gpt-4");
+/// ```
 #[must_use]
 pub fn merge_catalog(
     config: &ProviderCatalogConfig,
     discovered: &[StaticModelCatalogEntry],
 ) -> Vec<StaticModelCatalogEntry> {
-    let mut entries = BTreeMap::<String, StaticModelCatalogEntry>::new();
+    // Deduplicate by id via a `Vec` instead of a `BTreeMap<String, _>` so the
+    // id is not cloned a second time purely to serve as a discarded map key
+    // (the value already carries its own `id`). The catalog is bounded and
+    // built only on the cold refresh path, so the linear override lookup is
+    // cheaper than the redundant allocation it replaces.
+    let mut entries: Vec<StaticModelCatalogEntry> = Vec::new();
 
     if matches!(
         config.mode,
         ProviderCatalogMode::Discovered | ProviderCatalogMode::Hybrid
     ) {
         for model in discovered {
-            entries.insert(model.id.clone(), model.clone());
+            entries.push(model.clone());
         }
     }
     if matches!(
@@ -56,24 +109,64 @@ pub fn merge_catalog(
         ProviderCatalogMode::Static | ProviderCatalogMode::Hybrid
     ) {
         for model in &config.models {
-            entries.insert(model.id.clone(), model.clone());
+            if let Some(existing) = entries.iter_mut().find(|entry| entry.id == model.id) {
+                // Static metadata overrides the discovered entry for this id.
+                *existing = model.clone();
+            } else {
+                entries.push(model.clone());
+            }
         }
     }
 
+    // Restore the deterministic by-id ordering that the previous `BTreeMap`
+    // dedup provided as a side effect of keyed insertion. A stable, sorted
+    // model list is an observable contract of the `/v1/models` endpoint
+    // (clients paginate and snapshot-test on it; `first_id`/`last_id` depend on
+    // a fixed order), so the clone-elimination refactor above must not drop it.
+    // Sorting the owned Vec in place by the already-present `id` field avoids
+    // the second `id.clone()` that the `BTreeMap<String, _>` key required, so
+    // this keeps the GAP-LOW-7 benefit without sacrificing sorted output. Ids
+    // are unique after dedup, so the unstable variant is safe.
+    entries.sort_unstable_by(|a, b| a.id.cmp(&b.id));
     entries
-        .into_values()
+        .into_iter()
         .filter(|model| model_allowed(&model.id, &config.allow, &config.deny))
         .collect()
 }
 
 /// Return whether a model ID passes the configured glob filters.
+///
+/// A model is allowed when it matches the `allow` list (or `allow` is empty)
+/// and is not matched by `deny`, unless a non-wildcard `allow` pattern
+/// explicitly includes it (which overrides `deny`).
+///
+/// ```
+/// use llm_proxy_core::model_allowed;
+///
+/// // Empty allow list permits everything not explicitly denied.
+/// assert!(model_allowed("gpt-4", &[], &[]));
+/// // Glob allow pattern matches.
+/// assert!(model_allowed("gpt-4", &["gpt-*".to_owned()], &[]));
+/// // Deny excludes unless a concrete allow pattern overrides it.
+/// assert!(!model_allowed("gpt-4-preview", &["*".to_owned()], &["*-preview".to_owned()]));
+/// assert!(model_allowed(
+///     "gpt-4-preview",
+///     &["*".to_owned(), "gpt-4-preview".to_owned()],
+///     &["*-preview".to_owned()],
+/// ));
+/// ```
 #[must_use]
 pub fn model_allowed(model: &str, allow: &[String], deny: &[String]) -> bool {
-    let allowed = allow.is_empty() || allow.iter().any(|pattern| glob_matches(pattern, model));
+    // Evaluate each `allow` pattern against `model` exactly once; both
+    // `allowed` and `explicitly_allowed` are derived from this single pass so
+    // `glob_matches` (which takes the `GLOB_CACHE` mutex) isn't re-run.
+    let matched: Vec<bool> = allow.iter().map(|pattern| glob_matches(pattern, model)).collect();
+    let allowed = allow.is_empty() || matched.iter().any(|&m| m);
     let denied = deny.iter().any(|pattern| glob_matches(pattern, model));
     let explicitly_allowed = allow
         .iter()
-        .any(|pattern| pattern != "*" && glob_matches(pattern, model));
+        .zip(matched.iter())
+        .any(|(pattern, &m)| pattern != "*" && m);
     allowed && (!denied || explicitly_allowed)
 }
 
@@ -177,6 +270,58 @@ mod tests {
             .find(|m| m.id == "other")
             .expect("other model should be present");
         assert!(other.display_name.is_none());
+    }
+
+    #[test]
+    fn merge_catalog_sorts_output_by_id() {
+        // Regression guard for the sorted-by-id contract: the `/v1/models`
+        // endpoint paginates and snapshot-tests on a stable, lexicographic
+        // model order. An earlier BTreeMap dedup provided this for free; the
+        // Vec dedup that replaced it does not, so the sort is now explicit.
+        // Feed models in deliberately non-sorted insertion order.
+        let cfg = ProviderCatalogConfig {
+            mode: ProviderCatalogMode::Discovered,
+            enforce: false,
+            cache_ttl: Duration::from_secs(60),
+            allow: vec!["*".to_owned()],
+            deny: Vec::new(),
+            models: Vec::new(),
+        };
+        let discovered = vec![
+            model("deepseek-v3.1", None),
+            model("claude-sonnet-4", None),
+            model("anthropic/claude-opus", None),
+        ];
+        let merged = merge_catalog(&cfg, &discovered);
+        let ids: Vec<&str> = merged.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["anthropic/claude-opus", "claude-sonnet-4", "deepseek-v3.1"],
+            "merge_catalog must return entries sorted ascending by id"
+        );
+    }
+
+    #[test]
+    fn merge_catalog_sorts_after_static_override() {
+        // The static-override path updates a discovered entry in place (keeping
+        // its discovered-list position) rather than re-appending, so the final
+        // sort must run AFTER the override. Verify a static entry that overrides
+        // a discovered one still lands in its correct sorted position.
+        let cfg = ProviderCatalogConfig {
+            mode: ProviderCatalogMode::Hybrid,
+            enforce: false,
+            cache_ttl: Duration::from_secs(60),
+            allow: vec!["*".to_owned()],
+            deny: Vec::new(),
+            models: vec![
+                model("zzz-tail", None),
+                model("aaa-head", None),
+            ],
+        };
+        let discovered = vec![model("mmm-middle", None)];
+        let merged = merge_catalog(&cfg, &discovered);
+        let ids: Vec<&str> = merged.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, vec!["aaa-head", "mmm-middle", "zzz-tail"]);
     }
 
     #[test]

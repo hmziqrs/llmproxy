@@ -101,9 +101,14 @@ pub async fn cmd_models(
                                 catalog: CatalogFileMetadata {
                                     provider: provider.name.clone(),
                                     source: "live".to_owned(),
+                                    // Rfc3339 formatting of a UTC OffsetDateTime is
+                                    // infallible in practice, but the time crate models it
+                                    // as fallible. Propagate a fallback epoch timestamp
+                                    // instead of panicking after a successful live fetch,
+                                    // mirroring catalog_service::now_rfc3339.
                                     generated_at: time::OffsetDateTime::now_utc()
                                         .format(&time::format_description::well_known::Rfc3339)
-                                        .expect("Rfc3339 formatting is infallible for a valid OffsetDateTime"),
+                                        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_owned()),
                                     models: discovered,
                                 },
                             },

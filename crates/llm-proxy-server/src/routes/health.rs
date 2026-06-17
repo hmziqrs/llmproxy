@@ -1,9 +1,24 @@
-use axum::{Json, extract::State, http::StatusCode};
-use serde::Serialize;
+use axum::{Json, extract::{Query, State}, http::StatusCode};
+use serde::{Deserialize, Serialize};
 
 use crate::state::AppState;
 
+/// Query parameters for `/health`.
+///
+/// `metrics=true` opts in to the aggregate operational counters. Without it the
+/// health body omits metrics entirely: the endpoint is unauthenticated, so
+/// operational telemetry is not exposed by default (LOW-13).
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct HealthQuery {
+    #[serde(default)]
+    metrics: bool,
+}
+
 /// Health check response body.
+///
+/// `metrics` is omitted from the serialized body unless the caller opts in via
+/// `?metrics=true`, so a bare unauthenticated `/health` probe reveals no
+/// operational telemetry (LOW-13).
 ///
 /// Note: `#[serde(deny_unknown_fields)]` is intentionally omitted because these
 /// structs are outbound-only (`Serialize`, never `Deserialize` from external
@@ -13,7 +28,8 @@ use crate::state::AppState;
 pub(crate) struct HealthBody {
     status: &'static str,
     service: String,
-    metrics: HealthMetrics,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metrics: Option<HealthMetrics>,
 }
 
 /// Metrics snapshot included in the health response.
@@ -28,29 +44,42 @@ struct HealthMetrics {
     upstream_calls: i64,
     rate_limited: i64,
     deduplicated: i64,
+    client_cancelled: i64,
 }
 
-/// Liveness probe with aggregate metrics.
+/// Liveness probe.
 ///
-/// Per-provider and per-model counters are intentionally omitted because this
-/// endpoint is unauthenticated.
-pub async fn health(State(state): State<AppState>) -> (StatusCode, Json<HealthBody>) {
-    let snapshot = state.metrics.get_snapshot();
+/// Returns a minimal `{status, service}` body by default. Aggregate
+/// operational counters are included only when the caller opts in via
+/// `?metrics=true`; the endpoint is unauthenticated, so telemetry is not
+/// exposed to bare probes (LOW-13). Per-provider and per-model counters are
+/// always omitted.
+pub async fn health(
+    State(state): State<AppState>,
+    Query(query): Query<HealthQuery>,
+) -> (StatusCode, Json<HealthBody>) {
+    let metrics = if query.metrics {
+        let snapshot = state.metrics.get_snapshot();
+        Some(HealthMetrics {
+            requests_received: snapshot.requests_received,
+            requests_streamed: snapshot.requests_streamed,
+            requests_success: snapshot.requests_success,
+            requests_failed: snapshot.requests_failed,
+            upstream_calls: snapshot.upstream_calls,
+            rate_limited: snapshot.rate_limited,
+            deduplicated: snapshot.deduplicated,
+            client_cancelled: snapshot.client_cancelled,
+        })
+    } else {
+        None
+    };
 
     (
         StatusCode::OK,
         Json(HealthBody {
             status: "ok",
             service: state.server_name().to_owned(),
-            metrics: HealthMetrics {
-                requests_received: snapshot.requests_received,
-                requests_streamed: snapshot.requests_streamed,
-                requests_success: snapshot.requests_success,
-                requests_failed: snapshot.requests_failed,
-                upstream_calls: snapshot.upstream_calls,
-                rate_limited: snapshot.rate_limited,
-                deduplicated: snapshot.deduplicated,
-            },
+            metrics,
         }),
     )
 }

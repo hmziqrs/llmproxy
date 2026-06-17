@@ -4,7 +4,7 @@
 
 use std::path::PathBuf;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 
 use crate::paths::config_dir;
 #[cfg(target_os = "macos")]
@@ -18,7 +18,17 @@ use crate::platform::format_plist;
 use crate::platform::format_desktop_entry;
 
 /// Run the `autostart enable` command.
-pub fn cmd_autostart_enable(config_path: Option<PathBuf>, port: Option<u16>) -> Result<()> {
+///
+/// If the launchd plist (macOS) or `.desktop` entry (Linux) already exists,
+/// the command aborts unless `force` is set, mirroring `cmd_init`'s overwrite
+/// guard. This prevents a hand-edited unit (`KeepAlive`, custom
+/// `EnvironmentVariables`, `StartInterval`, …) being silently rewritten on the
+/// next `enable` (audit GAP-MED-4).
+pub fn cmd_autostart_enable(
+    config_path: Option<PathBuf>,
+    port: Option<u16>,
+    force: bool,
+) -> Result<()> {
     let dir = config_dir();
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("creating directory {}", dir.display()))?;
@@ -50,6 +60,8 @@ pub fn cmd_autostart_enable(config_path: Option<PathBuf>, port: Option<u16>) -> 
         std::fs::create_dir_all(plist_dir)
             .with_context(|| format!("creating {}", plist_dir.display()))?;
 
+        require_overwrite_ok(&plist_path, "launchd plist", force)?;
+
         std::fs::write(&plist_path, plist_content)
             .with_context(|| format!("writing {}", plist_path.display()))?;
         // Set restrictive permissions on the plist file.
@@ -66,6 +78,7 @@ pub fn cmd_autostart_enable(config_path: Option<PathBuf>, port: Option<u16>) -> 
         std::fs::create_dir_all(&autostart_dir)
             .with_context(|| format!("creating {}", autostart_dir.display()))?;
         let desktop_path = autostart_dir.join("llm-proxy.desktop");
+        require_overwrite_ok(&desktop_path, "desktop entry", force)?;
         std::fs::write(&desktop_path, desktop_content)
             .with_context(|| format!("writing {}", desktop_path.display()))?;
         // Set restrictive permissions on the desktop entry.
@@ -165,4 +178,55 @@ pub fn cmd_autostart_status() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Reject an overwrite of an existing unit file unless `force` is set.
+///
+/// Returns `Ok(())` when the path does not exist or `force` is set, otherwise
+/// an error naming the file and offering `--force`. Extracted as a pure
+/// function so the clobber guard is unit-testable without resolving the real
+/// `$HOME`-derived plist/desktop path (audit GAP-MED-4).
+fn require_overwrite_ok(path: &std::path::Path, kind: &str, force: bool) -> Result<()> {
+    if path.exists() && !force {
+        bail!(
+            "{kind} already exists at {}; re-run with --force to overwrite",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn require_overwrite_ok_blocks_existing_without_force() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("unit");
+        std::fs::write(&p, "existing").unwrap();
+
+        let err = require_overwrite_ok(&p, "launchd plist", false).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("already exists"), "expected 'already exists': {msg}");
+        assert!(msg.contains("--force"), "expected --force hint: {msg}");
+        assert!(msg.contains("launchd plist"), "expected kind label: {msg}");
+    }
+
+    #[test]
+    fn require_overwrite_ok_allows_existing_with_force() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("unit");
+        std::fs::write(&p, "existing").unwrap();
+
+        require_overwrite_ok(&p, "launchd plist", true).expect("--force permits overwrite");
+    }
+
+    #[test]
+    fn require_overwrite_ok_allows_missing_without_force() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("absent");
+
+        require_overwrite_ok(&p, "desktop entry", false).expect("missing file is always allowed");
+    }
 }

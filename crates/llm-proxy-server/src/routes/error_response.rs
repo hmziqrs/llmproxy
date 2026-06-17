@@ -103,6 +103,17 @@ pub enum RouteError {
     /// The requested path does not match any mounted route.
     #[error("not found")]
     NotFound,
+    /// The request exceeded the configured server timeout (408).
+    ///
+    /// Produced by the per-route timeout layer, then normalised into a
+    /// protocol-shaped JSON body by the outermost response-normaliser layer
+    /// (audit MEDIUM-7). Distinct from [`RouteError::UpstreamTimeout`], which
+    /// is a 504 for an upstream call that exceeded its own deadline.
+    #[error("request timeout")]
+    RequestTimeout,
+    /// The request body exceeded the maximum allowed size (413).
+    #[error("request body too large")]
+    PayloadTooLarge,
 }
 
 // ---------------------------------------------------------------------------
@@ -324,6 +335,16 @@ fn extract_error_fields(error: RouteError) -> (StatusCode, &'static str, String)
             StatusCode::NOT_FOUND,
             "not_found_error",
             "not found".to_owned(),
+        ),
+        RouteError::RequestTimeout => (
+            StatusCode::REQUEST_TIMEOUT,
+            "timeout_error",
+            "request timed out".to_owned(),
+        ),
+        RouteError::PayloadTooLarge => (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "invalid_request_error",
+            "request body too large".to_owned(),
         ),
     }
 }
@@ -693,6 +714,51 @@ mod tests {
             .get(header::CONTENT_TYPE)
             .expect("content-type header");
         assert_eq!(ct, "application/json");
+    }
+
+    // -- MEDIUM-7: timeout / payload-too-large variants -----------------------
+
+    #[test]
+    fn request_timeout_returns_408() {
+        let response = route_error_response(ClientProtocol::Anthropic, RouteError::RequestTimeout);
+        assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+    }
+
+    #[test]
+    fn payload_too_large_returns_413() {
+        let response =
+            route_error_response(ClientProtocol::Anthropic, RouteError::PayloadTooLarge);
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn request_timeout_anthropic_body_is_json_envelope() {
+        let response = route_error_response(ClientProtocol::Anthropic, RouteError::RequestTimeout);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .expect("body");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("valid JSON");
+        assert_eq!(json["type"], "error");
+        assert_eq!(json["error"]["type"], "timeout_error");
+        assert_eq!(json["error"]["message"], "request timed out");
+    }
+
+    #[tokio::test]
+    async fn payload_too_large_openai_body_is_json_envelope() {
+        let response =
+            route_error_response(ClientProtocol::OpenAiChat, RouteError::PayloadTooLarge);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .expect("body");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("valid JSON");
+        assert_eq!(json["error"]["type"], "invalid_request_error");
+        assert!(json["error"]["code"].is_null());
+        assert!(
+            json["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("too large")
+        );
     }
 
     // -- map_upstream_status ---------------------------------------------------

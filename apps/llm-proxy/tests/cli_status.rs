@@ -1,38 +1,72 @@
 //! Integration tests for the `status` command.
 //!
-//! Verifies graceful handling when no PID file exists and when a stale PID
-//! file is present. We cannot call `cmd_status()` directly because it reads
-//! from the global config_dir, so we test the underlying pid helpers.
+//! Drives `cmd_status` directly against a tempdir-backed [`CommandPaths`],
+//! covering the "no PID file", stale-PID, running-process, and config-display
+//! branches (audit MEDIUM-6).
 
-use llm_proxy_app::pid::is_process_running;
+use std::path::Path;
+
+use llm_proxy_app::commands::cmd_status;
+use llm_proxy_app::defaults::DEFAULT_CONFIG_TOML;
+use llm_proxy_app::paths::CommandPaths;
+use llm_proxy_core::PidManager;
+
+/// Build a [`CommandPaths`] whose PID file and config path both live under
+/// `dir`.
+fn tempdir_paths(dir: &Path) -> CommandPaths {
+    CommandPaths::new(PidManager::new(dir), dir.join("config.toml"))
+}
 
 #[test]
-fn status_no_pid_file_returns_none() {
-    // read_pid() uses config_dir(), so we test the underlying PidManager
-    // directly instead.
+fn status_no_pid_file_is_ok() {
     let dir = tempfile::tempdir().unwrap();
-    let mgr = llm_proxy_core::PidManager::new(dir.path());
-
-    // No PID file → None.
-    let pid = mgr.read_pid().unwrap();
-    assert_eq!(pid, None);
+    let paths = tempdir_paths(dir.path());
+    cmd_status(&paths).expect("no PID file -> Ok");
 }
 
 #[test]
-fn status_detects_current_process() {
-    let my_pid = std::process::id();
-    assert!(is_process_running(my_pid), "current process should be running");
+fn status_stale_pid_is_ok() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = tempdir_paths(dir.path());
+    std::fs::write(paths.pid_manager().pid_file(), "299999999").unwrap();
+    cmd_status(&paths).expect("stale PID -> Ok");
 }
 
-#[test]
-fn status_nonexistent_pid_not_running() {
-    // PID 299999999 is extremely unlikely to exist.
-    assert!(!is_process_running(299_999_999));
-}
+#[cfg(unix)]
+mod unix {
+    use super::*;
+    use std::process::Command;
 
-#[test]
-fn status_pid_zero_not_running() {
-    // PID 0 must not be reported as running to avoid signaling the entire
-    // process group on Unix.
-    assert!(!is_process_running(0));
+    #[test]
+    fn status_running_process_is_ok() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = tempdir_paths(dir.path());
+
+        let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+        std::fs::write(paths.pid_manager().pid_file(), child.id().to_string()).unwrap();
+
+        cmd_status(&paths).expect("running process -> Ok");
+
+        // Reap the child so it does not outlive the test.
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn status_with_present_config_is_ok() {
+        // `cmd_status` reads the config to display the `listen` address. With a
+        // valid config present it hits the parse-success arm; the command
+        // returns Ok either way (parse failures are reported, not propagated).
+        let dir = tempfile::tempdir().unwrap();
+        let paths = tempdir_paths(dir.path());
+
+        std::fs::write(paths.config_path(), DEFAULT_CONFIG_TOML.as_bytes()).unwrap();
+        let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+        std::fs::write(paths.pid_manager().pid_file(), child.id().to_string()).unwrap();
+
+        cmd_status(&paths).expect("running + config -> Ok");
+
+        let _ = child.kill();
+        let _ = child.wait();
+    }
 }

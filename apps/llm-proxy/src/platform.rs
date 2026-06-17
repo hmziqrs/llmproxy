@@ -134,6 +134,22 @@ pub fn xml_escape(s: &str) -> String {
 mod tests {
     use super::*;
 
+    /// Escape the regex metacharacters in a literal string.
+    ///
+    /// Used to build an `insta::Settings::add_filter` regex that matches the
+    /// verbatim log path (which contains regex-special characters like `.`)
+    /// so it can be redacted to `[log_path]` in snapshots.
+    fn regex_escape(literal: &str) -> String {
+        let mut out = String::with_capacity(literal.len());
+        for ch in literal.chars() {
+            if "\\.+*?()[]{}|^$".contains(ch) {
+                out.push('\\');
+            }
+            out.push(ch);
+        }
+        out
+    }
+
     // --- xml_escape tests ---
 
     #[test]
@@ -178,6 +194,18 @@ mod tests {
     }
 
     // --- format_plist tests (macOS only) ---
+    //
+    // The full-document test (`format_plist_basic`) snapshots the rendered
+    // plist via insta so structural regressions (a dropped `<key>`, a missing
+    // `<array>`) fail loudly instead of slipping past substring checks. The
+    // generated plist embeds a platform- and home-dependent absolute log path
+    // (`config_dir()/llm-proxy.log`), which would otherwise make the snapshot
+    // non-reproducible across machines, so the test binds an `insta::Settings`
+    // scope that filters the concrete log path down to a `[log_path]`
+    // placeholder before snapshotting. The two companion tests below keep
+    // targeted `contains()` assertions for the XML-escaping contract
+    // (positive/negative containment), which reads more clearly there than a
+    // snapshot would.
 
     #[cfg(target_os = "macos")]
     #[test]
@@ -187,10 +215,15 @@ mod tests {
             .map(|s| s.to_string())
             .collect();
         let plist = format_plist(&args);
-        assert!(plist.contains("<string>/usr/bin/llm-proxy</string>"));
-        assert!(plist.contains("<string>serve</string>"));
-        assert!(plist.contains("<?xml version=\"1.0\""));
-        assert!(plist.contains("com.llm-proxy"));
+
+        // Redact the machine-specific log path so the snapshot is portable.
+        // `add_filter` takes a regex, so the path's regex metacharacters (e.g.
+        // the dots in `llm-proxy.log`) are escaped first.
+        let log_path = config_dir().join("llm-proxy.log").display().to_string();
+        let filter = format!("({})", regex_escape(&log_path));
+        let mut settings = insta::Settings::clone_current();
+        settings.add_filter(&filter, "[log_path]");
+        settings.bind(|| insta::assert_snapshot!("launchd_plist_basic", plist));
     }
 
     #[cfg(target_os = "macos")]
@@ -246,5 +279,23 @@ mod tests {
     #[test]
     fn desktop_exec_escape_no_special_chars() {
         assert_eq!(desktop_exec_escape("/usr/bin/llm-proxy"), "/usr/bin/llm-proxy");
+    }
+
+    // --- format_desktop_entry full-document snapshot (Linux only) ---
+    //
+    // Unlike the plist, the desktop entry contains no platform-dependent
+    // absolute paths, so the full rendered document can be snapshotted
+    // directly. This catches structural regressions (e.g. a dropped
+    // `X-GNOME-Autostart-enabled` key) that substring checks would miss.
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn format_desktop_entry_basic() {
+        let args: Vec<String> = ["/usr/bin/llm-proxy", "serve"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let entry = format_desktop_entry(&args);
+        insta::assert_snapshot!("desktop_entry_basic", entry);
     }
 }

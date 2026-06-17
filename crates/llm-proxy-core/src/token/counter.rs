@@ -35,7 +35,7 @@ const CHARS_PER_TOKEN: usize = 4;
 
 /// Simplified token counter.
 ///
-/// Uses a rough heuristic of [`CHARS_PER_TOKEN`] characters per token rather
+/// Uses a rough heuristic of `CHARS_PER_TOKEN` characters per token rather
 /// than a full BPE encoding. Good enough for cost estimation and rate-limiting
 /// decisions where exact counts are not required.
 #[derive(Debug, Clone, Default)]
@@ -49,7 +49,7 @@ impl Counter {
 
     /// Estimate the number of tokens in a single text string.
     ///
-    /// Uses the approximation of [`CHARS_PER_TOKEN`] characters per token,
+    /// Uses the approximation of `CHARS_PER_TOKEN` characters per token,
     /// counting Unicode code points (not bytes). Returns a minimum of 1 token
     /// for any non-empty string, including whitespace-only input.
     pub fn count_tokens(&self, text: &str) -> usize {
@@ -72,7 +72,7 @@ impl Counter {
     ///       + sum(count_tokens(role) + count_tokens(content) + PER_MESSAGE_OVERHEAD)
     /// ```
     ///
-    /// The extra [`PER_MESSAGE_OVERHEAD`] per message accounts for formatting
+    /// The extra `PER_MESSAGE_OVERHEAD` per message accounts for formatting
     /// overhead (role labels, separator tokens, etc.).
     ///
     /// Note: `system` is a flat string. If the upstream protocol supports
