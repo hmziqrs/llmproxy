@@ -886,15 +886,20 @@ impl StreamEncoder {
 
     fn make_chunk(&self, choice: Choice) -> ChatCompletionChunk {
         ChatCompletionChunk {
-            // `id`/`model` are `Arc<str>` on the encoder; materialise the owned
-            // `String` required by `ChatCompletionChunk` once per chunk. This is
-            // the single unavoidable allocation per chunk: `ChatCompletionChunk`
-            // is ALSO a deserialized input type (provider SSE chunks are decoded
-            // into it at `adapter/openai_chat.rs`), so its `id`/`model` must stay
-            // owned `String`. Making them `Arc<str>` would require serde's `rc`
-            // feature workspace-wide — a deliberate footgun (transparent
-            // `Arc`/`Rc` deserialization) avoided here. Splitting input/output
-            // chunk types to break that constraint is not worth the parallel type.
+            // GAP-LOW-7 (evaluated, deferred by design): the per-chunk
+            // allocation of `id`/`model` persists here because
+            // `ChatCompletionChunk` is ALSO a deserialized *input* type
+            // (upstream provider SSE chunks are decoded into it at
+            // `adapter/openai_chat.rs`), so its `id`/`model` must stay owned
+            // `String`. Eliminating the allocation would require either serde's
+            // `rc` feature workspace-wide (a deliberate footgun: transparent
+            // `Arc`/`Rc` deserialization) or a parallel output-only chunk type
+            // that must stay wire-compatible with this one — both
+            // disproportionate for a GAP-LOW on a network-bound path, where
+            // upstream LLM latency dominates two small allocations per chunk.
+            // The encoder stores `id`/`model` as `Arc<str>` so that any future
+            // cloning of the encoder is a refcount bump; the per-chunk owned
+            // `String` remains the single unavoidable allocation.
             id: self.id.to_string(),
             object: "chat.completion.chunk".to_owned(),
             created: self.created,

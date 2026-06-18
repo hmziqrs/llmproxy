@@ -4,6 +4,7 @@
 
 use std::path::PathBuf;
 
+use axum::serve::{Listener, ListenerExt};
 use anyhow::{Context, Result, bail};
 use llm_proxy_provider::{ProviderAdapterRegistry, ProxyClient};
 use llm_proxy_server::{build_router, shutdown_signal};
@@ -90,7 +91,17 @@ pub async fn cmd_serve(
     let shutdown_deadline = state.shutdown_timeout();
     let app = build_router(state);
 
-    let listener = bind_listener(bind_addr).await?;
+    // `tap_io` runs on every accepted connection (audit MEDIUM-2 option A).
+    // `TCP_NODELAY` is a per-connection socket option that is *not* inherited
+    // from the listening socket, so it must be applied to each accepted
+    // `TcpStream` here. Disabling Nagle flushes small SSE chunks to the client
+    // without the ~40ms coalescing delay, which matters for streaming token
+    // output. `SO_KEEPALIVE` is set on the listener in `bind_listener`.
+    let listener = bind_listener(bind_addr).await?.tap_io(|tcp_stream| {
+        if let Err(error) = tcp_stream.set_nodelay(true) {
+            tracing::trace!(%error, "failed to set TCP_NODELAY on accepted connection");
+        }
+    });
     info!(
         addr = %listener.local_addr()?,
         version = env!("CARGO_PKG_VERSION"),
