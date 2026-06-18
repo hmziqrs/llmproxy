@@ -644,10 +644,12 @@ impl ResponsesAdapter {
                 }
                 "function_call" => {
                     let input = output
+                        // Lazily build the empty object only on the `None`/parse-fail path
+                        // so the common tool-calling happy path avoids a heap allocation (MEDIUM-4).
                         .arguments
                         .as_ref()
                         .and_then(|args| serde_json::from_str::<serde_json::Value>(args).ok())
-                        .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+                        .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
 
                     content.push(CoreContent::ToolUse {
                         id: output.call_id.clone().unwrap_or_default(),

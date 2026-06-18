@@ -151,20 +151,21 @@ impl ProxyClient {
     /// in practice. If a future configuration change makes this fallible,
     /// callers should switch to [`Self::try_new`].
     ///
-    /// # Lint suppression (audit LOW-2)
+    /// # Lint expectation (audit LOW-2)
     ///
     /// The `expect` below is deliberate: this is the documented infallible-in-
     /// practice convenience constructor, with [`Self::try_new`] offered as the
-    /// fallible alternative. The `#[allow(clippy::expect_used)]` annotation is
-    /// intentionally retained even though `clippy::expect_used` (a
-    /// `clippy::restriction` lint, not part of `clippy::all`) is currently
-    /// disabled in `[workspace.lints.clippy]` and so suppresses nothing today.
-    /// It is a defensive guard: if the workspace later enables the restriction
-    /// group, this intentional `.expect` site stays acknowledged instead of
-    /// surfacing as a fresh diagnostic. Converting to `#[expect(...)]` would
-    /// *activate* the lint here and emit the real "used `expect` on `Ok`
-    /// value" warning (per the LOW-2 verifier note), which is not desired.
-    #[allow(clippy::expect_used)]
+    /// fallible alternative. `#[expect(clippy::expect_used)]` acknowledges the
+    /// intentional `.expect` at this site. `clippy::expect_used` is a
+    /// `clippy::restriction` lint, disabled across the workspace, so a plain
+    /// `#[allow(...)]` here would be inert (it suppresses a never-enabled lint).
+    /// `#[expect(...)]` instead makes the deliberate use compile-time-checked:
+    /// the expectation is satisfied because the `.expect` is present, and if the
+    /// `.expect` is ever removed the expectation becomes unfulfilled and fails
+    /// the build — surfacing the change for review instead of leaving a silent,
+    /// inert `#[allow]`. `#[expect]` does not emit the lint as a warning; it
+    /// only errors when the lint does not fire.
+    #[expect(clippy::expect_used)]
     pub fn new() -> Self {
         Self::try_new().expect("failed to build reqwest client with default configuration")
     }

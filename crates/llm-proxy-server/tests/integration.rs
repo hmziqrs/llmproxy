@@ -26,6 +26,7 @@ fn state() -> AppState {
             shutdown_timeout: Duration::from_secs(30),
             log_level: "info".to_owned(),
             hot_reload: false,
+            allowed_origins: None,
             server_name: "test-proxy".to_owned(),
             rate_limit_rpm: 100,
             trust_forwarded_headers: false,
@@ -85,6 +86,7 @@ fn state_with_provider() -> AppState {
                 shutdown_timeout: Duration::from_secs(30),
                 log_level: "info".to_owned(),
                 hot_reload: false,
+                allowed_origins: None,
                 server_name: "test-proxy".to_owned(),
                 rate_limit_rpm: 100,
                 trust_forwarded_headers: false,
@@ -187,11 +189,7 @@ async fn messages_without_auth_header_reaches_upstream() {
     // using its configured API key. The upstream is unreachable, so we get
     // 502 Bad Gateway (or 500 for a routing error).
     let status = resp.status();
-    assert_ne!(
-        status,
-        StatusCode::NOT_FOUND,
-        "route must be registered"
-    );
+    assert_ne!(status, StatusCode::NOT_FOUND, "route must be registered");
     let valid_statuses = [
         StatusCode::BAD_GATEWAY,           // 502 - upstream unreachable
         StatusCode::INTERNAL_SERVER_ERROR, // 500 - routing error
@@ -657,7 +655,8 @@ async fn toml_count_tokens_returns_estimate() {
 // Additional integration tests for edge cases (findings 113, 114, 115, 117, 119)
 // ---------------------------------------------------------------------------
 
-/// GET on POST-only messages route returns 405 (finding 115).
+/// GET on POST-only messages route returns a protocol-shaped 405 (finding 115,
+/// audit LOW-27): Anthropic envelope body, not axum's empty 405.
 #[tokio::test]
 async fn get_on_messages_route_returns_405() {
     let app = build_router(state_with_provider());
@@ -668,9 +667,17 @@ async fn get_on_messages_route_returns_405() {
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+    let body: Value = serde_json::from_slice(
+        &axum::body::to_bytes(resp.into_body(), 4096).await.unwrap(),
+    )
+    .unwrap();
+    assert_eq!(body["type"], "error", "405 must be an Anthropic-shaped envelope");
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+    assert_eq!(body["error"]["message"], "method not allowed");
 }
 
-/// GET on POST-only chat completions route returns 405 (finding 115).
+/// GET on POST-only chat completions route returns a protocol-shaped 405
+/// (finding 115, audit LOW-27): OpenAI envelope body.
 #[tokio::test]
 async fn get_on_chat_completions_route_returns_405() {
     let app = build_router(state_with_provider());
@@ -681,6 +688,13 @@ async fn get_on_chat_completions_route_returns_405() {
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+    let body: Value = serde_json::from_slice(
+        &axum::body::to_bytes(resp.into_body(), 4096).await.unwrap(),
+    )
+    .unwrap();
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+    assert_eq!(body["error"]["message"], "method not allowed");
+    assert!(body["error"]["code"].is_null());
 }
 
 /// POST on GET-only health route returns 405 (finding 115).
@@ -768,10 +782,12 @@ async fn count_tokens_unknown_provider_returns_404() {
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
-/// Health endpoint includes metrics sub-object when opted in via `?metrics=true`
-/// (finding 117 / LOW-13).
+/// Health endpoint never exposes operational metrics, even when the caller opts
+/// in via the legacy `?metrics=true` query (LOW-13): the route is
+/// unauthenticated, so the query parameter is now ignored and the body is
+/// always the trivial `{status, service}` liveness probe.
 #[tokio::test]
-async fn health_includes_metrics_sub_object() {
+async fn health_never_exposes_metrics_even_with_opt_in_query() {
     let app = build_router(state());
     let req = Request::builder()
         .uri("/health?metrics=true")
@@ -785,16 +801,14 @@ async fn health_includes_metrics_sub_object() {
             .unwrap(),
     )
     .unwrap();
-    assert!(body["metrics"].is_object(), "health response with ?metrics=true must include 'metrics' sub-object");
-    let metrics = &body["metrics"];
-    // Verify the expected counter fields exist.
-    assert!(metrics["requests_received"].is_number());
-    assert!(metrics["requests_streamed"].is_number());
-    assert!(metrics["requests_success"].is_number());
-    assert!(metrics["requests_failed"].is_number());
-    assert!(metrics["upstream_calls"].is_number());
-    assert!(metrics["rate_limited"].is_number());
-    assert!(metrics["deduplicated"].is_number());
+    assert!(
+        body.get("metrics").is_none(),
+        "/health must not include 'metrics' even with ?metrics=true \
+         (unauthenticated endpoint, LOW-13); got: {body}"
+    );
+    // The trivial body still carries status + service.
+    assert_eq!(body["status"], "ok");
+    assert!(body["service"].is_string());
 }
 
 /// Health endpoint omits operational metrics by default (LOW-13): the route is
@@ -841,7 +855,10 @@ async fn count_tokens_response_has_correct_shape() {
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     // Verify Content-Type is application/json.
-    let ct = resp.headers().get("content-type").expect("content-type header");
+    let ct = resp
+        .headers()
+        .get("content-type")
+        .expect("content-type header");
     assert!(ct.to_str().unwrap().contains("application/json"));
     let resp_body: Value = serde_json::from_slice(
         &axum::body::to_bytes(resp.into_body(), 64 * 1024)
@@ -852,5 +869,102 @@ async fn count_tokens_response_has_correct_shape() {
     assert!(resp_body["input_tokens"].is_number());
     assert!(resp_body["input_tokens"].as_u64().unwrap() > 0);
     // Verify only the expected field is present.
-    assert!(resp_body.as_object().unwrap().len() == 1, "count_tokens response should only have input_tokens field");
+    assert!(
+        resp_body.as_object().unwrap().len() == 1,
+        "count_tokens response should only have input_tokens field"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// CORS (audit LOW-12)
+// ---------------------------------------------------------------------------
+
+/// Build AppState whose `server.allowed_origins` is set to `origins` (audit
+/// LOW-12). Mirrors [`state`] but installs an explicit cross-origin allow list.
+fn state_with_origins(origins: Vec<String>) -> AppState {
+    let app_config = AppConfig {
+        server: ServerConfig {
+            bind: "127.0.0.1:3456".parse().unwrap(),
+            request_timeout: Duration::from_secs(300),
+            shutdown_timeout: Duration::from_secs(30),
+            log_level: "info".to_owned(),
+            hot_reload: false,
+            allowed_origins: Some(origins),
+            server_name: "test-proxy".to_owned(),
+            rate_limit_rpm: 100,
+            trust_forwarded_headers: false,
+            dedup_window: Duration::from_millis(500),
+        },
+    };
+    let registry = ProviderRegistry::from_providers(vec![]).expect("empty registry");
+    AppState::new(
+        app_config,
+        registry,
+        ProviderAdapterRegistry::builtin(),
+        ProxyClient::new(),
+        BuildInfo {
+            name: "test",
+            version: "0.0.0",
+            target: "test",
+            git_sha: "test",
+        },
+    )
+}
+
+/// A configured origin is echoed on a CORS preflight, and the permitted
+/// method/headers are advertised (audit LOW-12).
+#[tokio::test]
+async fn cors_preflight_echoes_configured_origin() {
+    let app = build_router(state_with_origins(vec![
+        "https://app.example.com".to_owned(),
+    ]));
+    let req = Request::builder()
+        .method("OPTIONS")
+        .uri("/health")
+        .header("origin", "https://app.example.com")
+        .header("access-control-request-method", "POST")
+        .header("access-control-request-headers", "content-type")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers()
+            .get("access-control-allow-origin")
+            .expect("allow-origin echoed on preflight"),
+        "https://app.example.com"
+    );
+    // The advertised methods must be the curated set, not "*" (LOW-12).
+    let allow_methods = resp
+        .headers()
+        .get("access-control-allow-methods")
+        .expect("allow-methods present")
+        .to_str()
+        .unwrap();
+    assert!(allow_methods.contains("POST"));
+    assert!(allow_methods.contains("GET"));
+    assert!(!allow_methods.contains('*'));
+}
+
+/// With no `allowed_origins` configured, no CORS layer is installed and a
+/// browser preflight is not answered with an allow-origin echo (audit LOW-12).
+/// This is the regression guard: the old `CorsLayer::very_permissive()` admitted
+/// every origin by default; the new default must not.
+#[tokio::test]
+async fn cors_absent_when_origins_unset() {
+    // `state()` builds with `allowed_origins: None`.
+    let app = build_router(state());
+    let req = Request::builder()
+        .method("OPTIONS")
+        .uri("/health")
+        .header("origin", "https://attacker.example")
+        .header("access-control-request-method", "POST")
+        .header("access-control-request-headers", "content-type")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert!(
+        resp.headers().get("access-control-allow-origin").is_none(),
+        "no allow-origin should be emitted when CORS is not configured"
+    );
 }

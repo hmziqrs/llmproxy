@@ -179,6 +179,15 @@ impl AppState {
         self.app_config.server.trust_forwarded_headers
     }
 
+    /// Configured CORS allow-origin list, if any (audit LOW-12).
+    ///
+    /// `None` means cross-origin requests are not permitted: no `CorsLayer` is
+    /// installed and browsers enforce a same-origin default. `Some(origins)`
+    /// are the exact origins a restrictive `CorsLayer` will echo.
+    pub fn allowed_origins(&self) -> Option<&[String]> {
+        self.app_config.server.allowed_origins.as_deref()
+    }
+
     /// Access the TOML app config.
     pub fn app_config(&self) -> &AppConfig {
         &self.app_config
@@ -221,6 +230,7 @@ mod tests {
                 shutdown_timeout: Duration::from_secs(30),
                 log_level: "info".to_owned(),
                 hot_reload: false,
+                allowed_origins: None,
                 server_name: "test-proxy".to_owned(),
                 rate_limit_rpm: 100,
                 trust_forwarded_headers: false,

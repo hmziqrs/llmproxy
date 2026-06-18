@@ -296,6 +296,39 @@ pub(super) fn validate_provider_name(name: &str) -> Result<(), RouteError> {
     Ok(())
 }
 
+/// Reject a request whose `Content-Type` is not JSON before attempting to parse
+/// the body, so a non-JSON body yields a precise "expected application/json"
+/// 400 rather than a misleading "invalid JSON" parse error (audit LOW-30).
+///
+/// Handlers accept `axum::body::Bytes` (so the raw body can be hashed for
+/// dedup), which bypasses the `Json` extractor's built-in content-type check.
+/// This restores the spirit of that check uniformly across every JSON POST
+/// handler (`chat`, `messages`, `token_count`). A missing `Content-Type` is
+/// tolerated for backwards compatibility, matching the prior behaviour.
+pub(super) fn validate_json_content_type(headers: &HeaderMap) -> Result<(), RouteError> {
+    let Some(value) = headers.get(header::CONTENT_TYPE) else {
+        return Ok(());
+    };
+    let Ok(ct) = value.to_str() else {
+        return Ok(());
+    };
+    // Accept `application/json` and any `+json` suffix (e.g.
+    // `application/vnd.api+json`). Strip any `; charset=...` parameters first.
+    let essence = ct
+        .split(';')
+        .next()
+        .unwrap_or(ct)
+        .trim()
+        .to_ascii_lowercase();
+    let is_json = essence == "application/json" || essence.ends_with("+json");
+    if !is_json {
+        return Err(RouteError::InvalidRequest(format!(
+            "expected application/json Content-Type, got {ct}"
+        )));
+    }
+    Ok(())
+}
+
 /// Validate a provider name extracted from the URL path.
 ///
 /// This is a thin wrapper around [`validate_provider_name`] used at handler
@@ -337,16 +370,19 @@ async fn resolve_target(
             .as_ref()
             .is_some_and(|catalog| catalog.enforce)
         {
-            let catalog = state
+            // O(1) membership check backed by a cached id index inside
+            // ModelCatalogService (audit LOW-9); replaces a per-request O(N)
+            // linear scan over the merged catalog.
+            let allowed = state
                 .model_catalogs()
-                .catalog(provider, false)
+                .contains_model(
+                    provider,
+                    &adapter_target_config.upstream_model,
+                    &adapter_target_config.protocol,
+                )
                 .await
                 .map_err(|error| RouteError::Internal(error.to_string()))?;
-            if !catalog_contains_model(
-                &catalog,
-                &adapter_target_config.upstream_model,
-                &adapter_target_config.protocol,
-            ) {
+            if !allowed {
                 return Err(RouteError::ModelNotAllowed(
                     adapter_target_config.upstream_model.clone(),
                 ));
@@ -402,23 +438,6 @@ fn map_provider_route_error(error: ProviderRouteResolutionError) -> RouteError {
         }
         error => RouteError::Internal(error.to_string()),
     }
-}
-
-fn catalog_contains_model(
-    catalog: &[llm_proxy_core::StaticModelCatalogEntry],
-    upstream_model: &str,
-    protocol: &str,
-) -> bool {
-    if protocol == "gemini_generate_content" {
-        let requested = upstream_model
-            .strip_prefix("models/")
-            .unwrap_or(upstream_model);
-        return catalog
-            .iter()
-            .any(|model| model.id.strip_prefix("models/").unwrap_or(&model.id) == requested);
-    }
-
-    catalog.iter().any(|model| model.id == upstream_model)
 }
 
 // ---------------------------------------------------------------------------
@@ -688,7 +707,8 @@ pub(crate) async fn handle_core_stream(
     let first_event = first_byte_rx.await.map_err(|_| {
         state.metrics.record_failure();
         RouteError::Internal(
-            "stream task exited before first event (possible panic, cancellation, or empty stream)".to_owned(),
+            "stream task exited before first event (possible panic, cancellation, or empty stream)"
+                .to_owned(),
         )
     })?;
 
@@ -1370,6 +1390,7 @@ mod tests {
                 shutdown_timeout: Duration::from_secs(30),
                 log_level: "info".to_owned(),
                 hot_reload: false,
+                allowed_origins: None,
                 rate_limit_rpm,
                 trust_forwarded_headers,
                 dedup_window: std::time::Duration::ZERO,
@@ -1425,8 +1446,28 @@ mod tests {
         let headers = HeaderMap::new();
         let address = "127.0.0.1:12345".parse().unwrap();
 
-        assert!(prepare_request(&state, "req-test".to_owned(), &headers, Some(&address), b"one", "/test").is_ok());
-        assert!(prepare_request(&state, "req-test".to_owned(), &headers, Some(&address), b"two", "/test").is_ok());
+        assert!(
+            prepare_request(
+                &state,
+                "req-test".to_owned(),
+                &headers,
+                Some(&address),
+                b"one",
+                "/test"
+            )
+            .is_ok()
+        );
+        assert!(
+            prepare_request(
+                &state,
+                "req-test".to_owned(),
+                &headers,
+                Some(&address),
+                b"two",
+                "/test"
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -1438,9 +1479,26 @@ mod tests {
         let mut second_headers = HeaderMap::new();
         second_headers.insert("x-forwarded-for", "203.0.113.2".parse().unwrap());
 
-        assert!(prepare_request(&state, "req-test".to_owned(), &first_headers, Some(&address), b"one", "/test").is_ok());
+        assert!(
+            prepare_request(
+                &state,
+                "req-test".to_owned(),
+                &first_headers,
+                Some(&address),
+                b"one",
+                "/test"
+            )
+            .is_ok()
+        );
         assert!(matches!(
-            prepare_request(&state, "req-test".to_owned(), &second_headers, Some(&address), b"two", "/test"),
+            prepare_request(
+                &state,
+                "req-test".to_owned(),
+                &second_headers,
+                Some(&address),
+                b"two",
+                "/test"
+            ),
             Err(RouteError::RateLimited)
         ));
     }
@@ -1457,38 +1515,6 @@ mod tests {
         let route_error = map_provider_route_error(error);
 
         assert!(matches!(route_error, RouteError::UnsupportedRoute(_)));
-    }
-
-    #[test]
-    fn gemini_catalog_enforcement_accepts_unprefixed_requested_model() {
-        let catalog = vec![llm_proxy_core::StaticModelCatalogEntry {
-            id: "models/gemini-2.5-pro".to_owned(),
-            display_name: None,
-            supports: Vec::new(),
-            context_length: None,
-        }];
-
-        assert!(catalog_contains_model(
-            &catalog,
-            "gemini-2.5-pro",
-            "gemini_generate_content"
-        ));
-    }
-
-    #[test]
-    fn non_gemini_catalog_enforcement_remains_exact() {
-        let catalog = vec![llm_proxy_core::StaticModelCatalogEntry {
-            id: "models/example".to_owned(),
-            display_name: None,
-            supports: Vec::new(),
-            context_length: None,
-        }];
-
-        assert!(!catalog_contains_model(
-            &catalog,
-            "example",
-            "openai_chat_completions"
-        ));
     }
 
     #[test]
@@ -1531,6 +1557,7 @@ mod tests {
                 shutdown_timeout: Duration::from_secs(30),
                 log_level: "info".to_owned(),
                 hot_reload: false,
+                allowed_origins: None,
                 server_name: "test".to_owned(),
                 rate_limit_rpm: 100,
                 trust_forwarded_headers: false,
@@ -1598,6 +1625,7 @@ mod tests {
                 shutdown_timeout: Duration::from_secs(30),
                 log_level: "info".to_owned(),
                 hot_reload: false,
+                allowed_origins: None,
                 server_name: "test".to_owned(),
                 rate_limit_rpm: 100,
                 trust_forwarded_headers: false,
@@ -1706,7 +1734,8 @@ mod tests {
     #[test]
     fn fully_sanitize_redacts_api_key_patterns() {
         // A long sk-ant-... value (40 trailing token chars) is a real key shape.
-        let msg = "upstream auth failed for key sk-ant-api03-ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcd";
+        let msg =
+            "upstream auth failed for key sk-ant-api03-ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcd";
         let sanitized = fully_sanitize_upstream_error(msg);
         assert!(
             !sanitized.contains("sk-ant-api03-"),

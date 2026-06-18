@@ -306,31 +306,28 @@ fn parse_models(
 }
 
 fn set_query_parameter(url: &mut Url, name: &str, value: &str) {
-    // Rebuild the query without the `name` pair, then append the new value.
+    // Single-pass query rebuild (audit GAP-LOW-5).
     //
-    // The decoded pairs are owned (`into_owned`) before the mutable
-    // `query_pairs_mut` borrow begins: `query_pairs()` yields `Cow<str>`
-    // borrowed from `url`'s internal buffer while `query_pairs_mut` requires
-    // `&mut url`, so the pairs must be detached from the read borrow first.
+    // Snapshot the existing query string once (a single allocation of the whole
+    // query), clear it, then re-append every pair except the one named `name`,
+    // and finally append the new value. `form_urlencoded::parse` yields
+    // `Cow<str>` borrowed from the snapshot, so no per-pair `into_owned()` is
+    // needed -- the prior implementation allocated two owned `String`s per pair
+    // (one for the key, one for the value) solely to detach them from `url`'s
+    // read borrow before the mutable `query_pairs_mut` borrow began. Parsing the
+    // snapshot sidesteps that borrow conflict with a single allocation.
     //
-    // NOTE (GAP-LOW-5, deferred): the double `into_owned` per pair is the named
-    // smell, but fully eliminating it requires rebuilding the query through a
-    // percent-encoder (e.g. `url::form_urlencoded::Serializer`) and writing it
-    // back with `set_query(Some(&encoded))` — a single-pass, allocation-free
-    // path. That encoder is not reachable here because the `url` crate is not a
-    // direct dependency of `llm-proxy-provider` (only re-exported as
-    // `reqwest::Url`), and adding it is outside this finding's owned file.
-    let existing: Vec<(String, String)> = url
-        .query_pairs()
-        .filter(|(key, _)| key != name)
-        .map(|(key, value)| (key.into_owned(), value.into_owned()))
-        .collect();
+    // All existing pairs keyed `name` are dropped and exactly one new pair is
+    // appended, matching the prior behavior.
+    let snapshot = url.query().unwrap_or("").to_owned();
     url.set_query(None);
-    let mut query = url.query_pairs_mut();
-    for (key, value) in existing {
-        query.append_pair(&key, &value);
+    let mut serializer = url.query_pairs_mut();
+    for (key, val) in form_urlencoded::parse(snapshot.as_bytes()) {
+        if key != name {
+            serializer.append_pair(&key, &val);
+        }
     }
-    query.append_pair(name, value);
+    serializer.append_pair(name, value);
 }
 
 fn next_page(kind: ProviderDiscoveryKind, value: &Value) -> Option<(&'static str, String)> {

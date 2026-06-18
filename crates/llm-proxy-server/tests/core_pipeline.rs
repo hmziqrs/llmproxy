@@ -191,6 +191,7 @@ fn state_with_provider(
             shutdown_timeout: Duration::from_secs(30),
             log_level: "info".to_owned(),
             hot_reload: false,
+            allowed_origins: None,
             server_name: "test-proxy".to_owned(),
             rate_limit_rpm: 100,
             trust_forwarded_headers: false,
@@ -1315,6 +1316,7 @@ async fn rate_limited_request_returns_429() {
                 shutdown_timeout: Duration::from_secs(30),
                 log_level: "info".to_owned(),
                 hot_reload: false,
+                allowed_origins: None,
                 server_name: "test-proxy".to_owned(),
                 rate_limit_rpm: 1,
                 trust_forwarded_headers: false,
@@ -1420,6 +1422,7 @@ async fn duplicate_request_returns_409() {
                 shutdown_timeout: Duration::from_secs(30),
                 log_level: "info".to_owned(),
                 hot_reload: false,
+                allowed_origins: None,
                 server_name: "test-proxy".to_owned(),
                 rate_limit_rpm: 100,
                 trust_forwarded_headers: false,
@@ -1442,7 +1445,11 @@ async fn duplicate_request_returns_409() {
 
     // First request should succeed or fail for non-dedup reasons.
     let resp1 = app.clone().oneshot(messages_request(&body)).await.unwrap();
-    assert_ne!(resp1.status(), StatusCode::CONFLICT, "first request should not be a duplicate");
+    assert_ne!(
+        resp1.status(),
+        StatusCode::CONFLICT,
+        "first request should not be a duplicate"
+    );
 
     // Second request with the same body and path should be deduplicated.
     let resp2 = app.oneshot(messages_request(&body)).await.unwrap();
@@ -1745,6 +1752,7 @@ fn state_for_validation_tests() -> AppState {
                 shutdown_timeout: Duration::from_secs(30),
                 log_level: "info".to_owned(),
                 hot_reload: false,
+                allowed_origins: None,
                 server_name: "test-proxy".to_owned(),
                 rate_limit_rpm: 100,
                 trust_forwarded_headers: false,
@@ -1780,7 +1788,9 @@ async fn unknown_provider_name_returns_404() {
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     let resp_body: Value = serde_json::from_slice(
-        &axum::body::to_bytes(resp.into_body(), 64 * 1024).await.unwrap(),
+        &axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap(),
     )
     .unwrap();
     // Anthropic-shaped error.
@@ -1855,5 +1865,9 @@ async fn missing_content_type_on_messages_still_parses() {
     // axum Bytes extractor does not require content-type. The request
     // should either succeed (and fail at the upstream call) or return
     // an error status -- either way it should not panic.
-    assert!(resp.status().is_client_error() || resp.status().is_server_error() || resp.status() == StatusCode::OK);
+    assert!(
+        resp.status().is_client_error()
+            || resp.status().is_server_error()
+            || resp.status() == StatusCode::OK
+    );
 }

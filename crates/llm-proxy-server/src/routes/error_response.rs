@@ -114,6 +114,13 @@ pub enum RouteError {
     /// The request body exceeded the maximum allowed size (413).
     #[error("request body too large")]
     PayloadTooLarge,
+    /// The request used an HTTP method the matched route does not allow (405).
+    ///
+    /// Produced by the router-wide `method_not_allowed_fallback` so that axum's
+    /// bare 405 (empty body) is rendered through the same protocol-shaped JSON
+    /// envelope as 404/408/413 (audit LOW-27).
+    #[error("method not allowed")]
+    MethodNotAllowed,
 }
 
 // ---------------------------------------------------------------------------
@@ -345,6 +352,11 @@ fn extract_error_fields(error: RouteError) -> (StatusCode, &'static str, String)
             StatusCode::PAYLOAD_TOO_LARGE,
             "invalid_request_error",
             "request body too large".to_owned(),
+        ),
+        RouteError::MethodNotAllowed => (
+            StatusCode::METHOD_NOT_ALLOWED,
+            "invalid_request_error",
+            "method not allowed".to_owned(),
         ),
     }
 }
@@ -726,8 +738,7 @@ mod tests {
 
     #[test]
     fn payload_too_large_returns_413() {
-        let response =
-            route_error_response(ClientProtocol::Anthropic, RouteError::PayloadTooLarge);
+        let response = route_error_response(ClientProtocol::Anthropic, RouteError::PayloadTooLarge);
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
@@ -758,6 +769,45 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("too large")
+        );
+    }
+
+    // -- LOW-27: MethodNotAllowed ---------------------------------------------
+
+    #[test]
+    fn method_not_allowed_returns_405() {
+        let response =
+            route_error_response(ClientProtocol::Anthropic, RouteError::MethodNotAllowed);
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    #[tokio::test]
+    async fn method_not_allowed_anthropic_body_is_json_envelope() {
+        let response =
+            route_error_response(ClientProtocol::Anthropic, RouteError::MethodNotAllowed);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .expect("body");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("valid JSON");
+        assert_eq!(json["type"], "error");
+        assert_eq!(json["error"]["type"], "invalid_request_error");
+        assert_eq!(json["error"]["message"], "method not allowed");
+    }
+
+    #[tokio::test]
+    async fn method_not_allowed_openai_body_is_json_envelope() {
+        let response =
+            route_error_response(ClientProtocol::OpenAiChat, RouteError::MethodNotAllowed);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .expect("body");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("valid JSON");
+        assert_eq!(json["error"]["type"], "invalid_request_error");
+        assert_eq!(json["error"]["message"], "method not allowed");
+        assert!(json["error"]["code"].is_null());
+        assert!(
+            json.get("type").is_none() || json["type"].is_null(),
+            "OpenAI 405 must not carry the Anthropic 'type' field"
         );
     }
 

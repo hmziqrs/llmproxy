@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
 use axum::{
-    Json, Router,
+    Router,
     extract::{DefaultBodyLimit, Request, State},
-    http::{HeaderValue, StatusCode, header},
+    http::{HeaderName, HeaderValue, Method, StatusCode, header},
     middleware::{Next, from_fn, from_fn_with_state},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -137,33 +137,94 @@ pub fn router(state: AppState) -> Router {
         .route("/providers/{provider}/v1/models", get(handle_models))
         .layer(api_middleware);
 
-    Router::new()
+    let router = Router::new()
         .merge(lightweight)
         .merge(api)
         .fallback(not_found)
         // Protocol-aware 405: shape method-not-allowed responses through the
         // same error envelope as 404/408/413 instead of axum's empty body
         // (audit LOW-27).
-        .method_not_allowed_fallback(method_not_allowed)
-        // Global middleware (audit LOW-11, LOW-12) -- outermost wraps applied
-        // to the merged router so they cover every route and both fallbacks.
-        //   1. `CorsLayer::very_permissive()` -- explicit cross-origin policy
-        //      (LOW-12). The proxy is server-to-server; this documents the
-        //      implicit same-origin default as permissive and overridable.
-        //   2. `SetResponseHeaderLayer` -- `X-Content-Type-Options: nosniff`
+        .method_not_allowed_fallback(method_not_allowed);
+
+    // Config-gated CORS (audit LOW-12). A `CorsLayer` is installed only when
+    // the operator explicitly lists cross-origin callers, and then only for
+    // those exact origins. This replaces a former `CorsLayer::very_permissive()`
+    // that admitted every origin -- the opposite of the finding's intent. The
+    // default (`server.allowed_origins` unset) applies no CORS layer, so
+    // browsers enforce a same-origin policy and this server-to-server proxy is
+    // not unexpectedly reachable from arbitrary web origins.
+    let router = match cors_layer_for(state.allowed_origins()) {
+        Some(cors) => router.layer(cors),
+        None => router,
+    };
+
+    router
+        // Global, outermost middleware (audit LOW-11, LOW-12) -- applied to the
+        // merged router so they cover every route and both fallbacks. CORS sits
+        // just inside these so a preflight still receives the headers below and
+        // panic protection.
+        //   1. `SetResponseHeaderLayer` -- `X-Content-Type-Options: nosniff`
         //      on every response so JSON error bodies are not MIME-sniffed
         //      into executable types (LOW-12).
-        //   3. `CatchPanicLayer` -- outermost (LOW-11): converts a panic in
+        //   2. `CatchPanicLayer` -- outermost (LOW-11): converts a panic in
         //      any inner layer or handler into a 500 instead of dropping the
         //      connection (which would otherwise present as a reset to the
         //      client and bypass `TraceLayer`'s response-span logging).
-        .layer(CorsLayer::very_permissive())
         .layer(SetResponseHeaderLayer::if_not_present(
             header::X_CONTENT_TYPE_OPTIONS,
             HeaderValue::from_static("nosniff"),
         ))
         .layer(CatchPanicLayer::new())
         .with_state(state)
+}
+
+/// Build a restrictive `CorsLayer` for an explicit allow-origin list, or return
+/// `None` when cross-origin access is disabled (audit LOW-12).
+///
+/// `None` (no origins configured, or every entry fails to parse as a header
+/// value) means "install no CORS layer": browsers then enforce a same-origin
+/// default, which is the safe baseline for a server-to-server proxy. When
+/// origins are configured the layer echoes `Access-Control-Allow-Origin` only
+/// for those exact origins and answers preflight with the proxy's actual
+/// methods plus the request headers the LLM SDKs it fronts commonly send.
+fn cors_layer_for(origins: Option<&[String]>) -> Option<CorsLayer> {
+    let origins = origins?;
+    let parsed: Vec<HeaderValue> = origins
+        .iter()
+        .filter_map(|origin| match origin.parse::<HeaderValue>() {
+            Ok(value) => Some(value),
+            Err(error) => {
+                tracing::warn!(%error, origin, "skipping invalid server.allowed_origins entry");
+                None
+            }
+        })
+        .collect();
+    if parsed.is_empty() {
+        return None;
+    }
+    // The methods the proxy actually serves; OPTIONS is covered by the CORS
+    // preflight the layer itself synthesizes, but is listed so the preflight
+    // response advertises it as permitted.
+    let methods = [Method::GET, Method::POST, Method::OPTIONS];
+    // Request headers the LLM SDKs the proxy fronts commonly send. Kept to a
+    // curated set rather than `Any` so the policy stays restrictive.
+    let headers = [
+        header::CONTENT_TYPE,
+        header::AUTHORIZATION,
+        header::ACCEPT,
+        header::USER_AGENT,
+        HeaderName::from_static("x-api-key"),
+        HeaderName::from_static("anthropic-version"),
+        HeaderName::from_static("anthropic-beta"),
+        HeaderName::from_static("x-goog-api-key"),
+        HeaderName::from_static("x-request-id"),
+    ];
+    Some(
+        CorsLayer::new()
+            .allow_origin(parsed)
+            .allow_methods(methods)
+            .allow_headers(headers),
+    )
 }
 
 /// Outermost middleware: mint one request id per request and store it in
@@ -254,8 +315,8 @@ async fn normalize_error_responses(req: Request, next: Next) -> Response {
 /// normalised 408/413 bodies stay consistent with the handler the request
 /// *would* have reached.
 fn protocol_for_path(path: &str) -> error_response::ClientProtocol {
-    let is_openai_chat_path = path.contains("/v1/chat/completions")
-        || path.contains("/v1/chat/edits");
+    let is_openai_chat_path =
+        path.contains("/v1/chat/completions") || path.contains("/v1/chat/edits");
     if is_openai_chat_path {
         error_response::ClientProtocol::OpenAiChat
     } else {
@@ -290,10 +351,7 @@ async fn not_found(req: Request) -> impl IntoResponse {
     }
 
     let protocol = protocol_for_path(&path);
-    error_response::route_error_response(
-        protocol,
-        error_response::RouteError::NotFound,
-    )
+    error_response::route_error_response(protocol, error_response::RouteError::NotFound)
 }
 
 /// Protocol-aware 405 Method Not Allowed fallback (audit LOW-27).
@@ -309,12 +367,10 @@ async fn not_found(req: Request) -> impl IntoResponse {
 /// automatically unless the response sets it, which it does not, so the
 /// header is preserved.
 ///
-/// NOTE on partial implementation: the ideal fix adds a
-/// `RouteError::MethodNotAllowed` variant to `error_response.rs` and reuses
-/// [`error_response::route_error_response`]. That file is owned by another
-/// agent in this pass, so this handler builds the same Anthropic/OpenAI
-/// envelope shapes inline. A follow-up should consolidate this into a
-/// `MethodNotAllowed` variant so all error paths share one encoder.
+/// Delegates to [`error_response::route_error_response`] with
+/// [`error_response::RouteError::MethodNotAllowed`] so the 405 body is produced
+/// by the single shared encoder every other status code uses (audit LOW-27),
+/// rather than a bespoke inline envelope.
 async fn method_not_allowed(req: Request) -> impl IntoResponse {
     let path = req.uri().path().to_owned();
 
@@ -324,42 +380,44 @@ async fn method_not_allowed(req: Request) -> impl IntoResponse {
     }
 
     let protocol = protocol_for_path(&path);
-    method_not_allowed_response(protocol)
+    error_response::route_error_response(protocol, error_response::RouteError::MethodNotAllowed)
 }
 
-/// Encode the 405 body in the client protocol's envelope shape.
-///
-/// Mirrors the Anthropic `{"type":"error","error":{...}}` and OpenAI
-/// `{"error":{"message":...,"type":...,"code":null}}` shapes produced by
-/// `error_response` for the other status codes. Kept as a standalone helper so
-/// the shape construction is readable and testable in isolation.
-fn method_not_allowed_response(protocol: error_response::ClientProtocol) -> Response {
-    let status = StatusCode::METHOD_NOT_ALLOWED;
-    let mut response = match protocol {
-        error_response::ClientProtocol::Anthropic => {
-            let body = serde_json::json!({
-                "type": "error",
-                "error": {
-                    "type": "invalid_request_error",
-                    "message": "method not allowed",
-                },
-            });
-            (status, Json(body)).into_response()
-        }
-        error_response::ClientProtocol::OpenAiChat => {
-            let body = serde_json::json!({
-                "error": {
-                    "message": "method not allowed",
-                    "type": "invalid_request_error",
-                    "code": serde_json::Value::Null,
-                },
-            });
-            (status, Json(body)).into_response()
-        }
-    };
-    response.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("application/json"),
-    );
-    response
+#[cfg(test)]
+mod tests {
+    use super::cors_layer_for;
+
+    #[test]
+    fn cors_layer_absent_when_origins_unset() {
+        assert!(cors_layer_for(None).is_none());
+    }
+
+    #[test]
+    fn cors_layer_absent_when_origins_empty() {
+        let empty: Vec<String> = Vec::new();
+        assert!(cors_layer_for(Some(&empty)).is_none());
+    }
+
+    #[test]
+    fn cors_layer_absent_when_every_origin_is_invalid() {
+        // Newlines and NUL are not legal header-value bytes, so every entry is
+        // skipped and no layer is installed (audit LOW-12).
+        let bad = vec!["bad\norigin".to_owned(), "\0".to_owned()];
+        assert!(cors_layer_for(Some(&bad)).is_none());
+    }
+
+    #[test]
+    fn cors_layer_present_when_origin_configured() {
+        let origins = vec!["https://app.example.com".to_owned()];
+        assert!(cors_layer_for(Some(&origins)).is_some());
+    }
+
+    #[test]
+    fn cors_layer_keeps_valid_origins_while_skipping_invalid() {
+        let origins = vec![
+            "bad\norigin".to_owned(),
+            "https://app.example.com".to_owned(),
+        ];
+        assert!(cors_layer_for(Some(&origins)).is_some());
+    }
 }

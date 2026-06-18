@@ -1,85 +1,41 @@
-use axum::{Json, extract::{Query, State}, http::StatusCode};
-use serde::{Deserialize, Serialize};
+use axum::{
+    Json,
+    extract::State,
+    http::StatusCode,
+};
+use serde::Serialize;
 
 use crate::state::AppState;
 
-/// Query parameters for `/health`.
-///
-/// `metrics=true` opts in to the aggregate operational counters. Without it the
-/// health body omits metrics entirely: the endpoint is unauthenticated, so
-/// operational telemetry is not exposed by default (LOW-13).
-#[derive(Debug, Default, Deserialize)]
-pub(crate) struct HealthQuery {
-    #[serde(default)]
-    metrics: bool,
-}
-
 /// Health check response body.
 ///
-/// `metrics` is omitted from the serialized body unless the caller opts in via
-/// `?metrics=true`, so a bare unauthenticated `/health` probe reveals no
-/// operational telemetry (LOW-13).
+/// Deliberately trivial (`{status, service}`): `/health` is the unauthenticated
+/// liveness probe hammered by load balancers, so it must not expose operational
+/// telemetry (audit LOW-13). Aggregate counters live on the in-process
+/// [`Metrics`](llm_proxy_core::Metrics) snapshot for observability tooling, not
+/// on this public route; a future authenticated admin or Prometheus endpoint
+/// could surface them without putting them on the liveness probe.
 ///
 /// Note: `#[serde(deny_unknown_fields)]` is intentionally omitted because these
 /// structs are outbound-only (`Serialize`, never `Deserialize` from external
 /// input). The attribute has no runtime effect on Serialize-only types.
-///
 #[derive(Serialize)]
 pub(crate) struct HealthBody {
     status: &'static str,
     service: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    metrics: Option<HealthMetrics>,
-}
-
-/// Metrics snapshot included in the health response.
-///
-/// Note: `#[serde(deny_unknown_fields)]` is intentionally omitted (Serialize-only type).
-#[derive(Serialize)]
-struct HealthMetrics {
-    requests_received: i64,
-    requests_streamed: i64,
-    requests_success: i64,
-    requests_failed: i64,
-    upstream_calls: i64,
-    rate_limited: i64,
-    deduplicated: i64,
-    client_cancelled: i64,
 }
 
 /// Liveness probe.
 ///
-/// Returns a minimal `{status, service}` body by default. Aggregate
-/// operational counters are included only when the caller opts in via
-/// `?metrics=true`; the endpoint is unauthenticated, so telemetry is not
-/// exposed to bare probes (LOW-13). Per-provider and per-model counters are
-/// always omitted.
-pub async fn health(
-    State(state): State<AppState>,
-    Query(query): Query<HealthQuery>,
-) -> (StatusCode, Json<HealthBody>) {
-    let metrics = if query.metrics {
-        let snapshot = state.metrics.get_snapshot();
-        Some(HealthMetrics {
-            requests_received: snapshot.requests_received,
-            requests_streamed: snapshot.requests_streamed,
-            requests_success: snapshot.requests_success,
-            requests_failed: snapshot.requests_failed,
-            upstream_calls: snapshot.upstream_calls,
-            rate_limited: snapshot.rate_limited,
-            deduplicated: snapshot.deduplicated,
-            client_cancelled: snapshot.client_cancelled,
-        })
-    } else {
-        None
-    };
-
+/// Returns a minimal `{status, service}` body. No operational metrics are
+/// exposed: the endpoint is unauthenticated and serves as a liveness probe, so
+/// it must not leak telemetry (audit LOW-13). Query parameters are ignored.
+pub async fn health(State(state): State<AppState>) -> (StatusCode, Json<HealthBody>) {
     (
         StatusCode::OK,
         Json(HealthBody {
             status: "ok",
             service: state.server_name().to_owned(),
-            metrics,
         }),
     )
 }

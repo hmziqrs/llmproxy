@@ -8,10 +8,10 @@
 //! Architecture boundary: route handlers do not perform scenario detection,
 //! endpoint classification, fallback routing, or provider-specific streaming.
 
+use axum::Json;
 use axum::body::Body;
 use axum::extract::{Extension, Path, State};
 use axum::http::{HeaderMap, Response};
-use axum::Json;
 use llm_proxy_core::ProviderRouteKind;
 use llm_proxy_protocol::anthropic::MessageRequest;
 use llm_proxy_protocol::client::anthropic;
@@ -62,6 +62,10 @@ async fn handle_messages_inner(
     if state.providers().get(&provider).is_none() {
         return Err(RouteError::UnknownProvider(provider.clone()));
     }
+
+    // Reject non-JSON Content-Type before parsing, so a wrong media type is not
+    // misreported as a JSON syntax error (audit LOW-30).
+    core_pipeline::validate_json_content_type(&headers)?;
 
     // Pre-flight: rate limit, dedup, request ID.
     let request_path = format!("/providers/{provider}/v1/messages");
@@ -133,9 +137,7 @@ async fn handle_messages_inner(
 /// header is only inspected by the `FromRequest` extractor), and `BytesRejection`
 /// only arises from the request extraction path — neither is reachable here, so
 /// the wildcard arm covers any future `#[non_exhaustive]` variant defensively.
-fn json_rejection_to_route_error(
-    rejection: axum::extract::rejection::JsonRejection,
-) -> RouteError {
+fn json_rejection_to_route_error(rejection: axum::extract::rejection::JsonRejection) -> RouteError {
     match rejection {
         axum::extract::rejection::JsonRejection::JsonSyntaxError(e) => {
             RouteError::InvalidRequest(format!("invalid JSON: {e}"))

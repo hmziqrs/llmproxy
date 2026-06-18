@@ -25,12 +25,13 @@ use axum::Router;
 
 /// Build the application router for the given state.
 ///
-/// `clippy::double_must_use` is suppressed because both `Router` and this
-/// function are annotated with `#[must_use]`. This is intentional: the
-/// function must be called (to produce the router) and the router must be
-/// used (to start a server). Removing either `must_use` would weaken the
-/// compile-time safety net.
-#[allow(clippy::double_must_use)]
+/// Carries an explicit `#[must_use]` (audit LOW-2): `axum::Router` is not
+/// itself `#[must_use]`, so this attribute is the single, non-redundant
+/// reminder that the returned router must be driven by a server. No
+/// `clippy::double_must_use` annotation is warranted — that lint does not fire
+/// here (verified: an `#[expect(clippy::double_must_use)]` was unfulfilled),
+/// because only the function, not the return type, is `#[must_use]`. The
+/// former inert `#[allow(...)]` that LOW-2 flagged has been removed.
 #[must_use = "the Router must be used with a server"]
 pub fn build_router(state: AppState) -> Router {
     routes::router(state)

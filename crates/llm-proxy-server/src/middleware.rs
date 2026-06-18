@@ -249,7 +249,8 @@ impl RateLimiter {
         if self.prune_counter.fetch_add(1, Ordering::Relaxed) % PRUNE_INTERVAL == 0 {
             let now = std::time::Instant::now();
             buckets.retain(|_, bucket| {
-                now.duration_since(bucket.last_refill) < std::time::Duration::from_secs(RATE_LIMITER_IDLE_EVICT_SECS)
+                now.duration_since(bucket.last_refill)
+                    < std::time::Duration::from_secs(RATE_LIMITER_IDLE_EVICT_SECS)
             });
         }
 
@@ -620,7 +621,10 @@ mod tests {
         let connect_info = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
 
         let ip = super::get_client_ip(&headers, Some(&connect_info), true);
-        assert_eq!(ip, "1.2.3.4", "should pick the leftmost IP from multi-value XFF");
+        assert_eq!(
+            ip, "1.2.3.4",
+            "should pick the leftmost IP from multi-value XFF"
+        );
     }
 
     // -- get_client_ip returns 'unknown' (finding 26) --------------------------
@@ -631,7 +635,10 @@ mod tests {
 
         let headers = HeaderMap::new();
         let ip = super::get_client_ip(&headers, None, false);
-        assert_eq!(ip, "unknown", "should return 'unknown' when no IP source is available");
+        assert_eq!(
+            ip, "unknown",
+            "should return 'unknown' when no IP source is available"
+        );
     }
 
     #[test]
@@ -644,7 +651,10 @@ mod tests {
         let connect_info = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 8080);
 
         let ip = super::get_client_ip(&headers, Some(&connect_info), true);
-        assert_eq!(ip, "10.0.0.1", "invalid XFF value should fall through to connect_info");
+        assert_eq!(
+            ip, "10.0.0.1",
+            "invalid XFF value should fall through to connect_info"
+        );
     }
 
     #[test]

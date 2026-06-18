@@ -71,6 +71,21 @@ pub struct ServerConfig {
     pub dedup_window: Duration,
     /// Public server name reported in version/health endpoints.
     pub server_name: String,
+    /// Cross-origin origins permitted to call the proxy from a browser
+    /// (audit LOW-12).
+    ///
+    /// `None` (the default) installs **no** CORS layer, so browsers enforce a
+    /// same-origin policy and this server-to-server proxy is not unexpectedly
+    /// reachable from arbitrary web origins. Setting a list installs a
+    /// restrictive `CorsLayer` that echoes `Access-Control-Allow-Origin` only
+    /// for these exact origins -- replacing a former `very_permissive` policy
+    /// that admitted every origin.
+    ///
+    /// Each entry should be an absolute origin (`scheme://host[:port]`),
+    /// e.g. `"https://app.example.com"`. Entries that fail to parse as a
+    /// header value are skipped (with a warning) when the router is built.
+    #[serde(default)]
+    pub allowed_origins: Option<Vec<String>>,
 }
 
 const fn default_rate_limit_rpm() -> u32 {
@@ -1172,16 +1187,17 @@ pub fn load_provider_config(
                 // catch this for all fields, not just api_key.
             }
             Some(value) if value.is_empty() => {
-                return Err(CoreError::ConfigValidation {
-                    message: ConfigValidationError::EmptyEnvVar {
-                        // Provider name is not yet known (no parse has occurred),
-                        // so we include the file path as context instead.
+                // Provider name is not yet known (no parse has occurred), so we
+                // include the file path as context instead. Carried as a typed
+                // `CoreError::ConfigValidation` source via `From` (GAP-LOW-11),
+                // so this failure is variant-recoverable by callers.
+                return Err(
+                    ConfigValidationError::EmptyEnvVar {
                         provider: format!("(file: {})", path.display()),
                         var: var_name,
                     }
-                    .to_string(),
-                    source: None,
-                });
+                    .into(),
+                );
             }
             Some(_) => {}
         }
@@ -1202,12 +1218,11 @@ pub fn load_provider_config(
         });
     }
     let file: ProviderFile = toml::from_str(&interpolated).map_err(CoreError::ConfigParse)?;
-    validate_provider_config(&file.provider, known_protocols).map_err(|e| {
-        CoreError::ConfigValidation {
-            message: e.to_string(),
-            source: Some(Box::new(e)),
-        }
-    })?;
+    // The typed `ConfigValidationError` flows into `CoreError::ConfigValidation`
+    // as a first-class typed source via `From` (GAP-LOW-11), not boxed behind
+    // `dyn Error`, so callers can match on the concrete variant.
+    validate_provider_config(&file.provider, known_protocols)
+        .map_err(CoreError::from)?;
     Ok(file.provider)
 }
 

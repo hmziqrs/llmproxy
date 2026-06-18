@@ -113,7 +113,13 @@ fn state_with_provider(
     adapter_name: &str,
     _model_name: &str,
 ) -> AppState {
-    state_with_provider_timeout(mock_endpoint, protocol, adapter_name, _model_name, Duration::from_secs(300))
+    state_with_provider_timeout(
+        mock_endpoint,
+        protocol,
+        adapter_name,
+        _model_name,
+        Duration::from_secs(300),
+    )
 }
 
 /// Like [`state_with_provider`] but with a configurable `request_timeout`.
@@ -169,6 +175,7 @@ fn state_with_provider_timeout(
             shutdown_timeout: Duration::from_secs(30),
             log_level: "info".to_owned(),
             hot_reload: false,
+            allowed_origins: None,
             server_name: "test-proxy".to_owned(),
             rate_limit_rpm: 100,
             trust_forwarded_headers: false,
@@ -361,6 +368,7 @@ fn empty_state() -> AppState {
             shutdown_timeout: Duration::from_secs(30),
             log_level: "info".to_owned(),
             hot_reload: false,
+            allowed_origins: None,
             server_name: "test-proxy".to_owned(),
             rate_limit_rpm: 100,
             trust_forwarded_headers: false,
@@ -427,6 +435,7 @@ fn state_with_mock_provider_no_upstream() -> AppState {
             shutdown_timeout: Duration::from_secs(30),
             log_level: "info".to_owned(),
             hot_reload: false,
+            allowed_origins: None,
             server_name: "test-proxy".to_owned(),
             rate_limit_rpm: 100,
             trust_forwarded_headers: false,
@@ -1917,6 +1926,7 @@ async fn same_model_routes_to_different_providers() {
                 shutdown_timeout: Duration::from_secs(30),
                 log_level: "info".to_owned(),
                 hot_reload: false,
+                allowed_origins: None,
                 server_name: "test".to_owned(),
                 rate_limit_rpm: 100,
                 trust_forwarded_headers: false,

@@ -770,10 +770,12 @@ impl AnthropicAdapter {
                     });
                 }
                 "tool_use" => {
+                    // Lazily build the empty object only on the `None` path so the
+                    // common tool-calling happy path avoids a heap allocation (MEDIUM-4).
                     let input = block
                         .input
                         .clone()
-                        .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+                        .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
                     // Reverse-map sanitized tool names back to originals.
                     let name = block.name.clone().unwrap_or_else(|| {
                         tracing::warn!("Anthropic: tool_use block missing name in response decode");

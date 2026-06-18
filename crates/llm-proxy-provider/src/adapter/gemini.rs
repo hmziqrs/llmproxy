@@ -517,10 +517,12 @@ impl GeminiAdapter {
                 }
             }
             if let Some(ref function_call) = part.function_call {
+                // Lazily build the empty object only on the `None` path so the
+                // common tool-calling happy path avoids a heap allocation (MEDIUM-4).
                 let input = function_call
                     .args
                     .clone()
-                    .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+                    .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
                 content.push(CoreContent::ToolUse {
                     id: format!("gemini_call_{}", tool_id_counter),
                     name: function_call.name.clone(),

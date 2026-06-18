@@ -199,9 +199,7 @@ fn map_catalog_error(error: ProviderError) -> RouteError {
         | ProviderError::Utf8(_)
         | ProviderError::SseFraming(_)
         | ProviderError::EmptyResponse(_)
-        | ProviderError::InvalidConfig(_) => {
-            RouteError::Internal(error.to_string())
-        }
+        | ProviderError::InvalidConfig(_) => RouteError::Internal(error.to_string()),
         // ProviderError is #[non_exhaustive] so a wildcard arm is required
         // to handle future variants added to the enum.
         _ => RouteError::Internal(error.to_string()),
@@ -268,6 +266,7 @@ mod tests {
                     shutdown_timeout: std::time::Duration::from_secs(30),
                     log_level: "info".to_owned(),
                     hot_reload: false,
+                    allowed_origins: None,
                     server_name: "test".to_owned(),
                     rate_limit_rpm: 100,
                     trust_forwarded_headers: false,
@@ -309,6 +308,7 @@ mod tests {
                     shutdown_timeout: std::time::Duration::from_secs(30),
                     log_level: "info".to_owned(),
                     hot_reload: false,
+                    allowed_origins: None,
                     server_name: "test".to_owned(),
                     rate_limit_rpm: 100,
                     trust_forwarded_headers: false,

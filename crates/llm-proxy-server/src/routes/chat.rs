@@ -8,10 +8,10 @@
 //! Architecture boundary: route handlers do not perform scenario detection,
 //! endpoint classification, fallback routing, or provider-specific streaming.
 
+use axum::Json;
 use axum::body::Body;
 use axum::extract::{Extension, Path, State};
-use axum::http::{HeaderMap, Response, header};
-use axum::Json;
+use axum::http::{HeaderMap, Response};
 use llm_proxy_core::ProviderRouteKind;
 use llm_proxy_protocol::client::openai_chat;
 use llm_proxy_protocol::openai::ChatCompletionRequest;
@@ -35,7 +35,8 @@ pub async fn handle_chat_completions(
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response<Body> {
-    match handle_chat_completions_inner(state, req_id, provider, connect_info, headers, body).await {
+    match handle_chat_completions_inner(state, req_id, provider, connect_info, headers, body).await
+    {
         Ok(response) => response,
         Err(error) => {
             warn!(error = %error, "request failed");
@@ -61,7 +62,7 @@ async fn handle_chat_completions_inner(
     if state.providers().get(&provider).is_none() {
         return Err(RouteError::UnknownProvider(provider.clone()));
     }
-    validate_json_content_type(&headers)?;
+    core_pipeline::validate_json_content_type(&headers)?;
 
     let request_path = format!("/providers/{provider}/v1/chat/completions");
     let ctx = core_pipeline::prepare_request(
@@ -119,33 +120,6 @@ async fn handle_chat_completions_inner(
         )
         .await
     }
-}
-
-/// Reject requests whose `Content-Type` is present but not a JSON media type.
-///
-/// Handlers accept `axum::body::Bytes` (so the raw body can be hashed for
-/// dedup), which bypasses the `Json` extractor's built-in content-type check.
-/// This restores the spirit of that check: a body that is not advertised as
-/// JSON should not be reported as a misleading "invalid JSON" parse error.
-/// A missing `Content-Type` is tolerated for backwards compatibility, matching
-/// the prior behaviour.
-fn validate_json_content_type(headers: &HeaderMap) -> Result<(), RouteError> {
-    let Some(value) = headers.get(header::CONTENT_TYPE) else {
-        return Ok(());
-    };
-    let Ok(ct) = value.to_str() else {
-        return Ok(());
-    };
-    // Accept `application/json` and any `+json` suffix (e.g.
-    // `application/vnd.api+json`). Strip any `; charset=...` parameters first.
-    let essence = ct.split(';').next().unwrap_or(ct).trim().to_ascii_lowercase();
-    let is_json = essence == "application/json" || essence.ends_with("+json");
-    if !is_json {
-        return Err(RouteError::InvalidRequest(format!(
-            "expected application/json Content-Type, got {ct}"
-        )));
-    }
-    Ok(())
 }
 
 /// Map an axum `JsonRejection` to a `RouteError`, preserving the distinction

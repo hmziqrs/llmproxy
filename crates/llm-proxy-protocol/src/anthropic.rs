@@ -208,7 +208,7 @@ impl Message {
     /// "content": [{"type":"text","text":"hello"}]
     /// ```
     #[must_use]
-    #[allow(deprecated)] // constructs ContentBlock with output: None
+    #[expect(deprecated, reason = "constructs ContentBlock with output: None")]
     pub fn content_blocks(&self) -> Vec<ContentBlock> {
         if self.content.is_null() {
             return Vec::new();
@@ -330,7 +330,7 @@ pub struct ContentBlock {
     pub data: Option<String>,
 }
 
-#[allow(deprecated)] // constructors set `output: None` which is the deprecated field
+#[expect(deprecated, reason = "constructors set `output: None` which is the deprecated field")]
 impl ContentBlock {
     /// Create a text content block with the given string.
     #[must_use]
@@ -503,7 +503,7 @@ impl ContentBlock {
             }
         }
         // Fallback to the deprecated output field.
-        #[allow(deprecated)]
+        #[expect(deprecated, reason = "reads the deprecated `output` field as a text fallback")]
         if let Some(ref val) = self.output {
             if let Some(s) = val.as_str() {
                 return s.to_owned();
@@ -632,7 +632,7 @@ impl Serialize for ContentBlock {
                     data: Option<String>,
                 }
 
-                #[allow(deprecated)]
+                #[expect(deprecated, reason = "AllFields debug aid mirrors the deprecated `output` field")]
                 let all = AllFields {
                     r#type: self.r#type.clone(),
                     text: self.text.clone(),
@@ -870,7 +870,7 @@ pub struct ApiError {
 // ===========================================================================
 
 #[cfg(test)]
-#[allow(deprecated)] // tests construct ContentBlock with `output` field
+#[expect(deprecated, reason = "tests construct ContentBlock with `output` field")]
 mod tests {
     use super::*;
 

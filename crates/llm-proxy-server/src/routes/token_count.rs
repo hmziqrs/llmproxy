@@ -5,8 +5,8 @@
 //! representation.
 
 use axum::body::Body;
-use axum::extract::{Extension, Path, State};
 use axum::extract::rejection::JsonRejection;
+use axum::extract::{Extension, Path, State};
 use axum::http::{HeaderMap, Response};
 use axum::response::IntoResponse;
 use llm_proxy_core::MessageContent;
@@ -50,7 +50,15 @@ pub async fn count_tokens(
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response<Body> {
-    match count_tokens_inner(&state, req_id, &provider, connect_info.as_ref(), &headers, body).await
+    match count_tokens_inner(
+        &state,
+        req_id,
+        &provider,
+        connect_info.as_ref(),
+        &headers,
+        body,
+    )
+    .await
     {
         Ok(response) => response,
         Err(error) => {
@@ -82,27 +90,38 @@ async fn count_tokens_inner(
     connect_info: Option<&std::net::SocketAddr>,
     headers: &HeaderMap,
     body: axum::body::Bytes,
-) -> Result<Response<Body>, RouteError> {    // Pre-flight: rate limit, dedup, request ID.
+) -> Result<Response<Body>, RouteError> {
+    // Pre-flight: rate limit, dedup, request ID.
     core_pipeline::validate_provider_name(provider)?;
     if state.providers().get(provider).is_none() {
         return Err(RouteError::UnknownProvider(provider.to_owned()));
     }
+    // Reject non-JSON Content-Type before parsing, so a wrong media type is not
+    // misreported as a JSON syntax error (audit LOW-30).
+    core_pipeline::validate_json_content_type(headers)?;
     let request_path = format!("/providers/{provider}/v1/messages/count_tokens");
-    let ctx =
-        core_pipeline::prepare_request(state, req_id.0, headers, connect_info, &body, &request_path)?;
+    let ctx = core_pipeline::prepare_request(
+        state,
+        req_id.0,
+        headers,
+        connect_info,
+        &body,
+        &request_path,
+    )?;
     // Parse and validate the Anthropic MessageRequest.
     //
     // Go through `axum::Json::from_bytes` (rather than `serde_json::from_slice`)
     // so the `JsonRejection` taxonomy is preserved: syntax errors and data
     // (deserialization) errors are surfaced with distinct messages instead of
     // being collapsed into a single opaque "invalid JSON" string.
-    let req: MessageRequest =
-        match axum::Json::<MessageRequest>::from_bytes(&body) {
-            Ok(axum::Json(value)) => value,
-            Err(rejection) => {
-                return Err(RouteError::InvalidRequest(json_rejection_message(&rejection)));
-            }
-        };
+    let req: MessageRequest = match axum::Json::<MessageRequest>::from_bytes(&body) {
+        Ok(axum::Json(value)) => value,
+        Err(rejection) => {
+            return Err(RouteError::InvalidRequest(json_rejection_message(
+                &rejection,
+            )));
+        }
+    };
 
     req.validate()
         .map_err(|e| RouteError::InvalidRequest(e.to_string()))?;

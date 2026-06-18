@@ -234,7 +234,6 @@ impl ProviderRegistry {
                             first_path,
                             file_path.display()
                         ),
-                        source: None,
                     });
                 }
                 std::collections::hash_map::Entry::Vacant(e) => {
@@ -268,7 +267,6 @@ impl ProviderRegistry {
                         "duplicate provider name \"{}\": defined in multiple entries",
                         existing.name
                     ),
-                    source: None,
                 });
             }
             map.insert(provider.name.clone(), provider);
@@ -313,7 +311,6 @@ impl ProviderRegistry {
                             "provider \"{}\": adapter \"{}\" uses unknown protocol \"{}\"",
                             provider.name, adapter_name, adapter_cfg.protocol
                         ),
-                        source: None,
                     });
                 }
             }
