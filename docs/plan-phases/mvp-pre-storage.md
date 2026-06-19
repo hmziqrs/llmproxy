@@ -56,7 +56,15 @@ Out of scope (deferred to storage/api phases):
    `/v1/messages/count_tokens` route never hard-fails on a new model id.
 2. **`tiktoken-rs` is the tokenizer crate.** It bundles the BPE ranks for
    the OpenAI encodings (`cl100k_base`, `o200k_base`, `p50k_base`,
-   `r50k_base`) and is the de facto Rust port of tiktoken. No custom BPE.
+   `r50k_base`) at **compile time** via `include_bytes!` — no network
+   fetch at runtime, offline-safe. `CoreBPE` is `Send + Sync`. No custom
+   BPE. Lazy-loaded on first `count_tokens` for a known model prefix;
+   cached in `Arc` for subsequent calls.
+9. **`Counter::count_messages` signature changes to accept a model id.**
+   This is the one call-site break in the plan (`token_count.rs:212`).
+   The model id selects the BPE encoding; unknown models fall back to
+   the heuristic. The old ZST `Counter` becomes a struct holding a
+   `HashMap<String, Arc<dyn Tokenizer>>` + heuristic fallback.
 3. **Streaming upstream IDs use a buffered-first-event approach, not a
    pre-flight request.** The first decoded `CoreEvent` is held until its
    type is known; if it is `MessageStart` with `Some(id)`, that id seeds
@@ -291,6 +299,14 @@ Every other touch is a move or clone of the `SecretString` itself, which
 is cheap (it wraps an `Arc`-backed `Zeroizing<String>` in the `alloc`
 feature, so clone is a refcount bump).
 
+**Note on `expose_secret()` return type**: `SecretString::expose_secret()`
+returns `&Zeroizing<String>`, not `&str`. Deref coercion (`&Zeroizing
+<String>` → `&String` → `&str`) makes it work in most contexts (e.g.
+`bearer_auth(...)`, `header(...)`, `.trim()`, `.is_empty()`). Do NOT
+call `.to_string()` on the exposed value — that would clone the secret
+unnecessarily. Use `&**provider.api_key.expose_secret()` if you need an
+explicit `&str` in a context where deref coercion doesn't apply.
+
 ### AuthHeaders field type
 
 `AuthHeaders.api_key` (`transport.rs:40`) should also become
@@ -323,6 +339,46 @@ pattern (`:1096` interpolate, `:1109` deserialize).
   loads to a `SecretString` whose `expose_secret()` equals the env value.
 - Validation rejects an empty `api_key` without printing it.
 
+### Literal construction sites that must be updated (compile-critical)
+
+Changing `api_key: String` to `api_key: SecretString` breaks every Rust
+struct literal that constructs `ProviderConfig` or
+`ProviderAdapterTargetConfig` with `api_key: "test-key".to_owned()`.
+The complete inventory (verified by workspace grep):
+
+**`ProviderConfig` / `ProviderAdapterTargetConfig` literals (9 sites):**
+- `crates/llm-proxy-server/tests/integration.rs:58`
+- `crates/llm-proxy-server/tests/chat_completions.rs:149,408,1885,1908`
+- `crates/llm-proxy-server/tests/core_pipeline.rs:165,1288,1394,1724`
+- `crates/llm-proxy-server/src/state.rs:294,394,437,552,575` (in-crate
+  unit tests)
+
+Each must change `api_key: "test-key".to_owned()` to
+`api_key: secrecy::SecretString::from("test-key")` (or
+`secrecy::SecretString::new("test-key".to_owned())`). Add `secrecy` to
+`llm-proxy-server`'s `[dev-dependencies]` if not already a regular dep.
+
+**`ServerConfig` literals that break when `log_format` is added (Step 4):**
+- `crates/llm-proxy-server/src/state.rs:227`
+- `crates/llm-proxy-server/src/routes/core_pipeline.rs:1387,1554,1622`
+- `crates/llm-proxy-server/src/routes/models.rs:263,305`
+- `crates/llm-proxy-server/tests/integration.rs:23,83,886`
+- `crates/llm-proxy-server/tests/chat_completions.rs:172,365,432,1923`
+- `crates/llm-proxy-server/tests/core_pipeline.rs:188,1313,1419,1749`
+
+Each must add `log_format: LogFormat::default()` (or `LogFormat::Plain`).
+`#[serde(default)]` helps TOML deserialization but does NOT help Rust
+struct literals — every literal must be updated or it won't compile.
+
+**TOML fixture files (OK — no update needed):**
+- `crates/llm-proxy-core/src/provider_config.rs:1252,1275,1294,1321,1348`
+  — inline TOML strings parsed via `toml::from_str`. `#[serde(default)]`
+  on `log_format` and `pricing` handles missing fields in TOML. No
+  update needed.
+- `config.toml.example` and `providers/*.toml.example` — should be
+  updated to document the new fields (see "Files needing documentation
+  updates" below).
+
 ## Step 1 — Real upstream message IDs (buffer first event)
 
 ### Scope
@@ -333,38 +389,65 @@ the route just has to use it.
 
 ### Change
 
-In `handle_core_stream` (`core_pipeline.rs:596`), after the upstream byte
-stream and `provider_decoder` are ready (`:638-649`), do not construct the
-client encoder immediately. Instead:
+The current streaming architecture constructs the `ClientStreamEncoder`
+in the **handler** (`core_pipeline.rs:675-676`) and moves it into
+`StreamContext` (`:687-701`), which is then moved into a spawned task
+that runs `build_sse_output_stream`. The cancellation select lives
+**inside** that spawned task (`:892-905`).
 
-1. Pull the first SSE frame from the byte stream and decode it with
-   `provider_decoder.decode_frame(...)`.
-2. Inspect the resulting `Vec<CoreEvent>`:
-   - If the first event is `CoreEvent::MessageStart { id: Some(real), .. }`,
-     use `real` as `msg_id`.
-   - Otherwise (no `MessageStart`, or `id: None`, or an error frame), fall
-     back to the existing synthetic id and push the decoded events into a
-   small pre-queue that the output stream drains before reading more
-   frames.
-3. Construct `ClientStreamEncoder::new(client_protocol, msg_id, ...)` with
-   the resolved id. Note: the route calls `ClientStreamEncoder::new`
-   (`core_pipeline.rs:69`), a wrapper that dispatches to the protocol
-   `StreamEncoder::new` for Anthropic or OpenAI. The protocol encoders
-   themselves (`client/anthropic.rs:622`, `client/openai_chat.rs:620`)
-   are not modified — only the route-level wrapper construction changes.
-4. Chain the pre-queue externally before the output stream:
-   `futures::stream::iter(pre_queue).chain(output_stream)`. This mirrors
-   the existing first-event prepend pattern at `core_pipeline.rs:723-725`.
-   Do NOT try to feed the pre-queue into `build_sse_output_stream` — that
-   function (`:863`) takes only `byte_stream` + `StreamContext` (which
-   owns the decoder/framer/encoder) and has no parameter for a pre-queue.
-   External chaining is the correct approach.
+To buffer the first event while preserving cancellation, the buffering
+must happen **inside the spawned task**, not in the handler. The
+encoder construction must also move into the task so it can use the
+real upstream id. Concretely:
 
-The first-byte probe (`first_byte_tx`/`first_byte_rx` at `:684`) already
-waits for the first encoded client event before committing HTTP 200. The
-buffering happens upstream of that probe, so the probe's semantics are
-preserved: errors before the first client byte still become HTTP errors,
-errors after still become in-band SSE errors.
+1. **Do not** construct `ClientStreamEncoder` in the handler at
+   `:675-676`. Instead, pass the raw `client_protocol`,
+   `core.model.requested`, and a reference to `&core` into `StreamContext`
+   (add them as fields).
+2. Inside the spawned task, before entering the main decode loop:
+   a. **Loop** reading bytes from `byte_stream` and feeding them to
+      `sse_framer.push_chunk(...)` until `sse_framer` yields at least
+      one complete `SseFrame`. This loop handles partial reads
+      (`push_chunk` can return an empty `Vec<SseFrame>` when the chunk
+      doesn't complete a frame — keep reading). If `byte_stream` returns
+      `None` (stream ended) before any frame, fall back to synthetic id
+      and proceed with an empty pre-queue.
+   b. Call `provider_decoder.decode_frame(&frame)` on the first
+      complete frame. This can return an empty `Vec<CoreEvent>` (e.g.
+      the frame was a `:keepalive` comment). If empty, keep reading
+      frames (loop back to 2a) until a non-empty `Vec<CoreEvent>` is
+      produced or the stream ends.
+   c. Inspect the first non-empty `Vec<CoreEvent>`:
+      - If the first event is `CoreEvent::MessageStart { id: Some(real),
+        .. }`, use `real` as `msg_id`.
+      - Otherwise (no `MessageStart`, `id: None`, `Error`, `Ping`,
+        etc.), fall back to the synthetic id (`chatcmpl-{uuid}` or
+        `msg_{uuid}`).
+   d. Construct `ClientStreamEncoder::new(client_protocol, msg_id,
+      core.model.requested.clone(), &core)` **inside the task**.
+   e. **Encode** the buffered `Vec<CoreEvent>` through the newly
+      constructed encoder using `encode_core_event(...)`, producing
+      `Vec<Event>` (axum SSE `Event`s). These are the pre-queue items.
+      **The pre-queue is `Vec<Event>`, not `Vec<CoreEvent>`** — the
+      types must match `output_stream` for `.chain()`.
+   f. If the buffered events included an `Error`, feed it to the
+      `first_byte_tx` probe as today.
+3. The main decode loop then proceeds as today, but the output stream
+   is `futures::stream::iter(pre_queue).chain(main_loop_stream)` so the
+   pre-queue events are emitted first. No events are lost or duplicated.
+
+**Why inside the task, not the handler**: the cancellation select
+(`tokio::select!` on `cancel_clone.cancelled()`, `:892-905`) lives inside
+the task. If buffering moved to the handler, a client disconnect during
+first-frame wait would not be detected until the upstream responded,
+defeating the cancellation. By keeping buffering in the task, the
+`select!` covers the first-frame wait too.
+
+**What changes in `StreamContext`** (`core_pipeline.rs:796-805`): add
+fields `client_protocol: ClientProtocol`, `requested_model: String`,
+`core_ref: CoreRequest` (or the specific fields the encoder needs from
+`&core`). Remove the `client_encoder` field (now constructed inside the
+task). The `first_byte_tx` probe stays.
 
 ### Encoder behavior notes
 
@@ -388,31 +471,41 @@ The two protocol encoders handle `MessageStart` id differently:
 
 - The upstream returns no `MessageStart` at all (some providers open with
   a `Ping` or content). Keep the synthetic id; the pre-queue holds the
-  events that did arrive.
-- The first frame decodes to an `Error` event. The existing
-  `FirstByteResult::Error` path handles this; the buffered error event
-  flows through it.
+  encoded events that did arrive.
+- The first frame decodes to an **empty** `Vec<CoreEvent>` (e.g. a
+  `:keepalive` comment). Keep reading frames until a non-empty Vec is
+  produced or the stream ends. Do not fall back to synthetic on the
+  first empty decode — only fall back when the stream ends or an
+  `Error` appears.
+- The first frame decodes to an `Error` event. Feed it to the
+  `first_byte_tx` probe as today; the buffered error event flows
+  through the `FirstByteResult::Error` path.
 - The upstream closes before any frame. Existing empty-stream handling
   applies; no id is needed.
-
-### Why not a pre-flight request
-
-A pre-flight non-streaming request to fetch the id would double the
-upstream cost and latency and would not match the id of the streaming
-response. Buffering the first event is the standard approach and adds no
-upstream traffic.
+- The client disconnects during first-frame wait. Because buffering is
+  inside the spawned task, the `tokio::select!` on
+  `cancel_clone.cancelled()` covers this — the task aborts cleanly.
+- Multiple `CoreEvent`s in the first non-empty decode (e.g.
+  `MessageStart` + `ContentStart` in one frame). All are encoded into
+  the pre-queue; no events are lost.
 
 ### Tests
 
 - A mocked upstream whose first event is `MessageStart { id: Some("msg_real_123") }`
   produces client SSE with `id: "msg_real_123"` (Anthropic) or
-  `id: "chatcmpl-real_123"` (OpenAI, prefix preserved).
+  `id: "chatcmpl-abc123"` (OpenAI — the upstream id is used **verbatim**,
+  not re-prefixed; the synthetic fallback adds `chatcmpl-` but the real
+  id already has it).
 - A mocked upstream with `MessageStart { id: None }` falls back to the
   synthetic `msg_`/`chatcmpl-` id.
 - A mocked upstream that opens with `Ping` then `MessageStart` still
   surfaces the real id (the pre-queue drains correctly).
-- No events are lost or duplicated when the first frame contains multiple
-  events.
+- A mocked upstream whose first frame is a `:keepalive` comment (empty
+  decode) followed by `MessageStart` still surfaces the real id.
+- No events are lost or duplicated when the first non-empty frame
+  contains multiple events.
+- Client disconnect during first-frame wait does not hang the task
+  (cancellation fires).
 
 ## Step 2 — Real token counting (tiktoken-rs)
 
@@ -437,34 +530,84 @@ Introduce a `Tokenizer` trait in a new
 keeping the public `Counter` as the front door:
 
 ```rust
-pub trait Tokenizer: Send + Sync {
+/// Token-counting backend.
+///
+/// `Debug` is required so that `Counter` (which holds `Arc<dyn
+/// Tokenizer>`) can derive `Debug`.
+pub trait Tokenizer: Send + Sync + std::fmt::Debug {
     /// Count tokens in a single text string.
     fn count_tokens(&self, text: &str) -> usize;
 }
 
 /// Heuristic backend (~4 chars/token). Zero-allocation, infallible.
+#[derive(Debug, Clone, Default)]
 pub struct HeuristicTokenizer;
 
 /// BPE backend using a specific tiktoken encoding.
+///
+/// `CoreBPE` is `Send + Sync` in tiktoken-rs 0.6 (verified against the
+/// crate's impl; if a future version regresses, wrap in `Mutex`). Wrapped
+/// in `Arc` so `Counter` is cheap to clone.
+#[derive(Debug, Clone)]
 pub struct TiktokenTokenizer {
-    bpe: tiktoken_rs::CoreBPE,
+    bpe: Arc<tiktoken_rs::CoreBPE>,
 }
 ```
 
-`Counter` becomes a small enum or holds an `Arc<dyn Tokenizer>` selected
-by model id:
+`Counter` holds a map of model-id-prefix to `Arc<dyn Tokenizer>`, plus
+the heuristic fallback:
 
 ```rust
+/// Token counter with model-aware BPE dispatch.
+///
+/// No longer a ZST after this change. `AppState` stores it inline; the
+/// derived `Clone` on `AppState` handles the `Arc` refcount bump. The
+/// old ZST doc comment at `state.rs:64-70` must be updated.
+#[derive(Debug, Clone)]
 pub struct Counter {
-    default: HeuristicTokenizer,
-    // Optional model-specific BPE handle, resolved once at startup or
-    // lazily on first use. Kept cheap to clone (Arc).
+    /// Heuristic fallback for unknown models.
+    heuristic: HeuristicTokenizer,
+    /// Model-prefix -> BPE tokenizer. Looked up by longest matching
+    /// prefix of the model id.
+    encodings: HashMap<String, Arc<dyn Tokenizer>>,
 }
 ```
 
-The `count_tokens` and `count_messages` methods keep their current
-signatures so callers (including `token_count.rs`) are unchanged at the
-call site. The methods dispatch to the selected backend.
+**The `count_messages` signature must change to accept a model id** so
+the counter can dispatch to the right encoding. This is the one call-site
+break in the plan:
+
+```rust
+pub fn count_messages(
+    &self,
+    model: &str,
+    system: &str,
+    messages: &[MessageContent],
+) -> usize
+```
+
+The call site at `token_count.rs:212` (`state.token_counter.count_messages
+(&system_text, &messages)`) must become `state.token_counter
+.count_messages(&core.model.requested, &system_text, &messages)`. The
+`core: CoreRequest` is in scope at that point (`token_count.rs:131`
+decodes it), so `core.model.requested` is available.
+
+`Counter::Default` can no longer be derived (HashMap has no Default for
+`Arc<dyn Tokenizer>` values — actually `HashMap::default()` is an empty
+map, which works). Verify: `HashMap<String, Arc<dyn Tokenizer>>:
+Default` is `HashMap::default()` (empty map) — this is fine. So
+`#[derive(Default)]` on `Counter` works if `HeuristicTokenizer: Default`
+(it does). **But** `Arc<dyn Tokenizer>` does not implement `Default`,
+and `#[derive(Default)]` only requires `Default` on fields, not on
+trait objects inside a `HashMap` (the `HashMap` itself is `Default`).
+So `#[derive(Default)]` on `Counter` is valid. Confirm during
+implementation.
+
+The `count_tokens` method also gains a `model` parameter:
+
+```rust
+pub fn count_tokens(&self, model: &str, text: &str) -> usize
+```
 
 ### Model-to-encoding selection
 
@@ -504,10 +647,35 @@ guardrails.
 
 ### Fallback behavior
 
-If `tiktoken_rs::o200k_base()` (or any encoding constructor) fails at
-runtime (missing ranks file, offline), log a `warn!` once and use the
-heuristic for that encoding. The proxy must never fail a request because
-the tokenizer could not load; the heuristic is always available.
+If an encoding constructor fails at runtime (missing ranks, offline),
+log a `warn!` once and use the heuristic for that encoding. The proxy
+must never fail a request because the tokenizer could not load; the
+heuristic is always available.
+
+### tiktoken-rs specifics (resolved)
+
+**Rank loading**: `tiktoken-rs` 0.6 bundles BPE ranks at **compile time**
+via `include_bytes!` for the standard encodings (`cl100k_base`,
+`o200k_base`, `p50k_base`, `r50k_base`). No network fetch at runtime.
+This means the binary grows by ~2-4 MB per encoding (the rank files are
+gzip-compressed and decompressed on first use). Offline operation is
+fully supported. Verify on first `cargo build` that no network fetch
+occurs; if a future `tiktoken-rs` version changes this, the plan's
+lazy-load + `warn!` fallback covers it.
+
+**Send + Sync**: `tiktoken_rs::CoreBPE` is `Send + Sync` (its fields are
+`HashMap<Vec<u8>, (Vec<u8>, usize)>` and `HashMap<(Vec<u8>, Vec<u8>),
+usize>` — both `Send + Sync`). So `Arc<CoreBPE>` is directly shareable
+across tasks with no `Mutex`. If a future version regresses, wrap in
+`Arc<Mutex<CoreBPE>>` and document the lock contention (serializes all
+token counts across requests, which is acceptable for a count-only
+operation that is not on the inference hot path).
+
+**Load timing**: Lazy on first `count_tokens` call for a known model
+prefix. The first request for that model pays a one-time decompression
+cost (~1-5 ms). Subsequent requests use the cached `Arc<CoreBPE>`. This
+keeps server startup fast and avoids failing the server when a rank
+file is corrupt (the failure is per-encoding, not server-wide).
 
 ### Tests
 
@@ -610,8 +778,16 @@ cache_read = "0.00000125"
 reasoning = "0.000010"
 ```
 
-`Decimal` serializes as a string to preserve precision. Document this in
-`config.toml.example` and the provider examples under `providers/`.
+`Decimal` serializes as a string to preserve precision. **Critical
+usability note**: if an operator writes `input = 0.0000014` (unquoted),
+TOML parses it as `f64` (losing precision), and `rust_decimal::Decimal`'s
+`Deserialize` impl **rejects** floats — deserialization fails with a
+confusing error. Operators must **always quote** decimal values:
+`input = "0.0000014"`. Document this prominently in `config.toml.example`,
+`defaults.rs`, and the provider examples. Consider adding a custom
+deserializer that accepts both string and float (coercing via
+`Decimal::try_from(f64)`) as a follow-up; for this plan, the "always
+quote" documentation is sufficient.
 
 ### Cost computation
 
@@ -645,7 +821,32 @@ impl Cost {
 `ModelPricing` field using `Decimal` arithmetic and sums to `total`.
 `Usage` itself is unchanged (it stays the provider-reported token counts);
 `Cost` is a derived value computed at the pipeline boundary where
-`Usage` is final.
+`Usage` is final. The full body:
+
+```rust
+impl Cost {
+    pub fn from_usage(usage: &Usage, pricing: &ModelPricing) -> Self {
+        let input = Decimal::from(usage.input_tokens) * pricing.input;
+        let output = Decimal::from(usage.output_tokens) * pricing.output;
+        let cache_creation = Decimal::from(
+            usage.cache_creation_input_tokens.unwrap_or(0),
+        ) * pricing.cache_creation;
+        let cache_read = Decimal::from(
+            usage.cache_read_input_tokens.unwrap_or(0),
+        ) * pricing.cache_read;
+        let reasoning = Decimal::from(
+            usage.reasoning_tokens.unwrap_or(0),
+        ) * pricing.reasoning;
+        let total = input + output + cache_creation + cache_read + reasoning;
+        Self { input, output, cache_creation, cache_read, reasoning, total }
+    }
+}
+```
+
+`Option<i32>` fields use `unwrap_or(0)` — if the provider didn't report
+cache/reasoning tokens, they contribute zero cost. Negative `Usage`
+fields (theoretical with cache-adjustment deltas) produce negative
+costs; this is intentional (refund/adjustment semantics), not clamped.
 
 ### Integration
 
@@ -653,7 +854,13 @@ impl Cost {
   `pricing_for(&self, provider: &str, upstream_model: &str) ->
   Option<&ModelPricing>` accessor on `ProviderRegistry` so the pipeline
   can look up pricing after alias resolution (the upstream model id is
-  the key, per locked decision 8).
+  the key, per locked decision 8). **Borrow lifetime note**: the
+  returned `&ModelPricing` borrows from `Arc<ProviderRegistry>` in
+  `AppState`. If the pipeline holds it across `.await` points while
+  reborrowing `AppState`, borrowck can conflict. The safest pattern is
+  to `cloned()` the `ModelPricing` (cheap: 5 `Decimal`s = 80 bytes)
+  immediately after lookup, before any `.await`, and pass the owned
+  `ModelPricing` into the stream/task.
 - `crates/llm-proxy-server/src/routes/core_pipeline.rs` — in both
   `handle_core_once` (`:452`) and `handle_core_stream` (`:596`), once the
   final `Usage` is known, compute `Cost::from_usage` if pricing exists,
@@ -669,6 +876,19 @@ impl Cost {
     has been seen — not inline at each `UsageDelta`. Wire the cost
     computation into the `MessageStop` tail of
     `build_sse_output_stream`, using the latest buffered `Usage`.
+    **StreamContext additions** (`core_pipeline.rs:796-805`): add
+    `pending_usage: Option<Usage>` (updated on every `UsageDelta`),
+    `pricing: Option<ModelPricing>` (cloned from `pricing_for` before
+    the stream starts), `event_bus: Arc<dyn EventBus>`, `request_id:
+    String`, `provider_name: String`, `upstream_message_id:
+    Option<String>`, `start: Instant` (for `latency_ms`). The decode
+    loop (`:969-979`) must match on `CoreEvent::UsageDelta` to update
+    `pending_usage` and on `CoreEvent::MessageStop` to compute
+    `Cost::from_usage(pending_usage, pricing)`, emit `ResponseCompleted`
+    via `event_bus.emit(&event)`, and then proceed with the normal
+    `MessageStop` encoding. The encoder's internal `pending_usage`
+    (Anthropic) is private and not accessible to the route — the route
+    needs its own accumulator.
 - `CoreResponse` (`core.rs:747`) gains an optional `cost: Option<Cost>`
   field, serialized as `cost` in the normalized core response. The client
   encoders (`client/anthropic.rs`, `client/openai_chat.rs`) are not
@@ -676,6 +896,21 @@ impl Cost {
   field); it is available to the event log and the future API crate.
   Keep `#[serde(skip_serializing_if = "Option::is_none")]` so existing
   wire shapes are byte-identical when no pricing is configured.
+  - **Doc the field**: `/// Computed cost, if pricing was configured.
+    None when no pricing is configured for the model.` — the protocol
+    crate has `#![deny(missing_docs)]` (`lib.rs:7`), so the field MUST
+    have a `///` or the build fails.
+  - **Update `CoreResponse`'s manual `Debug`** (`core.rs:769-781`): add
+    `.field("cost", &self.cost)` so cost is visible in debug output.
+    Without this, cost is silently invisible in debug (not a compile
+    error, but a debugging hazard for a billing-relevant field).
+  - **Read ordering in `handle_core_once`** (`core_pipeline.rs:501-527`):
+    `core_resp` is **moved** into `encode_response` at `:516`/`:522`.
+    The `Cost` and `Usage` for the event log must be read **before** that
+    move. Compute `let cost = Cost::from_usage(&core_resp.usage, ...)`
+    at `:507` (before encode), then set `core_resp.cost = Some(cost
+    .clone())` before the move, and pass `cost` to the event log after
+    the move. The `Cost` clone is cheap (5 `Decimal`s = 5 × 16 bytes).
 
 ### Validation
 
@@ -741,6 +976,20 @@ pub enum LogFormat {
     Plain,
     Json,
 }
+
+impl LogFormat {
+    /// Read `RUST_LOG_FORMAT` env var. Defaults to `Plain`.
+    pub fn from_env() -> Self {
+        match std::env::var("RUST_LOG_FORMAT")
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "json" => Self::Json,
+            _ => Self::Plain,
+        }
+    }
+}
 ```
 
 `apps/llm-proxy/src/state.rs:129` (`init_tracing`) — accept a `LogFormat`
@@ -788,72 +1037,124 @@ use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
 /// One request/response lifecycle event, ready to persist or emit.
+///
+/// Internally tagged via `kind` for JSON/TOML consumers. Every field on
+/// every variant has a `///` doc comment because `missing_docs = "warn"`
+/// (workspace) is promoted to deny by the plan's `cargo clippy -- -D
+/// warnings` gate.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ProxyEvent {
+    /// A request was received and routed.
     RequestReceived(RequestReceived),
+    /// A response completed successfully.
     ResponseCompleted(ResponseCompleted),
+    /// A response failed before or during upstream dispatch.
     ResponseFailed(ResponseFailed),
 }
 
+/// Event payload for a received request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RequestReceived {
+    /// Proxy-generated unique request identifier.
     pub request_id: String,
+    /// When the request was received (RFC 3339).
+    #[serde(with = "time::serde::rfc3339")]
     pub timestamp: OffsetDateTime,
+    /// Provider name from the URL path.
     pub provider: String,
+    /// Route kind (`"chat_completions"` or `"messages"`).
     pub route_kind: String,
+    /// Client protocol (`"openai_chat"` or `"anthropic"`).
     pub client_protocol: String,
+    /// Requested and upstream model.
     pub model: ModelRef,
+    /// Whether the request requested streaming.
     pub streaming: bool,
-    /// SHA-256 of the request body for dedup/correlation (not the body
-    /// itself, which may contain secrets).
+    /// SHA-256 of the raw client request body for dedup/correlation
+    /// (not the body itself, which may contain secrets).
     pub body_hash: String,
 }
 
+/// Event payload for a completed response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResponseCompleted {
+    /// Proxy-generated unique request identifier.
     pub request_id: String,
+    /// When the response completed (RFC 3339).
+    #[serde(with = "time::serde::rfc3339")]
     pub timestamp: OffsetDateTime,
+    /// Provider name.
     pub provider: String,
+    /// Upstream message id, if available from `MessageStart` or
+    /// `CoreResponse.id`.
     pub upstream_message_id: Option<String>,
+    /// Requested and upstream model.
     pub model: ModelRef,
+    /// Token usage reported by the provider.
     pub usage: Usage,
+    /// Computed cost, if pricing was configured for the model.
     pub cost: Option<Cost>,
+    /// Why the model stopped generating.
     pub stop_reason: StopReason,
+    /// Request latency in milliseconds.
     pub latency_ms: u64,
 }
 
+/// Event payload for a failed response.
+///
+/// `model` and `provider` are `Option` because early failures (unknown
+/// provider, JSON parse error, rate limit) can occur before the model
+/// or provider is confirmed.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResponseFailed {
+    /// Proxy-generated unique request identifier.
     pub request_id: String,
+    /// When the failure occurred (RFC 3339).
+    #[serde(with = "time::serde::rfc3339")]
     pub timestamp: OffsetDateTime,
-    pub provider: String,
-    pub model: ModelRef,
+    /// Provider name, if known at failure time.
+    pub provider: Option<String>,
+    /// Requested and upstream model, if decoded before failure.
+    pub model: Option<ModelRef>,
+    /// Error kind string from the `RouteError` variant name.
     pub error_kind: String,
     /// Sanitized error message; never includes api keys or raw upstream
     /// bodies.
     pub message: String,
+    /// HTTP status code returned to the client.
     pub http_status: u16,
+    /// Request latency in milliseconds.
     pub latency_ms: u64,
 }
 
 /// In-process event sink. Implementations: `NoopBus`, `RecordingBus`
 /// (tests), and the future SQLite backend.
-pub trait EventBus: Send + Sync {
-    fn emit(&self, event: ProxyEvent);
+///
+/// `Debug` is a super-trait so that `Arc<dyn EventBus>` can be formatted
+/// in `AppState`'s manual `Debug` impl (`state.rs:94-108`). Without it,
+/// the manual `Debug` cannot compile.
+pub trait EventBus: Send + Sync + std::fmt::Debug {
+    /// Emit one event. Must not block the calling task; backends do IO
+    /// on a dedicated writer task.
+    fn emit(&self, event: &ProxyEvent);
 }
 
 /// Default no-op sink.
 #[derive(Debug, Clone, Default)]
 pub struct NoopBus;
 impl EventBus for NoopBus {
-    fn emit(&self, _event: ProxyEvent) {}
+    fn emit(&self, _event: &ProxyEvent) {}
 }
 
-/// Test-only sink that records events for assertions.
-#[cfg(test)]
+/// Test-only sink that records events for assertions. Available behind
+/// the `test-utils` cargo feature (NOT `#[cfg(test)]`, which is stripped
+/// when the crate is compiled as a dependency — `llm-proxy-server` tests
+/// need to import it).
+#[cfg(any(test, feature = "test-utils"))]
 #[derive(Debug, Default)]
 pub struct RecordingBus {
+    /// Recorded events, guarded by a mutex for interior mutability.
     pub events: std::sync::Mutex<Vec<ProxyEvent>>,
 }
 ```
@@ -864,12 +1165,34 @@ pub struct RecordingBus {
 to `AppState`, defaulting to `Arc::new(NoopBus)`. `cmd_serve` constructs
 the real bus (still `NoopBus` in this plan; the persisted bus lands later).
 
+**AppState Debug + constructor updates (compile-critical):**
+
+- `AppState` has a manual `impl Debug` (`state.rs:94-108`) that calls
+  `.field(name, &self.field)` for every field. Because `EventBus` now
+  requires `Debug` (see trait definition above), `Arc<dyn EventBus>`
+  formats correctly. Add `.field("event_bus", &self.event_bus)` to the
+  manual `Debug` impl.
+- The regression test `app_state_debug_covers_all_fields` (`state.rs:335`)
+  iterates a hardcoded field-name list — **must add `"event_bus"`** or it
+  fails.
+- `AppState::new` (`state.rs:114`) and `AppState::new_with_catalog_dir`
+  (`state.rs:133-157`) both construct `AppState` as a struct literal.
+  **Both must initialize `event_bus: Arc::new(NoopBus)`** or the literal
+  won't compile. `AppState::new` delegates to `new_with_catalog_dir`, so
+  only the latter needs the field added; but verify the delegation chain.
+- `llm-proxy-server/Cargo.toml` must add `llm-proxy-storage` as a regular
+  dependency (for `NoopBus`/`EventBus`) and as a dev-dependency with
+  `features = ["test-utils"]` (for `RecordingBus` in integration tests).
+
 `crates/llm-proxy-server/src/routes/core_pipeline.rs` — emit:
 
 - `RequestReceived` at the end of `prepare_request` (`:224`), after the
   request id and provider are known. `body_hash` is computed over the
-  encoded `CoreRequest` bytes (or the raw client body) with `sha2`; add
-  `sha2` to workspace deps. Never include the body itself.
+  **raw client `body: &[u8]`** passed to `prepare_request` (the raw body
+  is available there — it has NOT yet been decoded into `CoreRequest`;
+  decoding happens after `prepare_request`, e.g. `chat.rs:81-90`). Hash
+  with `sha2::Sha256` (already a dep of `llm-proxy-server`). Never
+  include the body itself in the event.
 - `ResponseCompleted` at the success tail of `handle_core_once` and at
   the `MessageStop` tail of `build_sse_output_stream`. Includes `usage`,
   `cost` (from Step 3), `upstream_message_id` (from Step 1),
@@ -879,9 +1202,12 @@ the real bus (still `NoopBus` in this plan; the persisted bus lands later).
   `map_upstream_status` / the route error's status mapping.
 
 The emit calls must never block the hot path. `EventBus::emit` takes
-`&self` and is expected to be cheap (queue/spawn). Document that backend
-implementations must not do synchronous IO on the calling task; the
-SQLite backend will spawn a dedicated writer task.
+`&ProxyEvent` (not by value) so `NoopBus` does not force the caller to
+allocate. Callers construct `ProxyEvent` on the stack and pass `&event`;
+if the bus is `NoopBus`, the only cost is the stack construction (which
+the compiler can elide if the event is unused after `emit`). For the
+future SQLite backend, the `emit` impl clones the event into a channel
+and returns immediately; the writer task does the IO.
 
 ### Dependencies
 
@@ -893,14 +1219,28 @@ SQLite backend will spawn a dedicated writer task.
   `["formatting", "parsing"]` only — **no `serde` feature**. The
   `OffsetDateTime` fields in `ProxyEvent` etc. use
   `#[derive(Serialize, Deserialize)]`, which requires `time`'s `serde`
-  feature. **Must change** `Cargo.toml:39` to:
-  `time = { version = "=0.3.44", features = ["formatting", "parsing", "serde"] }`.
-  Then add `time = { workspace = true }` to `llm-proxy-storage`.
+  feature. Furthermore, `time`'s default `serde` impl serializes
+  `OffsetDateTime` as an **opaque struct** (unix seconds + nanos +
+  offset), not RFC3339 — which is useless for a queryable event log.
+  **Must change** `Cargo.toml:39` to:
+  `time = { version = "=0.3.44", features = ["formatting", "parsing", "serde", "serde-well-known"] }`.
+  The `serde-well-known` feature enables `time::serde::rfc3339`, used via
+  `#[serde(with = "time::serde::rfc3339")]` on every `timestamp` field
+  (as shown in the event type definitions above). Then add
+  `time = { workspace = true }` to `llm-proxy-storage`.
 - `llm-proxy-storage` currently has **zero dependencies** (only
   `[package]` + `[lints]`). It now depends on `llm-proxy-protocol` (for
   `Usage`, `Cost`, `ModelRef`, `StopReason`), `rust_decimal`, `time`,
   `secrecy`, and `serde`. No cycle is created: `llm-proxy-protocol` does
   not depend on `llm-proxy-storage`.
+- **`test-utils` feature**: add `[features] test-utils = []` to
+  `llm-proxy-storage/Cargo.toml`. `RecordingBus` is gated as
+  `#[cfg(any(test, feature = "test-utils"))]`. Then
+  `crates/llm-proxy-server/Cargo.toml` adds
+  `llm-proxy-storage = { workspace = true, features = ["test-utils"] }`
+  under `[dev-dependencies]` so integration tests can use `RecordingBus`.
+  Regular `[dependencies]` in `llm-proxy-server` uses
+  `llm-proxy-storage = { workspace = true }` (no `test-utils`).
 - `llm-proxy-protocol/src/lib.rs` has **no `pub use` re-exports** — the
   types `Cost`, `Usage`, `ModelRef`, `StopReason` live at
   `llm_proxy_protocol::core::*`, not the crate root. The storage crate
@@ -931,9 +1271,11 @@ SQLite backend will spawn a dedicated writer task.
 
 - `SecretString` on `ProviderConfig` and `ProviderAdapterTargetConfig`.
 - `ModelId`, `ModelPricing`, `pricing` map on `ProviderConfig`.
-- `LogFormat` on `ServerConfig`.
-- `Tokenizer` trait, `TiktokenTokenizer`, `HeuristicTokenizer`,
-  model-to-encoding map in `token/`.
+- `LogFormat` on `ServerConfig` + `LogFormat::from_env()`.
+- `Tokenizer` trait (`Send + Sync + Debug`), `TiktokenTokenizer`,
+  `HeuristicTokenizer`, model-to-encoding map in `token/`.
+- `Counter` signature change: `count_messages` / `count_tokens` gain
+  `model: &str` param. No longer a ZST.
 - Pricing validation in `validate_provider_config`.
 - `pricing_for` accessor on `ProviderRegistry`.
 - No HTTP, no event emission.
@@ -954,17 +1296,27 @@ SQLite backend will spawn a dedicated writer task.
 
 `llm-proxy-storage`:
 
-- `ProxyEvent`, `RequestReceived`, `ResponseCompleted`, `ResponseFailed`.
-- `EventBus` trait, `NoopBus`, `RecordingBus` (test).
+- `ProxyEvent`, `RequestReceived`, `ResponseCompleted`, `ResponseFailed`
+  (all fields documented for `missing_docs`).
+- `EventBus` trait (`Send + Sync + Debug`), `NoopBus`, `RecordingBus`
+  (behind `test-utils` feature).
+- `test-utils` cargo feature.
 - No persistence backend yet (this plan).
 
 `llm-proxy-server`:
 
-- Buffered-first-event upstream id in `core_pipeline.rs`.
-- Tokenizer integration in `token_count.rs` (via `Counter`).
-- Cost computation at pipeline boundaries.
-- `EventBus` in `AppState`; emit calls at pipeline boundaries.
-- `body_hash` computation with `sha2`.
+- Buffered-first-event upstream id in `core_pipeline.rs` (inside spawned
+  task, not handler).
+- `StreamContext` additions: `pending_usage`, `pricing`, `event_bus`,
+  `request_id`, `provider_name`, `upstream_message_id`, `start`.
+- Tokenizer integration in `token_count.rs` (via `Counter` with model
+  param).
+- Cost computation at pipeline boundaries (non-stream: before
+  `encode_response` move; stream: at `MessageStop` in decode loop).
+- `EventBus` in `AppState` (with `Debug` update + constructor update);
+  emit calls at pipeline boundaries.
+- `body_hash` computation with `sha2` (already a dep).
+- `llm-proxy-storage` as regular dep + dev-dep with `test-utils`.
 
 `apps/llm-proxy`:
 
@@ -996,7 +1348,7 @@ SQLite backend will spawn a dedicated writer task.
 | Ch. 6 Generics & Dispatch | `dyn Tokenizer` is acceptable here (counting is not hot enough to matter vs. the BPE work itself). `Arc<dyn EventBus>` is the standard shape for a swappable sink. |
 | Ch. 7 Type State | Not needed. `SecretString` already encodes the "secret vs exposed" distinction at the type level via `expose_secret()`. |
 | Ch. 8 Docs | `///` on `ModelId`, `ModelPricing`, `Cost`, `ProxyEvent`, `EventBus` — and on **every public field** of each. Workspace `missing_docs = "warn"` (`Cargo.toml:65`), but `llm-proxy-protocol/src/lib.rs:7` overrides to `#![deny(missing_docs)]`, so any undocumented public item in the protocol crate (e.g. `Cost`, `Cost`'s fields) **fails the build immediately**. The storage crate inherits the workspace "warn"; promote to deny once it has real items. Under `cargo clippy -- -D warnings` (the plan's gate), "warn" becomes a hard fail everywhere, so every public field needs a `///` — including `ModelId(pub String)`'s field. |
-| Ch. 9 Send/Sync | `EventBus: Send + Sync` so it can live in `Arc` inside `AppState`. `TiktokenTokenizer` must be `Send + Sync` (verify `CoreBPE` is; if not, wrap in a `Mutex`). |
+| Ch. 9 Send/Sync | `EventBus: Send + Sync + Debug` so it can live in `Arc` inside `AppState` and format in the manual `Debug` impl. `TiktokenTokenizer` wraps `Arc<CoreBPE>` (verified `Send + Sync` in tiktoken-rs 0.6). `Tokenizer: Send + Sync + Debug` so `Counter` can derive `Debug`. |
 
 ## Test Plan
 
@@ -1017,41 +1369,68 @@ SQLite backend will spawn a dedicated writer task.
 ### Upstream message IDs
 
 - Mocked `MessageStart { id: Some("msg_real_123") }` surfaces as the
-  client SSE id.
+  client SSE id (Anthropic: `msg_real_123`; OpenAI: the upstream id
+  verbatim, e.g. `chatcmpl-abc123` — NOT re-prefixed).
 - `id: None` falls back to synthetic.
 - First-frame `Ping` then `MessageStart` still surfaces the real id.
+- First-frame `:keepalive` (empty decode) then `MessageStart` still
+  surfaces the real id (loop continues past empty decodes).
 - Multi-event first frame: no events lost or duplicated.
+- Client disconnect during first-frame wait: task aborts cleanly
+  (cancellation select covers the buffering loop).
 
 ### Token counting
 
-- Model-to-encoding map selects correct encoding for known OpenAI ids.
+- Known OpenAI model ids select the expected encoding.
 - Unknown ids fall back to heuristic.
-- BPE count for a fixture string matches recorded tiktoken count.
-- `count_messages` within tolerance of provider-reported `Usage` on a
-  golden fixture.
-- BPE load failure falls back to heuristic without panic.
-- Existing `counter.rs` heuristic tests stay green.
+- `count_messages` with model param: a known model's BPE count for a
+  fixture string matches a recorded tiktoken count (use a stable fixture,
+  e.g. "hello world" -> known token count for `cl100k_base`).
+- `count_messages` with model param: within a small tolerance of the
+  provider-reported `Usage.input_tokens` on a captured fixture (golden
+  test).
+- Heuristic path is unchanged (existing `counter.rs` tests stay green
+  after updating call sites to pass a model param — use an unknown model
+  id to hit the heuristic path).
+- BPE load failure falls back to heuristic without panicking.
+- `Counter` is no longer a ZST but is `Clone` (Arc refcount bump) and
+  `Debug` (trait requires Debug).
 
 ### Pricing
 
-- `ModelPricing` parses from TOML with string decimals.
-- `Cost::from_usage` matches hand-computed fixture.
-- Negative price rejected; empty `ModelId` rejected.
+- `ModelPricing` parses from TOML with quoted string decimals.
+- `ModelPricing` with unquoted float TOML value fails with a clear error
+  (document the "always quote" rule).
+- `Cost::from_usage` matches hand-computed fixture (including
+  `Option<i32>` fields that are `None` → 0 cost).
+- Negative price rejected by validation; empty `ModelId` rejected.
 - No `pricing` block -> `Cost = None` -> wire response byte-identical.
 - Alias resolution: pricing looked up under upstream id, not alias.
+- `pricing_for` returns `Option<&ModelPricing>`; caller clones before
+  crossing `.await` (borrow lifetime test).
+- `CoreResponse` manual `Debug` includes the `cost` field.
 
 ### Event log
 
 - `LogFormat::Json` produces JSON log lines.
+- `LogFormat::from_env()` reads `RUST_LOG_FORMAT` correctly (case-
+  insensitive, defaults to `Plain`).
 - `RecordingBus` captures `RequestReceived` + `ResponseCompleted` for a
   successful non-stream request.
 - `RecordingBus` captures `ResponseFailed` with correct `http_status`
-  for a 404 unknown-provider.
+  for a 404 unknown-provider (model and provider are `None` in the
+  event).
 - Stream request emits `ResponseCompleted` with the real
-  `upstream_message_id`.
-- `body_hash` stable for identical bodies, differs for different bodies.
-- Event JSON contains no `api_key` / secret inner values (source-guard).
-- `NoopBus` does not block the request path (latency test).
+  `upstream_message_id` from Step 1.
+- `body_hash` is SHA-256 of the raw client body (stable for identical
+  bodies, differs for different bodies).
+- Event JSON timestamps are RFC 3339 format (not opaque structs).
+- Event JSON never contains `api_key` or `SecretString` inner values
+  (source-guard test: grep event serialization for known key strings).
+- `NoopBus` does not force allocation on emit (`emit(&self, &ProxyEvent)`
+  — NoopBus drops the reference without cloning).
+- `RecordingBus` is importable from `llm-proxy-server` integration tests
+  (via `test-utils` feature).
 
 ## Verification Commands
 
@@ -1059,9 +1438,14 @@ Run after every step, and once at the end:
 
 ```sh
 cargo fmt --all -- --check
-cargo test --workspace --all-targets --all-features --locked
-cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+cargo test --workspace --all-targets --locked
+cargo clippy --workspace --all-targets --locked -- -D warnings
 ```
+
+Note: `--all-features` is intentionally omitted. The workspace currently
+defines no cargo features. If the `test-utils` feature is added to
+`llm-proxy-storage` (for `RecordingBus`), `--all-features` would pull
+test-only code into release builds, which is undesirable.
 
 End-of-plan source-guard scans:
 
@@ -1072,6 +1456,24 @@ rg "Debug for Provider(Config|AdapterTarget"  # expect zero manual impls (derive
 rg "pricing|ModelPricing|Cost" crates    # expect matches in core/protocol/server
 rg "EventBus|ProxyEvent" crates          # expect matches in storage/server
 ```
+
+## Files Needing Documentation Updates
+
+These files must be updated to document the new config fields. They are
+not compile-critical (serde defaults handle missing fields in TOML), but
+operators will not know the fields exist without them:
+
+- `config.toml.example` — add `# log_format = "plain"` comment showing
+  the option and the `"json"` alternative.
+- `apps/llm-proxy/src/defaults.rs:16-25` (`DEFAULT_CONFIG_TOML`) — add
+  a `log_format` line or comment so `llm-proxy init` generates configs
+  that document the option.
+- `providers/opencode-go.toml.example` — add a commented
+  `[provider.pricing]` example block.
+- `providers/opencode-zen.toml.example` — add a commented
+  `[provider.pricing]` example block.
+- `apps/llm-proxy/src/commands/validate.rs` — optionally extend the
+  route table printout to show pricing entries per provider.
 
 ## Deferred Features
 
@@ -1089,11 +1491,10 @@ rg "EventBus|ProxyEvent" crates          # expect matches in storage/server
 
 ## Open Questions
 
-1. **BPE load timing.** Eager at startup (fail fast, offline-unsafe) vs.
-   lazy on first use (fast startup, first request pays). Recommendation:
-   lazy, with a one-time `warn!` on load failure. Confirm `tiktoken-rs`
-   ranks are bundled at build time or fetched at runtime; if fetched,
-   offline operation needs a cache path.
+1. **BPE load timing.** Resolved: lazy on first use, with a one-time
+   `warn!` on load failure. `tiktoken-rs` 0.6 bundles ranks at compile
+   time via `include_bytes!` — no network fetch, offline-safe. Binary
+   grows ~2-4 MB per encoding. See "tiktoken-rs specifics" in Step 2.
 2. **`SecretString` and env interpolation order.** Verified:
    `load_provider_config` (`provider_config.rs:1164`) interpolates
    `${VAR}` in the raw TOML string BEFORE `toml::from_str`
@@ -1101,12 +1502,13 @@ rg "EventBus|ProxyEvent" crates          # expect matches in storage/server
    at `:1220`). So `${VAR}` is resolved before serde builds the
    `SecretString`. No extra work needed; the existing interpolation hook
    covers `api_key` because it runs on the whole raw string.
-3. **`log_format` env vs. TOML.** The subscriber must init before config
-   load. Resolution: `RUST_LOG_FORMAT` env var at init; TOML field is the
+3. **`log_format` env vs. TOML.** Resolved: `RUST_LOG_FORMAT` env var at
+   init (via `LogFormat::from_env()`, reading the env var case-
+   insensitively, defaulting to `Plain`); TOML `log_format` field is the
    documented default the operator sets so a wrapper script can export
-   the env var from it. Alternative: defer subscriber init until after
-   config load and accept that pre-config log lines use the plain format.
-   Recommendation: env-at-init (matches `RUST_LOG`).
+   the env var from it. The subscriber must init before config load
+   (existing doc at `state.rs:125-128`), so env-at-init is the only
+   viable path.
 4. **`Cost` on the wire.** Currently proposed as
    `#[serde(skip_serializing_if = "Option::is_none")]` so it is invisible
    when no pricing is configured. If a future API client wants cost in the
