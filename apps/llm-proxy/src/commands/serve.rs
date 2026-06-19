@@ -4,8 +4,9 @@
 
 use std::path::PathBuf;
 
-use axum::serve::{Listener, ListenerExt};
 use anyhow::{Context, Result, bail};
+use axum::serve::{Listener, ListenerExt};
+use llm_proxy_core::LogFormat;
 use llm_proxy_provider::{ProviderAdapterRegistry, ProxyClient};
 use llm_proxy_server::{build_router, shutdown_signal};
 use tokio::net::TcpListener;
@@ -29,7 +30,7 @@ pub async fn cmd_serve(
     // process can log during spawn_daemon(). The daemon child reinitializes
     // its own subscriber; calling init_tracing twice is safe (the second
     // call is a no-op since the global subscriber is already set).
-    init_tracing();
+    init_tracing(LogFormat::from_env());
 
     // If background mode requested, spawn self as child with --daemonize.
     if background && !daemonize {
@@ -47,8 +48,9 @@ pub async fn cmd_serve(
     // fail at startup on an invalid `HTTP_PROXY`/`HTTPS_PROXY` env value or a
     // TLS-init failure; using `try_new` (audit GAP-LOW-13) lets us surface that
     // as a contextualized error instead of panicking the daemon.
-    let proxy_client = ProxyClient::try_new()
-        .with_context(|| "building proxy HTTP client (check HTTP_PROXY/HTTPS_PROXY and TLS config)")?;
+    let proxy_client = ProxyClient::try_new().with_context(
+        || "building proxy HTTP client (check HTTP_PROXY/HTTPS_PROXY and TLS config)",
+    )?;
 
     // Load TOML config and build state before writing the PID file. This
     // ensures a bad config does not leave a stale PID file on disk.
@@ -274,7 +276,8 @@ fn spawn_daemon(config_path: Option<PathBuf>, port_override: Option<u16>) -> Res
         Ok(Some(status)) => {
             bail!(
                 "daemon child exited immediately with status {}",
-                status.code()
+                status
+                    .code()
                     .map(|c| c.to_string())
                     .unwrap_or_else(|| "signal".to_string())
             );

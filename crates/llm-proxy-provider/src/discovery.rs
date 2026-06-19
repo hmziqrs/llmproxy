@@ -8,6 +8,7 @@ use llm_proxy_core::{
     StaticModelCatalogEntry,
 };
 use reqwest::{Client, RequestBuilder, Url};
+use secrecy::ExposeSecret;
 use serde_json::Value;
 
 use crate::ProviderError;
@@ -178,13 +179,14 @@ impl DiscoveryClient {
         url: &Url,
     ) -> RequestBuilder {
         let mut request = self.http.get(url.clone());
+        // Transport boundary (discovery bypasses `AuthHeaders`): the secret is
+        // exposed only here to build the reqwest auth header(s).
+        let api_key: &str = provider.api_key.expose_secret();
         request = match provider.auth_style {
-            AuthStyle::Bearer => request.bearer_auth(&provider.api_key),
-            AuthStyle::XApiKey => request.header("x-api-key", &provider.api_key),
-            AuthStyle::XGoogleApiKey => request.header("x-goog-api-key", &provider.api_key),
-            AuthStyle::Both => request
-                .bearer_auth(&provider.api_key)
-                .header("x-api-key", &provider.api_key),
+            AuthStyle::Bearer => request.bearer_auth(api_key),
+            AuthStyle::XApiKey => request.header("x-api-key", api_key),
+            AuthStyle::XGoogleApiKey => request.header("x-goog-api-key", api_key),
+            AuthStyle::Both => request.bearer_auth(api_key).header("x-api-key", api_key),
         };
         if discovery.kind == ProviderDiscoveryKind::AnthropicModels
             && !discovery
@@ -419,7 +421,7 @@ mod tests {
     ) -> ProviderConfig {
         ProviderConfig {
             name: "test-provider".to_owned(),
-            api_key: "test-key".to_owned(),
+            api_key: secrecy::SecretString::from("test-key"),
             auth_style: AuthStyle::XApiKey,
             adapters: HashMap::new(),
             routes: ProviderRoutesConfig::default(),
@@ -433,6 +435,7 @@ mod tests {
                 max_response_bytes: 4 * 1024 * 1024,
             }),
             catalog: None,
+            pricing: Default::default(),
         }
     }
 

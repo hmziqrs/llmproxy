@@ -7,3 +7,17 @@ license.workspace = true
 
 [lints]
 workspace = true
+
+[features]
+# Exposes `RecordingBus` so downstream crates' integration tests can assert on
+# the event sequence. Not enabled in release builds.
+test-utils = []
+
+[dependencies]
+llm-proxy-protocol = { path = "../llm-proxy-protocol" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+time = { workspace = true }
+
+[dev-dependencies]
+# serde_json is already a regular dep; reused by the in-crate tests above.

@@ -4,7 +4,9 @@
 
 use anyhow::{Context, Result, bail};
 
-use crate::defaults::{DEFAULT_CONFIG_TOML, DEFAULT_PROVIDER_OPENCODE_GO, DEFAULT_PROVIDER_OPENCODE_ZEN};
+use crate::defaults::{
+    DEFAULT_CONFIG_TOML, DEFAULT_PROVIDER_OPENCODE_GO, DEFAULT_PROVIDER_OPENCODE_ZEN,
+};
 use crate::paths::{config_dir, default_config_path, providers_dir_for};
 use crate::permissions::{create_private_file, set_private_dir_permissions};
 
@@ -61,7 +63,9 @@ pub fn cmd_init() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use crate::defaults::{DEFAULT_CONFIG_TOML, DEFAULT_PROVIDER_OPENCODE_GO, DEFAULT_PROVIDER_OPENCODE_ZEN};
+    use crate::defaults::{
+        DEFAULT_CONFIG_TOML, DEFAULT_PROVIDER_OPENCODE_GO, DEFAULT_PROVIDER_OPENCODE_ZEN,
+    };
     use crate::permissions::set_private_permissions;
 
     #[test]
@@ -96,17 +100,11 @@ mod tests {
         let go_content = std::fs::read_to_string(&go_path).unwrap();
         let parsed: toml::Value = toml::from_str(&go_content).unwrap();
         assert!(parsed.get("provider").is_some());
-        assert_eq!(
-            parsed["provider"]["name"].as_str(),
-            Some("opencode-go")
-        );
+        assert_eq!(parsed["provider"]["name"].as_str(), Some("opencode-go"));
 
         let zen_content = std::fs::read_to_string(&zen_path).unwrap();
         let parsed: toml::Value = toml::from_str(&zen_content).unwrap();
-        assert_eq!(
-            parsed["provider"]["name"].as_str(),
-            Some("opencode-zen")
-        );
+        assert_eq!(parsed["provider"]["name"].as_str(), Some("opencode-zen"));
 
         // Verify restrictive permissions on Unix
         #[cfg(unix)]

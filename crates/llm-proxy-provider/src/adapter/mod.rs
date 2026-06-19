@@ -32,6 +32,7 @@ use llm_proxy_core::AuthStyle;
 use llm_proxy_protocol::core::{
     CoreEvent, CoreRequest, CoreResponse, ModelRef, StopReason, Usage, UsageProvenance,
 };
+use secrecy::SecretString;
 
 use crate::error::ProviderError;
 use crate::sse::SseFrame;
@@ -108,8 +109,8 @@ pub struct ProviderAdapterTarget {
     pub endpoint: String,
     /// How to authenticate with the upstream.
     pub auth_style: AuthStyle,
-    /// API key for the upstream. Redacted in Debug output.
-    pub api_key: String,
+    /// API key for the upstream (wrapped in [`SecretString`]). Redacted in Debug output.
+    pub api_key: SecretString,
     /// The model the client asked for.
     pub requested_model: String,
     /// The model to send upstream (may differ due to aliasing).
@@ -218,10 +219,7 @@ impl ProviderAdapter {
     /// a boxed trait object: the decoder set is closed (4 impls), so an enum
     /// avoids the per-stream heap allocation and lets `decode_frame`/`finish`
     /// static-dispatch instead of going through a vtable per frame (GAP-LOW-1).
-    pub fn new_stream_decoder(
-        &self,
-        target: &ProviderAdapterTarget,
-    ) -> ProviderStreamDecoderKind {
+    pub fn new_stream_decoder(&self, target: &ProviderAdapterTarget) -> ProviderStreamDecoderKind {
         match self {
             Self::OpenAiChat(a) => {
                 ProviderStreamDecoderKind::OpenAiChat(a.new_stream_decoder(target))
@@ -734,7 +732,7 @@ mod tests {
             protocol: ProviderProtocol::OpenAiChatCompletions,
             endpoint: "https://api.openai.com/v1/chat/completions?key=query-secret".into(),
             auth_style: AuthStyle::Bearer,
-            api_key: "sk-test-super-secret-key-1234567890".into(),
+            api_key: SecretString::from("sk-test-super-secret-key-1234567890"),
             requested_model: "gpt-4o".into(),
             upstream_model: "gpt-4o".into(),
             headers: Arc::new(std::collections::HashMap::new()),
@@ -821,7 +819,7 @@ mod tests {
             protocol: ProviderProtocol::OpenAiChatCompletions,
             endpoint: "https://api.openai.com/v1/chat/completions".into(),
             auth_style: AuthStyle::Bearer,
-            api_key: "key".into(),
+            api_key: SecretString::from("key"),
             requested_model: "gpt-4o".into(),
             upstream_model: "gpt-4o".into(),
             headers: Arc::new(std::collections::HashMap::new()),
@@ -839,7 +837,7 @@ mod tests {
             protocol: ProviderProtocol::OpenAiChatCompletions,
             endpoint: "https://api.openai.com/v1/chat/completions".into(),
             auth_style: AuthStyle::Bearer,
-            api_key: "key".into(),
+            api_key: SecretString::from("key"),
             requested_model: "my-alias".into(),
             upstream_model: "gpt-4o-2024-08-06".into(),
             headers: Arc::new(std::collections::HashMap::new()),
@@ -954,7 +952,7 @@ mod tests {
             protocol,
             endpoint,
             auth_style,
-            api_key: "test-key".into(),
+            api_key: SecretString::from("test-key"),
             requested_model: "gpt-4o".into(),
             upstream_model: "gemini-2.5-pro".into(),
             headers: Arc::new(std::collections::HashMap::new()),

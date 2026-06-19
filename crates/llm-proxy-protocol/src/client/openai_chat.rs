@@ -99,10 +99,7 @@ pub fn decode_request(req: ChatCompletionRequest) -> Result<CoreRequest, Protoco
                     r#type: CacheControlType::from(cc.r#type),
                 });
                 if !text.is_empty() || cache.is_some() {
-                    system.push(CoreContent::Text {
-                        text,
-                        cache,
-                    });
+                    system.push(CoreContent::Text { text, cache });
                 }
             }
             "user" => {
@@ -112,10 +109,7 @@ pub fn decode_request(req: ChatCompletionRequest) -> Result<CoreRequest, Protoco
                 });
                 let mut content = Vec::new();
                 if !text.is_empty() || cache.is_some() {
-                    content.push(CoreContent::Text {
-                        text,
-                        cache,
-                    });
+                    content.push(CoreContent::Text { text, cache });
                 }
                 messages.push(CoreMessage {
                     role: CoreRole::User,
@@ -986,6 +980,7 @@ mod tests {
             stop_sequence: None,
             usage: Usage::provider_reported(10, 20),
             provider_meta: serde_json::Map::new(),
+            cost: None,
         }
     }
 
@@ -1386,6 +1381,7 @@ mod tests {
             stop_sequence: None,
             usage: Usage::provider_reported(10, 20),
             provider_meta: serde_json::Map::new(),
+            cost: None,
         };
         let out = encode_response(resp).unwrap();
         assert_eq!(out.choices[0].finish_reason.as_deref(), Some("tool_calls"));
@@ -1452,6 +1448,7 @@ mod tests {
             stop_sequence: None,
             usage: Usage::default(),
             provider_meta: serde_json::Map::new(),
+            cost: None,
         };
         let out = encode_response(resp).unwrap();
         let msg = out.choices[0].message.as_ref().unwrap();
@@ -1744,6 +1741,7 @@ mod tests {
             stop_sequence: None,
             usage: Usage::default(),
             provider_meta: serde_json::Map::new(),
+            cost: None,
         };
         let out = encode_response(resp).unwrap();
         let msg = out.choices[0].message.as_ref().unwrap();
@@ -1766,6 +1764,7 @@ mod tests {
             stop_sequence: None,
             usage: Usage::default(),
             provider_meta: serde_json::Map::new(),
+            cost: None,
         };
         let out = encode_response(resp).unwrap();
         let msg = out.choices[0].message.as_ref().unwrap();
@@ -1789,6 +1788,7 @@ mod tests {
             stop_sequence: None,
             usage: Usage::default(),
             provider_meta: serde_json::Map::new(),
+            cost: None,
         };
         let out = encode_response(resp).unwrap();
         let msg = out.choices[0].message.as_ref().unwrap();
@@ -1810,6 +1810,7 @@ mod tests {
             stop_sequence: None,
             usage: Usage::default(),
             provider_meta: serde_json::Map::new(),
+            cost: None,
         };
         let out = encode_response(resp).unwrap();
         let msg = out.choices[0].message.as_ref().unwrap();
@@ -1831,6 +1832,7 @@ mod tests {
             stop_sequence: None,
             usage: Usage::default(),
             provider_meta: serde_json::Map::new(),
+            cost: None,
         };
         let out = encode_response(resp).unwrap();
         let msg = out.choices[0].message.as_ref().unwrap();
@@ -1854,6 +1856,7 @@ mod tests {
             stop_sequence: None,
             usage: Usage::default(),
             provider_meta: serde_json::Map::new(),
+            cost: None,
         };
         let out = encode_response(resp).unwrap();
         let msg = out.choices[0].message.as_ref().unwrap();
@@ -1919,6 +1922,7 @@ mod tests {
             stop_sequence: None,
             usage: Usage::default(),
             provider_meta: serde_json::Map::new(),
+            cost: None,
         };
         let out = encode_response(resp).unwrap();
         // RedactedThinking is skipped (not an error), so content is empty.
@@ -1947,6 +1951,7 @@ mod tests {
             stop_sequence: None,
             usage: Usage::default(),
             provider_meta: serde_json::Map::new(),
+            cost: None,
         };
         let out = encode_response(resp).unwrap();
         let msg = out.choices[0].message.as_ref().unwrap();
@@ -1967,6 +1972,7 @@ mod tests {
             stop_sequence: None,
             usage: Usage::default(),
             provider_meta: serde_json::Map::new(),
+            cost: None,
         };
         let out = encode_response(resp).unwrap();
         let msg = out.choices[0].message.as_ref().unwrap();
@@ -1987,6 +1993,7 @@ mod tests {
             stop_sequence: None,
             usage: Usage::default(),
             provider_meta: serde_json::Map::new(),
+            cost: None,
         };
         let out = encode_response(resp).unwrap();
         assert!(out.id.starts_with("chatcmpl-"));
@@ -2090,6 +2097,7 @@ mod tests {
             stop_sequence: Some("\n".into()),
             usage: Usage::default(),
             provider_meta: serde_json::Map::new(),
+            cost: None,
         };
         let out = encode_response(resp).unwrap();
         // stop_sequence is dropped (OpenAI has no field for it), but the
@@ -2119,6 +2127,7 @@ mod tests {
             stop_sequence: None,
             usage: Usage::default(),
             provider_meta: serde_json::Map::new(),
+            cost: None,
         };
         let out = encode_response(resp).unwrap();
         let msg = out.choices[0].message.as_ref().unwrap();
@@ -2143,6 +2152,7 @@ mod tests {
             stop_sequence: None,
             usage: Usage::default(),
             provider_meta: serde_json::Map::new(),
+            cost: None,
         };
         let out = encode_response(resp).unwrap();
         let msg = out.choices[0].message.as_ref().unwrap();
@@ -2367,7 +2377,10 @@ mod tests {
             msg.contains("stop must be a string, array of strings, or null"),
             "expected stop-type rejection, got: {msg}"
         );
-        assert!(msg.contains("number"), "expected type name in message: {msg}");
+        assert!(
+            msg.contains("number"),
+            "expected type name in message: {msg}"
+        );
     }
 
     #[test]
@@ -2382,6 +2395,9 @@ mod tests {
             msg.contains("stop array must contain only strings"),
             "expected stop-array rejection, got: {msg}"
         );
-        assert!(msg.contains("number"), "expected type name in message: {msg}");
+        assert!(
+            msg.contains("number"),
+            "expected type name in message: {msg}"
+        );
     }
 }

@@ -6,7 +6,9 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use llm_proxy_core::{AppConfig, ProviderConfig, ProviderRegistry, merge_catalog, parse_catalog_file};
+use llm_proxy_core::{
+    AppConfig, LogFormat, ProviderConfig, ProviderRegistry, merge_catalog, parse_catalog_file,
+};
 use llm_proxy_provider::{ProviderAdapterRegistry, ProxyClient};
 use llm_proxy_server::{AppState, BuildInfo};
 use tracing::info;
@@ -122,20 +124,23 @@ pub fn build_info() -> BuildInfo {
 
 /// Initialize the tracing subscriber.
 ///
-/// Uses `RUST_LOG` env var with fallback to "info". The `log_level` field in
-/// the TOML config file is intentionally not used here because the subscriber
-/// must be initialized before the config is loaded (tracing is needed during
-/// config loading itself). To control log verbosity, set `RUST_LOG` instead.
-pub fn init_tracing() {
+/// Uses `RUST_LOG` env var with fallback to "info". The output format is
+/// selected by `log_format`: [`LogFormat::Plain`] (default) for human-readable
+/// logs, [`LogFormat::Json`] for structured JSON (one object per line). The
+/// format is read from the `RUST_LOG_FORMAT` env var at init via
+/// [`LogFormat::from_env`], before the TOML config is loaded (tracing is needed
+/// during config loading itself). To control log verbosity, set `RUST_LOG`.
+pub fn init_tracing(log_format: LogFormat) {
     use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
     // Fallback to "info" level when RUST_LOG is not set. "info" is a known-valid
     // filter string so parse_lossy is safe here (it never panics).
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::builder().parse_lossy("info"));
-    tracing_subscriber::registry()
-        .with(filter)
-        .with(fmt::layer())
-        .init();
+    let registry = tracing_subscriber::registry().with(filter);
+    match log_format {
+        LogFormat::Plain => registry.with(fmt::layer()).init(),
+        LogFormat::Json => registry.with(fmt::layer().json()).init(),
+    }
 }
 
 #[cfg(test)]

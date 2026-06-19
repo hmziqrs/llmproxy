@@ -63,8 +63,8 @@ pub fn create_private_file(path: &std::path::Path, content: &[u8]) -> Result<()>
     }
     #[cfg(not(unix))]
     {
-        let mut f = std::fs::File::create(path)
-            .with_context(|| format!("creating {}", path.display()))?;
+        let mut f =
+            std::fs::File::create(path).with_context(|| format!("creating {}", path.display()))?;
         f.write_all(content)
             .with_context(|| format!("writing {}", path.display()))?;
         set_private_permissions(path)?;

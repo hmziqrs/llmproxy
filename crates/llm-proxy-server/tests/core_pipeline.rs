@@ -162,7 +162,7 @@ fn state_with_provider(
 
     let provider = ProviderConfig {
         name: "mock-provider".to_owned(),
-        api_key: "test-key".to_owned(),
+        api_key: secrecy::SecretString::from("test-key"),
         auth_style: AuthStyle::Bearer,
         adapters: {
             let mut m = HashMap::new();
@@ -180,6 +180,7 @@ fn state_with_provider(
         model_aliases: HashMap::new(),
         discovery: None,
         catalog: None,
+        pricing: Default::default(),
     };
 
     let registry = ProviderRegistry::from_providers(vec![provider]).expect("registry");
@@ -196,6 +197,7 @@ fn state_with_provider(
             rate_limit_rpm: 100,
             trust_forwarded_headers: false,
             dedup_window: Duration::from_millis(500),
+            log_format: Default::default(),
         },
     };
 
@@ -878,6 +880,20 @@ async fn stream_anthropic_provider_forwards_text_delta() {
     );
 }
 
+/// stream:true Anthropic provider surfaces the upstream provider's real message
+/// id (from `message_start`) rather than a proxy-generated synthetic id.
+#[tokio::test]
+async fn stream_anthropic_provider_surfaces_upstream_message_id() {
+    let mock_url = spawn_mock_anthropic_stream().await;
+    let text = collect_anthropic_stream_body(&mock_url).await;
+    // The mock emits `message_start` with id "msg_mock_stream"; the client SSE
+    // must carry that real id, not a synthetic `msg_{uuid}`.
+    assert!(
+        text.contains("msg_mock_stream"),
+        "client SSE must surface the upstream message id; got: {text}"
+    );
+}
+
 // ===========================================================================
 // Streaming tests: OpenAI Chat provider
 // ===========================================================================
@@ -894,6 +910,72 @@ async fn collect_openai_chat_stream_body(mock_url: &str) -> String {
         .await
         .unwrap();
     String::from_utf8(bytes.to_vec()).unwrap()
+}
+
+/// stream:true OpenAI Chat provider surfaces the upstream provider's real chunk
+/// id rather than a proxy-generated synthetic `chatcmpl-{uuid}`.
+///
+/// The OpenAI client encoder uses only the id passed at construction (it
+/// ignores `CoreEvent::MessageStart`'s id), so this only succeeds because the
+/// first event is buffered to extract the upstream id *before* the encoder is
+/// built. This is the distinguishing case for the buffer-first-event change:
+/// before it, OpenAI streaming always emitted a synthetic id.
+#[tokio::test]
+async fn stream_openai_chat_provider_surfaces_upstream_message_id() {
+    let mock_url = spawn_mock_openai_chat_stream().await;
+    let text = collect_openai_chat_stream_body(&mock_url).await;
+    // The mock emits chunks with id "chatcmpl-stream"; the client SSE must carry
+    // that real upstream id, not a synthetic chatcmpl-{uuid}.
+    assert!(
+        text.contains("chatcmpl-stream"),
+        "client SSE must surface the upstream chunk id; got: {text}"
+    );
+}
+
+/// A successful non-stream request emits `RequestReceived` then
+/// `ResponseCompleted` on the event bus, with the provider-reported usage and
+/// upstream message id on the completed event, and no api-key leakage.
+#[tokio::test]
+async fn event_bus_records_request_received_and_response_completed() {
+    use std::sync::Arc;
+
+    use llm_proxy_storage::{ProxyEvent, RecordingBus};
+
+    let mock_url = spawn_mock_anthropic_non_stream().await;
+    let bus = Arc::new(RecordingBus::new());
+    let state = state_with_anthropic_provider(&mock_url).with_event_bus(bus.clone());
+    let app = build_router(state);
+
+    let body = make_messages_body("claude-sonnet-4-6", false);
+    let resp = app.oneshot(messages_request(&body)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let events = bus.snapshot();
+    assert_eq!(
+        events.len(),
+        2,
+        "expected RequestReceived + ResponseCompleted"
+    );
+    assert!(
+        matches!(events[0], ProxyEvent::RequestReceived(_)),
+        "first event must be RequestReceived"
+    );
+    match &events[1] {
+        ProxyEvent::ResponseCompleted(rc) => {
+            assert_eq!(rc.provider, "mock-provider");
+            assert_eq!(rc.upstream_message_id.as_deref(), Some("msg_mock123"));
+            assert_eq!(rc.usage.input_tokens, 10);
+            assert_eq!(rc.usage.output_tokens, 5);
+        }
+        other => panic!("expected ResponseCompleted, got {other:?}"),
+    }
+
+    // Defense-in-depth: no api-key fragments in the serialized event stream.
+    let json = serde_json::to_string(&events).expect("serialize events");
+    assert!(
+        !json.contains("test-key") && !json.contains("sk-"),
+        "event JSON must not contain api-key fragments: {json}"
+    );
 }
 
 /// stream:true OpenAI Chat provider returns HTTP 200 with an SSE content-type
@@ -1285,7 +1367,7 @@ async fn rate_limited_request_returns_429() {
     // Build state with rpm=1 so the second request is deterministically rejected.
     let provider = ProviderConfig {
         name: "mock-provider".to_owned(),
-        api_key: "test-key".to_owned(),
+        api_key: secrecy::SecretString::from("test-key"),
         auth_style: AuthStyle::Bearer,
         adapters: {
             let mut m = HashMap::new();
@@ -1306,6 +1388,7 @@ async fn rate_limited_request_returns_429() {
         model_aliases: HashMap::new(),
         discovery: None,
         catalog: None,
+        pricing: Default::default(),
     };
     let registry = ProviderRegistry::from_providers(vec![provider]).expect("registry");
     let state = AppState::new(
@@ -1321,6 +1404,7 @@ async fn rate_limited_request_returns_429() {
                 rate_limit_rpm: 1,
                 trust_forwarded_headers: false,
                 dedup_window: Duration::from_millis(500),
+                log_format: Default::default(),
             },
         },
         registry,
@@ -1391,7 +1475,7 @@ async fn duplicate_request_returns_409() {
     // to be caught, and rpm=100 so rate limiting does not interfere.
     let provider = ProviderConfig {
         name: "mock-provider".to_owned(),
-        api_key: "test-key".to_owned(),
+        api_key: secrecy::SecretString::from("test-key"),
         auth_style: AuthStyle::Bearer,
         adapters: {
             let mut m = HashMap::new();
@@ -1412,6 +1496,7 @@ async fn duplicate_request_returns_409() {
         model_aliases: HashMap::new(),
         discovery: None,
         catalog: None,
+        pricing: Default::default(),
     };
     let registry = ProviderRegistry::from_providers(vec![provider]).expect("registry");
     let state = AppState::new(
@@ -1427,6 +1512,7 @@ async fn duplicate_request_returns_409() {
                 rate_limit_rpm: 100,
                 trust_forwarded_headers: false,
                 dedup_window: Duration::from_secs(60),
+                log_format: Default::default(),
             },
         },
         registry,
@@ -1721,7 +1807,7 @@ async fn route_preserves_fields_through_core() {
 fn state_for_validation_tests() -> AppState {
     let provider = ProviderConfig {
         name: "mock-provider".to_owned(),
-        api_key: "test-key".to_owned(),
+        api_key: secrecy::SecretString::from("test-key"),
         auth_style: AuthStyle::Bearer,
         adapters: {
             let mut m = HashMap::new();
@@ -1742,6 +1828,7 @@ fn state_for_validation_tests() -> AppState {
         model_aliases: HashMap::new(),
         discovery: None,
         catalog: None,
+        pricing: Default::default(),
     };
     let registry = ProviderRegistry::from_providers(vec![provider]).expect("registry");
     AppState::new(
@@ -1757,6 +1844,7 @@ fn state_for_validation_tests() -> AppState {
                 rate_limit_rpm: 100,
                 trust_forwarded_headers: false,
                 dedup_window: Duration::from_millis(500),
+                log_format: Default::default(),
             },
         },
         registry,

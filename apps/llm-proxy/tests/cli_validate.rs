@@ -5,8 +5,8 @@
 //! accept/reject matrix is exercised as per-case unit tests in
 //! `src/config_validation.rs` (see LOW-20).
 
-use llm_proxy_app::defaults::DEFAULT_CONFIG_TOML;
 use llm_proxy_app::commands::cmd_validate;
+use llm_proxy_app::defaults::DEFAULT_CONFIG_TOML;
 
 #[test]
 fn validate_accepts_default_config() {
@@ -15,7 +15,11 @@ fn validate_accepts_default_config() {
     std::fs::write(&config, DEFAULT_CONFIG_TOML).unwrap();
 
     let result = cmd_validate(Some(config));
-    assert!(result.is_ok(), "default config should validate: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "default config should validate: {:?}",
+        result
+    );
 }
 
 #[test]

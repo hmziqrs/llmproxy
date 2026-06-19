@@ -165,10 +165,7 @@ mod tests {
     #[test]
     fn xml_escape_xss_vectors() {
         // CDATA injection attempt
-        assert_eq!(
-            xml_escape("]]><![CDATA["),
-            "]]&gt;&lt;![CDATA["
-        );
+        assert_eq!(xml_escape("]]><![CDATA["), "]]&gt;&lt;![CDATA[");
         // Processing instruction injection
         assert_eq!(
             xml_escape("<?xml version='1.0'?>"),
@@ -262,7 +259,10 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn desktop_exec_escape_spaces() {
-        assert_eq!(desktop_exec_escape("/path/with spaces"), "/path/with\\sspaces");
+        assert_eq!(
+            desktop_exec_escape("/path/with spaces"),
+            "/path/with\\sspaces"
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -278,7 +278,10 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn desktop_exec_escape_no_special_chars() {
-        assert_eq!(desktop_exec_escape("/usr/bin/llm-proxy"), "/usr/bin/llm-proxy");
+        assert_eq!(
+            desktop_exec_escape("/usr/bin/llm-proxy"),
+            "/usr/bin/llm-proxy"
+        );
     }
 
     // --- format_desktop_entry full-document snapshot (Linux only) ---

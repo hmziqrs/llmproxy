@@ -251,16 +251,15 @@ fn decode_content_block(block: ContentBlock) -> Result<CoreContent, ProtocolErro
                                     Ok(core) => blocks.push(core),
                                     Err(ProtocolError::Decode(msg)) => {
                                         // Char-boundary-safe truncation for log output.
-                                        let truncated =
-                                            if msg.len() > 64 {
-                                                let mut end = 64;
-                                                while !msg.is_char_boundary(end) && end > 0 {
-                                                    end -= 1;
-                                                }
-                                                &msg[..end]
-                                            } else {
-                                                &msg
-                                            };
+                                        let truncated = if msg.len() > 64 {
+                                            let mut end = 64;
+                                            while !msg.is_char_boundary(end) && end > 0 {
+                                                end -= 1;
+                                            }
+                                            &msg[..end]
+                                        } else {
+                                            &msg
+                                        };
                                         tracing::warn!(
                                             block_type = truncated,
                                             "skipping unknown block inside tool_result content array"
@@ -444,18 +443,17 @@ fn encode_content_block(content: CoreContent) -> Result<ContentBlock, ProtocolEr
             Ok(block)
         }
         CoreContent::Image { source } => {
-            let img_source =
-                serde_json::from_value(source).unwrap_or_else(|e| {
-                    tracing::warn!(
-                        error = %e,
-                        "Image source deserialization failed; producing empty ImageSource fallback"
-                    );
-                    anthropic::ImageSource {
-                        r#type: String::new(),
-                        media_type: String::new(),
-                        data: String::new(),
-                    }
-                });
+            let img_source = serde_json::from_value(source).unwrap_or_else(|e| {
+                tracing::warn!(
+                    error = %e,
+                    "Image source deserialization failed; producing empty ImageSource fallback"
+                );
+                anthropic::ImageSource {
+                    r#type: String::new(),
+                    media_type: String::new(),
+                    data: String::new(),
+                }
+            });
             Ok(ContentBlock::new_image(img_source))
         }
         CoreContent::ToolUse { id, name, input } => Ok(ContentBlock::new_tool_use(id, name, input)),
@@ -475,7 +473,11 @@ fn encode_content_block(content: CoreContent) -> Result<ContentBlock, ProtocolEr
             } else {
                 Some(serde_json::to_value(&content).unwrap_or(serde_json::Value::Null))
             };
-            Ok(ContentBlock::new_tool_result(tool_use_id, content_val, Some(is_error)))
+            Ok(ContentBlock::new_tool_result(
+                tool_use_id,
+                content_val,
+                Some(is_error),
+            ))
         }
         CoreContent::Thinking { text, signature } => {
             let mut block = ContentBlock::new_thinking(text);
@@ -1302,6 +1304,7 @@ mod tests {
             stop_sequence: None,
             usage: Usage::provider_reported(10, 20),
             provider_meta: serde_json::Map::new(),
+            cost: None,
         };
         let out = encode_response(resp).unwrap();
         assert_eq!(out.id, "msg_123");
@@ -1329,6 +1332,7 @@ mod tests {
             stop_sequence: None,
             usage: Usage::provider_reported(10, 20),
             provider_meta: serde_json::Map::new(),
+            cost: None,
         };
         let out = encode_response(resp).unwrap();
         assert_eq!(out.stop_reason.as_deref(), Some("tool_use"));
@@ -1385,6 +1389,7 @@ mod tests {
             stop_sequence: Some("\n".into()),
             usage: Usage::default(),
             provider_meta: serde_json::Map::new(),
+            cost: None,
         };
         let out = encode_response(resp).unwrap();
         assert_eq!(out.stop_sequence.as_deref(), Some("\n"));
@@ -1403,6 +1408,7 @@ mod tests {
             stop_sequence: None,
             usage: Usage::default(),
             provider_meta: serde_json::Map::new(),
+            cost: None,
         };
         let out = encode_response(resp).unwrap();
         assert_eq!(out.content.len(), 1);
@@ -1423,6 +1429,7 @@ mod tests {
             stop_sequence: None,
             usage: Usage::default(),
             provider_meta: serde_json::Map::new(),
+            cost: None,
         };
         let out = encode_response(resp).unwrap();
         assert!(out.id.starts_with("msg_"));
@@ -1841,6 +1848,7 @@ mod tests {
             stop_sequence: None,
             usage: Usage::default(),
             provider_meta: serde_json::Map::new(),
+            cost: None,
         };
         let out = encode_response(resp).unwrap();
         // Document block should be omitted; only text remains.
@@ -2027,6 +2035,7 @@ mod tests {
             stop_sequence: None,
             usage: Usage::default(),
             provider_meta: serde_json::Map::new(),
+            cost: None,
         };
         let result = encode_response(resp);
         // Refusal should propagate as ProtocolError::Encode (not skippable).
@@ -2058,6 +2067,7 @@ mod tests {
             stop_sequence: None,
             usage: Usage::default(),
             provider_meta: serde_json::Map::new(),
+            cost: None,
         };
         let out = encode_response(resp).unwrap();
         // Document is dropped; both text blocks are preserved.
@@ -2100,6 +2110,7 @@ mod tests {
             stop_sequence: None,
             usage: Usage::default(),
             provider_meta: serde_json::Map::new(),
+            cost: None,
         };
         let out = encode_response(resp).unwrap();
         assert_eq!(out.content[0].text.as_deref(), Some(large_text.as_str()));

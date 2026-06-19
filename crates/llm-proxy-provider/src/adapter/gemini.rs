@@ -569,6 +569,7 @@ impl GeminiAdapter {
             stop_sequence: None,
             usage,
             provider_meta: serde_json::Map::new(),
+            cost: None,
         })
     }
 
@@ -637,7 +638,7 @@ mod tests {
                 "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
                     .into(),
             auth_style: llm_proxy_core::AuthStyle::Bearer,
-            api_key: "test-key".into(),
+            api_key: secrecy::SecretString::from("test-key"),
             requested_model: "gemini-2.5-pro".into(),
             upstream_model: "gemini-2.5-pro".into(),
             headers: std::sync::Arc::new(std::collections::HashMap::new()),

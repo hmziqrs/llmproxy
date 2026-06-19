@@ -19,6 +19,7 @@ use bytes::Bytes;
 use futures::Stream;
 use futures::TryStreamExt;
 use llm_proxy_core::AuthStyle;
+use secrecy::{ExposeSecret, SecretString};
 use tokio::time::Sleep;
 
 use crate::error::ProviderError;
@@ -31,22 +32,14 @@ use crate::error::ProviderError;
 ///
 /// The `api_key` field is redacted in [`fmt::Debug`] output so that
 /// `tracing::debug!(?auth)` or snapshot output never leaks the secret.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct AuthHeaders {
     /// Which header style to use for the API key.
     pub style: AuthStyle,
-    /// The API key value. Redacted in Debug output.
-    pub api_key: String,
-}
-
-impl fmt::Debug for AuthHeaders {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("AuthHeaders")
-            .field("style", &self.style)
-            .field("api_key", &"[REDACTED]")
-            .finish()
-    }
+    /// The API key value, wrapped in [`SecretString`] (redacted in Debug,
+    /// zeroized on drop).
+    pub api_key: SecretString,
 }
 
 // ---------------------------------------------------------------------------
@@ -373,19 +366,23 @@ impl Stream for IdleTimeoutStream {
 /// Anthropic). Where possible, prefer `AuthStyle::Bearer` or
 /// `AuthStyle::XApiKey` to send the key in only one header.
 fn apply_auth(mut builder: reqwest::RequestBuilder, auth: &AuthHeaders) -> reqwest::RequestBuilder {
+    // Transport boundary: the secret is exposed here solely to build the
+    // reqwest header value. The borrowed `&str` never escapes this function
+    // except into the header value.
+    let api_key: &str = auth.api_key.expose_secret();
     match auth.style {
         AuthStyle::Bearer => {
-            builder = builder.header("Authorization", format!("Bearer {}", auth.api_key));
+            builder = builder.header("Authorization", format!("Bearer {}", api_key));
         }
         AuthStyle::XApiKey => {
-            builder = builder.header("x-api-key", &auth.api_key);
+            builder = builder.header("x-api-key", api_key);
         }
         AuthStyle::XGoogleApiKey => {
-            builder = builder.header("x-goog-api-key", &auth.api_key);
+            builder = builder.header("x-goog-api-key", api_key);
         }
         AuthStyle::Both => {
-            builder = builder.header("Authorization", format!("Bearer {}", auth.api_key));
-            builder = builder.header("x-api-key", &auth.api_key);
+            builder = builder.header("Authorization", format!("Bearer {}", api_key));
+            builder = builder.header("x-api-key", api_key);
         }
     }
     builder
@@ -421,7 +418,7 @@ mod tests {
     fn auth_headers_debug_redacts_api_key() {
         let auth = AuthHeaders {
             style: AuthStyle::Bearer,
-            api_key: "sk-super-secret-key-12345".to_owned(),
+            api_key: SecretString::from("sk-super-secret-key-12345"),
         };
         let debug_output = format!("{:?}", auth);
         assert!(
@@ -442,7 +439,7 @@ mod tests {
             url: "https://api.example.com/v1/chat/completions?key=query-secret".to_owned(),
             auth: AuthHeaders {
                 style: AuthStyle::Bearer,
-                api_key: "sk-super-secret-key-12345".to_owned(),
+                api_key: SecretString::from("sk-super-secret-key-12345"),
             },
             body: br#"{"model":"gpt-5"}"#.to_vec(),
             stream: false,
@@ -603,7 +600,7 @@ mod tests {
             url: format!("{}/test", base),
             auth: AuthHeaders {
                 style: AuthStyle::Bearer,
-                api_key: "test-key-123".to_owned(),
+                api_key: SecretString::from("test-key-123"),
             },
             body: br#"{"hello":"world"}"#.to_vec(),
             stream: false,
@@ -634,7 +631,7 @@ mod tests {
             url: format!("{}/test", base),
             auth: AuthHeaders {
                 style: AuthStyle::XApiKey,
-                api_key: "test-key-456".to_owned(),
+                api_key: SecretString::from("test-key-456"),
             },
             body: vec![],
             stream: false,
@@ -665,7 +662,7 @@ mod tests {
             url: format!("{}/test", base),
             auth: AuthHeaders {
                 style: AuthStyle::Both,
-                api_key: "test-key-789".to_owned(),
+                api_key: SecretString::from("test-key-789"),
             },
             body: vec![],
             stream: false,
@@ -696,7 +693,7 @@ mod tests {
             url: format!("{}/test", base),
             auth: AuthHeaders {
                 style: AuthStyle::XGoogleApiKey,
-                api_key: "google-test-key".to_owned(),
+                api_key: SecretString::from("google-test-key"),
             },
             body: vec![],
             stream: false,
@@ -737,7 +734,7 @@ mod tests {
             url: format!("{}/test", base),
             auth: AuthHeaders {
                 style: AuthStyle::Bearer,
-                api_key: "key".to_owned(),
+                api_key: SecretString::from("key"),
             },
             body: vec![],
             stream: false,
@@ -771,7 +768,7 @@ mod tests {
             url: format!("{}/test", base),
             auth: AuthHeaders {
                 style: AuthStyle::Bearer,
-                api_key: "key".to_owned(),
+                api_key: SecretString::from("key"),
             },
             body: br#"data: hello"#.to_vec(),
             stream: true,
@@ -797,7 +794,7 @@ mod tests {
             url: format!("{}/test", base),
             auth: AuthHeaders {
                 style: AuthStyle::Bearer,
-                api_key: "key".to_owned(),
+                api_key: SecretString::from("key"),
             },
             body: br#"{"hello":"world"}"#.to_vec(),
             stream: false,
@@ -825,7 +822,7 @@ mod tests {
             url: format!("{}/test", base),
             auth: AuthHeaders {
                 style: AuthStyle::Bearer,
-                api_key: "key".to_owned(),
+                api_key: SecretString::from("key"),
             },
             body: raw_body.clone(),
             stream: false,
@@ -867,7 +864,7 @@ mod tests {
             url: format!("{}/test", base),
             auth: AuthHeaders {
                 style: AuthStyle::Bearer,
-                api_key: "key".to_owned(),
+                api_key: SecretString::from("key"),
             },
             body: vec![],
             stream: false,
@@ -896,7 +893,7 @@ mod tests {
             url: format!("{}/test", base),
             auth: AuthHeaders {
                 style: AuthStyle::Bearer,
-                api_key: "key".to_owned(),
+                api_key: SecretString::from("key"),
             },
             body: vec![],
             stream: true,
@@ -928,7 +925,7 @@ mod tests {
             url: format!("{}/test", base),
             auth: AuthHeaders {
                 style: AuthStyle::Bearer,
-                api_key: "key".to_owned(),
+                api_key: SecretString::from("key"),
             },
             body: vec![],
             stream: true,
@@ -962,7 +959,7 @@ mod tests {
             url: format!("{}/test", base),
             auth: AuthHeaders {
                 style: AuthStyle::Bearer,
-                api_key: "key".to_owned(),
+                api_key: SecretString::from("key"),
             },
             body: vec![],
             stream: false,
@@ -989,7 +986,7 @@ mod tests {
             url: format!("{}/test", base),
             auth: AuthHeaders {
                 style: AuthStyle::Bearer,
-                api_key: "key".to_owned(),
+                api_key: SecretString::from("key"),
             },
             body: original_body.to_vec(),
             stream: false,
@@ -1052,7 +1049,7 @@ mod tests {
             url: format!("{}/test", base),
             auth: AuthHeaders {
                 style: AuthStyle::Bearer,
-                api_key: "key".to_owned(),
+                api_key: SecretString::from("key"),
             },
             body: vec![],
             stream: true,
@@ -1134,7 +1131,7 @@ mod tests {
             url: format!("{}/test", base),
             auth: AuthHeaders {
                 style: AuthStyle::Bearer,
-                api_key: "key".to_owned(),
+                api_key: SecretString::from("key"),
             },
             body: vec![],
             stream: true,
@@ -1144,10 +1141,7 @@ mod tests {
         let mut stream = client.send_stream(req).await.unwrap();
 
         // First chunk arrives promptly (well within the idle window).
-        let first = stream
-            .next()
-            .await
-            .expect("first chunk should arrive");
+        let first = stream.next().await.expect("first chunk should arrive");
         assert!(first.is_ok(), "first chunk should be Ok: {:?}", first);
 
         // Bound the test so a regression (timeout never fires) fails fast
@@ -1203,7 +1197,7 @@ mod tests {
             url: format!("{}/test", base),
             auth: AuthHeaders {
                 style: AuthStyle::Bearer,
-                api_key: "key".to_owned(),
+                api_key: SecretString::from("key"),
             },
             body: vec![],
             stream: true,
@@ -1260,7 +1254,7 @@ mod tests {
             url: format!("{}/test", base),
             auth: AuthHeaders {
                 style: AuthStyle::Bearer,
-                api_key: "key".to_owned(),
+                api_key: SecretString::from("key"),
             },
             body: vec![],
             stream: true,
@@ -1285,7 +1279,7 @@ mod tests {
             url: String::new(),
             auth: AuthHeaders {
                 style: AuthStyle::Bearer,
-                api_key: "key".to_owned(),
+                api_key: SecretString::from("key"),
             },
             body: vec![],
             stream: false,
@@ -1319,7 +1313,7 @@ mod tests {
             url: format!("{}/test", base),
             auth: AuthHeaders {
                 style: AuthStyle::Bearer,
-                api_key: "key".to_owned(),
+                api_key: SecretString::from("key"),
             },
             body: large_body.clone().into_bytes(),
             stream: false,
@@ -1415,7 +1409,7 @@ mod tests {
             url: format!("{}/test", base),
             auth: AuthHeaders {
                 style: AuthStyle::Bearer,
-                api_key: "key".to_owned(),
+                api_key: SecretString::from("key"),
             },
             body: vec![],
             stream: false,
@@ -1441,7 +1435,7 @@ mod tests {
             url: "http://192.0.2.1:1/test".to_owned(),
             auth: AuthHeaders {
                 style: AuthStyle::Bearer,
-                api_key: "key".to_owned(),
+                api_key: SecretString::from("key"),
             },
             body: vec![],
             stream: false,

@@ -22,10 +22,12 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
+use secrecy::SecretString;
+
 use crate::error::CoreError;
 use crate::provider_config::{
-    AuthStyle, ProviderConfig, ProviderRouteKind, StaticModelCatalogEntry, endpoint_without_query,
-    load_provider_config,
+    AuthStyle, ModelId, ModelPricing, ProviderConfig, ProviderRouteKind, StaticModelCatalogEntry,
+    endpoint_without_query, load_provider_config,
 };
 
 /// Typed failures from resolving a provider-scoped route.
@@ -76,7 +78,7 @@ pub enum ProviderRouteResolutionError {
 /// `endpoint` is the raw endpoint or URL template from provider TOML. It is
 /// **not** a route-built final URL. Provider adapters own endpoint URL shape,
 /// including Gemini `{model}` expansion.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone)]
 #[non_exhaustive]
 pub struct ProviderAdapterTargetConfig {
     /// Provider name (identifies the provider config).
@@ -89,8 +91,8 @@ pub struct ProviderAdapterTargetConfig {
     pub endpoint: String,
     /// Authentication header style.
     pub auth_style: AuthStyle,
-    /// API key for the upstream provider.
-    pub api_key: String,
+    /// API key for the upstream provider (wrapped in [`SecretString`]).
+    pub api_key: SecretString,
     /// The model name the client originally requested.
     pub requested_model: String,
     /// The model name to send to the upstream provider.
@@ -423,6 +425,21 @@ impl ProviderRegistry {
         self.providers.get(name)
     }
 
+    /// Look up the per-token pricing for a provider's upstream model, if any.
+    ///
+    /// `upstream_model` must already be alias-resolved (the upstream model id),
+    /// since pricing keys are upstream ids. Returns `None` when the provider is
+    /// unknown or has no pricing configured for the model. Callers that need the
+    /// price across an `.await` should `.cloned()` the result (cheap: five
+    /// `Decimal`s).
+    #[must_use]
+    pub fn pricing_for(&self, provider: &str, upstream_model: &str) -> Option<&ModelPricing> {
+        self.providers
+            .get(provider)?
+            .pricing
+            .get(&ModelId::new(upstream_model))
+    }
+
     /// Returns an iterator over all registered provider configs.
     pub fn iter(&self) -> impl Iterator<Item = &ProviderConfig> {
         self.providers.values()
@@ -466,14 +483,17 @@ mod tests {
     fn provider_route_resolves_alias_and_redacts_secrets() {
         let provider = ProviderConfig {
             name: "example".to_owned(),
-            api_key: "api-secret".to_owned(),
+            api_key: SecretString::from("api-secret"),
             auth_style: AuthStyle::Bearer,
             adapters: HashMap::from([(
                 "chat".to_owned(),
                 ProviderAdapterConfig {
                     protocol: "openai_chat_completions".to_owned(),
                     endpoint: "https://example.com/v1/chat/completions?key=query-secret".to_owned(),
-                    headers: Arc::new(HashMap::from([("x-secret".to_owned(), "header-secret".to_owned())])),
+                    headers: Arc::new(HashMap::from([(
+                        "x-secret".to_owned(),
+                        "header-secret".to_owned(),
+                    )])),
                 },
             )]),
             routes: ProviderRoutesConfig {
@@ -483,6 +503,7 @@ mod tests {
             model_aliases: HashMap::from([("short".to_owned(), "upstream".to_owned())]),
             discovery: None,
             catalog: None,
+            pricing: Default::default(),
         };
         let registry = ProviderRegistry::from_providers(vec![provider]).expect("registry");
         let target = registry
@@ -494,6 +515,55 @@ mod tests {
         assert!(!debug.contains("api-secret"));
         assert!(!debug.contains("header-secret"));
         assert!(!debug.contains("query-secret"));
+    }
+
+    #[test]
+    fn pricing_for_resolves_under_upstream_model_id() {
+        let provider = ProviderConfig {
+            name: "example".to_owned(),
+            api_key: SecretString::from("key"),
+            auth_style: AuthStyle::Bearer,
+            adapters: HashMap::from([(
+                "chat".to_owned(),
+                ProviderAdapterConfig {
+                    protocol: "openai_chat_completions".to_owned(),
+                    endpoint: "https://example.com/v1/chat/completions".to_owned(),
+                    headers: Arc::new(HashMap::new()),
+                },
+            )]),
+            routes: ProviderRoutesConfig {
+                chat_completions: Some("chat".to_owned()),
+                messages: None,
+            },
+            model_aliases: HashMap::from([(
+                "alias-name".to_owned(),
+                "real-upstream-model".to_owned(),
+            )]),
+            discovery: None,
+            catalog: None,
+            pricing: HashMap::from([(
+                ModelId::new("real-upstream-model"),
+                ModelPricing {
+                    input: "0.001".parse().unwrap(),
+                    ..ModelPricing::default()
+                },
+            )]),
+        };
+        let registry = ProviderRegistry::from_providers(vec![provider]).expect("registry");
+        // Pricing is keyed by the UPSTREAM (alias-resolved) model id.
+        let p = registry
+            .pricing_for("example", "real-upstream-model")
+            .expect("pricing present");
+        assert_eq!(p.input.to_string(), "0.001");
+        // The client-facing alias is NOT a pricing key.
+        assert!(registry.pricing_for("example", "alias-name").is_none());
+        // Unknown provider / model -> None.
+        assert!(
+            registry
+                .pricing_for("other", "real-upstream-model")
+                .is_none()
+        );
+        assert!(registry.pricing_for("example", "unpriced-model").is_none());
     }
 
     #[test]
@@ -515,13 +585,14 @@ mod tests {
     fn provider_route_returns_typed_unsupported_route_error() {
         let provider = ProviderConfig {
             name: "example".to_owned(),
-            api_key: "key".to_owned(),
+            api_key: SecretString::from("key"),
             auth_style: AuthStyle::Bearer,
             adapters: HashMap::new(),
             routes: ProviderRoutesConfig::default(),
             model_aliases: HashMap::new(),
             discovery: None,
             catalog: None,
+            pricing: Default::default(),
         };
         let registry = ProviderRegistry::from_providers([provider]).expect("registry");
 
@@ -630,7 +701,7 @@ chat_completions = "chat"
         // Build a provider with a route that points to a non-existent adapter.
         let provider = ProviderConfig {
             name: "broken".to_owned(),
-            api_key: "key".to_owned(),
+            api_key: SecretString::from("key"),
             auth_style: AuthStyle::Bearer,
             adapters: HashMap::new(), // no adapters defined
             routes: ProviderRoutesConfig {
@@ -640,6 +711,7 @@ chat_completions = "chat"
             model_aliases: HashMap::new(),
             discovery: None,
             catalog: None,
+            pricing: Default::default(),
         };
         let registry = ProviderRegistry::from_providers(vec![provider]).expect("registry");
 
@@ -660,17 +732,18 @@ chat_completions = "chat"
     fn from_providers_rejects_duplicate_names() {
         let provider_a = ProviderConfig {
             name: "dup".to_owned(),
-            api_key: "key".to_owned(),
+            api_key: SecretString::from("key"),
             auth_style: AuthStyle::Bearer,
             adapters: HashMap::new(),
             routes: ProviderRoutesConfig::default(),
             model_aliases: HashMap::new(),
             discovery: None,
             catalog: None,
+            pricing: Default::default(),
         };
         let provider_b = ProviderConfig {
             name: "dup".to_owned(),
-            api_key: "key2".to_owned(),
+            api_key: SecretString::from("key2"),
             ..provider_a.clone()
         };
         let result = ProviderRegistry::from_providers(vec![provider_a, provider_b]);
@@ -694,13 +767,14 @@ chat_completions = "chat"
     fn registry_with_one_provider() {
         let provider = ProviderConfig {
             name: "test".to_owned(),
-            api_key: "key".to_owned(),
+            api_key: SecretString::from("key"),
             auth_style: AuthStyle::Bearer,
             adapters: HashMap::new(),
             routes: ProviderRoutesConfig::default(),
             model_aliases: HashMap::new(),
             discovery: None,
             catalog: None,
+            pricing: Default::default(),
         };
         let registry = ProviderRegistry::from_providers(vec![provider]).expect("registry");
         assert!(!registry.is_empty());
@@ -721,13 +795,14 @@ chat_completions = "chat"
     fn catalog_models_returns_empty_for_provider_without_catalog() {
         let provider = ProviderConfig {
             name: "test".to_owned(),
-            api_key: "key".to_owned(),
+            api_key: SecretString::from("key"),
             auth_style: AuthStyle::Bearer,
             adapters: HashMap::new(),
             routes: ProviderRoutesConfig::default(),
             model_aliases: HashMap::new(),
             discovery: None,
             catalog: None,
+            pricing: Default::default(),
         };
         let registry = ProviderRegistry::from_providers(vec![provider]).expect("registry");
         let models = registry.catalog_models("test").expect("provider exists");
@@ -738,13 +813,14 @@ chat_completions = "chat"
     fn catalog_models_returns_entries_when_configured() {
         let provider = ProviderConfig {
             name: "test".to_owned(),
-            api_key: "key".to_owned(),
+            api_key: SecretString::from("key"),
             auth_style: AuthStyle::Bearer,
             adapters: HashMap::new(),
             routes: ProviderRoutesConfig::default(),
             model_aliases: HashMap::new(),
             discovery: None,
             catalog: Some(ProviderCatalogConfig::default()),
+            pricing: Default::default(),
         };
         let registry = ProviderRegistry::from_providers(vec![provider]).expect("registry");
         let models = registry.catalog_models("test").expect("provider exists");
@@ -758,7 +834,7 @@ chat_completions = "chat"
     fn resolve_without_alias_returns_requested_model() {
         let provider = ProviderConfig {
             name: "test".to_owned(),
-            api_key: "key".to_owned(),
+            api_key: SecretString::from("key"),
             auth_style: AuthStyle::Bearer,
             adapters: HashMap::from([(
                 "chat".to_owned(),
@@ -775,6 +851,7 @@ chat_completions = "chat"
             model_aliases: HashMap::new(),
             discovery: None,
             catalog: None,
+            pricing: Default::default(),
         };
         let registry = ProviderRegistry::from_providers(vec![provider]).expect("registry");
         let target = registry
@@ -790,19 +867,21 @@ chat_completions = "chat"
     fn into_iterator_works() {
         let provider_a = ProviderConfig {
             name: "a".to_owned(),
-            api_key: "key".to_owned(),
+            api_key: SecretString::from("key"),
             auth_style: AuthStyle::Bearer,
             adapters: HashMap::new(),
             routes: ProviderRoutesConfig::default(),
             model_aliases: HashMap::new(),
             discovery: None,
             catalog: None,
+            pricing: Default::default(),
         };
         let provider_b = ProviderConfig {
             name: "b".to_owned(),
             ..provider_a.clone()
         };
-        let registry = ProviderRegistry::from_providers(vec![provider_a, provider_b]).expect("registry");
+        let registry =
+            ProviderRegistry::from_providers(vec![provider_a, provider_b]).expect("registry");
         let names: Vec<&str> = (&registry).into_iter().map(|p| p.name.as_str()).collect();
         assert_eq!(names.len(), 2);
         assert!(names.contains(&"a"));
@@ -827,7 +906,7 @@ chat_completions = "chat"
         }
         let provider = ProviderConfig {
             name: "truncation-test".to_owned(),
-            api_key: "key".to_owned(),
+            api_key: SecretString::from("key"),
             auth_style: AuthStyle::Bearer,
             adapters,
             routes: ProviderRoutesConfig {
@@ -837,13 +916,21 @@ chat_completions = "chat"
             model_aliases: HashMap::new(),
             discovery: None,
             catalog: None,
+            pricing: Default::default(),
         };
         let registry = ProviderRegistry::from_providers(vec![provider]).expect("registry");
         let error = registry
-            .resolve_provider_route("truncation-test", ProviderRouteKind::ChatCompletions, "model")
+            .resolve_provider_route(
+                "truncation-test",
+                ProviderRouteKind::ChatCompletions,
+                "model",
+            )
             .expect_err("missing adapter");
 
         let msg = error.to_string();
-        assert!(msg.contains("+2 more"), "expected truncation message, got: {msg}");
+        assert!(
+            msg.contains("+2 more"),
+            "expected truncation message, got: {msg}"
+        );
     }
 }

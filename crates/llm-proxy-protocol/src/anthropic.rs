@@ -111,9 +111,10 @@ impl MessageRequest {
             ));
         }
         if self.max_tokens <= 0 {
-            return Err(crate::client::ProtocolError::InvalidRequest(
-                format!("max_tokens must be positive, got {}", self.max_tokens),
-            ));
+            return Err(crate::client::ProtocolError::InvalidRequest(format!(
+                "max_tokens must be positive, got {}",
+                self.max_tokens
+            )));
         }
         Ok(())
     }
@@ -330,7 +331,10 @@ pub struct ContentBlock {
     pub data: Option<String>,
 }
 
-#[expect(deprecated, reason = "constructors set `output: None` which is the deprecated field")]
+#[expect(
+    deprecated,
+    reason = "constructors set `output: None` which is the deprecated field"
+)]
 impl ContentBlock {
     /// Create a text content block with the given string.
     #[must_use]
@@ -503,7 +507,10 @@ impl ContentBlock {
             }
         }
         // Fallback to the deprecated output field.
-        #[expect(deprecated, reason = "reads the deprecated `output` field as a text fallback")]
+        #[expect(
+            deprecated,
+            reason = "reads the deprecated `output` field as a text fallback"
+        )]
         if let Some(ref val) = self.output {
             if let Some(s) = val.as_str() {
                 return s.to_owned();
@@ -632,7 +639,10 @@ impl Serialize for ContentBlock {
                     data: Option<String>,
                 }
 
-                #[expect(deprecated, reason = "AllFields debug aid mirrors the deprecated `output` field")]
+                #[expect(
+                    deprecated,
+                    reason = "AllFields debug aid mirrors the deprecated `output` field"
+                )]
                 let all = AllFields {
                     r#type: self.r#type.clone(),
                     text: self.text.clone(),
@@ -870,7 +880,10 @@ pub struct ApiError {
 // ===========================================================================
 
 #[cfg(test)]
-#[expect(deprecated, reason = "tests construct ContentBlock with `output` field")]
+#[expect(
+    deprecated,
+    reason = "tests construct ContentBlock with `output` field"
+)]
 mod tests {
     use super::*;
 

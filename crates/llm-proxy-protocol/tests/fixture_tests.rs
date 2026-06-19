@@ -508,31 +508,85 @@ fn required_client_non_stream_cases() -> Vec<(&'static str, Vec<&'static str>)> 
     vec![
         (
             "plain-text-request",
-            vec!["input.json", "core.json", "output.json", "core-response.json"],
+            vec![
+                "input.json",
+                "core.json",
+                "output.json",
+                "core-response.json",
+            ],
         ),
         (
             "system-prompt",
-            vec!["input.json", "core.json", "output.json", "core-response.json"],
+            vec![
+                "input.json",
+                "core.json",
+                "output.json",
+                "core-response.json",
+            ],
         ),
-        ("tool-call", vec!["input.json", "core.json", "output.json", "core-response.json"]),
+        (
+            "tool-call",
+            vec![
+                "input.json",
+                "core.json",
+                "output.json",
+                "core-response.json",
+            ],
+        ),
         (
             "tool-result",
-            vec!["input.json", "core.json", "output.json", "core-response.json"],
+            vec![
+                "input.json",
+                "core.json",
+                "output.json",
+                "core-response.json",
+            ],
         ),
-        ("thinking", vec!["input.json", "core.json", "output.json", "core-response.json"]),
+        (
+            "thinking",
+            vec![
+                "input.json",
+                "core.json",
+                "output.json",
+                "core-response.json",
+            ],
+        ),
         (
             "cache-control",
-            vec!["input.json", "core.json", "output.json", "core-response.json"],
+            vec![
+                "input.json",
+                "core.json",
+                "output.json",
+                "core-response.json",
+            ],
         ),
         (
             "tool-choice",
-            vec!["input.json", "core.json", "output.json", "core-response.json"],
+            vec![
+                "input.json",
+                "core.json",
+                "output.json",
+                "core-response.json",
+            ],
         ),
         (
             "stop-reason",
-            vec!["input.json", "core.json", "output.json", "core-response.json"],
+            vec![
+                "input.json",
+                "core.json",
+                "output.json",
+                "core-response.json",
+            ],
         ),
-        ("usage", vec!["input.json", "core.json", "output.json", "core-response.json"]),
+        (
+            "usage",
+            vec![
+                "input.json",
+                "core.json",
+                "output.json",
+                "core-response.json",
+            ],
+        ),
         ("malformed", vec!["input.json"]),
         // TODO: Additional cases for the next audit round:
         //   multiple-messages, refusal, redacted-thinking, image/document/audio/video

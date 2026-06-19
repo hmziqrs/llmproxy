@@ -16,6 +16,9 @@ toml = { workspace = true }
 humantime-serde = { workspace = true }
 regex = { workspace = true }
 tracing = { workspace = true }
+secrecy = { workspace = true }
+tiktoken-rs = { workspace = true }
+rust_decimal = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

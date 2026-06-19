@@ -518,7 +518,7 @@ mod tests {
     fn provider(endpoint: String) -> ProviderConfig {
         ProviderConfig {
             name: "test-provider".to_owned(),
-            api_key: "test-key".to_owned(),
+            api_key: secrecy::SecretString::from("test-key"),
             auth_style: AuthStyle::Bearer,
             adapters: HashMap::new(),
             routes: ProviderRoutesConfig::default(),
@@ -539,6 +539,7 @@ mod tests {
                 deny: Vec::new(),
                 models: Vec::new(),
             }),
+            pricing: Default::default(),
         }
     }
 
@@ -682,13 +683,14 @@ mod tests {
     fn minimal_provider(name: &str) -> ProviderConfig {
         ProviderConfig {
             name: name.to_owned(),
-            api_key: String::new(),
+            api_key: secrecy::SecretString::from(""),
             auth_style: AuthStyle::Bearer,
             adapters: HashMap::new(),
             routes: ProviderRoutesConfig::default(),
             model_aliases: HashMap::new(),
             discovery: None,
             catalog: None,
+            pricing: Default::default(),
         }
     }
 
@@ -1021,7 +1023,7 @@ mod tests {
     fn static_catalog_provider(name: &str, models: Vec<StaticModelCatalogEntry>) -> ProviderConfig {
         ProviderConfig {
             name: name.to_owned(),
-            api_key: String::new(),
+            api_key: secrecy::SecretString::from(""),
             auth_style: AuthStyle::Bearer,
             adapters: HashMap::new(),
             routes: ProviderRoutesConfig::default(),
@@ -1035,6 +1037,7 @@ mod tests {
                 deny: Vec::new(),
                 models,
             }),
+            pricing: Default::default(),
         }
     }
 

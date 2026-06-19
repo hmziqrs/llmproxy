@@ -4,13 +4,18 @@
 
 use std::fs;
 
-use llm_proxy_app::defaults::{DEFAULT_CONFIG_TOML, DEFAULT_PROVIDER_OPENCODE_GO, DEFAULT_PROVIDER_OPENCODE_ZEN};
+use llm_proxy_app::defaults::{
+    DEFAULT_CONFIG_TOML, DEFAULT_PROVIDER_OPENCODE_GO, DEFAULT_PROVIDER_OPENCODE_ZEN,
+};
 
 #[test]
 fn init_default_toml_is_valid() {
-    let parsed: toml::Value = toml::from_str(DEFAULT_CONFIG_TOML)
-        .expect("default config TOML should parse");
-    assert!(parsed.get("server").is_some(), "default config must have [server]");
+    let parsed: toml::Value =
+        toml::from_str(DEFAULT_CONFIG_TOML).expect("default config TOML should parse");
+    assert!(
+        parsed.get("server").is_some(),
+        "default config must have [server]"
+    );
 }
 
 #[test]
@@ -40,8 +45,16 @@ fn init_writes_files_to_tempdir() {
     fs::create_dir_all(&providers_dir).expect("providers dir");
 
     fs::write(&config_path, DEFAULT_CONFIG_TOML.as_bytes()).expect("config");
-    fs::write(providers_dir.join("opencode-go.toml"), DEFAULT_PROVIDER_OPENCODE_GO.as_bytes()).expect("go");
-    fs::write(providers_dir.join("opencode-zen.toml"), DEFAULT_PROVIDER_OPENCODE_ZEN.as_bytes()).expect("zen");
+    fs::write(
+        providers_dir.join("opencode-go.toml"),
+        DEFAULT_PROVIDER_OPENCODE_GO.as_bytes(),
+    )
+    .expect("go");
+    fs::write(
+        providers_dir.join("opencode-zen.toml"),
+        DEFAULT_PROVIDER_OPENCODE_ZEN.as_bytes(),
+    )
+    .expect("zen");
 
     assert!(config_path.exists());
     assert!(providers_dir.join("opencode-go.toml").exists());
@@ -51,10 +64,14 @@ fn init_writes_files_to_tempdir() {
     let main: toml::Value = toml::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
     assert!(main.get("server").is_some());
 
-    let go: toml::Value = toml::from_str(&fs::read_to_string(providers_dir.join("opencode-go.toml")).unwrap()).unwrap();
+    let go: toml::Value =
+        toml::from_str(&fs::read_to_string(providers_dir.join("opencode-go.toml")).unwrap())
+            .unwrap();
     assert_eq!(go["provider"]["name"].as_str(), Some("opencode-go"));
 
-    let zen: toml::Value = toml::from_str(&fs::read_to_string(providers_dir.join("opencode-zen.toml")).unwrap()).unwrap();
+    let zen: toml::Value =
+        toml::from_str(&fs::read_to_string(providers_dir.join("opencode-zen.toml")).unwrap())
+            .unwrap();
     assert_eq!(zen["provider"]["name"].as_str(), Some("opencode-zen"));
 }
 
@@ -70,8 +87,8 @@ fn init_rejects_existing_config() {
 #[test]
 #[cfg(unix)]
 fn init_files_have_restrictive_permissions() {
-    use std::os::unix::fs::PermissionsExt;
     use llm_proxy_app::permissions::create_private_file;
+    use std::os::unix::fs::PermissionsExt;
 
     let dir = tempfile::tempdir().unwrap();
 

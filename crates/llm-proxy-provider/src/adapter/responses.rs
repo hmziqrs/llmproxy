@@ -190,8 +190,7 @@ impl ProviderStreamDecoder for ResponsesStreamDecoder {
                 // If ToolCallStart was never emitted, emit one now before stop.
                 if !self.tool_call_started {
                     self.close_content_if_open();
-                    let synthetic_id =
-                        format!("__responses_missing_{}__", self.content_index);
+                    let synthetic_id = format!("__responses_missing_{}__", self.content_index);
                     tracing::warn!(
                         synthetic_id = synthetic_id,
                         "Responses: emitting synthetic ToolCallStart at arguments.done \
@@ -694,6 +693,7 @@ impl ResponsesAdapter {
             stop_sequence: None,
             usage,
             provider_meta: serde_json::Map::new(),
+            cost: None,
         })
     }
 
@@ -745,7 +745,7 @@ mod tests {
             protocol: super::super::ProviderProtocol::OpenAiResponses,
             endpoint: "https://api.openai.com/v1/responses".into(),
             auth_style: AuthStyle::Bearer,
-            api_key: "test-key".into(),
+            api_key: secrecy::SecretString::from("test-key"),
             requested_model: "gpt-4o".into(),
             upstream_model: "gpt-4o-2024-08-06".into(),
             headers: std::sync::Arc::new(std::collections::HashMap::new()),

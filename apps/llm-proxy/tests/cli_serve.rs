@@ -13,5 +13,8 @@ fn serve_rejects_non_toml_config_with_unsupported_message() {
     let result = validate_toml_extension(std::path::Path::new("config.json"));
     assert!(result.is_err());
     let msg = result.unwrap_err().to_string();
-    assert!(msg.contains("unsupported"), "expected 'unsupported' in error: {msg}");
+    assert!(
+        msg.contains("unsupported"),
+        "expected 'unsupported' in error: {msg}"
+    );
 }

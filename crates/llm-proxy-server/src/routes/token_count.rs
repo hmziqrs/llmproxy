@@ -22,12 +22,15 @@ use super::error_response::{ClientProtocol, RouteError, route_error_response};
 
 /// Response body for the token count endpoint.
 ///
-/// **Note:** The `input_tokens` value is an approximation based on a heuristic
-/// word/character-level counter, not an exact count from the upstream provider's
-/// tokenizer. It intentionally excludes tool definitions, non-text content blocks
-/// (images, documents), and tool-result content. This estimate is sufficient for
-/// gating requests by approximate size but should not be used for precise billing
-/// or token accounting.
+/// **Note:** The `input_tokens` value is computed locally with the model's own
+/// BPE tokenizer for known OpenAI models (`gpt-4o`, `gpt-4`, `gpt-3.5`, etc.),
+/// and falls back to a character-level heuristic (~4 chars/token) for any model
+/// the proxy does not have a tokenizer for. It is therefore exact for known
+/// OpenAI text but still an estimate for other providers and for non-text
+/// content. It intentionally excludes tool definitions, non-text content blocks
+/// (images, documents), and tool-result content. For non-OpenAI providers the
+/// provider-reported usage (returned in the actual response) remains the
+/// authoritative count for billing; this estimate is for pre-flight size gating.
 #[derive(Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct TokenCountResponse {
@@ -209,7 +212,9 @@ async fn count_tokens_inner(
         })
         .collect();
 
-    let count = state.token_counter.count_messages(&system_text, &messages);
+    let count = state
+        .token_counter
+        .count_messages(&core.model.requested, &system_text, &messages);
 
     let response = axum::Json(TokenCountResponse {
         input_tokens: count,

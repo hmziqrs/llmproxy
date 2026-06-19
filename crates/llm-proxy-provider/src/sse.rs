@@ -176,7 +176,7 @@ impl SseFramer {
             // instead of allocating a separate Vec.
             let trimmed_end = match self.buffer[..nl_pos].iter().rposition(|&b| b != b'\r') {
                 Some(pos) => pos + 1, // exclusive end
-                None => 0,             // Line was all \r characters.
+                None => 0,            // Line was all \r characters.
             };
 
             // Decode the trimmed line as UTF-8 and convert to an owned string

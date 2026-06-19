@@ -224,7 +224,7 @@ mod tests {
     fn build_state_with_catalog() -> AppState {
         let provider = ProviderConfig {
             name: "test-provider".to_owned(),
-            api_key: "sk-test".to_owned(),
+            api_key: secrecy::SecretString::from("sk-test"),
             auth_style: AuthStyle::Bearer,
             adapters: HashMap::new(),
             routes: ProviderRoutesConfig::default(),
@@ -254,6 +254,7 @@ mod tests {
                     },
                 ],
             }),
+            pricing: Default::default(),
         };
 
         let registry =
@@ -271,6 +272,7 @@ mod tests {
                     rate_limit_rpm: 100,
                     trust_forwarded_headers: false,
                     dedup_window: std::time::Duration::from_millis(500),
+                    log_format: Default::default(),
                 },
             },
             registry,
@@ -289,13 +291,14 @@ mod tests {
     fn build_state_without_catalog() -> AppState {
         let provider = ProviderConfig {
             name: "no-catalog".to_owned(),
-            api_key: "sk-test".to_owned(),
+            api_key: secrecy::SecretString::from("sk-test"),
             auth_style: AuthStyle::Bearer,
             adapters: HashMap::new(),
             routes: ProviderRoutesConfig::default(),
             model_aliases: HashMap::new(),
             discovery: None,
             catalog: None,
+            pricing: Default::default(),
         };
 
         let registry =
@@ -313,6 +316,7 @@ mod tests {
                     rate_limit_rpm: 100,
                     trust_forwarded_headers: false,
                     dedup_window: std::time::Duration::from_millis(500),
+                    log_format: Default::default(),
                 },
             },
             registry,

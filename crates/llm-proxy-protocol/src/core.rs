@@ -45,6 +45,7 @@
 
 use std::fmt;
 
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
@@ -764,6 +765,14 @@ pub struct CoreResponse {
     /// "null metadata".
     #[serde(default)]
     pub provider_meta: serde_json::Map<String, serde_json::Value>,
+    /// Computed USD cost for this request, if pricing was configured for the
+    /// model. `None` when no pricing is configured; in that case the field is
+    /// omitted from serialization so the wire shape is byte-identical to a
+    /// build without cost accounting. Not surfaced on the Anthropic/OpenAI
+    /// client wire (those formats have no cost field); available to the event
+    /// log and the future API crate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost: Option<Cost>,
 }
 
 impl fmt::Debug for CoreResponse {
@@ -776,8 +785,38 @@ impl fmt::Debug for CoreResponse {
             .field("stop_sequence", &self.stop_sequence)
             .field("usage", &self.usage)
             .field("provider_meta", &redact_map_helper(&self.provider_meta))
+            .field("cost", &self.cost)
             .finish()
     }
+}
+
+// ---------------------------------------------------------------------------
+// Cost
+// ---------------------------------------------------------------------------
+
+/// Computed cost for one request, in USD.
+///
+/// All fields are [`Decimal`] to avoid floating-point money. Derived from
+/// [`Usage`] and a per-token price table; the multiplication lives in the
+/// server crate (the first crate that sees both [`Usage`] and the core
+/// `ModelPricing` type). A request for a model with no configured pricing
+/// simply has no [`Cost`] (the carrier is `Option<Cost>`), so responses are
+/// unchanged when pricing is absent.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Cost {
+    /// Input-token cost.
+    pub input: Decimal,
+    /// Output-token cost.
+    pub output: Decimal,
+    /// Cache-creation-token cost.
+    pub cache_creation: Decimal,
+    /// Cache-read-token cost.
+    pub cache_read: Decimal,
+    /// Reasoning-token cost.
+    pub reasoning: Decimal,
+    /// Total cost = input + output + cache_creation + cache_read + reasoning.
+    pub total: Decimal,
 }
 
 // ---------------------------------------------------------------------------
@@ -1287,6 +1326,7 @@ mod tests {
             stop_sequence: Some("\n".into()),
             usage: Usage::default(),
             provider_meta: serde_json::Map::new(),
+            cost: None,
         };
         assert_eq!(resp.stop_reason, StopReason::StopSequence);
         assert_eq!(resp.stop_sequence.as_deref(), Some("\n"));
@@ -1498,6 +1538,7 @@ mod tests {
                 provenance: UsageProvenance::ProviderReported,
             },
             provider_meta: serde_json::from_str(r#"{"warnings":[]}"#).expect("parse provider_meta"),
+            cost: None,
         };
         let json = serde_json::to_string(&resp).expect("serialize CoreResponse");
         let back: CoreResponse = serde_json::from_str(&json).expect("deserialize CoreResponse");
@@ -2077,6 +2118,7 @@ mod tests {
             stop_sequence: None,
             usage: Usage::default(),
             provider_meta: meta,
+            cost: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
         let back: CoreResponse = serde_json::from_str(&json).unwrap();
@@ -2416,6 +2458,7 @@ mod tests {
             stop_sequence: None,
             usage: Usage::default(),
             provider_meta: serde_json::from_str(r#"{"secret":"value","count":42}"#).unwrap(),
+            cost: None,
         };
         let debug = format!("{resp:?}");
         assert!(

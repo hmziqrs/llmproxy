@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use llm_proxy_core::{AppConfig, Counter, Metrics, ProviderRegistry};
 use llm_proxy_provider::{ProviderAdapterRegistry, ProxyClient};
+use llm_proxy_storage::{EventBus, NoopBus};
 
 use crate::ModelCatalogService;
 use crate::middleware::{RateLimiter, RequestDeduplicator, RequestIdGenerator};
@@ -63,10 +64,11 @@ pub struct AppState {
     pub(crate) build: Arc<BuildInfo>,
     /// Token counter for estimating token usage.
     ///
-    /// `Counter` is a zero-sized unit struct (its `count_tokens`/`count_messages`
-    /// methods are pure functions of their arguments and read no `self` state), so
-    /// it is stored inline rather than wrapped in `Arc`. `AppState: Clone` makes a
-    /// trivial ZST copy at zero cost, and there is no shared mutable state to lose.
+    /// `Counter` dispatches to a real BPE tokenizer (tiktoken) for known OpenAI
+    /// models and a character heuristic otherwise. It holds a lazily-populated,
+    /// `Arc`-shared cache of loaded BPE encodings behind a `Mutex`, so cloning
+    /// the counter via `AppState: Clone` is a cheap refcount bump that shares
+    /// the cache across handlers.
     pub(crate) token_counter: Counter,
     /// Runtime metrics collector.
     pub(crate) metrics: Arc<Metrics>,
@@ -78,6 +80,9 @@ pub struct AppState {
     pub(crate) request_id_gen: Arc<RequestIdGenerator>,
     /// Mutable provider model catalog cache and discovery coordinator.
     pub(crate) model_catalogs: Arc<ModelCatalogService>,
+    /// Structured request/response event sink. Defaults to [`NoopBus`]; a real
+    /// persisted backend lands in a later phase.
+    pub(crate) event_bus: Arc<dyn EventBus>,
 }
 
 impl std::fmt::Debug for AppState {
@@ -104,6 +109,7 @@ impl std::fmt::Debug for AppState {
             .field("request_dedup", &self.request_dedup)
             .field("request_id_gen", &self.request_id_gen)
             .field("model_catalogs", &self.model_catalogs)
+            .field("event_bus", &self.event_bus)
             .finish()
     }
 }
@@ -153,7 +159,17 @@ impl AppState {
             request_dedup: Arc::new(RequestDeduplicator::with_window_ms(dedup_window_ms)),
             request_id_gen: Arc::new(RequestIdGenerator::new()),
             model_catalogs: Arc::new(ModelCatalogService::new(catalog_dir)),
+            event_bus: Arc::new(NoopBus) as Arc<dyn EventBus>,
         }
+    }
+
+    /// Replace the event bus (builder-style). Used by tests to inject a
+    /// [`RecordingBus`](llm_proxy_storage::RecordingBus); production wires the
+    /// real bus in `cmd_serve` (still `NoopBus` for now).
+    #[must_use]
+    pub fn with_event_bus(mut self, event_bus: Arc<dyn EventBus>) -> Self {
+        self.event_bus = event_bus;
+        self
     }
 
     /// Request timeout duration from app config.
@@ -235,6 +251,7 @@ mod tests {
                 rate_limit_rpm: 100,
                 trust_forwarded_headers: false,
                 dedup_window: Duration::from_millis(500),
+                log_format: Default::default(),
             },
         }
     }
@@ -291,13 +308,14 @@ mod tests {
         use llm_proxy_core::{AuthStyle, ProviderConfig, ProviderRoutesConfig};
         let provider = ProviderConfig {
             name: "test".to_owned(),
-            api_key: "sk-secret-key-99999".to_owned(),
+            api_key: secrecy::SecretString::from("sk-secret-key-99999"),
             auth_style: AuthStyle::Bearer,
             adapters: HashMap::new(),
             routes: ProviderRoutesConfig::default(),
             model_aliases: HashMap::new(),
             discovery: None,
             catalog: None,
+            pricing: Default::default(),
         };
         let registry = ProviderRegistry::from_providers(vec![provider]).expect("registry");
         let state = AppState::new(
@@ -344,6 +362,7 @@ mod tests {
             "request_dedup",
             "request_id_gen",
             "model_catalogs",
+            "event_bus",
         ] {
             assert!(
                 debug_output.contains(field),
@@ -391,7 +410,7 @@ mod tests {
         };
         let provider = ProviderConfig {
             name: "test".to_owned(),
-            api_key: "key".to_owned(),
+            api_key: secrecy::SecretString::from("key"),
             auth_style: AuthStyle::Bearer,
             adapters: {
                 let mut m = HashMap::new();
@@ -417,6 +436,7 @@ mod tests {
             model_aliases: HashMap::new(),
             discovery: None,
             catalog: None,
+            pricing: Default::default(),
         };
         let registry = ProviderRegistry::from_providers(vec![provider]).expect("registry");
         let adapter_reg = ProviderAdapterRegistry::builtin();
@@ -434,7 +454,7 @@ mod tests {
         };
         let provider = ProviderConfig {
             name: "bad".to_owned(),
-            api_key: "key".to_owned(),
+            api_key: secrecy::SecretString::from("key"),
             auth_style: AuthStyle::Bearer,
             adapters: {
                 let mut m = HashMap::new();
@@ -452,6 +472,7 @@ mod tests {
             model_aliases: HashMap::new(),
             discovery: None,
             catalog: None,
+            pricing: Default::default(),
         };
         let registry = ProviderRegistry::from_providers(vec![provider]).expect("registry");
         let adapter_reg = ProviderAdapterRegistry::builtin();
@@ -549,7 +570,7 @@ mod tests {
         // Provider with valid protocols
         let good = ProviderConfig {
             name: "good".to_owned(),
-            api_key: "key".to_owned(),
+            api_key: secrecy::SecretString::from("key"),
             auth_style: AuthStyle::Bearer,
             adapters: {
                 let mut m = HashMap::new();
@@ -567,12 +588,13 @@ mod tests {
             model_aliases: HashMap::new(),
             discovery: None,
             catalog: None,
+            pricing: Default::default(),
         };
 
         // Provider with invalid protocol
         let bad = ProviderConfig {
             name: "bad".to_owned(),
-            api_key: "key".to_owned(),
+            api_key: secrecy::SecretString::from("key"),
             auth_style: AuthStyle::Bearer,
             adapters: {
                 let mut m = HashMap::new();
@@ -590,6 +612,7 @@ mod tests {
             model_aliases: HashMap::new(),
             discovery: None,
             catalog: None,
+            pricing: Default::default(),
         };
 
         let registry = ProviderRegistry::from_providers(vec![good, bad]).expect("registry");

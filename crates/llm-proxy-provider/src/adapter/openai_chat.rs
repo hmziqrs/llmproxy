@@ -722,6 +722,7 @@ impl OpenAiChatAdapter {
             stop_sequence: None,
             usage,
             provider_meta: serde_json::Map::new(),
+            cost: None,
         })
     }
 
@@ -791,7 +792,7 @@ mod tests {
             protocol: super::super::ProviderProtocol::OpenAiChatCompletions,
             endpoint: "https://api.openai.com/v1/chat/completions".into(),
             auth_style: AuthStyle::Bearer,
-            api_key: "test-key".into(),
+            api_key: secrecy::SecretString::from("test-key"),
             requested_model: "gpt-4o".into(),
             upstream_model: "gpt-4o-2024-08-06".into(),
             headers: std::sync::Arc::new(std::collections::HashMap::new()),
@@ -834,7 +835,10 @@ mod tests {
         assert_eq!(body.model, "gpt-4o-2024-08-06");
         assert_eq!(body.messages.len(), 1);
         assert_eq!(body.messages[0].role, "user");
-        assert_eq!(body.messages[0].content, serde_json::Value::String("Hello".into()));
+        assert_eq!(
+            body.messages[0].content,
+            serde_json::Value::String("Hello".into())
+        );
     }
 
     #[test]
@@ -856,7 +860,10 @@ mod tests {
 
         let body: ChatCompletionRequest = serde_json::from_slice(&proxy_req.body).unwrap();
         assert_eq!(body.messages[0].role, "system");
-        assert_eq!(body.messages[0].content, serde_json::Value::String("You are helpful".into()));
+        assert_eq!(
+            body.messages[0].content,
+            serde_json::Value::String("You are helpful".into())
+        );
     }
 
     #[test]
@@ -941,7 +948,10 @@ mod tests {
         assert_eq!(body.messages[1].tool_calls.len(), 1);
         assert_eq!(body.messages[2].role, "tool");
         assert_eq!(body.messages[2].tool_call_id, Some("call_1".to_owned()));
-        assert_eq!(body.messages[2].content, serde_json::Value::String("72F sunny".into()));
+        assert_eq!(
+            body.messages[2].content,
+            serde_json::Value::String("72F sunny".into())
+        );
     }
 
     #[test]

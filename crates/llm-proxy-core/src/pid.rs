@@ -227,7 +227,11 @@ mod tests {
 
         match mgr.read_pid() {
             Err(PidError::Parse { path, source }) => {
-                assert_eq!(path, *mgr.pid_file(), "typed error should carry the PID file path");
+                assert_eq!(
+                    path,
+                    *mgr.pid_file(),
+                    "typed error should carry the PID file path"
+                );
                 let _ = source; // ParseIntError present; not asserting its exact wording
             }
             other => panic!("expected PidError::Parse, got {other:?}"),
@@ -248,7 +252,11 @@ mod tests {
 
         match mgr.read_pid() {
             Err(PidError::Io { path, .. }) => {
-                assert_eq!(path, *mgr.pid_file(), "typed Io error should carry the PID file path");
+                assert_eq!(
+                    path,
+                    *mgr.pid_file(),
+                    "typed Io error should carry the PID file path"
+                );
             }
             other => panic!("expected PidError::Io, got {other:?}"),
         }
@@ -287,7 +295,10 @@ mod tests {
         mgr.write_pid().expect("write_pid");
         assert!(mgr.pid_file().exists(), "PID file should exist after write");
         mgr.remove_pid().expect("remove_pid");
-        assert!(!mgr.pid_file().exists(), "PID file should be gone after remove");
+        assert!(
+            !mgr.pid_file().exists(),
+            "PID file should be gone after remove"
+        );
     }
 
     /// TestRemovePID_MissingFile: removing a non-existent PID file should
@@ -297,7 +308,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("create temp dir");
         let mgr = PidManager::new(dir.path());
         // No PID file was created. remove_pid should succeed.
-        mgr.remove_pid().expect("remove_pid on missing file should succeed");
+        mgr.remove_pid()
+            .expect("remove_pid on missing file should succeed");
     }
 
     /// TestAtomicWrite: verify the PID file has content immediately after

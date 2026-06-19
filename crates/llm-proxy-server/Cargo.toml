@@ -12,6 +12,7 @@ workspace = true
 llm-proxy-core = { workspace = true }
 llm-proxy-protocol = { path = "../llm-proxy-protocol" }
 llm-proxy-provider = { path = "../llm-proxy-provider" }
+llm-proxy-storage = { path = "../llm-proxy-storage" }
 
 axum = { workspace = true, features = ["macros", "json"] }
 tokio = { workspace = true, features = ["fs"] }
@@ -31,6 +32,9 @@ regex = { workspace = true }
 sha2 = "0.10"
 toml = { workspace = true }
 time = { workspace = true }
+secrecy = { workspace = true }
+rust_decimal = { workspace = true }
 
 [dev-dependencies]
 tower = { workspace = true, features = ["util"] }
+llm-proxy-storage = { path = "../llm-proxy-storage", features = ["test-utils"] }

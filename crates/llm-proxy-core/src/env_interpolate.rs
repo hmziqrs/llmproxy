@@ -154,7 +154,8 @@ mod tests {
         let _lock = crate::test_support::TestEnvLock::acquire();
         let _a = crate::test_support::EnvVarGuard::set("_LLM_PROXY_TEST_MULTI_A", "hello");
         let _b = crate::test_support::EnvVarGuard::set("_LLM_PROXY_TEST_MULTI_B", "world");
-        let result = interpolate_env_vars("${_LLM_PROXY_TEST_MULTI_A} and ${_LLM_PROXY_TEST_MULTI_B}");
+        let result =
+            interpolate_env_vars("${_LLM_PROXY_TEST_MULTI_A} and ${_LLM_PROXY_TEST_MULTI_B}");
         assert_eq!(result, "hello and world");
     }
 
@@ -162,9 +163,8 @@ mod tests {
     fn mix_of_resolved_and_unresolved() {
         let _lock = crate::test_support::TestEnvLock::acquire();
         let _a = crate::test_support::EnvVarGuard::set("_LLM_PROXY_TEST_MIX_A", "yes");
-        let result = interpolate_env_vars(
-            "${_LLM_PROXY_TEST_MIX_A} ${_LLM_PROXY_NEVER_EXISTS_MIX_B}",
-        );
+        let result =
+            interpolate_env_vars("${_LLM_PROXY_TEST_MIX_A} ${_LLM_PROXY_NEVER_EXISTS_MIX_B}");
         assert_eq!(result, "yes ${_LLM_PROXY_NEVER_EXISTS_MIX_B}");
     }
 

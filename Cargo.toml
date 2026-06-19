@@ -36,7 +36,7 @@ serde_json = "1"
 toml = "0.8"
 humantime-serde = "1"
 regex = "1"
-time = { version = "=0.3.44", features = ["formatting", "parsing"] }
+time = { version = "=0.3.44", features = ["formatting", "parsing", "serde", "serde-well-known"] }
 
 # CLI
 clap = { version = "4", features = ["derive", "env"] }
@@ -45,9 +45,18 @@ clap = { version = "4", features = ["derive", "env"] }
 thiserror = "2"
 anyhow = "1"
 
+# Secrets
+secrecy = { version = "0.10", features = ["serde"] }
+
+# Tokenization
+tiktoken-rs = "0.6"
+
+# Money (cost/pricing) -- fixed-point, never float
+rust_decimal = "1"
+
 # Observability
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 
 # Build metadata
 vergen-gix = "1"

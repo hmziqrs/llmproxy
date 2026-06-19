@@ -160,7 +160,10 @@ pub fn model_allowed(model: &str, allow: &[String], deny: &[String]) -> bool {
     // Evaluate each `allow` pattern against `model` exactly once; both
     // `allowed` and `explicitly_allowed` are derived from this single pass so
     // `glob_matches` (which takes the `GLOB_CACHE` mutex) isn't re-run.
-    let matched: Vec<bool> = allow.iter().map(|pattern| glob_matches(pattern, model)).collect();
+    let matched: Vec<bool> = allow
+        .iter()
+        .map(|pattern| glob_matches(pattern, model))
+        .collect();
     let allowed = allow.is_empty() || matched.iter().any(|&m| m);
     let denied = deny.iter().any(|pattern| glob_matches(pattern, model));
     let explicitly_allowed = allow
@@ -313,10 +316,7 @@ mod tests {
             cache_ttl: Duration::from_secs(60),
             allow: vec!["*".to_owned()],
             deny: Vec::new(),
-            models: vec![
-                model("zzz-tail", None),
-                model("aaa-head", None),
-            ],
+            models: vec![model("zzz-tail", None), model("aaa-head", None)],
         };
         let discovered = vec![model("mmm-middle", None)];
         let merged = merge_catalog(&cfg, &discovered);
@@ -345,10 +345,7 @@ mod tests {
     #[test]
     fn parse_catalog_file_rejects_invalid_toml() {
         let result = parse_catalog_file("this is not valid toml [[");
-        assert!(
-            result.is_err(),
-            "expected error for invalid TOML input"
-        );
+        assert!(result.is_err(), "expected error for invalid TOML input");
         assert!(
             matches!(result.unwrap_err(), CoreError::ConfigParse(_)),
             "expected CoreError::ConfigParse variant"
@@ -374,7 +371,10 @@ mod tests {
         let cfg = config(ProviderCatalogMode::Static);
         let merged = merge_catalog(
             &cfg,
-            &[model("discovered-a", None), model("shared", Some("discovered"))],
+            &[
+                model("discovered-a", None),
+                model("shared", Some("discovered")),
+            ],
         );
         // Only static entries should be present.
         assert_eq!(merged.len(), 1);

@@ -146,7 +146,7 @@ fn state_with_provider_timeout(
 
     let provider = ProviderConfig {
         name: "mock-provider".to_owned(),
-        api_key: "test-key".to_owned(),
+        api_key: secrecy::SecretString::from("test-key"),
         auth_style: AuthStyle::Bearer,
         adapters: {
             let mut m = HashMap::new();
@@ -164,6 +164,7 @@ fn state_with_provider_timeout(
         model_aliases: HashMap::new(),
         discovery: None,
         catalog: None,
+        pricing: Default::default(),
     };
 
     let registry = ProviderRegistry::from_providers(vec![provider]).expect("registry");
@@ -180,6 +181,7 @@ fn state_with_provider_timeout(
             rate_limit_rpm: 100,
             trust_forwarded_headers: false,
             dedup_window: Duration::from_millis(500),
+            log_format: Default::default(),
         },
     };
 
@@ -373,6 +375,7 @@ fn empty_state() -> AppState {
             rate_limit_rpm: 100,
             trust_forwarded_headers: false,
             dedup_window: Duration::from_millis(500),
+            log_format: Default::default(),
         },
     };
     let registry = ProviderRegistry::from_providers(vec![]).expect("empty registry");
@@ -405,7 +408,7 @@ fn empty_state() -> AppState {
 fn state_with_mock_provider_no_upstream() -> AppState {
     let provider = ProviderConfig {
         name: "mock-provider".to_owned(),
-        api_key: "test-key".to_owned(),
+        api_key: secrecy::SecretString::from("test-key"),
         auth_style: AuthStyle::Bearer,
         adapters: {
             let mut m = HashMap::new();
@@ -426,6 +429,7 @@ fn state_with_mock_provider_no_upstream() -> AppState {
         model_aliases: HashMap::new(),
         discovery: None,
         catalog: None,
+        pricing: Default::default(),
     };
     let registry = ProviderRegistry::from_providers(vec![provider]).expect("registry");
     let app_config = AppConfig {
@@ -440,6 +444,7 @@ fn state_with_mock_provider_no_upstream() -> AppState {
             rate_limit_rpm: 100,
             trust_forwarded_headers: false,
             dedup_window: Duration::from_millis(500),
+            log_format: Default::default(),
         },
     };
     AppState::new(
@@ -1882,7 +1887,7 @@ async fn same_model_routes_to_different_providers() {
     );
     let provider_a = ProviderConfig {
         name: "provider-a".to_owned(),
-        api_key: "key-a".to_owned(),
+        api_key: secrecy::SecretString::from("key-a"),
         auth_style: AuthStyle::Bearer,
         adapters: adapters_a,
         routes: llm_proxy_core::ProviderRoutesConfig {
@@ -1892,6 +1897,7 @@ async fn same_model_routes_to_different_providers() {
         model_aliases: HashMap::new(),
         discovery: None,
         catalog: None,
+        pricing: Default::default(),
     };
 
     let mut adapters_b = HashMap::new();
@@ -1905,7 +1911,7 @@ async fn same_model_routes_to_different_providers() {
     );
     let provider_b = ProviderConfig {
         name: "provider-b".to_owned(),
-        api_key: "key-b".to_owned(),
+        api_key: secrecy::SecretString::from("key-b"),
         auth_style: AuthStyle::Bearer,
         adapters: adapters_b,
         routes: llm_proxy_core::ProviderRoutesConfig {
@@ -1915,6 +1921,7 @@ async fn same_model_routes_to_different_providers() {
         model_aliases: HashMap::new(),
         discovery: None,
         catalog: None,
+        pricing: Default::default(),
     };
 
     let registry = ProviderRegistry::from_providers(vec![provider_a, provider_b]).unwrap();
@@ -1931,6 +1938,7 @@ async fn same_model_routes_to_different_providers() {
                 rate_limit_rpm: 100,
                 trust_forwarded_headers: false,
                 dedup_window: Duration::from_millis(500),
+                log_format: Default::default(),
             },
         },
         registry,

@@ -533,7 +533,10 @@ mod tests {
     fn chat_completion_request_accepts_unknown_fields() {
         let json = r#"{"model":"gpt-4o","messages":[],"future_field":"value"}"#;
         let req: ChatCompletionRequest = serde_json::from_str(json).unwrap();
-        assert_eq!(req.extra.get("future_field").unwrap().as_str(), Some("value"));
+        assert_eq!(
+            req.extra.get("future_field").unwrap().as_str(),
+            Some("value")
+        );
     }
 
     #[test]

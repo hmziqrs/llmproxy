@@ -12,10 +12,10 @@ use crate::paths::launchd_plist_path;
 #[cfg(target_os = "linux")]
 use crate::paths::linux_autostart_dir;
 use crate::permissions::set_private_permissions;
-#[cfg(target_os = "macos")]
-use crate::platform::format_plist;
 #[cfg(target_os = "linux")]
 use crate::platform::format_desktop_entry;
+#[cfg(target_os = "macos")]
+use crate::platform::format_plist;
 
 /// Run the `autostart enable` command.
 ///
@@ -208,7 +208,10 @@ mod tests {
 
         let err = require_overwrite_ok(&p, "launchd plist", false).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("already exists"), "expected 'already exists': {msg}");
+        assert!(
+            msg.contains("already exists"),
+            "expected 'already exists': {msg}"
+        );
         assert!(msg.contains("--force"), "expected --force hint: {msg}");
         assert!(msg.contains("launchd plist"), "expected kind label: {msg}");
     }

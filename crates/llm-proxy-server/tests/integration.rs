@@ -31,6 +31,7 @@ fn state() -> AppState {
             rate_limit_rpm: 100,
             trust_forwarded_headers: false,
             dedup_window: Duration::from_millis(500),
+            log_format: Default::default(),
         },
     };
     let registry = ProviderRegistry::from_providers(vec![]).expect("empty registry");
@@ -55,7 +56,7 @@ fn state() -> AppState {
 fn state_with_provider() -> AppState {
     let provider = ProviderConfig {
         name: "mock-provider".to_owned(),
-        api_key: "test-key".to_owned(),
+        api_key: secrecy::SecretString::from("test-key"),
         auth_style: AuthStyle::Bearer,
         adapters: {
             let mut m = HashMap::new();
@@ -76,6 +77,7 @@ fn state_with_provider() -> AppState {
         model_aliases: HashMap::new(),
         discovery: None,
         catalog: None,
+        pricing: Default::default(),
     };
     let registry = ProviderRegistry::from_providers(vec![provider]).expect("registry");
     AppState::new(
@@ -91,6 +93,7 @@ fn state_with_provider() -> AppState {
                 rate_limit_rpm: 100,
                 trust_forwarded_headers: false,
                 dedup_window: Duration::from_millis(500),
+                log_format: Default::default(),
             },
         },
         registry,
@@ -667,11 +670,13 @@ async fn get_on_messages_route_returns_405() {
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
-    let body: Value = serde_json::from_slice(
-        &axum::body::to_bytes(resp.into_body(), 4096).await.unwrap(),
-    )
-    .unwrap();
-    assert_eq!(body["type"], "error", "405 must be an Anthropic-shaped envelope");
+    let body: Value =
+        serde_json::from_slice(&axum::body::to_bytes(resp.into_body(), 4096).await.unwrap())
+            .unwrap();
+    assert_eq!(
+        body["type"], "error",
+        "405 must be an Anthropic-shaped envelope"
+    );
     assert_eq!(body["error"]["type"], "invalid_request_error");
     assert_eq!(body["error"]["message"], "method not allowed");
 }
@@ -688,10 +693,9 @@ async fn get_on_chat_completions_route_returns_405() {
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
-    let body: Value = serde_json::from_slice(
-        &axum::body::to_bytes(resp.into_body(), 4096).await.unwrap(),
-    )
-    .unwrap();
+    let body: Value =
+        serde_json::from_slice(&axum::body::to_bytes(resp.into_body(), 4096).await.unwrap())
+            .unwrap();
     assert_eq!(body["error"]["type"], "invalid_request_error");
     assert_eq!(body["error"]["message"], "method not allowed");
     assert!(body["error"]["code"].is_null());
@@ -894,6 +898,7 @@ fn state_with_origins(origins: Vec<String>) -> AppState {
             rate_limit_rpm: 100,
             trust_forwarded_headers: false,
             dedup_window: Duration::from_millis(500),
+            log_format: Default::default(),
         },
     };
     let registry = ProviderRegistry::from_providers(vec![]).expect("empty registry");

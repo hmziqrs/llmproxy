@@ -14,18 +14,20 @@ use axum::response::IntoResponse;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use bytes::Bytes;
 use futures::stream::{BoxStream, StreamExt};
-use llm_proxy_core::{Metrics, ProviderRouteKind, ProviderRouteResolutionError};
+use llm_proxy_core::{Metrics, ModelPricing, ProviderRouteKind, ProviderRouteResolutionError};
 use llm_proxy_protocol::client::anthropic;
 use llm_proxy_protocol::client::anthropic::StreamEncoder as AnthropicStreamEncoder;
 use llm_proxy_protocol::client::openai_chat;
 use llm_proxy_protocol::client::openai_chat::StreamEncoder as OpenAiStreamEncoder;
-use llm_proxy_protocol::core::{CoreEvent, CoreRequest};
+use llm_proxy_protocol::core::{CoreEvent, CoreRequest, Cost, Usage};
 use llm_proxy_provider::adapter::{
     ProviderAdapter, ProviderAdapterTarget, ProviderProtocol, ProviderStreamDecoder,
     ProviderStreamDecoderKind,
 };
 use llm_proxy_provider::sse::SseFramer;
 use llm_proxy_provider::transport::ProxyRequest;
+use llm_proxy_storage::{ProxyEvent, RequestReceived, ResponseCompleted};
+use rust_decimal::Decimal;
 use tracing::warn;
 
 use crate::middleware::get_client_ip;
@@ -444,6 +446,60 @@ fn map_provider_route_error(error: ProviderRouteResolutionError) -> RouteError {
 // handle_core_once
 // ---------------------------------------------------------------------------
 
+/// Canonical string for a [`ProviderRouteKind`] (used in the event log).
+fn route_kind_str(kind: ProviderRouteKind) -> &'static str {
+    match kind {
+        ProviderRouteKind::ChatCompletions => "chat_completions",
+        ProviderRouteKind::Messages => "messages",
+    }
+}
+
+/// Canonical string for a [`ClientProtocol`] (used in the event log).
+fn client_protocol_str(protocol: ClientProtocol) -> &'static str {
+    match protocol {
+        ClientProtocol::OpenAiChat => "openai_chat",
+        ClientProtocol::Anthropic => "anthropic",
+    }
+}
+
+/// Stable correlation hash for a request.
+///
+/// Hashes the serialized normalized [`CoreRequest`] (not the raw wire body) so
+/// the hash is insensitive to client-side whitespace/formatting while still
+/// uniquely identifying identical request payloads. SHA-256 of the body itself
+/// is never stored -- only this digest.
+fn body_hash_of(core: &CoreRequest) -> String {
+    use sha2::{Digest, Sha256};
+    let bytes = serde_json::to_vec(core).unwrap_or_default();
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes);
+    format!("{:x}", hasher.finalize())
+}
+
+/// Compute the USD cost of a request from its [`Usage`] and a per-token price
+/// table.
+///
+/// Pure domain math. Lives in the server crate (not on the protocol [`Cost`]
+/// type) because [`Usage`] is in the protocol crate and [`ModelPricing`] in the
+/// core crate, and the server is the first crate that depends on both.
+fn compute_cost(usage: &Usage, pricing: &ModelPricing) -> Cost {
+    let input = Decimal::from(usage.input_tokens) * pricing.input;
+    let output = Decimal::from(usage.output_tokens) * pricing.output;
+    let cache_creation =
+        Decimal::from(usage.cache_creation_input_tokens.unwrap_or(0)) * pricing.cache_creation;
+    let cache_read = Decimal::from(usage.cache_read_input_tokens.unwrap_or(0)) * pricing.cache_read;
+    let reasoning = Decimal::from(usage.reasoning_tokens.unwrap_or(0)) * pricing.reasoning;
+    let total = input + output + cache_creation + cache_read + reasoning;
+    Cost {
+        input,
+        output,
+        cache_creation,
+        cache_read,
+        reasoning,
+        total,
+    }
+}
+
 /// Non-streaming core pipeline.
 ///
 /// ```text
@@ -468,6 +524,20 @@ pub(crate) async fn handle_core_once(
         streaming = false,
         "processing request"
     );
+
+    // Emit a structured RequestReceived event.
+    state
+        .event_bus
+        .emit(&ProxyEvent::RequestReceived(RequestReceived {
+            request_id: ctx.request_id.clone(),
+            timestamp: time::OffsetDateTime::now_utc(),
+            provider: provider_name.to_owned(),
+            route_kind: route_kind_str(route_kind).to_owned(),
+            client_protocol: client_protocol_str(client_protocol).to_owned(),
+            model: core.model.clone(),
+            streaming: false,
+            body_hash: body_hash_of(&core),
+        }));
 
     let (target, adapter) = resolve_target(&state, provider_name, route_kind, &core)
         .await
@@ -498,7 +568,7 @@ pub(crate) async fn handle_core_once(
     })?;
 
     // Decode the provider response into a CoreResponse.
-    let core_resp = adapter
+    let mut core_resp = adapter
         .decode_response(&response_bytes, &target)
         .map_err(|e| {
             state.metrics.record_failure();
@@ -510,6 +580,32 @@ pub(crate) async fn handle_core_once(
     state
         .metrics
         .record_success(&target.provider_name, &target.upstream_model, latency);
+
+    // Attach computed cost when pricing is configured for the (alias-resolved)
+    // upstream model. The price is cloned out of the registry before the
+    // `core_resp` move into the client encoder below.
+    let pricing = state
+        .providers()
+        .pricing_for(&target.provider_name, &target.upstream_model)
+        .cloned();
+    let cost = pricing.map(|p| compute_cost(&core_resp.usage, &p));
+    core_resp.cost = cost.clone();
+
+    // Emit a structured ResponseCompleted event before core_resp is moved into
+    // the client encoder below.
+    state
+        .event_bus
+        .emit(&ProxyEvent::ResponseCompleted(ResponseCompleted {
+            request_id: ctx.request_id.clone(),
+            timestamp: time::OffsetDateTime::now_utc(),
+            provider: target.provider_name.clone(),
+            upstream_message_id: core_resp.id.clone(),
+            model: core_resp.model.clone(),
+            usage: core_resp.usage.clone(),
+            cost,
+            stop_reason: core_resp.stop_reason.clone(),
+            latency_ms: latency.as_millis().try_into().unwrap_or(u64::MAX),
+        }));
 
     let response_body = match client_protocol {
         ClientProtocol::Anthropic => {
@@ -648,32 +744,12 @@ pub(crate) async fn handle_core_stream(
     let provider_decoder = adapter.new_stream_decoder(&target);
     let sse_framer = SseFramer::new();
 
-    // Create the client stream encoder.
-    //
-    // NOTE: This generates a synthetic message ID because the stream encoder
-    // needs an ID before any events arrive. The prefix is chosen based on the
-    // client protocol so it matches the expected convention:
-    //   - OpenAI Chat uses `chatcmpl-` prefix
-    //   - Anthropic uses `msg_` prefix
-    //
-    // Trade-off: the upstream provider's real message ID (available in
-    // CoreEvent::MessageStart) is not used because: (a) the encoder needs an
-    // ID at construction time, and (b) extracting it would require buffering
-    // the first event. Clients tracking message IDs for conversation continuity
-    // will see the proxy-generated ID instead. This is acceptable for v1;
-    // a future improvement could pre-flight the first event to extract the
-    // real upstream ID before constructing the encoder.
-    //
-    // TODO(v2): Buffer the first CoreEvent to extract the upstream message ID
-    // from CoreEvent::MessageStart, then construct the client encoder with the
-    // real ID. This avoids clients seeing proxy-generated IDs that differ from
-    // the upstream's own ID.
-    let msg_id = match client_protocol {
-        ClientProtocol::OpenAiChat => format!("chatcmpl-{}", uuid::Uuid::new_v4()),
-        ClientProtocol::Anthropic => format!("msg_{}", uuid::Uuid::new_v4()),
-    };
-    let client_encoder =
-        ClientStreamEncoder::new(client_protocol, msg_id, core.model.requested.clone(), &core);
+    // The client stream encoder is constructed *inside* the spawned stream
+    // task (see `build_sse_output_stream`), after buffering the first decoded
+    // `CoreEvent`. This lets the encoder be seeded with the upstream provider's
+    // real message ID (from `CoreEvent::MessageStart`) instead of a synthetic
+    // one, so clients tracking message IDs see the upstream's own ID rather than
+    // a proxy-generated one.
 
     // ctx is consumed after this point. request_id is cloned once for the
     // spawned task and once for the response header (both are needed).
@@ -687,8 +763,8 @@ pub(crate) async fn handle_core_stream(
         StreamContext {
             provider_decoder,
             sse_framer,
-            client_encoder,
             client_protocol,
+            core,
             request_id: request_id.clone(),
             stream_metrics: StreamMetrics {
                 metrics: Arc::clone(&state.metrics),
@@ -796,8 +872,12 @@ struct StreamMetrics {
 struct StreamContext {
     provider_decoder: ProviderStreamDecoderKind,
     sse_framer: SseFramer,
-    client_encoder: ClientStreamEncoder,
     client_protocol: ClientProtocol,
+    /// The normalized core request. Held so the client stream encoder can be
+    /// constructed inside the stream task -- after buffering the first event to
+    /// extract the upstream message ID -- with access to `model.requested` and
+    /// provider hints.
+    core: CoreRequest,
     request_id: String,
     stream_metrics: StreamMetrics,
     first_byte_tx: Option<tokio::sync::oneshot::Sender<FirstByteResult>>,
@@ -888,6 +968,107 @@ fn build_sse_output_stream(
         // skip the finalization path that follows the main loop.
         let mut stream_errored = false;
 
+        // Buffer the first decoded event batch so the client stream encoder can
+        // be seeded with the upstream provider's real message ID (from
+        // `CoreEvent::MessageStart`) instead of a synthetic one. This runs
+        // *inside* the spawned task so the cancellation `select!` covers the
+        // first-frame wait: a client disconnect during buffering aborts cleanly
+        // instead of blocking on the upstream.
+        //
+        // `CoreEvent`s accumulate across frames/chunks until the first non-empty
+        // batch arrives (empty decodes -- e.g. `:keepalive` comments -- are
+        // skipped), then the encoder is constructed and the buffered events are
+        // replayed through it. No events are lost or reordered.
+        let mut pending: Vec<CoreEvent> = Vec::new();
+        'buffer: loop {
+            tokio::select! {
+                _ = cancel_clone.cancelled() => {
+                    // Client disconnected before the first event.
+                    ctx.stream_metrics.metrics.record_client_cancel();
+                    ctx.send_pre_stream_error(
+                        RouteError::Internal("client disconnected before first byte".to_owned()),
+                    );
+                    return;
+                }
+                chunk = stream.next() => match chunk {
+                    Some(Ok(bytes)) => {
+                        let frames = match ctx.sse_framer.push_chunk(&bytes) {
+                            Ok(f) => f,
+                            Err(e) => {
+                                warn!(
+                                    request_id = %ctx.request_id,
+                                    error = %e,
+                                    "SSE framing error in stream"
+                                );
+                                ctx.stream_metrics.metrics.record_failure();
+                                ctx.send_pre_stream_error(RouteError::ProviderDecode(
+                                    format!("stream framing error: {e}"),
+                                ));
+                                return;
+                            }
+                        };
+                        for frame in &frames {
+                            match ctx.provider_decoder.decode_frame(frame) {
+                                Ok(events) => pending.extend(events),
+                                Err(e) => {
+                                    warn!(
+                                        request_id = %ctx.request_id,
+                                        error = %e,
+                                        "provider decode error in stream"
+                                    );
+                                    ctx.stream_metrics.metrics.record_failure();
+                                    ctx.send_pre_stream_error(RouteError::ProviderDecode(
+                                        format!("provider decode error: {e}"),
+                                    ));
+                                    return;
+                                }
+                            }
+                        }
+                        if !pending.is_empty() {
+                            break 'buffer;
+                        }
+                    }
+                    Some(Err(e)) => {
+                        warn!(
+                            request_id = %ctx.request_id,
+                            error = %e,
+                            "upstream stream error"
+                        );
+                        ctx.stream_metrics.metrics.record_failure();
+                        ctx.send_pre_stream_error(map_provider_error(e));
+                        return;
+                    }
+                    None => break 'buffer,
+                }
+            }
+        }
+
+        // Seed the encoder with the real upstream message ID when the buffered
+        // batch contained a `MessageStart { id: Some(..) }`; otherwise fall back
+        // to the protocol-conventional synthetic id.
+        let msg_id =
+            extract_upstream_message_id(&pending).unwrap_or_else(|| match ctx.client_protocol {
+                ClientProtocol::OpenAiChat => format!("chatcmpl-{}", uuid::Uuid::new_v4()),
+                ClientProtocol::Anthropic => format!("msg_{}", uuid::Uuid::new_v4()),
+            });
+        let mut encoder = ClientStreamEncoder::new(
+            ctx.client_protocol,
+            msg_id,
+            ctx.core.model.requested.clone(),
+            &ctx.core,
+        );
+
+        // Replay the buffered events. The first one crosses the first-byte
+        // boundary (committing HTTP 200 via the `first_byte` channel); the rest
+        // flow directly to the output channel.
+        for core_event in pending.drain(..) {
+            for event in encode_core_event(&mut encoder, core_event) {
+                if !ctx.emit_event(event, &tx).await {
+                    return;
+                }
+            }
+        }
+
         'outer: loop {
             tokio::select! {
                 _ = cancel_clone.cancelled() => {
@@ -924,7 +1105,7 @@ fn build_sse_output_stream(
                                         );
                                     } else {
                                         emit_stream_error(
-                                            &mut ctx.client_encoder,
+                                            &mut encoder,
                                             &tx,
                                             &ctx.client_protocol,
                                             PROVIDER_DECODE_CLIENT_MESSAGE,
@@ -954,7 +1135,7 @@ fn build_sse_output_stream(
                                             );
                                         } else {
                                             emit_stream_error(
-                                                &mut ctx.client_encoder,
+                                                &mut encoder,
                                                 &tx,
                                                 &ctx.client_protocol,
                                                 PROVIDER_DECODE_CLIENT_MESSAGE,
@@ -968,7 +1149,7 @@ fn build_sse_output_stream(
 
                                 for core_event in core_events {
                                     let client_events = encode_core_event(
-                                        &mut ctx.client_encoder,
+                                        &mut encoder,
                                         core_event,
                                     );
                                     for event in client_events {
@@ -998,7 +1179,7 @@ fn build_sse_output_stream(
                                 // (audit GAP-LOW-2).
                                 let sanitized = fully_sanitize_upstream_error(&e.to_string());
                                 emit_stream_error(
-                                    &mut ctx.client_encoder,
+                                    &mut encoder,
                                     &tx,
                                     &ctx.client_protocol,
                                     &sanitized,
@@ -1041,8 +1222,7 @@ fn build_sse_output_stream(
                             }
                         };
                         for core_event in core_events {
-                            let client_events =
-                                encode_core_event(&mut ctx.client_encoder, core_event);
+                            let client_events = encode_core_event(&mut encoder, core_event);
                             for event in client_events {
                                 if !ctx.emit_event(event, &tx).await {
                                     return;
@@ -1064,7 +1244,7 @@ fn build_sse_output_stream(
             match ctx.provider_decoder.finish() {
                 Ok(final_events) => {
                     for core_event in final_events {
-                        let client_events = encode_core_event(&mut ctx.client_encoder, core_event);
+                        let client_events = encode_core_event(&mut encoder, core_event);
                         for event in client_events {
                             if !ctx.emit_event(event, &tx).await {
                                 return;
@@ -1082,7 +1262,7 @@ fn build_sse_output_stream(
             }
 
             // Emit any remaining client encoder events (synthetic terminal if needed).
-            match ctx.client_encoder.finish() {
+            match encoder.finish() {
                 Ok(final_encoded_events) => {
                     for encoded in final_encoded_events {
                         let event = client_event_to_sse(encoded);
@@ -1144,6 +1324,20 @@ fn build_sse_output_stream(
             item
         })
         .boxed()
+}
+
+/// Extract the upstream message ID from the first `MessageStart` event in a
+/// batch, if any carries one.
+///
+/// Used to seed the client stream encoder with the provider's real message ID
+/// instead of a synthetic one. Only `MessageStart { id: Some(..) }` contributes;
+/// earlier events in the batch (e.g. `Ping`) are skipped, so a
+/// `Ping`-then-`MessageStart` opening still surfaces the real id.
+fn extract_upstream_message_id(events: &[CoreEvent]) -> Option<String> {
+    events.iter().find_map(|event| match event {
+        CoreEvent::MessageStart { id: Some(id), .. } => Some(id.clone()),
+        _ => None,
+    })
 }
 
 /// Encode a single [`CoreEvent`] using the appropriate client stream encoder.
@@ -1379,6 +1573,43 @@ pub(crate) fn protocol_error_to_route(e: llm_proxy_protocol::client::ProtocolErr
 mod tests {
     use super::*;
 
+    #[test]
+    fn compute_cost_multiplies_usage_by_per_token_prices() {
+        use llm_proxy_core::ModelPricing;
+        use llm_proxy_protocol::core::Usage;
+
+        let usage = Usage {
+            input_tokens: 1000,
+            output_tokens: 500,
+            reasoning_tokens: Some(50),
+            cache_creation_input_tokens: Some(200),
+            cache_read_input_tokens: None,
+            ..Usage::default()
+        };
+        let pricing = ModelPricing {
+            input: "0.0000015".parse().unwrap(),
+            output: "0.000003".parse().unwrap(),
+            cache_creation: "0.000001875".parse().unwrap(),
+            cache_read: "0.00000015".parse().unwrap(),
+            reasoning: "0.000003".parse().unwrap(),
+        };
+        let cost = compute_cost(&usage, &pricing);
+        // input:         1000 * 0.0000015    = 0.0015
+        // output:         500 * 0.000003     = 0.0015
+        // cache_creation: 200 * 0.000001875  = 0.000375
+        // cache_read:     None -> 0
+        // reasoning:       50 * 0.000003     = 0.00015
+        // total = 0.0015 + 0.0015 + 0.000375 + 0 + 0.00015 = 0.003525
+        // `.normalize().to_string()` strips trailing zeros so the expected
+        // strings are scale-independent.
+        assert_eq!(cost.input.normalize().to_string(), "0.0015");
+        assert_eq!(cost.output.normalize().to_string(), "0.0015");
+        assert_eq!(cost.cache_creation.normalize().to_string(), "0.000375");
+        assert_eq!(cost.cache_read.normalize().to_string(), "0");
+        assert_eq!(cost.reasoning.normalize().to_string(), "0.00015");
+        assert_eq!(cost.total.normalize().to_string(), "0.003525");
+    }
+
     fn state_with_operational_config(
         rate_limit_rpm: u32,
         trust_forwarded_headers: bool,
@@ -1395,6 +1626,7 @@ mod tests {
                 trust_forwarded_headers,
                 dedup_window: std::time::Duration::ZERO,
                 server_name: "test".to_owned(),
+                log_format: Default::default(),
             },
         };
         let providers =
@@ -1562,6 +1794,7 @@ mod tests {
                 rate_limit_rpm: 100,
                 trust_forwarded_headers: false,
                 dedup_window: std::time::Duration::from_millis(500),
+                log_format: Default::default(),
             },
         };
 
@@ -1630,6 +1863,7 @@ mod tests {
                 rate_limit_rpm: 100,
                 trust_forwarded_headers: false,
                 dedup_window: std::time::Duration::from_millis(500),
+                log_format: Default::default(),
             },
         };
 

@@ -709,8 +709,7 @@ impl AnthropicAdapter {
             if !stop.is_empty() {
                 obj.insert(
                     "stop_sequences".to_owned(),
-                    serde_json::to_value(stop)
-                        .expect("Vec<String> serialization is infallible"),
+                    serde_json::to_value(stop).expect("Vec<String> serialization is infallible"),
                 );
             }
         }
@@ -837,6 +836,7 @@ impl AnthropicAdapter {
             stop_sequence: resp.stop_sequence,
             usage,
             provider_meta: serde_json::Map::new(),
+            cost: None,
         })
     }
 
@@ -1017,7 +1017,7 @@ mod tests {
             protocol: super::super::ProviderProtocol::AnthropicMessages,
             endpoint: "https://api.anthropic.com/v1/messages".into(),
             auth_style: llm_proxy_core::AuthStyle::XApiKey,
-            api_key: "test-key".into(),
+            api_key: secrecy::SecretString::from("test-key"),
             requested_model: "claude-sonnet-4-20250514".into(),
             upstream_model: "claude-sonnet-4-20250514".into(),
             headers: std::sync::Arc::new(std::collections::HashMap::new()),

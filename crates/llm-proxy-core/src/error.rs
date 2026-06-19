@@ -110,7 +110,10 @@ mod tests {
             source: std::io::Error::new(std::io::ErrorKind::NotFound, "not found"),
         };
         let msg = err.to_string();
-        assert!(msg.contains("/tmp/test.toml"), "display should contain path");
+        assert!(
+            msg.contains("/tmp/test.toml"),
+            "display should contain path"
+        );
         assert!(msg.contains("failed to read config"));
     }
 
@@ -157,10 +160,9 @@ mod tests {
     fn config_validation_preserves_fielded_variant() {
         // A non-unit (fielded) variant must round-trip through CoreError so callers
         // can match its fields without downcasting (GAP-LOW-11 / GAP-LOW-12).
-        let validation_err =
-            crate::provider_config::ConfigValidationError::EmptyApiKey {
-                provider: "my-provider".to_owned(),
-            };
+        let validation_err = crate::provider_config::ConfigValidationError::EmptyApiKey {
+            provider: "my-provider".to_owned(),
+        };
         let core_err: CoreError = validation_err.into();
         match core_err.validation_error() {
             Some(crate::provider_config::ConfigValidationError::EmptyApiKey { provider }) => {

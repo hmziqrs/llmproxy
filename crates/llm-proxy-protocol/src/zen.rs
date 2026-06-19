@@ -431,9 +431,18 @@ mod tests {
             total_token_count: 150,
         };
         let json = serde_json::to_string(&usage).unwrap();
-        assert!(json.contains("promptTokenCount"), "expected camelCase: {json}");
-        assert!(json.contains("candidatesTokenCount"), "expected camelCase: {json}");
-        assert!(json.contains("totalTokenCount"), "expected camelCase: {json}");
+        assert!(
+            json.contains("promptTokenCount"),
+            "expected camelCase: {json}"
+        );
+        assert!(
+            json.contains("candidatesTokenCount"),
+            "expected camelCase: {json}"
+        );
+        assert!(
+            json.contains("totalTokenCount"),
+            "expected camelCase: {json}"
+        );
     }
 
     #[test]

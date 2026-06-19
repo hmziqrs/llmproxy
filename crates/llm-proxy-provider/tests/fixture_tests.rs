@@ -88,7 +88,7 @@ fn make_target(protocol: ProviderProtocol) -> ProviderAdapterTarget {
         protocol,
         endpoint,
         auth_style,
-        api_key: "test-key".into(),
+        api_key: secrecy::SecretString::from("test-key"),
         requested_model: model.clone(),
         upstream_model: model,
         headers: std::sync::Arc::new(std::collections::HashMap::new()),

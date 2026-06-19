@@ -11,6 +11,8 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use rust_decimal::Decimal;
+use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 
 use crate::env_interpolate::{find_env_var_refs, find_unresolved_env_var, interpolate_env_vars};
@@ -33,6 +35,34 @@ pub struct AppConfig {
 // ---------------------------------------------------------------------------
 // ServerConfig
 // ---------------------------------------------------------------------------
+
+/// Log output format for the tracing subscriber.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LogFormat {
+    /// Human-readable plain-text logs (default).
+    #[default]
+    Plain,
+    /// Structured JSON logs (one JSON object per line).
+    Json,
+}
+
+impl LogFormat {
+    /// Read the format from the `RUST_LOG_FORMAT` env var (case-insensitive).
+    ///
+    /// Defaults to [`LogFormat::Plain`] when unset or unrecognized. Read at
+    /// subscriber init (before config load), consistent with `RUST_LOG`.
+    pub fn from_env() -> Self {
+        match std::env::var("RUST_LOG_FORMAT")
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "json" => Self::Json,
+            _ => Self::Plain,
+        }
+    }
+}
 
 /// Server operational settings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -57,6 +87,11 @@ pub struct ServerConfig {
     pub shutdown_timeout: Duration,
     /// Log level: `"trace"`, `"debug"`, `"info"`, `"warn"`, `"error"`.
     pub log_level: String,
+    /// Log output format for the tracing subscriber: `"plain"` (default) or
+    /// `"json"`. Applied at subscriber init from the `RUST_LOG_FORMAT` env var
+    /// (see [`LogFormat::from_env`]); this field documents the intended default.
+    #[serde(default)]
+    pub log_format: LogFormat,
     /// Reserved hot-reload flag. Configuration loading rejects `true`.
     pub hot_reload: bool,
     /// Per-client requests allowed per minute. `0` disables rate limiting.
@@ -128,16 +163,18 @@ pub struct ProviderFile {
 /// The `api_key` field is redacted in [`Debug`] output and excluded from
 /// [`Serialize`] output to prevent credential leakage in logs, error messages,
 /// and API responses.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderConfig {
     /// Provider name (e.g. `"opencode-go"`, `"opencode-zen"`).
     pub name: String,
     /// API key for authenticating with the upstream provider.
-    /// Supports `${ENV_VAR}` interpolation.
+    /// Supports `${ENV_VAR}` interpolation (applied to the raw TOML *before*
+    /// this field is constructed, so the resolved value is what gets wrapped).
     ///
-    /// Redacted in Debug output. Not serialized (use explicit methods if you
-    /// need to write a config file).
+    /// Wrapped in [`SecretString`]: redacted in [`Debug`] and [`Display`] output
+    /// and zeroized on drop. Not serialized (`skip_serializing`) -- use explicit
+    /// methods if you need to write a config file.
     ///
     /// WHY `skip_serializing`: prevents credentials from leaking through
     /// serialization paths (e.g. debug logs, API responses, config dumps).
@@ -146,7 +183,7 @@ pub struct ProviderConfig {
     /// required field. This is intentional -- credentials should never
     /// round-trip through serialization.
     #[serde(skip_serializing)]
-    pub api_key: String,
+    pub api_key: SecretString,
     /// Authentication header style.
     pub auth_style: AuthStyle,
     /// Named adapter configurations (protocol + endpoint pairs).
@@ -164,21 +201,66 @@ pub struct ProviderConfig {
     /// Model catalog configuration (optional, defaults to advisory hybrid).
     #[serde(default)]
     pub catalog: Option<ProviderCatalogConfig>,
+    /// Per-model pricing, keyed by upstream model id. Used for cost estimation
+    /// only; not enforced for routing. Aliases are resolved before lookup, so
+    /// the key is the upstream model id. Defaults to empty (no cost accounting).
+    #[serde(default)]
+    pub pricing: HashMap<ModelId, ModelPricing>,
 }
 
-impl std::fmt::Debug for ProviderConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ProviderConfig")
-            .field("name", &self.name)
-            .field("api_key", &"[REDACTED]")
-            .field("auth_style", &self.auth_style)
-            .field("adapters", &self.adapters)
-            .field("routes", &self.routes)
-            .field("model_aliases", &self.model_aliases)
-            .field("discovery", &self.discovery)
-            .field("catalog", &self.catalog)
-            .finish()
+// ---------------------------------------------------------------------------
+// ModelId / ModelPricing
+// ---------------------------------------------------------------------------
+
+/// Provider-local model identifier used as a pricing key.
+///
+/// Transparent newtype over `String` so it serializes as a plain string in
+/// TOML/JSON. Intentionally minimal: existing `String` model fields elsewhere
+/// are not migrated to this type.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ModelId(
+    /// The model id string (the upstream model id, after alias resolution).
+    pub String,
+);
+
+impl ModelId {
+    /// Create a model id from anything string-like.
+    pub fn new(id: impl Into<String>) -> Self {
+        Self(id.into())
     }
+    /// The model id as a string slice.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Per-token price for one model, in USD.
+///
+/// All fields are USD per token as [`Decimal`] to avoid floating-point money. A
+/// price of `0` means "unmetered". `cache_creation`, `cache_read`, and
+/// `reasoning` default to `0` and may be omitted.
+///
+/// **Operators must always quote decimal values in TOML** (e.g.
+/// `input = "0.0000014"`). An unquoted `0.0000014` is parsed by TOML as an
+/// `f64` (losing precision), and `rust_decimal::Decimal` rejects floats, so
+/// deserialization fails with a confusing error.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelPricing {
+    /// USD per input token.
+    pub input: Decimal,
+    /// USD per output token.
+    pub output: Decimal,
+    /// USD per cache-creation input token.
+    #[serde(default)]
+    pub cache_creation: Decimal,
+    /// USD per cache-read input token.
+    #[serde(default)]
+    pub cache_read: Decimal,
+    /// USD per reasoning token.
+    #[serde(default)]
+    pub reasoning: Decimal,
 }
 
 // ---------------------------------------------------------------------------
@@ -209,7 +291,10 @@ pub enum AuthStyle {
 /// feature, which this crate deliberately leaves OFF (it is a footgun: it
 /// deserializes `Rc`/`Arc` by reference-sharing). These helpers give the shared
 /// headers map ordinary by-value (de)serialization without enabling that feature.
-fn serialize_arc_headers<S>(headers: &Arc<HashMap<String, String>>, serializer: S) -> Result<S::Ok, S::Error>
+fn serialize_arc_headers<S>(
+    headers: &Arc<HashMap<String, String>>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
 where
     S: serde::Serializer,
 {
@@ -218,7 +303,9 @@ where
 }
 
 /// Deserialize a headers map into a fresh `Arc` (by value, not reference-shared).
-fn deserialize_arc_headers<'de, D>(deserializer: D) -> Result<Arc<HashMap<String, String>>, D::Error>
+fn deserialize_arc_headers<'de, D>(
+    deserializer: D,
+) -> Result<Arc<HashMap<String, String>>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -561,6 +648,16 @@ pub enum ConfigValidationError {
         /// Provider name.
         provider: String,
     },
+    /// A pricing entry is invalid (empty model id or negative price).
+    #[error("provider \"{provider}\": pricing for model \"{model}\" is invalid: {message}")]
+    InvalidPricing {
+        /// Provider name.
+        provider: String,
+        /// Model id whose pricing is invalid.
+        model: String,
+        /// What is wrong (e.g. "negative input price").
+        message: String,
+    },
     /// A provider name is empty.
     #[error("provider name is empty")]
     EmptyProviderName,
@@ -741,10 +838,11 @@ pub enum ConfigValidationError {
 ///     AuthStyle, ProviderAdapterConfig, ProviderConfig, ProviderRoutesConfig,
 ///     validate_provider_config,
 /// };
+/// use secrecy::SecretString;
 ///
 /// let provider = ProviderConfig {
 ///     name: "example".to_owned(),
-///     api_key: "secret".to_owned(),
+///     api_key: SecretString::from("secret"),
 ///     auth_style: AuthStyle::Bearer,
 ///     adapters: HashMap::from([(
 ///         "chat".to_owned(),
@@ -758,6 +856,7 @@ pub enum ConfigValidationError {
 ///     model_aliases: HashMap::new(),
 ///     discovery: None,
 ///     catalog: None,
+///     pricing: Default::default(),
 /// };
 /// assert!(validate_provider_config(&provider, None).is_ok());
 /// ```
@@ -770,16 +869,18 @@ pub enum ConfigValidationError {
 ///     AuthStyle, ConfigValidationError, ProviderConfig, ProviderRoutesConfig,
 ///     validate_provider_config,
 /// };
+/// use secrecy::SecretString;
 ///
 /// let provider = ProviderConfig {
 ///     name: "   ".to_owned(), // whitespace-only is treated as empty
-///     api_key: "secret".to_owned(),
+///     api_key: SecretString::from("secret"),
 ///     auth_style: AuthStyle::Bearer,
 ///     adapters: HashMap::new(),
 ///     routes: ProviderRoutesConfig::default(),
 ///     model_aliases: HashMap::new(),
 ///     discovery: None,
 ///     catalog: None,
+///     pricing: Default::default(),
 /// };
 /// assert_eq!(
 ///     validate_provider_config(&provider, None),
@@ -808,16 +909,42 @@ pub fn validate_provider_config(
     }
 
     // api_key checks.
-    if let Some(var) = find_unresolved_env_var(&provider.api_key) {
+    if let Some(var) = find_unresolved_env_var(provider.api_key.expose_secret()) {
         return Err(ConfigValidationError::UnresolvedEnvVar {
             provider: name.clone(),
             var,
         });
     }
-    if provider.api_key.trim().is_empty() {
+    if provider.api_key.expose_secret().trim().is_empty() {
         return Err(ConfigValidationError::EmptyApiKey {
             provider: name.clone(),
         });
+    }
+
+    // Pricing validation: keys non-empty, prices non-negative.
+    for (model_id, pricing) in &provider.pricing {
+        if model_id.as_str().is_empty() {
+            return Err(ConfigValidationError::InvalidPricing {
+                provider: name.clone(),
+                model: model_id.as_str().to_owned(),
+                message: "pricing key is empty".to_owned(),
+            });
+        }
+        for (field, value) in [
+            ("input", pricing.input),
+            ("output", pricing.output),
+            ("cache_creation", pricing.cache_creation),
+            ("cache_read", pricing.cache_read),
+            ("reasoning", pricing.reasoning),
+        ] {
+            if value < Decimal::ZERO {
+                return Err(ConfigValidationError::InvalidPricing {
+                    provider: name.clone(),
+                    model: model_id.as_str().to_owned(),
+                    message: format!("negative {field} price"),
+                });
+            }
+        }
     }
 
     // Adapter validation.
@@ -1191,13 +1318,11 @@ pub fn load_provider_config(
                 // include the file path as context instead. Carried as a typed
                 // `CoreError::ConfigValidation` source via `From` (GAP-LOW-11),
                 // so this failure is variant-recoverable by callers.
-                return Err(
-                    ConfigValidationError::EmptyEnvVar {
-                        provider: format!("(file: {})", path.display()),
-                        var: var_name,
-                    }
-                    .into(),
-                );
+                return Err(ConfigValidationError::EmptyEnvVar {
+                    provider: format!("(file: {})", path.display()),
+                    var: var_name,
+                }
+                .into());
             }
             Some(_) => {}
         }
@@ -1221,8 +1346,7 @@ pub fn load_provider_config(
     // The typed `ConfigValidationError` flows into `CoreError::ConfigValidation`
     // as a first-class typed source via `From` (GAP-LOW-11), not boxed behind
     // `dyn Error`, so callers can match on the concrete variant.
-    validate_provider_config(&file.provider, known_protocols)
-        .map_err(CoreError::from)?;
+    validate_provider_config(&file.provider, known_protocols).map_err(CoreError::from)?;
     Ok(file.provider)
 }
 
@@ -1412,6 +1536,29 @@ x-discovery-secret = "super-sensitive-value"
         assert!(!debug.contains("adapter-query-secret"));
         assert!(!debug.contains("super-sensitive-value"));
         assert!(!debug.contains("query-secret"));
+    }
+
+    #[test]
+    fn env_interpolated_api_key_loads_into_secret_string() {
+        // Production secret-loading path: `${VAR}` in the raw TOML is resolved
+        // by env interpolation *before* serde constructs the `SecretString`, so
+        // the resolved value is what gets wrapped and `expose_secret()` returns.
+        let _lock = crate::test_support::TestEnvLock::acquire();
+        let _guard =
+            crate::test_support::EnvVarGuard::set("_LLM_PROXY_TEST_SECRET_KEY", "sk-resolved-007");
+        let raw = r#"
+[provider]
+name = "test"
+api_key = "${_LLM_PROXY_TEST_SECRET_KEY}"
+auth_style = "bearer"
+"#;
+        let interpolated = interpolate_env_vars(raw);
+        let file: ProviderFile = toml::from_str(&interpolated).expect("provider parses");
+        let key: &str = file.provider.api_key.expose_secret();
+        assert_eq!(
+            key, "sk-resolved-007",
+            "env-interpolated value must land in the SecretString",
+        );
     }
 
     #[test]
@@ -1606,10 +1753,7 @@ chat_completions = "chat"
         )
         .expect("provider config");
         let headers = &mut provider.provider.adapters.get_mut("chat").unwrap().headers;
-        Arc::make_mut(headers).insert(
-            "x-evil".to_owned(),
-            "value\r\nInjected: true".to_owned(),
-        );
+        Arc::make_mut(headers).insert("x-evil".to_owned(), "value\r\nInjected: true".to_owned());
         assert!(matches!(
             validate_provider_config(&provider.provider, None),
             Err(ConfigValidationError::HeaderContainsCrlf { .. })
@@ -1672,7 +1816,7 @@ endpoint = "https://example.com/v1"
     fn validate_rejects_empty_protocol() {
         let provider = ProviderConfig {
             name: "example".to_owned(),
-            api_key: "key".to_owned(),
+            api_key: SecretString::from("key"),
             auth_style: AuthStyle::Bearer,
             adapters: HashMap::from([(
                 "chat".to_owned(),
@@ -1686,6 +1830,7 @@ endpoint = "https://example.com/v1"
             model_aliases: HashMap::new(),
             discovery: None,
             catalog: None,
+            pricing: Default::default(),
         };
         assert!(matches!(
             validate_provider_config(&provider, None),
@@ -1697,7 +1842,7 @@ endpoint = "https://example.com/v1"
     fn validate_rejects_empty_model_alias_key() {
         let provider = ProviderConfig {
             name: "example".to_owned(),
-            api_key: "key".to_owned(),
+            api_key: SecretString::from("key"),
             auth_style: AuthStyle::Bearer,
             adapters: HashMap::from([(
                 "chat".to_owned(),
@@ -1711,6 +1856,7 @@ endpoint = "https://example.com/v1"
             model_aliases: HashMap::from([("".to_owned(), "target".to_owned())]),
             discovery: None,
             catalog: None,
+            pricing: Default::default(),
         };
         assert!(matches!(
             validate_provider_config(&provider, None),
@@ -1722,7 +1868,7 @@ endpoint = "https://example.com/v1"
     fn validate_rejects_empty_model_alias_target() {
         let provider = ProviderConfig {
             name: "example".to_owned(),
-            api_key: "key".to_owned(),
+            api_key: SecretString::from("key"),
             auth_style: AuthStyle::Bearer,
             adapters: HashMap::from([(
                 "chat".to_owned(),
@@ -1736,6 +1882,7 @@ endpoint = "https://example.com/v1"
             model_aliases: HashMap::from([("alias".to_owned(), "".to_owned())]),
             discovery: None,
             catalog: None,
+            pricing: Default::default(),
         };
         assert!(matches!(
             validate_provider_config(&provider, None),
@@ -1747,13 +1894,14 @@ endpoint = "https://example.com/v1"
     fn validate_rejects_provider_name_exceeding_length_limit() {
         let provider = ProviderConfig {
             name: "a".repeat(65), // 65 chars exceeds the 64-char limit
-            api_key: "key".to_owned(),
+            api_key: SecretString::from("key"),
             auth_style: AuthStyle::Bearer,
             adapters: HashMap::new(),
             routes: ProviderRoutesConfig::default(),
             model_aliases: HashMap::new(),
             discovery: None,
             catalog: None,
+            pricing: Default::default(),
         };
         assert!(matches!(
             validate_provider_config(&provider, None),
@@ -1765,17 +1913,127 @@ endpoint = "https://example.com/v1"
     fn validate_accepts_provider_name_at_max_length() {
         let provider = ProviderConfig {
             name: "a".repeat(64), // exactly 64 chars
-            api_key: "key".to_owned(),
+            api_key: SecretString::from("key"),
             auth_style: AuthStyle::Bearer,
             adapters: HashMap::new(),
             routes: ProviderRoutesConfig::default(),
             model_aliases: HashMap::new(),
             discovery: None,
             catalog: None,
+            pricing: Default::default(),
         };
         // Should not fail on name validation (will fail on empty api_key
         // if key is empty, but our key is "key").
         // Actually no adapters/routes means it passes.
         assert!(validate_provider_config(&provider, None).is_ok());
+    }
+
+    // -- Pricing / cost ------------------------------------------------------
+
+    #[test]
+    fn model_pricing_parses_from_toml_with_quoted_decimals() {
+        let raw = r#"
+[provider]
+name = "test"
+api_key = "key"
+auth_style = "bearer"
+
+[provider.pricing."gpt-4o"]
+input = "0.0000025"
+output = "0.000010"
+cache_creation = "0.000003"
+cache_read = "0.00000125"
+reasoning = "0.000010"
+"#;
+        let file: ProviderFile = toml::from_str(raw).expect("parses");
+        let pricing = file
+            .provider
+            .pricing
+            .get(&ModelId::new("gpt-4o"))
+            .expect("pricing for gpt-4o");
+        assert_eq!(pricing.input.to_string(), "0.0000025");
+        assert_eq!(pricing.output.to_string(), "0.000010");
+        assert_eq!(pricing.cache_creation.to_string(), "0.000003");
+        assert_eq!(pricing.cache_read.to_string(), "0.00000125");
+        assert_eq!(pricing.reasoning.to_string(), "0.000010");
+    }
+
+    #[test]
+    fn model_pricing_unquoted_float_is_rejected() {
+        // An unquoted decimal is parsed by TOML as f64; rust_decimal rejects
+        // floats, so deserialization fails. Operators MUST quote decimals.
+        let raw = r#"
+[provider]
+name = "test"
+api_key = "key"
+auth_style = "bearer"
+[provider.pricing."gpt-4o"]
+input = 0.0000025
+"#;
+        assert!(toml::from_str::<ProviderFile>(raw).is_err());
+    }
+
+    #[test]
+    fn validate_rejects_negative_pricing() {
+        let provider = ProviderConfig {
+            name: "test".to_owned(),
+            api_key: SecretString::from("key"),
+            auth_style: AuthStyle::Bearer,
+            adapters: HashMap::new(),
+            routes: ProviderRoutesConfig::default(),
+            model_aliases: HashMap::new(),
+            discovery: None,
+            catalog: None,
+            pricing: HashMap::from([(
+                ModelId::new("gpt-4o"),
+                ModelPricing {
+                    input: "-0.0001".parse().unwrap(),
+                    ..ModelPricing::default()
+                },
+            )]),
+        };
+        assert!(matches!(
+            validate_provider_config(&provider, None),
+            Err(ConfigValidationError::InvalidPricing { .. })
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_empty_pricing_model_id() {
+        let provider = ProviderConfig {
+            name: "test".to_owned(),
+            api_key: SecretString::from("key"),
+            auth_style: AuthStyle::Bearer,
+            adapters: HashMap::new(),
+            routes: ProviderRoutesConfig::default(),
+            model_aliases: HashMap::new(),
+            discovery: None,
+            catalog: None,
+            pricing: HashMap::from([(ModelId::new(""), ModelPricing::default())]),
+        };
+        assert!(matches!(
+            validate_provider_config(&provider, None),
+            Err(ConfigValidationError::InvalidPricing { .. })
+        ));
+    }
+
+    #[test]
+    fn log_format_from_env_reads_rust_log_format() {
+        let _lock = crate::test_support::TestEnvLock::acquire();
+        // "json" (case-insensitive) -> Json.
+        {
+            let _g = crate::test_support::EnvVarGuard::set("RUST_LOG_FORMAT", "JSON");
+            assert_eq!(LogFormat::from_env(), LogFormat::Json);
+        }
+        // Unrecognized value -> Plain.
+        {
+            let _g = crate::test_support::EnvVarGuard::set("RUST_LOG_FORMAT", "xml");
+            assert_eq!(LogFormat::from_env(), LogFormat::Plain);
+        }
+        // Empty string -> Plain (same as unset).
+        {
+            let _g = crate::test_support::EnvVarGuard::set("RUST_LOG_FORMAT", "");
+            assert_eq!(LogFormat::from_env(), LogFormat::Plain);
+        }
     }
 }

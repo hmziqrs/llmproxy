@@ -61,8 +61,7 @@ mod unix {
         let mut child = Command::new("sleep").arg("30").spawn().unwrap();
         std::fs::write(paths.pid_manager().pid_file(), child.id().to_string()).unwrap();
 
-        cmd_stop_with_timing(&paths, 20, Duration::from_millis(5))
-            .expect("graceful stop -> Ok");
+        cmd_stop_with_timing(&paths, 20, Duration::from_millis(5)).expect("graceful stop -> Ok");
 
         let status = child.wait().unwrap();
         assert!(
@@ -91,8 +90,7 @@ mod unix {
             .unwrap();
         std::fs::write(paths.pid_manager().pid_file(), child.id().to_string()).unwrap();
 
-        cmd_stop_with_timing(&paths, 2, Duration::from_millis(5))
-            .expect("escalation -> Ok");
+        cmd_stop_with_timing(&paths, 2, Duration::from_millis(5)).expect("escalation -> Ok");
 
         let status = child.wait().unwrap();
         assert!(
