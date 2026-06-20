@@ -60,7 +60,16 @@ async fn handle_messages_inner(
     // budget or surfacing as a misleading 429/409 (audit LOW-29).
     core_pipeline::validate_provider_name(&provider)?;
     if state.providers().get(&provider).is_none() {
-        return Err(RouteError::UnknownProvider(provider.clone()));
+        let err = RouteError::UnknownProvider(provider.clone());
+        core_pipeline::emit_response_failed(
+            &state.event_bus,
+            &req_id.0,
+            Some(provider.as_str()),
+            None,
+            &err,
+            std::time::Instant::now(),
+        );
+        return Err(err);
     }
 
     // Reject non-JSON Content-Type before parsing, so a wrong media type is not

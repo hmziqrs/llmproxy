@@ -193,7 +193,7 @@ pub(crate) const PROVIDER_DECODE_CLIENT_MESSAGE: &str = "provider response decod
 /// disclosure. The actual messages are available through `RouteError::Display`
 /// for server-side logging before this function is called.
 fn anthropic_error_response(error: RouteError) -> Response<Body> {
-    let (status, error_type, message) = extract_error_fields(error);
+    let (status, error_type, message) = extract_error_fields(&error);
 
     let body = AnthropicErrorBody {
         r#type: "error",
@@ -240,7 +240,7 @@ fn anthropic_error_response(error: RouteError) -> Response<Body> {
 /// client error. The original upstream status is preserved in server-side
 /// logs for debugging.
 fn openai_error_response(error: RouteError) -> Response<Body> {
-    let (status, error_type, message) = extract_error_fields(error);
+    let (status, error_type, message) = extract_error_fields(&error);
     // OpenAI uses "server_error" for internal errors instead of "api_error".
     let error_type = match status {
         StatusCode::INTERNAL_SERVER_ERROR => "server_error",
@@ -287,9 +287,13 @@ pub fn openai_stream_error_json_with_type(message: &str, error_type: &str) -> Op
 /// Shared between `anthropic_error_response` and `openai_error_response` to
 /// avoid duplicating the match arms. Each caller wraps the tuple in its own
 /// JSON envelope.
-fn extract_error_fields(error: RouteError) -> (StatusCode, &'static str, String) {
+pub(crate) fn extract_error_fields(error: &RouteError) -> (StatusCode, &'static str, String) {
     match error {
-        RouteError::InvalidRequest(msg) => (StatusCode::BAD_REQUEST, "invalid_request_error", msg),
+        RouteError::InvalidRequest(msg) => (
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            msg.clone(),
+        ),
         RouteError::ModelNotAllowed(model) => (
             StatusCode::BAD_REQUEST,
             "invalid_request_error",
@@ -300,18 +304,20 @@ fn extract_error_fields(error: RouteError) -> (StatusCode, &'static str, String)
             "not_found_error",
             format!("unknown provider: {provider}"),
         ),
-        RouteError::UnsupportedRoute(msg) => {
-            (StatusCode::BAD_REQUEST, "invalid_request_error", msg)
-        }
+        RouteError::UnsupportedRoute(msg) => (
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            msg.clone(),
+        ),
         RouteError::InvalidProviderName(msg) => (
             StatusCode::BAD_REQUEST,
             "invalid_request_error",
             format!("invalid provider name: {msg}"),
         ),
         RouteError::Upstream { status, body } => (
-            map_upstream_status(status),
+            map_upstream_status(*status),
             "api_error",
-            truncate_error_body(&sanitize_upstream_body(&body)),
+            truncate_error_body(&sanitize_upstream_body(body)),
         ),
         RouteError::UpstreamTimeout(_msg) => (
             StatusCode::GATEWAY_TIMEOUT,

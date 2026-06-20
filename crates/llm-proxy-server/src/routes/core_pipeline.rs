@@ -19,14 +19,14 @@ use llm_proxy_protocol::client::anthropic;
 use llm_proxy_protocol::client::anthropic::StreamEncoder as AnthropicStreamEncoder;
 use llm_proxy_protocol::client::openai_chat;
 use llm_proxy_protocol::client::openai_chat::StreamEncoder as OpenAiStreamEncoder;
-use llm_proxy_protocol::core::{CoreEvent, CoreRequest, Cost, Usage};
+use llm_proxy_protocol::core::{CoreEvent, CoreRequest, Cost, ModelRef, StopReason, Usage};
 use llm_proxy_provider::adapter::{
     ProviderAdapter, ProviderAdapterTarget, ProviderProtocol, ProviderStreamDecoder,
     ProviderStreamDecoderKind,
 };
 use llm_proxy_provider::sse::SseFramer;
 use llm_proxy_provider::transport::ProxyRequest;
-use llm_proxy_storage::{ProxyEvent, RequestReceived, ResponseCompleted};
+use llm_proxy_storage::{EventBus, ProxyEvent, RequestReceived, ResponseCompleted, ResponseFailed};
 use rust_decimal::Decimal;
 use tracing::warn;
 
@@ -34,8 +34,8 @@ use crate::middleware::get_client_ip;
 use crate::state::AppState;
 
 use super::error_response::{
-    ClientProtocol, PROVIDER_DECODE_CLIENT_MESSAGE, RouteError, openai_stream_error_json_with_type,
-    truncate_with_suffix,
+    ClientProtocol, PROVIDER_DECODE_CLIENT_MESSAGE, RouteError, extract_error_fields,
+    openai_stream_error_json_with_type, truncate_with_suffix,
 };
 
 // ---------------------------------------------------------------------------
@@ -476,6 +476,50 @@ fn body_hash_of(core: &CoreRequest) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+/// Emit a structured `ResponseFailed` event for a route error. Borrows the
+/// error so the caller can still return it; derives HTTP status + client-facing
+/// error kind from the canonical [`extract_error_fields`] mapping.
+pub(crate) fn emit_response_failed(
+    event_bus: &Arc<dyn EventBus>,
+    request_id: &str,
+    provider: Option<&str>,
+    model: Option<&ModelRef>,
+    error: &RouteError,
+    start: Instant,
+) {
+    let (status, error_kind, message) = extract_error_fields(error);
+    event_bus.emit(&ProxyEvent::ResponseFailed(ResponseFailed {
+        request_id: request_id.to_owned(),
+        timestamp: time::OffsetDateTime::now_utc(),
+        provider: provider.map(str::to_owned),
+        model: model.cloned(),
+        error_kind: error_kind.to_owned(),
+        message,
+        http_status: status.as_u16(),
+        latency_ms: start.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
+    }));
+}
+
+/// Capture lifecycle fields from a [`CoreEvent`] into the stream context
+/// (upstream message id, cumulative usage, stop reason). Called on every event
+/// before it is consumed by `encode_core_event`, so the values survive to the
+/// stream-completion `ResponseCompleted` emission.
+fn capture_lifecycle(ctx: &mut StreamContext, event: &CoreEvent) {
+    match event {
+        CoreEvent::MessageStart { id: Some(id), .. } => {
+            ctx.upstream_message_id = Some(id.clone());
+        }
+        CoreEvent::UsageDelta { usage } => {
+            // Providers send a cumulative running total, so replace (do not sum).
+            ctx.pending_usage = Some(usage.clone());
+        }
+        CoreEvent::MessageStop { stop_reason, .. } => {
+            ctx.stop_reason = Some(stop_reason.clone());
+        }
+        _ => {}
+    }
+}
+
 /// Compute the USD cost of a request from its [`Usage`] and a per-token price
 /// table.
 ///
@@ -541,8 +585,16 @@ pub(crate) async fn handle_core_once(
 
     let (target, adapter) = resolve_target(&state, provider_name, route_kind, &core)
         .await
-        .inspect_err(|_| {
+        .inspect_err(|e| {
             state.metrics.record_failure();
+            emit_response_failed(
+                &state.event_bus,
+                &ctx.request_id,
+                Some(provider_name),
+                Some(&core.model),
+                e,
+                ctx.start,
+            );
         })?;
 
     tracing::debug!(
@@ -557,22 +609,49 @@ pub(crate) async fn handle_core_once(
     // the core pipeline has already validated the request at this point, so
     // any encode failure is a proxy/adapter issue, not a client error.
     let proxy_req: ProxyRequest = adapter.encode_request(&core, &target).map_err(|e| {
+        let err = RouteError::Internal(format!("encode error: {e}"));
         state.metrics.record_failure();
-        RouteError::Internal(format!("encode error: {e}"))
+        emit_response_failed(
+            &state.event_bus,
+            &ctx.request_id,
+            Some(provider_name),
+            Some(&core.model),
+            &err,
+            ctx.start,
+        );
+        err
     })?;
 
     // Send to upstream.
     let response_bytes = state.proxy_client.send(proxy_req).await.map_err(|e| {
+        let err = map_provider_error(e);
         state.metrics.record_failure();
-        map_provider_error(e)
+        emit_response_failed(
+            &state.event_bus,
+            &ctx.request_id,
+            Some(provider_name),
+            Some(&core.model),
+            &err,
+            ctx.start,
+        );
+        err
     })?;
 
     // Decode the provider response into a CoreResponse.
     let mut core_resp = adapter
         .decode_response(&response_bytes, &target)
         .map_err(|e| {
+            let err = RouteError::ProviderDecode(format!("decode response: {e}"));
             state.metrics.record_failure();
-            RouteError::ProviderDecode(format!("decode response: {e}"))
+            emit_response_failed(
+                &state.event_bus,
+                &ctx.request_id,
+                Some(provider_name),
+                Some(&core.model),
+                &err,
+                ctx.start,
+            );
+            err
         })?;
 
     // Encode into the client-specific response.
@@ -590,22 +669,13 @@ pub(crate) async fn handle_core_once(
         .cloned();
     let cost = pricing.map(|p| compute_cost(&core_resp.usage, &p));
     core_resp.cost = cost.clone();
-
-    // Emit a structured ResponseCompleted event before core_resp is moved into
-    // the client encoder below.
-    state
-        .event_bus
-        .emit(&ProxyEvent::ResponseCompleted(ResponseCompleted {
-            request_id: ctx.request_id.clone(),
-            timestamp: time::OffsetDateTime::now_utc(),
-            provider: target.provider_name.clone(),
-            upstream_message_id: core_resp.id.clone(),
-            model: core_resp.model.clone(),
-            usage: core_resp.usage.clone(),
-            cost,
-            stop_reason: core_resp.stop_reason.clone(),
-            latency_ms: latency.as_millis().try_into().unwrap_or(u64::MAX),
-        }));
+    // Capture the ResponseCompleted payload before `core_resp` is moved into the
+    // client encoder; the event is emitted AFTER a successful encode so we never
+    // log "completed" for a request that then fails client encoding.
+    let resp_usage = core_resp.usage.clone();
+    let resp_model = core_resp.model.clone();
+    let resp_upstream_id = core_resp.id.clone();
+    let resp_stop_reason = core_resp.stop_reason.clone();
 
     let response_body = match client_protocol {
         ClientProtocol::Anthropic => {
@@ -621,6 +691,21 @@ pub(crate) async fn handle_core_once(
                 .map_err(|e| RouteError::Internal(format!("serialize: {e}")))?
         }
     };
+
+    // Client encoding succeeded: emit the ResponseCompleted event.
+    state
+        .event_bus
+        .emit(&ProxyEvent::ResponseCompleted(ResponseCompleted {
+            request_id: ctx.request_id.clone(),
+            timestamp: time::OffsetDateTime::now_utc(),
+            provider: target.provider_name.clone(),
+            upstream_message_id: resp_upstream_id,
+            model: resp_model,
+            usage: resp_usage,
+            cost,
+            stop_reason: resp_stop_reason,
+            latency_ms: latency.as_millis().try_into().unwrap_or(u64::MAX),
+        }));
 
     tracing::debug!(
         request_id = %ctx.request_id,
@@ -711,8 +796,16 @@ pub(crate) async fn handle_core_stream(
 
     let (target, adapter) = resolve_target(&state, provider_name, route_kind, &core)
         .await
-        .inspect_err(|_| {
+        .inspect_err(|e| {
             state.metrics.record_failure();
+            emit_response_failed(
+                &state.event_bus,
+                &ctx.request_id,
+                Some(provider_name),
+                Some(&core.model),
+                e,
+                ctx.start,
+            );
         })?;
 
     tracing::debug!(
@@ -726,8 +819,17 @@ pub(crate) async fn handle_core_stream(
     // All encode errors map to Internal per the plan's error behavior spec:
     // the core pipeline has already validated the request at this point.
     let proxy_req: ProxyRequest = adapter.encode_request(&core, &target).map_err(|e| {
+        let err = RouteError::Internal(format!("encode error: {e}"));
         state.metrics.record_failure();
-        RouteError::Internal(format!("encode error: {e}"))
+        emit_response_failed(
+            &state.event_bus,
+            &ctx.request_id,
+            Some(provider_name),
+            Some(&core.model),
+            &err,
+            ctx.start,
+        );
+        err
     })?;
 
     // Open the streaming connection.
@@ -736,8 +838,17 @@ pub(crate) async fn handle_core_stream(
         .send_stream(proxy_req)
         .await
         .map_err(|e| {
+            let err = map_provider_error(e);
             state.metrics.record_failure();
-            map_provider_error(e)
+            emit_response_failed(
+                &state.event_bus,
+                &ctx.request_id,
+                Some(provider_name),
+                Some(&core.model),
+                &err,
+                ctx.start,
+            );
+            err
         })?;
 
     // Create a provider stream decoder.
@@ -756,6 +867,32 @@ pub(crate) async fn handle_core_stream(
     let request_id = ctx.request_id;
     let upstream_model = target.upstream_model.clone();
 
+    // Pricing for the resolved upstream model (None => no cost on the event).
+    let pricing = state
+        .providers()
+        .pricing_for(&target.provider_name, &target.upstream_model)
+        .cloned();
+    let event_bus = Arc::clone(&state.event_bus);
+
+    // Emit a structured RequestReceived event (streaming).
+    state
+        .event_bus
+        .emit(&ProxyEvent::RequestReceived(RequestReceived {
+            request_id: request_id.clone(),
+            timestamp: time::OffsetDateTime::now_utc(),
+            provider: provider_name.to_owned(),
+            route_kind: route_kind_str(route_kind).to_owned(),
+            client_protocol: client_protocol_str(client_protocol).to_owned(),
+            model: core.model.clone(),
+            streaming: true,
+            body_hash: body_hash_of(&core),
+        }));
+
+    // Capture fields needed for a stream ResponseFailed event, before `core`
+    // and `ctx.start` are moved into the StreamContext below.
+    let requested_model = core.model.clone();
+    let stream_start = ctx.start;
+
     // Build the output SSE stream with first-byte tracking.
     let (first_byte_tx, first_byte_rx) = tokio::sync::oneshot::channel::<FirstByteResult>();
     let output_stream = build_sse_output_stream(
@@ -770,10 +907,15 @@ pub(crate) async fn handle_core_stream(
                 metrics: Arc::clone(&state.metrics),
                 provider_name: target.provider_name.clone(),
                 upstream_model: upstream_model.clone(),
-                start: ctx.start,
+                start: stream_start,
             },
             first_byte_tx: Some(first_byte_tx),
             first_byte_sent: false,
+            pricing,
+            event_bus,
+            pending_usage: None,
+            stop_reason: None,
+            upstream_message_id: None,
         },
     );
 
@@ -781,16 +923,35 @@ pub(crate) async fn handle_core_stream(
     // first_byte_sent boundary: errors before this point become HTTP
     // errors; errors after this point become in-band SSE error events.
     let first_event = first_byte_rx.await.map_err(|_| {
-        state.metrics.record_failure();
-        RouteError::Internal(
+        let err = RouteError::Internal(
             "stream task exited before first event (possible panic, cancellation, or empty stream)"
                 .to_owned(),
-        )
+        );
+        state.metrics.record_failure();
+        emit_response_failed(
+            &state.event_bus,
+            &request_id,
+            Some(target.provider_name.as_str()),
+            Some(&requested_model),
+            &err,
+            stream_start,
+        );
+        err
     })?;
 
     match first_event {
         FirstByteResult::PreStreamError(route_error) => {
-            // Stream failed before emitting any data. Return as HTTP error.
+            // Stream failed before emitting any data. Emit a ResponseFailed
+            // event (covers every in-task pre-stream failure funnelled through
+            // the first-byte channel), then return as an HTTP error.
+            emit_response_failed(
+                &state.event_bus,
+                &request_id,
+                Some(target.provider_name.as_str()),
+                Some(&requested_model),
+                &route_error,
+                stream_start,
+            );
             Err(route_error)
         }
         FirstByteResult::FirstEvent(event) => {
@@ -882,6 +1043,17 @@ struct StreamContext {
     stream_metrics: StreamMetrics,
     first_byte_tx: Option<tokio::sync::oneshot::Sender<FirstByteResult>>,
     first_byte_sent: bool,
+    /// Per-token pricing for the resolved upstream model, for stream cost.
+    pricing: Option<ModelPricing>,
+    /// Event sink handle (the task emits ResponseCompleted at stream end).
+    event_bus: Arc<dyn EventBus>,
+    /// Latest cumulative usage seen via `CoreEvent::UsageDelta` (replaced, not
+    /// summed -- providers send a running total).
+    pending_usage: Option<Usage>,
+    /// Stop reason captured from `CoreEvent::MessageStop`.
+    stop_reason: Option<StopReason>,
+    /// Upstream message id captured from `CoreEvent::MessageStart`.
+    upstream_message_id: Option<String>,
 }
 
 impl StreamContext {
@@ -1062,6 +1234,7 @@ fn build_sse_output_stream(
         // boundary (committing HTTP 200 via the `first_byte` channel); the rest
         // flow directly to the output channel.
         for core_event in pending.drain(..) {
+            capture_lifecycle(&mut ctx, &core_event);
             for event in encode_core_event(&mut encoder, core_event) {
                 if !ctx.emit_event(event, &tx).await {
                     return;
@@ -1104,6 +1277,9 @@ fn build_sse_output_stream(
                                             ),
                                         );
                                     } else {
+                                        let err = RouteError::ProviderDecode(format!(
+                                            "stream framing error: {e}"
+                                        ));
                                         emit_stream_error(
                                             &mut encoder,
                                             &tx,
@@ -1111,6 +1287,14 @@ fn build_sse_output_stream(
                                             PROVIDER_DECODE_CLIENT_MESSAGE,
                                         ).await;
                                         ctx.stream_metrics.metrics.record_failure();
+                                        emit_response_failed(
+                                            &ctx.event_bus,
+                                            &ctx.request_id,
+                                            Some(ctx.stream_metrics.provider_name.as_str()),
+                                            Some(&ctx.core.model),
+                                            &err,
+                                            ctx.stream_metrics.start,
+                                        );
                                     }
                                     stream_errored = true;
                                     break 'outer;
@@ -1134,6 +1318,9 @@ fn build_sse_output_stream(
                                                 ),
                                             );
                                         } else {
+                                            let err = RouteError::ProviderDecode(
+                                                format!("provider decode error: {e}"),
+                                            );
                                             emit_stream_error(
                                                 &mut encoder,
                                                 &tx,
@@ -1141,6 +1328,14 @@ fn build_sse_output_stream(
                                                 PROVIDER_DECODE_CLIENT_MESSAGE,
                                             ).await;
                                             ctx.stream_metrics.metrics.record_failure();
+                                            emit_response_failed(
+                                                &ctx.event_bus,
+                                                &ctx.request_id,
+                                                Some(ctx.stream_metrics.provider_name.as_str()),
+                                                Some(&ctx.core.model),
+                                                &err,
+                                                ctx.stream_metrics.start,
+                                            );
                                         }
                                         stream_errored = true;
                                         break 'outer;
@@ -1148,6 +1343,7 @@ fn build_sse_output_stream(
                                 };
 
                                 for core_event in core_events {
+                                    capture_lifecycle(&mut ctx, &core_event);
                                     let client_events = encode_core_event(
                                         &mut encoder,
                                         core_event,
@@ -1185,6 +1381,17 @@ fn build_sse_output_stream(
                                     &sanitized,
                                 ).await;
                                 ctx.stream_metrics.metrics.record_failure();
+                                emit_response_failed(
+                                    &ctx.event_bus,
+                                    &ctx.request_id,
+                                    Some(ctx.stream_metrics.provider_name.as_str()),
+                                    Some(&ctx.core.model),
+                                    &RouteError::Upstream {
+                                        status: StatusCode::BAD_GATEWAY,
+                                        body: sanitized.clone(),
+                                    },
+                                    ctx.stream_metrics.start,
+                                );
                             }
                             stream_errored = true;
                             break 'outer;
@@ -1201,10 +1408,13 @@ fn build_sse_output_stream(
             }
         }
 
-        // Only run finalization when the stream completed normally (not errored).
-        // When stream_errored is true, emit_stream_error already handled the
-        // terminal events (or the error was sent back as an HTTP error).
-        if !stream_errored {
+        // Only run finalization when the stream completed normally (not errored)
+        // AND actually produced output (first_byte_sent). An empty / never-started
+        // upstream stream must NOT run finalization: the provider decoder's
+        // finish() would synthesize MessageStart+MessageStop, cross the first-byte
+        // boundary, and commit HTTP 200. Skipping finalization lets such a stream
+        // fall through to the PreStreamError -> 502 path below.
+        if !stream_errored && ctx.first_byte_sent {
             // Finalize: call sse_framer.finish() first to flush any trailing partial
             // SSE frame that arrived without a terminating blank line.
             match ctx.sse_framer.finish() {
@@ -1222,6 +1432,7 @@ fn build_sse_output_stream(
                             }
                         };
                         for core_event in core_events {
+                            capture_lifecycle(&mut ctx, &core_event);
                             let client_events = encode_core_event(&mut encoder, core_event);
                             for event in client_events {
                                 if !ctx.emit_event(event, &tx).await {
@@ -1244,6 +1455,7 @@ fn build_sse_output_stream(
             match ctx.provider_decoder.finish() {
                 Ok(final_events) => {
                     for core_event in final_events {
+                        capture_lifecycle(&mut ctx, &core_event);
                         let client_events = encode_core_event(&mut encoder, core_event);
                         for event in client_events {
                             if !ctx.emit_event(event, &tx).await {
@@ -1299,6 +1511,31 @@ fn build_sse_output_stream(
                 &ctx.stream_metrics.upstream_model,
                 ctx.stream_metrics.start.elapsed(),
             );
+            // Emit the stream ResponseCompleted event with accumulated lifecycle
+            // data (usage, cost, stop reason, upstream message id).
+            let usage = ctx
+                .pending_usage
+                .clone()
+                .unwrap_or_else(Usage::synthetic_zero);
+            let cost = ctx.pricing.as_ref().map(|p| compute_cost(&usage, p));
+            ctx.event_bus
+                .emit(&ProxyEvent::ResponseCompleted(ResponseCompleted {
+                    request_id: ctx.request_id.clone(),
+                    timestamp: time::OffsetDateTime::now_utc(),
+                    provider: ctx.stream_metrics.provider_name.clone(),
+                    upstream_message_id: ctx.upstream_message_id.clone(),
+                    model: ctx.core.model.clone(),
+                    usage,
+                    cost,
+                    stop_reason: ctx.stop_reason.clone().unwrap_or(StopReason::EndTurn),
+                    latency_ms: ctx
+                        .stream_metrics
+                        .start
+                        .elapsed()
+                        .as_millis()
+                        .try_into()
+                        .unwrap_or(u64::MAX),
+                }));
         }
 
         // If the stream ended without ever sending a first byte (empty stream

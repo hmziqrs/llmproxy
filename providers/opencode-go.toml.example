@@ -30,3 +30,18 @@ messages = "anthropic"
 # [provider.catalog]
 # mode = "hybrid"
 # enforce = false
+
+# Per-model USD-per-token pricing, keyed by the upstream model id (after alias
+# resolution). Used for cost estimation only; not enforced for routing.
+# Optional fields (cache_creation, cache_read, reasoning) default to 0.
+#
+# IMPORTANT: always quote decimal values, e.g. input = "0.0000014".
+# An unquoted 0.0000014 is parsed by TOML as f64 (losing precision), and
+# rust_decimal::Decimal rejects floats, so deserialization fails.
+#
+# [provider.pricing."gpt-4o"]
+# input = "0.0000025"
+# output = "0.000010"
+# cache_creation = "0.000003"
+# cache_read = "0.00000125"
+# reasoning = "0.000010"

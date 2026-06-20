@@ -7,6 +7,9 @@
 bind = "127.0.0.1:3456"
 request_timeout = "300s"
 log_level = "info"
+# Structured log output: "plain" (default) or "json". Also settable via the
+# RUST_LOG_FORMAT env var, which wins at startup.
+# log_format = "plain"
 hot_reload = false
 # Requests per minute allowed per client IP. 0 disables rate limiting.
 # Direct loopback connections are exempt unless trust_forwarded_headers = true.

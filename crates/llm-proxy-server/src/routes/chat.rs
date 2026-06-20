@@ -60,7 +60,16 @@ async fn handle_chat_completions_inner(
     // content-type -> rate-limit/dedup -> JSON parse.
     core_pipeline::validate_provider_name(&provider)?;
     if state.providers().get(&provider).is_none() {
-        return Err(RouteError::UnknownProvider(provider.clone()));
+        let err = RouteError::UnknownProvider(provider.clone());
+        core_pipeline::emit_response_failed(
+            &state.event_bus,
+            &req_id.0,
+            Some(provider.as_str()),
+            None,
+            &err,
+            std::time::Instant::now(),
+        );
+        return Err(err);
     }
     core_pipeline::validate_json_content_type(&headers)?;
 

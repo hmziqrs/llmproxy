@@ -17,6 +17,7 @@ pub const DEFAULT_CONFIG_TOML: &str = r#"[server]
 bind = "127.0.0.1:3456"
 request_timeout = "300s"
 log_level = "info"
+# log_format = "plain"  # "plain" (default) | "json"; RUST_LOG_FORMAT env overrides at startup
 hot_reload = false
 rate_limit_rpm = 100
 trust_forwarded_headers = false
@@ -54,6 +55,20 @@ messages = "anthropic"
 # max_pages = 100
 # max_models = 20000
 # max_response_bytes = 4194304
+# Per-model USD-per-token pricing, keyed by the upstream model id (after alias
+# resolution). Used for cost estimation only; not enforced for routing.
+# Optional fields (cache_creation, cache_read, reasoning) default to 0.
+#
+# IMPORTANT: always quote decimal values, e.g. input = "0.0000014".
+# An unquoted 0.0000014 is parsed by TOML as f64 (losing precision), and
+# rust_decimal::Decimal rejects floats, so deserialization fails.
+#
+# [provider.pricing."gpt-4o"]
+# input = "0.0000025"
+# output = "0.000010"
+# cache_creation = "0.000003"
+# cache_read = "0.00000125"
+# reasoning = "0.000010"
 "#;
 
 /// Default provider TOML for opencode-zen.
@@ -94,4 +109,18 @@ messages = "anthropic"
 # max_pages = 100
 # max_models = 20000
 # max_response_bytes = 4194304
+# Per-model USD-per-token pricing, keyed by the upstream model id (after alias
+# resolution). Used for cost estimation only; not enforced for routing.
+# Optional fields (cache_creation, cache_read, reasoning) default to 0.
+#
+# IMPORTANT: always quote decimal values, e.g. input = "0.0000014".
+# An unquoted 0.0000014 is parsed by TOML as f64 (losing precision), and
+# rust_decimal::Decimal rejects floats, so deserialization fails.
+#
+# [provider.pricing."gpt-4o"]
+# input = "0.0000025"
+# output = "0.000010"
+# cache_creation = "0.000003"
+# cache_read = "0.00000125"
+# reasoning = "0.000010"
 "#;

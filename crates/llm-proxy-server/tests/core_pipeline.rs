@@ -978,6 +978,129 @@ async fn event_bus_records_request_received_and_response_completed() {
     );
 }
 
+/// A successful streaming request emits `RequestReceived` (streaming=true) then
+/// `ResponseCompleted`, with the upstream message id captured from MessageStart.
+#[tokio::test]
+async fn event_bus_records_stream_request_and_response_completed() {
+    use std::sync::Arc;
+
+    use llm_proxy_storage::{ProxyEvent, RecordingBus};
+
+    let mock_url = spawn_mock_anthropic_stream().await;
+    let bus = Arc::new(RecordingBus::new());
+    let state = state_with_anthropic_provider(&mock_url).with_event_bus(bus.clone());
+    let app = build_router(state);
+
+    let body = make_messages_body("claude-sonnet-4-6", true);
+    let resp = app.oneshot(messages_request(&body)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    // Drain the SSE body so the spawned task runs to completion and emits the
+    // stream ResponseCompleted (it fires at the end of the task, before the
+    // output channel is dropped).
+    let _ = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+
+    let events = bus.snapshot();
+    let received = events
+        .iter()
+        .find_map(|e| match e {
+            ProxyEvent::RequestReceived(r) => Some(r),
+            _ => None,
+        })
+        .expect("RequestReceived emitted for stream");
+    assert!(
+        received.streaming,
+        "stream request must be marked streaming"
+    );
+    let completed = events
+        .iter()
+        .find_map(|e| match e {
+            ProxyEvent::ResponseCompleted(c) => Some(c),
+            _ => None,
+        })
+        .expect("ResponseCompleted emitted for stream");
+    // The Anthropic stream mock seeds message_start with id "msg_mock_stream".
+    assert_eq!(
+        completed.upstream_message_id.as_deref(),
+        Some("msg_mock_stream")
+    );
+}
+
+/// A request for an unknown provider emits `ResponseFailed` with the mapped
+/// HTTP status (404) and the provider name from the URL path.
+#[tokio::test]
+async fn event_bus_records_response_failed_for_unknown_provider() {
+    use std::sync::Arc;
+
+    use llm_proxy_storage::{ProxyEvent, RecordingBus};
+
+    let mock_url = spawn_mock_anthropic_non_stream().await;
+    let bus = Arc::new(RecordingBus::new());
+    let state = state_with_anthropic_provider(&mock_url).with_event_bus(bus.clone());
+    let app = build_router(state);
+
+    // Target a provider that is not registered.
+    let body = make_messages_body("claude-sonnet-4-6", false);
+    let req = Request::builder()
+        .method("POST")
+        .uri("/providers/does-not-exist/v1/messages")
+        .header("content-type", "application/json")
+        .body(Body::from(body))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    let events = bus.snapshot();
+    let failed = events
+        .iter()
+        .find_map(|e| match e {
+            ProxyEvent::ResponseFailed(f) => Some(f),
+            _ => None,
+        })
+        .expect("ResponseFailed emitted for unknown provider");
+    assert_eq!(failed.http_status, 404);
+    assert_eq!(failed.provider.as_deref(), Some("does-not-exist"));
+}
+
+/// An empty upstream stream (no events at all) returns 502, not 200 -- the
+/// pre-existing bug where finalization synthesized a terminal and committed
+/// HTTP 200. Also asserts the event log gets a ResponseFailed, not a
+/// ResponseCompleted, for the empty stream.
+#[tokio::test]
+async fn empty_upstream_stream_returns_502_not_200() {
+    use std::sync::Arc;
+
+    use llm_proxy_storage::{ProxyEvent, RecordingBus};
+
+    let mock_url = spawn_mock_server(Vec::new(), "text/event-stream").await;
+    let bus = Arc::new(RecordingBus::new());
+    let state = state_with_anthropic_provider(&mock_url).with_event_bus(bus.clone());
+    let app = build_router(state);
+
+    let body = make_messages_body("claude-sonnet-4-6", true);
+    let resp = app.oneshot(messages_request(&body)).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_GATEWAY,
+        "empty stream must be 502, not 200"
+    );
+
+    let events = bus.snapshot();
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, ProxyEvent::ResponseCompleted(_))),
+        "no ResponseCompleted for an empty stream"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, ProxyEvent::ResponseFailed(_))),
+        "ResponseFailed emitted for an empty stream"
+    );
+}
+
 /// stream:true OpenAI Chat provider returns HTTP 200 with an SSE content-type
 #[tokio::test]
 async fn stream_openai_chat_provider_returns_sse_content_type() {
