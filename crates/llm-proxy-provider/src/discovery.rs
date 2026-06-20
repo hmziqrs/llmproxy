@@ -423,6 +423,7 @@ mod tests {
             name: "test-provider".to_owned(),
             api_key: secrecy::SecretString::from("test-key"),
             auth_style: AuthStyle::XApiKey,
+            passthrough_auth: false,
             adapters: HashMap::new(),
             routes: ProviderRoutesConfig::default(),
             model_aliases: HashMap::new(),

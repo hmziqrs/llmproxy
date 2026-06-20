@@ -310,6 +310,7 @@ mod tests {
             name: "test".to_owned(),
             api_key: secrecy::SecretString::from("sk-secret-key-99999"),
             auth_style: AuthStyle::Bearer,
+            passthrough_auth: false,
             adapters: HashMap::new(),
             routes: ProviderRoutesConfig::default(),
             model_aliases: HashMap::new(),
@@ -412,6 +413,7 @@ mod tests {
             name: "test".to_owned(),
             api_key: secrecy::SecretString::from("key"),
             auth_style: AuthStyle::Bearer,
+            passthrough_auth: false,
             adapters: {
                 let mut m = HashMap::new();
                 m.insert(
@@ -456,6 +458,7 @@ mod tests {
             name: "bad".to_owned(),
             api_key: secrecy::SecretString::from("key"),
             auth_style: AuthStyle::Bearer,
+            passthrough_auth: false,
             adapters: {
                 let mut m = HashMap::new();
                 m.insert(
@@ -572,6 +575,7 @@ mod tests {
             name: "good".to_owned(),
             api_key: secrecy::SecretString::from("key"),
             auth_style: AuthStyle::Bearer,
+            passthrough_auth: false,
             adapters: {
                 let mut m = HashMap::new();
                 m.insert(
@@ -596,6 +600,7 @@ mod tests {
             name: "bad".to_owned(),
             api_key: secrecy::SecretString::from("key"),
             auth_style: AuthStyle::Bearer,
+            passthrough_auth: false,
             adapters: {
                 let mut m = HashMap::new();
                 m.insert(

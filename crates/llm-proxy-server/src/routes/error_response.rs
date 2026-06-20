@@ -121,6 +121,10 @@ pub enum RouteError {
     /// envelope as 404/408/413 (audit LOW-27).
     #[error("method not allowed")]
     MethodNotAllowed,
+    /// The client did not provide an auth token that a passthrough-auth provider
+    /// (`passthrough_auth = true`) requires. Maps to 401.
+    #[error("missing client auth token for passthrough provider")]
+    Unauthorized,
 }
 
 // ---------------------------------------------------------------------------
@@ -363,6 +367,11 @@ pub(crate) fn extract_error_fields(error: &RouteError) -> (StatusCode, &'static 
             StatusCode::METHOD_NOT_ALLOWED,
             "invalid_request_error",
             "method not allowed".to_owned(),
+        ),
+        RouteError::Unauthorized => (
+            StatusCode::UNAUTHORIZED,
+            "authentication_error",
+            "missing or invalid client auth token".to_owned(),
         ),
     }
 }

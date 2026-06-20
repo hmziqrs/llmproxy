@@ -28,6 +28,7 @@ use llm_proxy_provider::sse::SseFramer;
 use llm_proxy_provider::transport::ProxyRequest;
 use llm_proxy_storage::{EventBus, ProxyEvent, RequestReceived, ResponseCompleted, ResponseFailed};
 use rust_decimal::Decimal;
+use secrecy::SecretString;
 use tracing::warn;
 
 use crate::middleware::get_client_ip;
@@ -357,6 +358,7 @@ async fn resolve_target(
     provider_name: &str,
     route_kind: ProviderRouteKind,
     core: &CoreRequest,
+    inbound_auth: Option<&SecretString>,
 ) -> Result<(ProviderAdapterTarget, ProviderAdapter), RouteError> {
     let providers = state.providers();
 
@@ -415,13 +417,27 @@ async fn resolve_target(
         // zero-sized enum value out from under the borrow — no refcount bump.)
         .clone();
 
+    // Resolve the upstream api_key: passthrough-auth providers use the client's
+    // inbound token (401 if absent); others use the configured static key.
+    let api_key = if providers
+        .get(provider_name)
+        .is_some_and(|p| p.passthrough_auth)
+    {
+        match inbound_auth {
+            Some(token) => token.clone(),
+            None => return Err(RouteError::Unauthorized),
+        }
+    } else {
+        adapter_target_config.api_key
+    };
+
     let provider_target = ProviderAdapterTarget {
         provider_name: adapter_target_config.provider_name,
         adapter_name: adapter_target_config.adapter_name,
         protocol,
         endpoint: adapter_target_config.endpoint,
         auth_style: adapter_target_config.auth_style,
-        api_key: adapter_target_config.api_key,
+        api_key,
         requested_model: adapter_target_config.requested_model,
         upstream_model: adapter_target_config.upstream_model,
         headers: adapter_target_config.headers,
@@ -520,6 +536,35 @@ fn capture_lifecycle(ctx: &mut StreamContext, event: &CoreEvent) {
     }
 }
 
+/// Extract the client's inbound auth token from request headers, for passthrough
+/// providers. Checks `Authorization: Bearer <token>`, then `x-api-key`, then
+/// `x-goog-api-key`. The raw token is wrapped in [`SecretString`] so it is
+/// redacted in logs/Debug like any other credential.
+pub(crate) fn extract_inbound_auth(headers: &HeaderMap) -> Option<SecretString> {
+    if let Some(value) = headers.get(header::AUTHORIZATION) {
+        if let Ok(s) = value.to_str() {
+            if let Some(rest) = s
+                .strip_prefix("Bearer ")
+                .or_else(|| s.strip_prefix("bearer "))
+            {
+                if !rest.is_empty() {
+                    return Some(SecretString::from(rest.to_owned()));
+                }
+            }
+        }
+    }
+    for name in ["x-api-key", "x-goog-api-key"] {
+        if let Some(value) = headers.get(name) {
+            if let Ok(s) = value.to_str() {
+                if !s.is_empty() {
+                    return Some(SecretString::from(s.to_owned()));
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Compute the USD cost of a request from its [`Usage`] and a per-token price
 /// table.
 ///
@@ -556,6 +601,7 @@ pub(crate) async fn handle_core_once(
     route_kind: ProviderRouteKind,
     core: CoreRequest,
     client_protocol: ClientProtocol,
+    inbound_auth: Option<SecretString>,
 ) -> Result<Response<Body>, RouteError> {
     validate_provider_name_ref(provider_name)?;
 
@@ -583,19 +629,25 @@ pub(crate) async fn handle_core_once(
             body_hash: body_hash_of(&core),
         }));
 
-    let (target, adapter) = resolve_target(&state, provider_name, route_kind, &core)
-        .await
-        .inspect_err(|e| {
-            state.metrics.record_failure();
-            emit_response_failed(
-                &state.event_bus,
-                &ctx.request_id,
-                Some(provider_name),
-                Some(&core.model),
-                e,
-                ctx.start,
-            );
-        })?;
+    let (target, adapter) = resolve_target(
+        &state,
+        provider_name,
+        route_kind,
+        &core,
+        inbound_auth.as_ref(),
+    )
+    .await
+    .inspect_err(|e| {
+        state.metrics.record_failure();
+        emit_response_failed(
+            &state.event_bus,
+            &ctx.request_id,
+            Some(provider_name),
+            Some(&core.model),
+            e,
+            ctx.start,
+        );
+    })?;
 
     tracing::debug!(
         request_id = %ctx.request_id,
@@ -781,6 +833,7 @@ pub(crate) async fn handle_core_stream(
     route_kind: ProviderRouteKind,
     core: CoreRequest,
     client_protocol: ClientProtocol,
+    inbound_auth: Option<SecretString>,
 ) -> Result<Response<Body>, RouteError> {
     validate_provider_name_ref(provider_name)?;
 
@@ -794,19 +847,25 @@ pub(crate) async fn handle_core_stream(
         "processing streaming request"
     );
 
-    let (target, adapter) = resolve_target(&state, provider_name, route_kind, &core)
-        .await
-        .inspect_err(|e| {
-            state.metrics.record_failure();
-            emit_response_failed(
-                &state.event_bus,
-                &ctx.request_id,
-                Some(provider_name),
-                Some(&core.model),
-                e,
-                ctx.start,
-            );
-        })?;
+    let (target, adapter) = resolve_target(
+        &state,
+        provider_name,
+        route_kind,
+        &core,
+        inbound_auth.as_ref(),
+    )
+    .await
+    .inspect_err(|e| {
+        state.metrics.record_failure();
+        emit_response_failed(
+            &state.event_bus,
+            &ctx.request_id,
+            Some(provider_name),
+            Some(&core.model),
+            e,
+            ctx.start,
+        );
+    })?;
 
     tracing::debug!(
         request_id = %ctx.request_id,
@@ -2071,6 +2130,7 @@ mod tests {
             "nonexistent",
             ProviderRouteKind::ChatCompletions,
             &core,
+            None,
         )
         .await;
         assert!(result.is_err());
@@ -2140,6 +2200,7 @@ mod tests {
             "no-such-provider",
             ProviderRouteKind::Messages,
             &core,
+            None,
         )
         .await;
         assert!(result.is_err());

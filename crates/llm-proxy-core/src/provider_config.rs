@@ -186,6 +186,14 @@ pub struct ProviderConfig {
     pub api_key: SecretString,
     /// Authentication header style.
     pub auth_style: AuthStyle,
+    /// When true, ignore this provider's configured `api_key` and instead use
+    /// the inbound client's auth token (the `Authorization: Bearer ...` or
+    /// `x-api-key` request header) as the upstream credential
+    /// (bring-your-own-key / passthrough auth). The request fails with 401 if
+    /// the client sends no recognizable token. When false (default), the
+    /// provider's static `api_key` is used.
+    #[serde(default)]
+    pub passthrough_auth: bool,
     /// Named adapter configurations (protocol + endpoint pairs).
     #[serde(default)]
     pub adapters: HashMap<String, ProviderAdapterConfig>,
@@ -844,6 +852,7 @@ pub enum ConfigValidationError {
 ///     name: "example".to_owned(),
 ///     api_key: SecretString::from("secret"),
 ///     auth_style: AuthStyle::Bearer,
+///     passthrough_auth: false,
 ///     adapters: HashMap::from([(
 ///         "chat".to_owned(),
 ///         ProviderAdapterConfig {
@@ -875,6 +884,7 @@ pub enum ConfigValidationError {
 ///     name: "   ".to_owned(), // whitespace-only is treated as empty
 ///     api_key: SecretString::from("secret"),
 ///     auth_style: AuthStyle::Bearer,
+///     passthrough_auth: false,
 ///     adapters: HashMap::new(),
 ///     routes: ProviderRoutesConfig::default(),
 ///     model_aliases: HashMap::new(),
@@ -908,17 +918,21 @@ pub fn validate_provider_config(
         });
     }
 
-    // api_key checks.
-    if let Some(var) = find_unresolved_env_var(provider.api_key.expose_secret()) {
-        return Err(ConfigValidationError::UnresolvedEnvVar {
-            provider: name.clone(),
-            var,
-        });
-    }
-    if provider.api_key.expose_secret().trim().is_empty() {
-        return Err(ConfigValidationError::EmptyApiKey {
-            provider: name.clone(),
-        });
+    // api_key checks (skipped for passthrough auth -- the upstream credential
+    // comes from the inbound client request, so the configured api_key may be
+    // empty or unset).
+    if !provider.passthrough_auth {
+        if let Some(var) = find_unresolved_env_var(provider.api_key.expose_secret()) {
+            return Err(ConfigValidationError::UnresolvedEnvVar {
+                provider: name.clone(),
+                var,
+            });
+        }
+        if provider.api_key.expose_secret().trim().is_empty() {
+            return Err(ConfigValidationError::EmptyApiKey {
+                provider: name.clone(),
+            });
+        }
     }
 
     // Pricing validation: keys non-empty, prices non-negative.
@@ -1818,6 +1832,7 @@ endpoint = "https://example.com/v1"
             name: "example".to_owned(),
             api_key: SecretString::from("key"),
             auth_style: AuthStyle::Bearer,
+            passthrough_auth: false,
             adapters: HashMap::from([(
                 "chat".to_owned(),
                 ProviderAdapterConfig {
@@ -1844,6 +1859,7 @@ endpoint = "https://example.com/v1"
             name: "example".to_owned(),
             api_key: SecretString::from("key"),
             auth_style: AuthStyle::Bearer,
+            passthrough_auth: false,
             adapters: HashMap::from([(
                 "chat".to_owned(),
                 ProviderAdapterConfig {
@@ -1870,6 +1886,7 @@ endpoint = "https://example.com/v1"
             name: "example".to_owned(),
             api_key: SecretString::from("key"),
             auth_style: AuthStyle::Bearer,
+            passthrough_auth: false,
             adapters: HashMap::from([(
                 "chat".to_owned(),
                 ProviderAdapterConfig {
@@ -1896,6 +1913,7 @@ endpoint = "https://example.com/v1"
             name: "a".repeat(65), // 65 chars exceeds the 64-char limit
             api_key: SecretString::from("key"),
             auth_style: AuthStyle::Bearer,
+            passthrough_auth: false,
             adapters: HashMap::new(),
             routes: ProviderRoutesConfig::default(),
             model_aliases: HashMap::new(),
@@ -1915,6 +1933,7 @@ endpoint = "https://example.com/v1"
             name: "a".repeat(64), // exactly 64 chars
             api_key: SecretString::from("key"),
             auth_style: AuthStyle::Bearer,
+            passthrough_auth: false,
             adapters: HashMap::new(),
             routes: ProviderRoutesConfig::default(),
             model_aliases: HashMap::new(),
@@ -1979,6 +1998,7 @@ input = 0.0000025
             name: "test".to_owned(),
             api_key: SecretString::from("key"),
             auth_style: AuthStyle::Bearer,
+            passthrough_auth: false,
             adapters: HashMap::new(),
             routes: ProviderRoutesConfig::default(),
             model_aliases: HashMap::new(),
@@ -2004,6 +2024,7 @@ input = 0.0000025
             name: "test".to_owned(),
             api_key: SecretString::from("key"),
             auth_style: AuthStyle::Bearer,
+            passthrough_auth: false,
             adapters: HashMap::new(),
             routes: ProviderRoutesConfig::default(),
             model_aliases: HashMap::new(),
@@ -2035,5 +2056,48 @@ input = 0.0000025
             let _g = crate::test_support::EnvVarGuard::set("RUST_LOG_FORMAT", "");
             assert_eq!(LogFormat::from_env(), LogFormat::Plain);
         }
+    }
+
+    #[test]
+    fn validate_accepts_empty_api_key_when_passthrough_auth() {
+        // A passthrough-auth provider gets its upstream credential from the
+        // inbound client request, so an empty/unset api_key must be allowed.
+        let provider = ProviderConfig {
+            name: "test".to_owned(),
+            api_key: SecretString::from(""),
+            auth_style: AuthStyle::Bearer,
+            passthrough_auth: true,
+            adapters: HashMap::new(),
+            routes: ProviderRoutesConfig::default(),
+            model_aliases: HashMap::new(),
+            discovery: None,
+            catalog: None,
+            pricing: Default::default(),
+        };
+        assert!(
+            validate_provider_config(&provider, None).is_ok(),
+            "passthrough provider with empty api_key must pass validation"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_empty_api_key_when_not_passthrough() {
+        // Non-passthrough providers still require a non-empty api_key.
+        let provider = ProviderConfig {
+            name: "test".to_owned(),
+            api_key: SecretString::from(""),
+            auth_style: AuthStyle::Bearer,
+            passthrough_auth: false,
+            adapters: HashMap::new(),
+            routes: ProviderRoutesConfig::default(),
+            model_aliases: HashMap::new(),
+            discovery: None,
+            catalog: None,
+            pricing: Default::default(),
+        };
+        assert!(matches!(
+            validate_provider_config(&provider, None),
+            Err(ConfigValidationError::EmptyApiKey { .. })
+        ));
     }
 }

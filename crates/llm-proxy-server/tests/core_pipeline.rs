@@ -164,6 +164,7 @@ fn state_with_provider(
         name: "mock-provider".to_owned(),
         api_key: secrecy::SecretString::from("test-key"),
         auth_style: AuthStyle::Bearer,
+        passthrough_auth: false,
         adapters: {
             let mut m = HashMap::new();
             m.insert(
@@ -1492,6 +1493,7 @@ async fn rate_limited_request_returns_429() {
         name: "mock-provider".to_owned(),
         api_key: secrecy::SecretString::from("test-key"),
         auth_style: AuthStyle::Bearer,
+        passthrough_auth: false,
         adapters: {
             let mut m = HashMap::new();
             m.insert(
@@ -1600,6 +1602,7 @@ async fn duplicate_request_returns_409() {
         name: "mock-provider".to_owned(),
         api_key: secrecy::SecretString::from("test-key"),
         auth_style: AuthStyle::Bearer,
+        passthrough_auth: false,
         adapters: {
             let mut m = HashMap::new();
             m.insert(
@@ -1932,6 +1935,7 @@ fn state_for_validation_tests() -> AppState {
         name: "mock-provider".to_owned(),
         api_key: secrecy::SecretString::from("test-key"),
         auth_style: AuthStyle::Bearer,
+        passthrough_auth: false,
         adapters: {
             let mut m = HashMap::new();
             m.insert(

@@ -148,6 +148,7 @@ fn state_with_provider_timeout(
         name: "mock-provider".to_owned(),
         api_key: secrecy::SecretString::from("test-key"),
         auth_style: AuthStyle::Bearer,
+        passthrough_auth: false,
         adapters: {
             let mut m = HashMap::new();
             m.insert(
@@ -410,6 +411,7 @@ fn state_with_mock_provider_no_upstream() -> AppState {
         name: "mock-provider".to_owned(),
         api_key: secrecy::SecretString::from("test-key"),
         auth_style: AuthStyle::Bearer,
+        passthrough_auth: false,
         adapters: {
             let mut m = HashMap::new();
             m.insert(
@@ -1889,6 +1891,7 @@ async fn same_model_routes_to_different_providers() {
         name: "provider-a".to_owned(),
         api_key: secrecy::SecretString::from("key-a"),
         auth_style: AuthStyle::Bearer,
+        passthrough_auth: false,
         adapters: adapters_a,
         routes: llm_proxy_core::ProviderRoutesConfig {
             chat_completions: Some("chat".to_owned()),
@@ -1913,6 +1916,7 @@ async fn same_model_routes_to_different_providers() {
         name: "provider-b".to_owned(),
         api_key: secrecy::SecretString::from("key-b"),
         auth_style: AuthStyle::Bearer,
+        passthrough_auth: false,
         adapters: adapters_b,
         routes: llm_proxy_core::ProviderRoutesConfig {
             chat_completions: Some("chat".to_owned()),

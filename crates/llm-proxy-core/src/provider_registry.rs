@@ -485,6 +485,7 @@ mod tests {
             name: "example".to_owned(),
             api_key: SecretString::from("api-secret"),
             auth_style: AuthStyle::Bearer,
+            passthrough_auth: false,
             adapters: HashMap::from([(
                 "chat".to_owned(),
                 ProviderAdapterConfig {
@@ -523,6 +524,7 @@ mod tests {
             name: "example".to_owned(),
             api_key: SecretString::from("key"),
             auth_style: AuthStyle::Bearer,
+            passthrough_auth: false,
             adapters: HashMap::from([(
                 "chat".to_owned(),
                 ProviderAdapterConfig {
@@ -587,6 +589,7 @@ mod tests {
             name: "example".to_owned(),
             api_key: SecretString::from("key"),
             auth_style: AuthStyle::Bearer,
+            passthrough_auth: false,
             adapters: HashMap::new(),
             routes: ProviderRoutesConfig::default(),
             model_aliases: HashMap::new(),
@@ -703,6 +706,7 @@ chat_completions = "chat"
             name: "broken".to_owned(),
             api_key: SecretString::from("key"),
             auth_style: AuthStyle::Bearer,
+            passthrough_auth: false,
             adapters: HashMap::new(), // no adapters defined
             routes: ProviderRoutesConfig {
                 chat_completions: Some("nonexistent_adapter".to_owned()),
@@ -734,6 +738,7 @@ chat_completions = "chat"
             name: "dup".to_owned(),
             api_key: SecretString::from("key"),
             auth_style: AuthStyle::Bearer,
+            passthrough_auth: false,
             adapters: HashMap::new(),
             routes: ProviderRoutesConfig::default(),
             model_aliases: HashMap::new(),
@@ -769,6 +774,7 @@ chat_completions = "chat"
             name: "test".to_owned(),
             api_key: SecretString::from("key"),
             auth_style: AuthStyle::Bearer,
+            passthrough_auth: false,
             adapters: HashMap::new(),
             routes: ProviderRoutesConfig::default(),
             model_aliases: HashMap::new(),
@@ -797,6 +803,7 @@ chat_completions = "chat"
             name: "test".to_owned(),
             api_key: SecretString::from("key"),
             auth_style: AuthStyle::Bearer,
+            passthrough_auth: false,
             adapters: HashMap::new(),
             routes: ProviderRoutesConfig::default(),
             model_aliases: HashMap::new(),
@@ -815,6 +822,7 @@ chat_completions = "chat"
             name: "test".to_owned(),
             api_key: SecretString::from("key"),
             auth_style: AuthStyle::Bearer,
+            passthrough_auth: false,
             adapters: HashMap::new(),
             routes: ProviderRoutesConfig::default(),
             model_aliases: HashMap::new(),
@@ -836,6 +844,7 @@ chat_completions = "chat"
             name: "test".to_owned(),
             api_key: SecretString::from("key"),
             auth_style: AuthStyle::Bearer,
+            passthrough_auth: false,
             adapters: HashMap::from([(
                 "chat".to_owned(),
                 ProviderAdapterConfig {
@@ -869,6 +878,7 @@ chat_completions = "chat"
             name: "a".to_owned(),
             api_key: SecretString::from("key"),
             auth_style: AuthStyle::Bearer,
+            passthrough_auth: false,
             adapters: HashMap::new(),
             routes: ProviderRoutesConfig::default(),
             model_aliases: HashMap::new(),
@@ -908,6 +918,7 @@ chat_completions = "chat"
             name: "truncation-test".to_owned(),
             api_key: SecretString::from("key"),
             auth_style: AuthStyle::Bearer,
+            passthrough_auth: false,
             adapters,
             routes: ProviderRoutesConfig {
                 chat_completions: Some("nonexistent".to_owned()),

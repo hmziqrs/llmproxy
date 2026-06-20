@@ -58,6 +58,7 @@ fn state_with_provider() -> AppState {
         name: "mock-provider".to_owned(),
         api_key: secrecy::SecretString::from("test-key"),
         auth_style: AuthStyle::Bearer,
+        passthrough_auth: false,
         adapters: {
             let mut m = HashMap::new();
             m.insert(
