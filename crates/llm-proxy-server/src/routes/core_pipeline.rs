@@ -1906,6 +1906,38 @@ mod tests {
         assert_eq!(cost.total.normalize().to_string(), "0.003525");
     }
 
+    #[test]
+    fn body_hash_is_stable_and_distinguishes_requests() {
+        use llm_proxy_protocol::core::{CoreRequest, ModelRef};
+        let mk = |model: &str| CoreRequest {
+            model: ModelRef {
+                requested: model.to_owned(),
+                upstream: None,
+            },
+            system: vec![],
+            messages: vec![],
+            tools: vec![],
+            tool_choice: None,
+            sampling: Default::default(),
+            stream: false,
+            metadata: Default::default(),
+            provider_hints: Default::default(),
+        };
+        let a1 = mk("gpt-4o");
+        let a2 = mk("gpt-4o");
+        let b = mk("gpt-3.5-turbo");
+        assert_eq!(
+            body_hash_of(&a1),
+            body_hash_of(&a2),
+            "identical requests must produce the same hash"
+        );
+        assert_ne!(
+            body_hash_of(&a1),
+            body_hash_of(&b),
+            "different models must produce different hashes"
+        );
+    }
+
     fn state_with_operational_config(
         rate_limit_rpm: u32,
         trust_forwarded_headers: bool,

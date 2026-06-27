@@ -1102,6 +1102,84 @@ async fn empty_upstream_stream_returns_502_not_200() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Upstream message ID edge-case tests (plan Test Plan §"Upstream message IDs")
+// ---------------------------------------------------------------------------
+
+/// Build a raw Anthropic SSE body with a configurable message-start id and an
+/// optional leading prefix ("" / "ping" / "keepalive").
+fn anthropic_sse_body(message_start_id: &str, prefix: &str) -> Vec<u8> {
+    let mut s = String::new();
+    match prefix {
+        "keepalive" => s.push_str(":keepalive\n\n"),
+        "ping" => s.push_str("event: ping\ndata: {\"type\":\"ping\"}\n\n"),
+        _ => {}
+    }
+    s.push_str(&format!(
+        "event: message_start\ndata: {}\n\n",
+        json!({
+            "type": "message_start",
+            "message": {
+                "id": message_start_id,
+                "type": "message",
+                "role": "assistant",
+                "content": [],
+                "model": "claude-sonnet-4-6",
+                "stop_reason": null,
+                "stop_sequence": null,
+                "usage": { "input_tokens": 10, "output_tokens": 0 }
+            }
+        })
+    ));
+    s.push_str(&format!(
+        "event: content_block_delta\ndata: {}\n\n",
+        json!({ "type": "content_block_delta", "delta": { "type": "text_delta", "text": "Hi!" } })
+    ));
+    s.push_str(&format!(
+        "event: message_stop\ndata: {}\n\n",
+        json!({ "type": "message_stop" })
+    ));
+    s.into_bytes()
+}
+
+/// MessageStart with an empty id falls back to a synthetic `msg_`-prefixed id.
+#[tokio::test]
+async fn stream_empty_message_start_id_falls_back_to_synthetic() {
+    let body = anthropic_sse_body("", "");
+    let mock_url = spawn_mock_server(body, "text/event-stream").await;
+    let text = collect_anthropic_stream_body(&mock_url).await;
+    assert!(
+        text.contains("\"id\":\"msg_"),
+        "empty upstream id must produce a synthetic msg_-prefixed id; got: {text}"
+    );
+}
+
+/// A stream that opens with a Ping event then MessageStart (same chunk) still
+/// surfaces the real upstream message id.
+#[tokio::test]
+async fn stream_ping_then_message_start_surfaces_real_id() {
+    let body = anthropic_sse_body("msg_ping_real", "ping");
+    let mock_url = spawn_mock_server(body, "text/event-stream").await;
+    let text = collect_anthropic_stream_body(&mock_url).await;
+    assert!(
+        text.contains("msg_ping_real"),
+        "real upstream id must survive a leading ping; got: {text}"
+    );
+}
+
+/// A stream that opens with a `:keepalive` comment (empty decode) then
+/// MessageStart still surfaces the real upstream message id.
+#[tokio::test]
+async fn stream_keepalive_then_message_start_surfaces_real_id() {
+    let body = anthropic_sse_body("msg_ka_real", "keepalive");
+    let mock_url = spawn_mock_server(body, "text/event-stream").await;
+    let text = collect_anthropic_stream_body(&mock_url).await;
+    assert!(
+        text.contains("msg_ka_real"),
+        "real upstream id must survive a leading keepalive comment; got: {text}"
+    );
+}
+
 /// stream:true OpenAI Chat provider returns HTTP 200 with an SSE content-type
 #[tokio::test]
 async fn stream_openai_chat_provider_returns_sse_content_type() {
