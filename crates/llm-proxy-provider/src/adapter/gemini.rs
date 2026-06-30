@@ -111,8 +111,16 @@ impl ProviderStreamDecoder for GeminiStreamDecoder {
 
         let candidate = &chunk.candidates[0];
 
-        // Process parts.
-        for part in &candidate.content.parts {
+        // Process parts. A candidate may omit `content` entirely (e.g. for
+        // SAFETY/RECITATION-blocked responses or prompt-feedback-only
+        // candidates); treat a missing/empty content as producing no parts and
+        // rely on `finish_reason`/`usage_metadata` below for the stop/usage.
+        let parts: &[GeminiPart] = candidate
+            .content
+            .as_ref()
+            .map(|c| c.parts.as_slice())
+            .unwrap_or(&[]);
+        for part in parts {
             if let Some(ref text) = part.text {
                 if !text.is_empty() {
                     if !self.content_started {
@@ -312,16 +320,15 @@ impl GeminiAdapter {
                                     _ => None,
                                 })
                                 .collect();
-                            if texts.len() == result_content.len() {
-                                serde_json::json!({"result": texts.join("\n")})
-                            } else {
-                                // Mixed content; serialize the full content.
+                            if texts.len() != result_content.len() {
+                                // Mixed content; non-text blocks are dropped (Gemini's
+                                // functionResponse can only carry a string `result`).
                                 tracing::warn!(
                                     tool_use_id,
                                     "Gemini: dropping non-text content in tool result"
                                 );
-                                serde_json::json!({"result": texts.join("\n")})
                             }
+                            serde_json::json!({"result": texts.join("\n")})
                         };
 
                         // The name field must match the function name from the
@@ -329,16 +336,27 @@ impl GeminiAdapter {
                         // response with the function declaration.  We look up
                         // the function name by searching for the ToolUse content
                         // block that has a matching tool_use_id in prior messages.
-                        let fn_name =
-                            tool_name_map.get(tool_use_id).cloned().unwrap_or_else(|| {
-                                // Fallback: strip the 'gemini_call_' prefix from
-                                // tool_use_id (the Gemini decoder uses this format).
-                                tracing::warn!(
-                                    tool_use_id,
-                                    "Gemini: tool name lookup fell back to ID-stripping heuristic"
-                                );
-                                tool_use_id.trim_start_matches("gemini_call_").to_owned()
-                            });
+                        let fn_name = match tool_name_map.get(tool_use_id) {
+                            Some(name) => name.clone(),
+                            None => {
+                                // The lookup missed because the ToolUse block is
+                                // absent from the request being encoded (truncated/
+                                // pruned history) or the id is foreign (e.g. an
+                                // Anthropic `toolu_...` id round-tripping through
+                                // Gemini). The previous heuristic stripped a
+                                // `gemini_call_` prefix, but that only ever
+                                // produced an invalid function name (a bare number
+                                // or a raw foreign id) that Gemini rejects with a
+                                // confusing 400, and the happy-path ids are already
+                                // covered by the map above. Return a clear error
+                                // instead of shipping a guessed name.
+                                return Err(ProviderError::InvalidConfig(format!(
+                                    "Gemini: cannot resolve function name for tool_use_id \
+                                     \"{tool_use_id}\"; the corresponding ToolUse block was \
+                                     not found in the conversation history"
+                                )));
+                            }
+                        };
                         parts.push(GeminiPart::function_response(fn_name, response_val));
                     }
                     _ => {
@@ -403,13 +421,24 @@ impl GeminiAdapter {
                     },
                 );
                 // Synthetic model acknowledgment (see NOTE above).
-                contents.insert(
-                    1,
-                    llm_proxy_protocol::zen::GeminiContent {
-                        role: "model".to_owned(),
-                        parts: vec![GeminiPart::text("Understood.".to_owned())],
-                    },
-                );
+                //
+                // Only insert when the turn immediately following the system
+                // prompt is NOT already a "model" turn.  Gemini requires the
+                // conversation to start with a user turn followed by a model
+                // turn; if the first real message is already a model turn
+                // (e.g. an Assistant-first conversation), inserting a synthetic
+                // one would produce two consecutive model turns, which Gemini
+                // rejects.
+                let next_is_model = contents.get(1).is_some_and(|c| c.role == "model");
+                if !next_is_model {
+                    contents.insert(
+                        1,
+                        llm_proxy_protocol::zen::GeminiContent {
+                            role: "model".to_owned(),
+                            parts: vec![GeminiPart::text("Understood.".to_owned())],
+                        },
+                    );
+                }
             }
         }
 
@@ -507,7 +536,16 @@ impl GeminiAdapter {
         let mut content = Vec::new();
         let mut tool_id_counter = 0usize;
 
-        for part in &candidate.content.parts {
+        // A candidate may omit `content` entirely (e.g. for SAFETY/RECITATION-
+        // blocked responses or prompt-feedback-only candidates). Treat a
+        // missing/empty content as producing no parts; `finish_reason` still
+        // drives the stop reason and `content` is back-filled below if empty.
+        let parts: &[GeminiPart] = candidate
+            .content
+            .as_ref()
+            .map(|c| c.parts.as_slice())
+            .unwrap_or(&[]);
+        for part in parts {
             if let Some(ref text) = part.text {
                 if !text.is_empty() {
                     content.push(CoreContent::Text {
@@ -708,6 +746,54 @@ mod tests {
             Some("You are helpful".to_owned())
         );
         assert_eq!(body.contents[1].role, "model");
+    }
+
+    #[test]
+    fn encode_system_prompt_no_double_model_when_assistant_first() {
+        // Regression for gemini.rs:416 -- when a system prompt is present AND
+        // the first real message is already a model/assistant turn, the
+        // synthetic "Understood." model turn must NOT be inserted (it would
+        // create two consecutive model turns, which Gemini rejects).
+        let mut core = make_core_request(vec![CoreMessage {
+            role: CoreRole::Assistant,
+            content: vec![CoreContent::Text {
+                text: "I will help.".into(),
+                cache: None,
+            }],
+        }]);
+        core.system = vec![CoreContent::Text {
+            text: "You are helpful".into(),
+            cache: None,
+        }];
+        let adapter = GeminiAdapter;
+        let target = make_target();
+        let proxy_req = adapter.encode_request(&core, &target).unwrap();
+
+        let body: GeminiRequest = serde_json::from_slice(&proxy_req.body).unwrap();
+        // contents[0] = system prompt as user.
+        assert_eq!(body.contents[0].role, "user");
+        // contents[1] must be the real Assistant message (model), NOT the
+        // synthetic "Understood." turn.
+        assert_eq!(body.contents[1].role, "model");
+        // No synthetic "Understood." text anywhere.
+        let has_understood = body.contents.iter().any(|c| {
+            c.parts
+                .iter()
+                .any(|p| p.text.as_deref() == Some("Understood."))
+        });
+        assert!(
+            !has_understood,
+            "synthetic Understood. turn must be suppressed when the next turn is already model"
+        );
+        // And no two consecutive model turns.
+        for pair in body.contents.windows(2) {
+            assert!(
+                !(pair[0].role == "model" && pair[1].role == "model"),
+                "consecutive model turns are not allowed: {:?} -> {:?}",
+                pair[0].role,
+                pair[1].role
+            );
+        }
     }
 
     #[test]
@@ -1036,30 +1122,46 @@ mod tests {
 
     #[test]
     fn encode_tool_result_as_function_response() {
-        let core = make_core_request(vec![CoreMessage {
-            role: CoreRole::Tool,
-            content: vec![CoreContent::ToolResult {
-                tool_use_id: "gemini_call_0".into(),
-                content: vec![CoreContent::Text {
-                    text: "72F, sunny".into(),
-                    cache: None,
+        // The function name for a functionResponse is resolved from the
+        // matching ToolUse block in the conversation history (audit
+        // gemini-tool-result-name-heuristic). A bare ToolResult without the
+        // preceding ToolUse is now a hard error, so include the call.
+        let core = make_core_request(vec![
+            CoreMessage {
+                role: CoreRole::Assistant,
+                content: vec![CoreContent::ToolUse {
+                    id: "gemini_call_0".into(),
+                    name: "get_weather".into(),
+                    input: serde_json::json!({"city": "SF"}),
                 }],
-                is_error: false,
-            }],
-        }]);
+            },
+            CoreMessage {
+                role: CoreRole::Tool,
+                content: vec![CoreContent::ToolResult {
+                    tool_use_id: "gemini_call_0".into(),
+                    content: vec![CoreContent::Text {
+                        text: "72F, sunny".into(),
+                        cache: None,
+                    }],
+                    is_error: false,
+                }],
+            },
+        ]);
         let adapter = GeminiAdapter;
         let target = make_target();
         let proxy_req = adapter.encode_request(&core, &target).unwrap();
 
         let body: GeminiRequest = serde_json::from_slice(&proxy_req.body).unwrap();
-        assert_eq!(body.contents.len(), 1);
-        let part = &body.contents[0].parts[0];
-        assert!(
-            part.function_response.is_some(),
-            "ToolResult must be encoded as functionResponse"
-        );
-        let fr = part.function_response.as_ref().unwrap();
-        assert_eq!(fr.name, "0");
+        // The assistant ToolUse and the tool ToolResult produce their own
+        // contents entries (one function_call, one function_response). Find the
+        // function_response across the contents.
+        let fr = body
+            .contents
+            .iter()
+            .find_map(|c| c.parts.iter().find_map(|p| p.function_response.clone()))
+            .expect("ToolResult must be encoded as a functionResponse");
+        // Name is the real function name from the ToolUse, not a guessed id.
+        assert_eq!(fr.name, "get_weather");
     }
 
     #[test]

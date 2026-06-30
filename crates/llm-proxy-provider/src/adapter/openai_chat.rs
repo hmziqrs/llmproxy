@@ -167,7 +167,24 @@ impl ProviderStreamDecoder for OpenAiChatStreamDecoder {
                 self.close_content_if_open();
 
                 for tc in &delta.tool_calls {
-                    let oi = tc.index.unwrap_or(0) as usize;
+                    // The wire `index` is `Option<i32>`; negative values are
+                    // semantically meaningless but a malformed/malicious chunk
+                    // could carry one.  An unchecked `as usize` would wrap
+                    // (e.g. `-1` -> `usize::MAX`), producing phantom tool blocks
+                    // with huge indices.  Validate before casting: negatives
+                    // fall back to 0 and are logged.
+                    let oi = tc
+                        .index
+                        .and_then(|i| usize::try_from(i).ok())
+                        .unwrap_or_else(|| {
+                            if tc.index.map(|i| i < 0).unwrap_or(false) {
+                                tracing::warn!(
+                                    raw_index = tc.index,
+                                    "OpenAI: negative tool_call index, clamping to 0"
+                                );
+                            }
+                            0
+                        });
 
                     // New tool call?
                     if !self.tool_blocks.contains_key(&oi) {
@@ -349,6 +366,7 @@ impl OpenAiChatAdapter {
                             tool_call_id: None,
                             cache_control: None,
                             refusal: None,
+                            is_error: None,
                         });
                     }
                 }
@@ -376,6 +394,7 @@ impl OpenAiChatAdapter {
                             tool_call_id: None,
                             cache_control: None,
                             refusal: None,
+                            is_error: None,
                         });
                     }
 
@@ -397,6 +416,7 @@ impl OpenAiChatAdapter {
                                 tool_call_id: Some(tool_use_id.clone()),
                                 cache_control: None,
                                 refusal: None,
+                                is_error: None,
                             });
                         }
                     }
@@ -450,15 +470,29 @@ impl OpenAiChatAdapter {
                         }
                     }
 
+                    // When an assistant turn carries only tool calls (no text),
+                    // emit `content: null` rather than `content: ""`.  The
+                    // OpenAI Chat Completions API tolerates both, but some
+                    // strict OpenAI-compatible upstreams (e.g. Ollama) treat an
+                    // empty string differently from null/absent and drop out of
+                    // tool-calling mode.  `null` is the conventionally-correct
+                    // representation and is accepted by both OpenAI and Ollama.
+                    let content = if text.is_empty() && !tool_calls.is_empty() {
+                        serde_json::Value::Null
+                    } else {
+                        serde_json::Value::String(text)
+                    };
+
                     messages.push(ChatMessage {
                         role: "assistant".to_owned(),
-                        content: serde_json::Value::String(text),
+                        content,
                         reasoning_content,
                         tool_calls,
                         name: None,
                         tool_call_id: None,
                         cache_control: None,
                         refusal: None,
+                        is_error: None,
                     });
                 }
                 CoreRole::System => {
@@ -473,6 +507,7 @@ impl OpenAiChatAdapter {
                             tool_call_id: None,
                             cache_control: None,
                             refusal: None,
+                            is_error: None,
                         });
                     }
                 }
@@ -502,6 +537,7 @@ impl OpenAiChatAdapter {
                         tool_call_id: Some(tool_use_id),
                         cache_control: None,
                         refusal: None,
+                        is_error: None,
                     });
                 }
                 _ => {
@@ -517,6 +553,7 @@ impl OpenAiChatAdapter {
                             tool_call_id: None,
                             cache_control: None,
                             refusal: None,
+                            is_error: None,
                         });
                     }
                 }
@@ -1066,6 +1103,7 @@ mod tests {
                     tool_call_id: None,
                     cache_control: None,
                     refusal: None,
+                    is_error: None,
                 }),
                 finish_reason: Some("stop".into()),
                 delta: None,
@@ -1125,6 +1163,7 @@ mod tests {
                     tool_call_id: None,
                     cache_control: None,
                     refusal: None,
+                    is_error: None,
                 }),
                 finish_reason: Some("tool_calls".into()),
                 delta: None,
@@ -1173,6 +1212,7 @@ mod tests {
                     tool_call_id: None,
                     cache_control: None,
                     refusal: None,
+                    is_error: None,
                 }),
                 finish_reason: Some("stop".into()),
                 delta: None,
@@ -1284,6 +1324,90 @@ mod tests {
     }
 
     #[test]
+    fn stream_negative_tool_index_clamped() {
+        // A malformed/malicious chunk carrying a negative `index` must not wrap
+        // to usize::MAX and create a phantom tool block.  It should be clamped
+        // to 0 and still produce a valid ToolCallStart at index 0.
+        let target = make_target();
+        let adapter = OpenAiChatAdapter;
+        let mut decoder = adapter.new_stream_decoder(&target);
+
+        let frame = make_frame(
+            r#"{"id":"c","object":"chat.completion.chunk","created":0,"model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":-1,"id":"call_1","type":"function","function":{"name":"get_weather","arguments":""}}]},"finish_reason":null}]}"#,
+        );
+        let events = decoder.decode_frame(&frame).unwrap();
+
+        // Exactly one ToolCallStart, and its content_index is 0 (not a wrapped
+        // huge value).
+        let starts: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                CoreEvent::ToolCallStart { index, name, .. } => Some((*index, name.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(starts.len(), 1, "expected exactly one ToolCallStart");
+        assert_eq!(starts[0].0, 0, "negative index must clamp to 0");
+        assert_eq!(starts[0].1, "get_weather");
+    }
+
+    #[test]
+    fn encode_assistant_only_tool_calls_emits_null_content() {
+        // An assistant turn with only ToolUse blocks (no text) must serialize
+        // `content: null`, not `content: ""`, for compatibility with strict
+        // OpenAI-compatible upstreams.
+        let core = make_core_request(vec![CoreMessage {
+            role: CoreRole::Assistant,
+            content: vec![CoreContent::ToolUse {
+                id: "call_1".into(),
+                name: "get_weather".into(),
+                input: serde_json::json!({"city": "SF"}),
+            }],
+        }]);
+        let adapter = OpenAiChatAdapter;
+        let target = make_target();
+        let proxy_req = adapter.encode_request(&core, &target).unwrap();
+
+        let body: ChatCompletionRequest = serde_json::from_slice(&proxy_req.body).unwrap();
+        assert_eq!(body.messages.len(), 1);
+        assert_eq!(
+            body.messages[0].content,
+            serde_json::Value::Null,
+            "assistant-only-tool-calls must encode content as null"
+        );
+        assert_eq!(body.messages[0].tool_calls.len(), 1);
+    }
+
+    #[test]
+    fn encode_assistant_with_text_keeps_string_content() {
+        // An assistant turn with real text must keep `content` as the string
+        // (regression guard for the null-content fix).
+        let core = make_core_request(vec![CoreMessage {
+            role: CoreRole::Assistant,
+            content: vec![
+                CoreContent::Text {
+                    text: "thinking...".into(),
+                    cache: None,
+                },
+                CoreContent::ToolUse {
+                    id: "call_1".into(),
+                    name: "get_weather".into(),
+                    input: serde_json::json!({"city": "SF"}),
+                },
+            ],
+        }]);
+        let adapter = OpenAiChatAdapter;
+        let target = make_target();
+        let proxy_req = adapter.encode_request(&core, &target).unwrap();
+
+        let body: ChatCompletionRequest = serde_json::from_slice(&proxy_req.body).unwrap();
+        assert_eq!(
+            body.messages[0].content,
+            serde_json::Value::String("thinking...".into())
+        );
+    }
+
+    #[test]
     fn stream_done_marker_ignored() {
         let target = make_target();
         let adapter = OpenAiChatAdapter;
@@ -1337,6 +1461,7 @@ mod tests {
                     tool_call_id: None,
                     cache_control: None,
                     refusal: None,
+                    is_error: None,
                 }),
                 finish_reason: Some("stop".into()),
                 delta: None,
@@ -1388,6 +1513,7 @@ mod tests {
                     tool_call_id: None,
                     cache_control: None,
                     refusal: Some("I cannot help with that.".into()),
+                    is_error: None,
                 }),
                 finish_reason: Some("stop".into()),
                 delta: None,
@@ -1622,6 +1748,7 @@ mod tests {
                     tool_call_id: None,
                     cache_control: None,
                     refusal: None,
+                    is_error: None,
                 }),
                 finish_reason: Some("stop".into()),
                 delta: None,

@@ -16,6 +16,14 @@ use crate::ProviderError;
 const ANTHROPIC_VERSION_HEADER: &str = "anthropic-version";
 const DEFAULT_ANTHROPIC_VERSION: &str = "2023-06-01";
 
+/// Maximum number of bytes streamed from a discovery error body before it is
+/// passed to [`ProviderError::api`].
+///
+/// Streamed (not buffered-then-truncated) so an adversarial discovery endpoint
+/// returning a large error body cannot spike transient memory (audit
+/// discovery-error-body-full-read).
+const MAX_DISCOVERY_ERROR_BODY_BYTES: usize = 2048;
+
 /// GET-capable HTTP client for provider model discovery.
 #[derive(Debug, Clone)]
 pub struct DiscoveryClient {
@@ -36,10 +44,26 @@ impl DiscoveryClient {
                 if attempt.previous().len() >= 5 {
                     return attempt.error("too many discovery redirects");
                 }
-                match attempt.url().scheme() {
-                    "http" | "https" => attempt.follow(),
-                    _ => attempt.stop(),
+                let next = attempt.url();
+                if !matches!(next.scheme(), "http" | "https") {
+                    return attempt.stop();
                 }
+                // SSRF / credential-disclosure guard: reqwest strips
+                // `Authorization` on cross-host redirects, but it does NOT strip
+                // custom auth headers such as `x-api-key` / `x-goog-api-key`
+                // (the credentials used by Anthropic and Gemini discovery).
+                // Refuse to follow a redirect whose host/port/scheme differs from
+                // the original request's so a compromised or MITM discovery
+                // endpoint cannot replay the provider API key to an attacker host.
+                if let Some(origin) = attempt.previous().first() {
+                    let cross_host = next.host_str() != origin.host_str()
+                        || next.port_or_known_default() != origin.port_or_known_default()
+                        || next.scheme() != origin.scheme();
+                    if cross_host {
+                        return attempt.error("discovery redirect leaves the origin host");
+                    }
+                }
+                attempt.follow()
             }))
             .build()?;
         Ok(Self { http })
@@ -67,6 +91,12 @@ impl DiscoveryClient {
         })?;
         let mut models = Vec::new();
         let mut dropped = 0usize;
+        // Track the previous pagination token so a non-advancing token (the
+        // upstream returns the same `nextPageToken` / `after_id` every page) is
+        // detected and pagination stops early with a warning, instead of
+        // fetching the same page up to `max_pages` times (audit
+        // discovery-nonadvancing-pagination-token).
+        let mut previous_token: Option<String> = None;
 
         for _ in 0..discovery.max_pages {
             let value = self.fetch_page(provider, &url).await?;
@@ -95,6 +125,26 @@ impl DiscoveryClient {
                 }
                 return Ok(models);
             };
+
+            // Stop early if the upstream returned a token identical to the one
+            // we just used: feeding it back would re-fetch the same page in a
+            // tight loop until `max_pages`. Sort/dedup the (possibly partial)
+            // catalog and return it rather than treating this as a hard error,
+            // since the records gathered so far are valid (audit
+            // discovery-nonadvancing-pagination-token).
+            if previous_token.as_deref() == Some(token.as_str()) {
+                tracing::warn!(
+                    provider = %provider.name,
+                    token = %token,
+                    "discovery pagination token did not advance; stopping early \
+                     to avoid repeated identical page fetches",
+                );
+                models.sort_by(|a, b| a.id.cmp(&b.id));
+                models.dedup_by(|a, b| a.id == b.id);
+                return Ok(models);
+            }
+            previous_token = Some(token.clone());
+
             set_query_parameter(&mut url, name, &token);
         }
 
@@ -166,6 +216,10 @@ impl DiscoveryClient {
     /// and configuration errors are non-transient.
     fn is_transient(error: &ProviderError) -> bool {
         match error {
+            // Redirect-policy violations (e.g. too many redirects, or a
+            // cross-host redirect refused by the custom policy) are
+            // deterministic: retrying just re-runs the same redirect chain.
+            ProviderError::Http { redirect: true, .. } => false,
             ProviderError::Http { .. } => true,
             ProviderError::Api { status, .. } => (500..600).contains(status),
             _ => false,
@@ -212,15 +266,13 @@ impl DiscoveryClient {
         let response = request.send().await?;
         let status = response.status();
         if !status.is_success() {
-            // Read only a small prefix of the error body for diagnostics.
-            let body_prefix = response
-                .bytes()
-                .await
-                .map(|b| {
-                    let end = b.len().min(2048);
-                    String::from_utf8_lossy(&b[..end]).into_owned()
-                })
-                .unwrap_or_else(|e| format!("<failed to read error body: {}>", e));
+            // Stream only a small prefix of the error body for diagnostics,
+            // mirroring the success path's bounded read, so a misbehaving
+            // discovery endpoint returning a large error body cannot spike
+            // transient memory (audit discovery-error-body-full-read).
+            let body_prefix =
+                crate::error::read_error_body_bounded(response, MAX_DISCOVERY_ERROR_BODY_BYTES)
+                    .await;
             return Err(ProviderError::api(status.as_u16(), body_prefix));
         }
         let mut stream = response.bytes_stream();
@@ -369,11 +421,20 @@ fn next_page(kind: ProviderDiscoveryKind, value: &Value) -> Option<(&'static str
 impl Default for DiscoveryClient {
     /// Returns a default discovery client.
     ///
+    /// # Lint expectation
+    ///
+    /// The `expect` below is deliberate: this is the infallible-in-practice
+    /// convenience constructor (no custom TLS backend), with [`Self::try_new`]
+    /// as the fallible alternative -- mirroring the convention established for
+    /// `ProxyClient::new` in `transport.rs` (audit LOW-2). `#[expect]` makes the
+    /// deliberate use compile-time-checked.
+    ///
     /// # Panics
     ///
     /// Panics if the underlying `reqwest::Client` cannot be constructed (e.g.
     /// due to a TLS backend initialization failure). Use [`DiscoveryClient::try_new`]
     /// for a fallible constructor.
+    #[expect(clippy::expect_used)]
     fn default() -> Self {
         Self::try_new().expect("default discovery HTTP client configuration is valid")
     }
@@ -554,6 +615,53 @@ mod tests {
         assert!(error.to_string().contains("exceeded 8 bytes"));
     }
 
+    #[tokio::test]
+    async fn discovery_stops_on_non_advancing_pagination_token() {
+        // A Gemini-style endpoint that always returns the SAME nextPageToken
+        // must be detected: pagination stops early after the second identical
+        // token instead of fetching the same page up to `max_pages` times
+        // (audit discovery-nonadvancing-pagination-token).
+        async fn static_token_models(State(calls): State<Arc<AtomicUsize>>) -> Json<Value> {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Json(json!({
+                "models": [{
+                    "name": "models/gemini-pro",
+                    "supportedGenerationMethods": ["generateContent"]
+                }],
+                "nextPageToken": "stale"
+            }))
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let endpoint = start_test_server(
+            Router::new()
+                .route("/models", get(static_token_models))
+                .with_state(Arc::clone(&calls)),
+        )
+        .await;
+        let provider = discovery_provider(
+            endpoint,
+            ProviderDiscoveryKind::GeminiModels,
+            HashMap::new(),
+        );
+
+        let models = DiscoveryClient::default()
+            .discover(&provider)
+            .await
+            .expect("non-advancing token should stop early, not error");
+
+        // Exactly two pages fetched: the first yields the token, the second
+        // returns the identical token and trips the non-advancing guard.
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "pagination should stop after detecting the repeated token"
+        );
+        // The catalog gathered so far is valid and deduplicated.
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "models/gemini-pro");
+    }
+
     #[test]
     fn openai_records_are_sorted_and_malformed_records_are_skipped() {
         let mut models = Vec::new();
@@ -611,5 +719,150 @@ mod tests {
             url.as_str(),
             "https://example.com/models?limit=10&pageToken=new"
         );
+    }
+
+    // -- discovery auth: secret is used on the wire AND redacted from Debug --
+
+    /// Build a discovery provider with an explicit api key and auth style, so
+    /// tests can prove each auth style places the exposed secret on the wire.
+    fn discovery_provider_with_auth(
+        endpoint: String,
+        auth_style: AuthStyle,
+        api_key: &str,
+    ) -> ProviderConfig {
+        ProviderConfig {
+            name: "test-provider".to_owned(),
+            api_key: secrecy::SecretString::from(api_key),
+            auth_style,
+            passthrough_auth: false,
+            adapters: HashMap::new(),
+            routes: ProviderRoutesConfig::default(),
+            model_aliases: HashMap::new(),
+            discovery: Some(ProviderDiscoveryConfig {
+                kind: ProviderDiscoveryKind::OpenAiCompatibleModels,
+                endpoint,
+                headers: HashMap::new(),
+                max_pages: 100,
+                max_models: 20_000,
+                max_response_bytes: 4 * 1024 * 1024,
+            }),
+            catalog: None,
+            pricing: Default::default(),
+        }
+    }
+
+    /// Test-server handler that echoes the received auth header value back as
+    /// the single model id, so the test can assert which credential reached the
+    /// wire. Configured via `EchoAuthConfig` state (the header name to read and
+    /// an optional prefix to strip, e.g. the `Bearer ` scheme prefix).
+    #[derive(Clone)]
+    struct EchoAuthConfig {
+        header_name: String,
+        strip_prefix: Option<String>,
+    }
+
+    async fn echo_auth_header(
+        State(config): State<Arc<EchoAuthConfig>>,
+        headers: HeaderMap,
+    ) -> Json<Value> {
+        let value = headers
+            .get(config.header_name.as_str())
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("missing");
+        let value = match &config.strip_prefix {
+            Some(prefix) => value.strip_prefix(prefix).unwrap_or(value),
+            None => value,
+        };
+        Json(json!({ "data": [{ "id": value }] }))
+    }
+
+    /// The discovery auth path exposes the secret ONLY to build the reqwest
+    /// auth header(s); each auth style must place the configured key on the
+    /// wire (proving the secret IS used), while the ProviderConfig Debug output
+    /// must never contain the raw key (proving redaction). Parameterized over
+    /// the three auth styles the discovery builder supports.
+    async fn run_discovery_auth_on_the_wire_and_redacted(
+        auth_style: AuthStyle,
+        header_name: &'static str,
+        strip_prefix: Option<&'static str>,
+    ) {
+        const SECRET: &str = "sk-discovery-secret-xyz";
+
+        let config = Arc::new(EchoAuthConfig {
+            header_name: header_name.to_owned(),
+            strip_prefix: strip_prefix.map(str::to_owned),
+        });
+        let endpoint = start_test_server(
+            Router::new()
+                .route("/models", get(echo_auth_header))
+                .with_state(config),
+        )
+        .await;
+        let provider = discovery_provider_with_auth(endpoint, auth_style, SECRET);
+
+        // (a) The exposed secret must reach the wire: the echo handler returns
+        // the received auth-header value as the model id, which must equal the
+        // configured key.
+        let models = DiscoveryClient::default()
+            .discover(&provider)
+            .await
+            .expect("discovery should succeed");
+        assert_eq!(
+            models.len(),
+            1,
+            "echo handler should return exactly one model"
+        );
+        assert_eq!(
+            models[0].id, SECRET,
+            "the configured api key must be sent on the wire as the auth header"
+        );
+
+        // (b) The ProviderConfig Debug output must NOT leak the raw key.
+        let debug = format!("{provider:?}");
+        assert!(
+            !debug.contains(SECRET),
+            "ProviderConfig Debug must redact the api key; leaked in: {debug}"
+        );
+        assert!(
+            debug.contains("[REDACTED]"),
+            "ProviderConfig Debug should mark the api key as redacted; got: {debug}"
+        );
+    }
+
+    #[tokio::test]
+    async fn discovery_bearer_auth_uses_secret_on_wire_and_redacts_debug() {
+        run_discovery_auth_on_the_wire_and_redacted(
+            AuthStyle::Bearer,
+            "authorization",
+            Some("Bearer "),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn discovery_x_api_key_auth_uses_secret_on_wire_and_redacts_debug() {
+        run_discovery_auth_on_the_wire_and_redacted(AuthStyle::XApiKey, "x-api-key", None).await;
+    }
+
+    #[tokio::test]
+    async fn discovery_x_goog_api_key_auth_uses_secret_on_wire_and_redacts_debug() {
+        run_discovery_auth_on_the_wire_and_redacted(
+            AuthStyle::XGoogleApiKey,
+            "x-goog-api-key",
+            None,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn discovery_both_auth_uses_secret_on_wire_and_redacts_debug() {
+        // AuthStyle::Both sets Bearer + x-api-key; assert the Bearer side lands
+        // on the wire (the x-api-key side is covered by the XApiKey test).
+        run_discovery_auth_on_the_wire_and_redacted(
+            AuthStyle::Both,
+            "authorization",
+            Some("Bearer "),
+        )
+        .await;
     }
 }
