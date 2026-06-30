@@ -98,6 +98,16 @@ pub struct ServerConfig {
     #[serde(default = "default_rate_limit_rpm")]
     pub rate_limit_rpm: u32,
     /// Whether client identity may use `X-Forwarded-For` and `X-Real-IP`.
+    ///
+    /// # Trust model
+    ///
+    /// When true, the **leftmost** value of `X-Forwarded-For` (and the value of
+    /// `X-Real-IP`) is trusted as the client address. This is only correct
+    /// behind a **single** reverse proxy that strips or overwrites any inbound
+    /// `X-Forwarded-For` before appending its own. With multiple untrusted hops
+    /// the leftmost entry is attacker-controllable (a client can prepend
+    /// arbitrary values), so the extracted address must not be trusted for
+    /// authentication, rate-limit bypass, or audit logging.
     #[serde(default)]
     pub trust_forwarded_headers: bool,
     /// Window for rejecting identical path/body requests. `0s` disables deduplication.
@@ -269,6 +279,20 @@ pub struct ModelPricing {
     /// USD per reasoning token.
     #[serde(default)]
     pub reasoning: Decimal,
+}
+
+/// Upper bound for any per-token USD price accepted by config validation.
+///
+/// Every real per-token price is far below $1; values above $1000/token are
+/// treated as gross misconfigurations (stray exponents, per-1M-token prices
+/// entered verbatim, misplaced decimals) and rejected at load time. See
+/// [`validate_provider_config`]. `compute_cost` uses checked arithmetic on top
+/// of this, so the proxy can never panic on overflow regardless.
+///
+/// Returned by a function rather than a `const` because `Decimal` has no
+/// const constructor at this rust_decimal version (`Decimal::new` is not const).
+fn max_per_token_price() -> Decimal {
+    Decimal::new(1_000, 0)
 }
 
 // ---------------------------------------------------------------------------
@@ -641,8 +665,13 @@ pub enum ConfigValidationError {
         var: String,
     },
     /// An environment variable resolved to an empty value.
+    ///
+    /// This is emitted by [`load_provider_config`], which scans the entire raw
+    /// TOML for `${VAR}` references (any field: `endpoint`, `protocol`, `name`,
+    /// `headers`, `api_key`, ...), not just `api_key`. The message is therefore
+    /// field-agnostic; it does not name a specific field.
     #[error(
-        "provider \"{provider}\": api_key environment variable \"{var}\" resolved to an empty value"
+        "provider \"{provider}\": environment variable \"{var}\" referenced in the provider config resolved to an empty value"
     )]
     EmptyEnvVar {
         /// Provider name.
@@ -958,6 +987,25 @@ pub fn validate_provider_config(
                     message: format!("negative {field} price"),
                 });
             }
+            // Upper bound: every real per-token USD price is well under $1, so
+            // any value above $1000/token is a gross misconfiguration (a stray
+            // exponent, a per-1M-token price entered verbatim, or a misplaced
+            // decimal). Rejecting it here fails fast at config-load instead of
+            // letting a bad entry produce nonsensical costs. `compute_cost`
+            // additionally uses checked arithmetic so even a value that slipped
+            // past this bound can never panic on overflow.
+            let max_price = max_per_token_price();
+            if value > max_price {
+                return Err(ConfigValidationError::InvalidPricing {
+                    provider: name.clone(),
+                    model: model_id.as_str().to_owned(),
+                    message: format!(
+                        "{field} price {value} exceeds the ${max_price}/token upper \
+                         bound; per-token USD prices are expected to be far below $1 -- did you \
+                         enter a per-1M-token price?"
+                    ),
+                });
+            }
         }
     }
 
@@ -1136,7 +1184,22 @@ const FORBIDDEN_HEADERS: &[&str] = &[
 /// Rejects non-HTTP schemes (e.g. `file://`, `ftp://`) to prevent SSRF
 /// attacks via crafted endpoint URLs.
 fn has_valid_http_scheme(endpoint: &str) -> bool {
-    endpoint.starts_with("http://") || endpoint.starts_with("https://")
+    // Schemes are case-insensitive per RFC 3986 (e.g. `HTTP://`, `Https://`),
+    // and reqwest accepts them. Lowercase only the leading scheme region
+    // (everything up to the first `://`, capped at the known scheme length) so
+    // the prefix test is case-insensitive without allocating a full lowercase
+    // copy of the endpoint or pulling the `url` crate into llm-proxy-core.
+    let scheme_region = scheme_region(endpoint);
+    scheme_region.eq_ignore_ascii_case("http") || scheme_region.eq_ignore_ascii_case("https")
+}
+
+/// Return the leading scheme region of `endpoint` (the text before the first
+/// `://`, or the empty string when no `://` separator is present).
+fn scheme_region(endpoint: &str) -> &str {
+    match endpoint.find("://") {
+        Some(idx) => &endpoint[..idx],
+        None => "",
+    }
 }
 
 /// Validate a map of static headers for CRLF injection and forbidden header names.
@@ -1270,6 +1333,22 @@ pub fn load_app_config(path: impl AsRef<Path>) -> Result<AppConfig, CoreError> {
                  a zero or sub-second timeout makes every API request return 408 \
                  before any handler runs",
                 cfg.server.request_timeout
+            ),
+            source: None,
+        });
+    }
+    // Reject a dedup window whose millisecond magnitude does not fit u64. The
+    // deduplicator stores the window as a `u64` millisecond count (see
+    // `AppState::new_with_catalog_dir` in llm-proxy-server), so an out-of-range
+    // `Duration` would otherwise silently fall back to the `unwrap_or` default
+    // rather than being reported. `Duration::MAX` is the only realistic value
+    // that trips this, and it indicates a misconfiguration.
+    if u64::try_from(cfg.server.dedup_window.as_millis()).is_err() {
+        return Err(CoreError::ConfigValidation {
+            message: format!(
+                "server.dedup_window is {:?}, whose millisecond magnitude does \
+                 not fit u64; use a smaller window (0s disables deduplication)",
+                cfg.server.dedup_window
             ),
             source: None,
         });
@@ -1497,6 +1576,50 @@ server_name = "test"
                 .contains("server.request_timeout must be at least 1 second"),
             "got: {error}"
         );
+    }
+
+    #[test]
+    fn load_app_config_rejects_dedup_window_exceeding_u64_millis() {
+        // A dedup window whose millisecond magnitude does not fit u64 (only
+        // realistically `Duration::MAX`) cannot be stored by the deduplicator
+        // and must be rejected at load time rather than silently clamped.
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[server]
+bind = "127.0.0.1:3456"
+request_timeout = "300s"
+dedup_window = "5000000000000000000s"
+log_level = "info"
+hot_reload = false
+server_name = "test"
+"#,
+        )
+        .unwrap();
+
+        let error = load_app_config(&path).expect_err("oversized dedup window must be rejected");
+        assert!(
+            error.to_string().contains("server.dedup_window")
+                && error.to_string().contains("does not fit u64"),
+            "got: {error}"
+        );
+    }
+
+    #[test]
+    fn has_valid_http_scheme_is_case_insensitive() {
+        // Schemes are case-insensitive per RFC 3986 and reqwest accepts mixed
+        // case; the validator must not reject `HTTP://` / `Https://`.
+        assert!(has_valid_http_scheme("http://host"));
+        assert!(has_valid_http_scheme("https://host"));
+        assert!(has_valid_http_scheme("HTTP://host"));
+        assert!(has_valid_http_scheme("Https://host"));
+        assert!(has_valid_http_scheme("HtTp://host/path"));
+        // Non-HTTP schemes are still rejected.
+        assert!(!has_valid_http_scheme("file://host"));
+        assert!(!has_valid_http_scheme("ftp://host"));
+        assert!(!has_valid_http_scheme("host"));
     }
 
     #[test]
@@ -2036,6 +2159,68 @@ input = 0.0000025
             validate_provider_config(&provider, None),
             Err(ConfigValidationError::InvalidPricing { .. })
         ));
+    }
+
+    #[test]
+    fn validate_rejects_implausibly_large_pricing() {
+        // A per-token USD price above the MAX_PER_TOKEN_PRICE bound is a gross
+        // misconfiguration (a stray exponent, a per-1M-token price entered
+        // verbatim, or a misplaced decimal) and is rejected at load time rather
+        // than allowed to produce nonsensical costs.
+        let provider = ProviderConfig {
+            name: "test".to_owned(),
+            api_key: SecretString::from("key"),
+            auth_style: AuthStyle::Bearer,
+            passthrough_auth: false,
+            adapters: HashMap::new(),
+            routes: ProviderRoutesConfig::default(),
+            model_aliases: HashMap::new(),
+            discovery: None,
+            catalog: None,
+            pricing: HashMap::from([(
+                ModelId::new("gpt-4o"),
+                // $1000000/token: parses cleanly as a Decimal but exceeds the bound.
+                ModelPricing {
+                    input: "1000000".parse().unwrap(),
+                    ..ModelPricing::default()
+                },
+            )]),
+        };
+        match validate_provider_config(&provider, None) {
+            Err(ConfigValidationError::InvalidPricing { message, .. }) => {
+                assert!(
+                    message.contains("upper") || message.contains("bound"),
+                    "expected an upper-bound message, got: {message}"
+                );
+            }
+            other => panic!("expected InvalidPricing for a huge price, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_accepts_realistic_pricing_below_bound() {
+        // A realistic per-token price (a few $/1M tokens -> tiny $/token) is
+        // accepted. Guards against the upper bound being too tight.
+        let provider = ProviderConfig {
+            name: "test".to_owned(),
+            api_key: SecretString::from("key"),
+            auth_style: AuthStyle::Bearer,
+            passthrough_auth: false,
+            adapters: HashMap::new(),
+            routes: ProviderRoutesConfig::default(),
+            model_aliases: HashMap::new(),
+            discovery: None,
+            catalog: None,
+            pricing: HashMap::from([(
+                ModelId::new("gpt-4o"),
+                ModelPricing {
+                    input: "0.0000025".parse().unwrap(),
+                    output: "0.000010".parse().unwrap(),
+                    ..ModelPricing::default()
+                },
+            )]),
+        };
+        assert!(validate_provider_config(&provider, None).is_ok());
     }
 
     #[test]

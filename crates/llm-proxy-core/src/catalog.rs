@@ -13,7 +13,14 @@ pub struct CatalogFileMetadata {
     pub provider: String,
     /// Catalog source, normally `live`.
     pub source: String,
-    /// RFC 3339 timestamp when the catalog was generated.
+    /// Best-effort timestamp string (normally RFC 3339) recording when the
+    /// catalog was generated.
+    ///
+    /// This is an opaque, operator-controlled cache value that is **not**
+    /// validated at parse time. Format validity is checked only where the
+    /// value is consumed (e.g. staleness comparison in `catalog_service`); a
+    /// malformed value parses to `None` there and the entry is treated as
+    /// stale. Do not rely on this field being a well-formed RFC 3339 string.
     pub generated_at: String,
     /// Discovered model entries.
     #[serde(default)]

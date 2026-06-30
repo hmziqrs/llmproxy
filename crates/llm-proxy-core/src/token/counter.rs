@@ -7,9 +7,10 @@
 //! counting is offline-safe and the heuristic is always available as a
 //! last resort.
 //!
-//! The overhead constants (base tokens, per-message overhead, system overhead)
-//! mirror the Go reference implementation so unit-test expectations stay
-//! aligned.
+//! The per-message overhead mirrors `tiktoken-rs`'s
+//! `num_tokens_from_messages` convention (4 tokens/message for the `gpt-3.5`
+//! family, 3 otherwise, plus a trailing +3) so unit-test expectations stay
+//! aligned with the upstream tokenizer.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -107,38 +108,62 @@ impl Counter {
 
     /// Estimate the total token count for a chat completion request.
     ///
-    /// The formula mirrors the Go reference implementation:
+    /// The formula follows `tiktoken-rs`'s `num_tokens_from_messages`
+    /// convention rather than any separate "Go reference":
     ///
     /// ```text
-    /// total = BASE_TOKENS + system_tokens + SYSTEM_OVERHEAD
-    ///       + sum(count_tokens(role) + count_tokens(content) + PER_MESSAGE_OVERHEAD)
+    /// tokens_per_message = if model.starts_with("gpt-3.5") { 4 } else { 3 }
+    /// total = sum over (system-as-one-message + each message) of
+    ///           (tokens_per_message + count_tokens(role) + count_tokens(content))
+    ///       + 3   // trailing priming tokens
     /// ```
     ///
     /// Each piece is counted with the model-appropriate backend (BPE for known
-    /// OpenAI models, heuristic otherwise).
+    /// OpenAI models, heuristic otherwise). The system prompt is folded into
+    /// the message loop as a single `"system"`-role message when it is
+    /// non-empty, so it contributes `tokens_per_message` exactly the way
+    /// tiktoken-rs folds a system message into its iteration. When `system` is
+    /// empty no per-message overhead is added for it.
     ///
     /// Note: `system` is a flat string. If the upstream protocol supports
     /// multiple system blocks, the caller must pre-concatenate them.
     /// Role validation is the caller's responsibility.
     pub fn count_messages(&self, model: &str, system: &str, messages: &[MessageContent]) -> usize {
-        // Mirrors the Go reference implementation constants:
-        //   BASE_TOKENS = 3, PER_MESSAGE_OVERHEAD = 5, SYSTEM_OVERHEAD = 5
-        const BASE_TOKENS: usize = 3;
-        const PER_MESSAGE_OVERHEAD: usize = 5;
-        const SYSTEM_OVERHEAD: usize = 5;
+        // tiktoken-rs convention (see `num_tokens_from_messages`):
+        //   4 tokens/message for gpt-3.5*, 3 for everything else.
+        const GPT_35_PER_MESSAGE: usize = 4;
+        const DEFAULT_PER_MESSAGE: usize = 3;
+        // Trailing +3: every reply is primed with `<|start|>assistant<|message|>`.
+        const TRAILING_TOKENS: usize = 3;
 
-        let system_tokens = self.count_tokens(model, system);
+        let tokens_per_message = if model.starts_with("gpt-3.5") {
+            GPT_35_PER_MESSAGE
+        } else {
+            DEFAULT_PER_MESSAGE
+        };
+
+        // The system prompt is treated as one message in the loop (matching
+        // tiktoken-rs, which iterates system alongside the rest). Empty system
+        // contributes nothing -- no bogus per-message overhead for a missing
+        // block.
+        let system_overhead = if system.is_empty() {
+            0
+        } else {
+            tokens_per_message
+                + self.count_tokens(model, "system")
+                + self.count_tokens(model, system)
+        };
 
         let message_tokens: usize = messages
             .iter()
             .map(|msg| {
-                self.count_tokens(model, &msg.role)
+                tokens_per_message
+                    + self.count_tokens(model, &msg.role)
                     + self.count_tokens(model, &msg.content)
-                    + PER_MESSAGE_OVERHEAD
             })
             .sum();
 
-        BASE_TOKENS + system_tokens + SYSTEM_OVERHEAD + message_tokens
+        system_overhead + message_tokens + TRAILING_TOKENS
     }
 }
 
@@ -187,29 +212,29 @@ mod tests {
     #[test]
     fn count_messages_no_messages() {
         let counter = Counter::new();
-        // base(3) + system_tokens(4/4=1) + system_overhead(5) + 0 messages
-        // = 3 + 1 + 5 = 9
+        // system="test" folded in: per_msg(3) + role("system"=6/4=1) + content("test"=4/4=1) = 5
+        // 0 messages, +3 trailing = 5 + 0 + 3 = 8
         let total = counter.count_messages(HEURISTIC_MODEL, "test", &[]);
-        assert_eq!(total, 9);
+        assert_eq!(total, 8);
     }
 
     #[test]
     fn count_messages_empty_system() {
         let counter = Counter::new();
-        // base(3) + system_tokens(0) + system_overhead(5) + 0 messages = 8
+        // Empty system -> no system overhead. 0 messages. +3 trailing = 3.
         let total = counter.count_messages(HEURISTIC_MODEL, "", &[]);
-        assert_eq!(total, 8);
+        assert_eq!(total, 3);
     }
 
     #[test]
     fn count_messages_single_user_message() {
         let counter = Counter::new();
         let messages = vec![MessageContent::new("user", "hello")];
-        // base(3) + system(0) + sys_overhead(5)
-        // + role("user"=4/4=1) + content("hello"=5/4=1) + per_msg_overhead(5)
-        // = 3 + 0 + 5 + 1 + 1 + 5 = 15
+        // empty system -> 0
+        // msg: per_msg(3) + role("user"=4/4=1) + content("hello"=5/4=1) = 5
+        // +3 trailing = 0 + 5 + 3 = 8
         let total = counter.count_messages(HEURISTIC_MODEL, "", &messages);
-        assert_eq!(total, 15);
+        assert_eq!(total, 8);
     }
 
     #[test]
@@ -221,28 +246,24 @@ mod tests {
             MessageContent::new("assistant", "I'm doing well, thank you!"),
         ];
         let total = counter.count_messages(HEURISTIC_MODEL, "Be helpful", &messages);
-        // Manual calculation (heuristic):
-        // base = 3
-        // system = "Be helpful" = 10 chars / 4 = 2 tokens
-        // system_overhead = 5
-        //
-        // msg0: role="system"(6/4=1) + content="You are a helpful assistant."(27/4=6) + 5 = 12
-        // msg1: role="user"(4/4=1) + content="Hello, how are you?"(20/4=5) + 5 = 11
-        // msg2: role="assistant"(9/4=2) + content="I'm doing well, thank you!"(27/4=6) + 5 = 13
-        //
-        // total = 3 + 2 + 5 + 12 + 11 + 13 = 46
-        assert_eq!(total, 46);
+        // tokens_per_message = 3 (HEURISTIC_MODEL is not gpt-3.5).
+        // system="Be helpful"(10/4=2): per_msg(3) + role("system"=6/4=1) + content(2) = 6
+        // msg0: per_msg(3) + role("system"=1) + content="You are a helpful assistant."(27/4=6) = 10
+        // msg1: per_msg(3) + role("user"=4/4=1) + content="Hello, how are you?"(20/4=5) = 9
+        // msg2: per_msg(3) + role("assistant"=9/4=2) + content="I'm doing well, thank you!"(27/4=6) = 11
+        // +3 trailing = 6 + 10 + 9 + 11 + 3 = 39
+        assert_eq!(total, 39);
     }
 
     #[test]
     fn count_messages_with_system_prompt() {
         let counter = Counter::new();
         let messages = vec![MessageContent::new("user", "Hi")];
-        // base(3) + system("You are helpful"=15/4=3) + sys_overhead(5)
-        // + role("user"=4/4=1) + content("Hi"=2/4=0->1) + per_msg_overhead(5)
-        // = 3 + 3 + 5 + 1 + 1 + 5 = 18
+        // system="You are helpful"(15/4=3): per_msg(3) + role("system"=1) + content(3) = 7
+        // msg: per_msg(3) + role("user"=4/4=1) + content("Hi"=2/4=0->1) = 5
+        // +3 trailing = 7 + 5 + 3 = 15
         let total = counter.count_messages(HEURISTIC_MODEL, "You are helpful", &messages);
-        assert_eq!(total, 18);
+        assert_eq!(total, 15);
     }
 
     #[test]
@@ -262,20 +283,22 @@ mod tests {
     fn count_messages_empty_role() {
         let counter = Counter::new();
         let messages = vec![MessageContent::new("", "hello")];
-        // base(3) + system(0) + sys_overhead(5) + role("") + content(1) + per_msg(5)
-        // = 3 + 0 + 5 + 0 + 1 + 5 = 14
+        // empty system -> 0
+        // msg: per_msg(3) + role("") + content("hello"=5/4=1) = 3 + 0 + 1 = 4
+        // +3 trailing = 0 + 4 + 3 = 7
         let total = counter.count_messages(HEURISTIC_MODEL, "", &messages);
-        assert_eq!(total, 14);
+        assert_eq!(total, 7);
     }
 
     #[test]
     fn count_messages_empty_content() {
         let counter = Counter::new();
         let messages = vec![MessageContent::new("user", "")];
-        // base(3) + system(0) + sys_overhead(5) + role(1) + content(0) + per_msg(5)
-        // = 3 + 0 + 5 + 1 + 0 + 5 = 14
+        // empty system -> 0
+        // msg: per_msg(3) + role("user"=4/4=1) + content("") = 3 + 1 + 0 = 4
+        // +3 trailing = 0 + 4 + 3 = 7
         let total = counter.count_messages(HEURISTIC_MODEL, "", &messages);
-        assert_eq!(total, 14);
+        assert_eq!(total, 7);
     }
 
     #[test]
@@ -368,5 +391,162 @@ mod tests {
         let _ = counter.count_tokens("gpt-4", "third");
         let loaded = counter.cache.lock().unwrap().len();
         assert_eq!(loaded, 2, "gpt-4 adds the cl100k_base encoding");
+    }
+
+    // -- tok-02: golden parity with tiktoken-rs -----------------------------
+
+    /// Fixed multi-message fixture shared with tiktoken-rs's
+    /// `num_tokens_from_messages`. The proxy's `count_messages` must match the
+    /// upstream tokenizer to within a small tolerance (the plan allows <= 3
+    /// absolute; since we use the same BPE and the same overhead convention,
+    /// equality should hold exactly when `name` is absent).
+    fn golden_messages() -> Vec<MessageContent> {
+        vec![
+            MessageContent::new(
+                "system",
+                "You are a helpful assistant that only speaks French.",
+            ),
+            MessageContent::new("user", "Hello, how are you?"),
+            MessageContent::new("assistant", "Parlez-vous francais?"),
+        ]
+    }
+
+    fn golden_tiktoken_messages() -> Vec<tiktoken_rs::ChatCompletionRequestMessage> {
+        use tiktoken_rs::ChatCompletionRequestMessage;
+        vec![
+            ChatCompletionRequestMessage {
+                role: "system".to_string(),
+                content: Some("You are a helpful assistant that only speaks French.".to_string()),
+                name: None,
+                function_call: None,
+            },
+            ChatCompletionRequestMessage {
+                role: "user".to_string(),
+                content: Some("Hello, how are you?".to_string()),
+                name: None,
+                function_call: None,
+            },
+            ChatCompletionRequestMessage {
+                role: "assistant".to_string(),
+                content: Some("Parlez-vous francais?".to_string()),
+                name: None,
+                function_call: None,
+            },
+        ]
+    }
+
+    /// The system prompt passed separately to the proxy must equal the
+    /// `content` of the system message tiktoken-rs sees (otherwise the two
+    /// formulas would not be comparable).
+    const GOLDEN_SYSTEM: &str = "Be concise and correct.";
+
+    #[test]
+    fn count_messages_matches_tiktoken_for_gpt4o() {
+        let counter = Counter::new();
+        let messages = golden_messages();
+        let tiktoken_msgs = golden_tiktoken_messages();
+
+        let ours = counter.count_messages("gpt-4o", GOLDEN_SYSTEM, &messages);
+        let theirs = tiktoken_rs::num_tokens_from_messages("gpt-4o", &tiktoken_msgs)
+            .expect("gpt-4o resolves to a supported chat tokenizer");
+
+        // `num_tokens_from_messages` does not model the separate top-level
+        // `system` string the proxy exposes. We account for it by handing the
+        // same text to tiktoken-rs as an extra leading system message.
+        let mut with_system = golden_tiktoken_messages();
+        with_system.insert(
+            0,
+            tiktoken_rs::ChatCompletionRequestMessage {
+                role: "system".to_string(),
+                content: Some(GOLDEN_SYSTEM.to_string()),
+                name: None,
+                function_call: None,
+            },
+        );
+        let theirs_with_system = tiktoken_rs::num_tokens_from_messages("gpt-4o", &with_system)
+            .expect("gpt-4o resolves to a supported chat tokenizer");
+
+        // Same BPE + same overhead convention -> exact equality is expected;
+        // the plan's <= 3 tolerance is the documented safety margin.
+        assert!(
+            (ours as isize - theirs_with_system as isize).abs() <= 3,
+            "gpt-4o mismatch: ours={ours}, tiktoken_baseline_no_system={theirs}, \
+             tiktoken_with_system={theirs_with_system}"
+        );
+        // And the system-less baseline must be strictly less than our value
+        // (we added a real system message).
+        assert!(
+            ours > theirs,
+            "gpt-4o: adding a system prompt must increase the count (ours={ours}, baseline={theirs})"
+        );
+    }
+
+    #[test]
+    fn count_messages_matches_tiktoken_for_gpt35_turbo() {
+        // gpt-3.5-turbo exercises the `tokens_per_message = 4` branch.
+        let counter = Counter::new();
+        let messages = golden_messages();
+
+        let mut with_system = golden_tiktoken_messages();
+        with_system.insert(
+            0,
+            tiktoken_rs::ChatCompletionRequestMessage {
+                role: "system".to_string(),
+                content: Some(GOLDEN_SYSTEM.to_string()),
+                name: None,
+                function_call: None,
+            },
+        );
+        let theirs = tiktoken_rs::num_tokens_from_messages("gpt-3.5-turbo", &with_system)
+            .expect("gpt-3.5-turbo resolves to a supported chat tokenizer");
+        let ours = counter.count_messages("gpt-3.5-turbo", GOLDEN_SYSTEM, &messages);
+
+        assert!(
+            (ours as isize - theirs as isize).abs() <= 3,
+            "gpt-3.5-turbo mismatch: ours={ours}, tiktoken={theirs}"
+        );
+    }
+
+    /// gpt-3.5-turbo uses 4 tokens/message while other cl100k models (e.g.
+    /// gpt-4) use 3. A fixture with at least one real message must therefore
+    /// count strictly higher for gpt-3.5 than for gpt-4. This directly
+    /// exercises the `model.starts_with("gpt-3.5")` branch.
+    #[test]
+    fn count_messages_gpt35_overhead_is_higher_than_gpt4() {
+        let counter = Counter::new();
+        let messages = vec![MessageContent::new("user", "Hello, how are you today?")];
+
+        let gpt35 = counter.count_messages("gpt-3.5-turbo", "Be helpful", &messages);
+        let gpt4 = counter.count_messages("gpt-4", "Be helpful", &messages);
+        // system counts as 1 message + the user message = 2 messages, so gpt-3.5
+        // (4/msg) is +2 ahead of gpt-4 (3/msg).
+        assert_eq!(
+            gpt35 - gpt4,
+            2,
+            "gpt-3.5 uses 4 tokens/message vs gpt-4's 3; with 2 messages the gap is exactly 2"
+        );
+    }
+
+    // -- NON-ZST: Counter is Clone + Debug + non-zero-sized ------------------
+
+    #[test]
+    fn counter_is_clone_and_debug() {
+        let counter = Counter::new();
+        let cloned = counter.clone();
+        // Debug must not panic and must mention the backend.
+        let s = format!("{counter:?}");
+        assert!(s.contains("bpe+heuristic"), "debug output: {s}");
+        // Cloned counter is independently usable.
+        let _ = format!("{cloned:?}");
+    }
+
+    #[test]
+    fn counter_is_not_zero_sized() {
+        // A ZST counter (e.g. if the cache/heuristic fields were dropped) would
+        // be a regression: it would mean the lazily-loaded BPE cache is gone.
+        assert!(
+            std::mem::size_of::<Counter>() > 0,
+            "Counter must not be zero-sized; it carries an Arc<Mutex<HashMap<..>>>"
+        );
     }
 }
