@@ -2,6 +2,23 @@
 //!
 //! Contains small helper functions used internally by the protocol adapters.
 
+/// Truncate `s` to at most `max_bytes` bytes on a UTF-8 char boundary.
+///
+/// Returns `s` unchanged if it fits within `max_bytes`. Otherwise backs up
+/// to the nearest char boundary at or before `max_bytes`, so the result may
+/// be up to 3 bytes shorter than `max_bytes`. Never panics on multi-byte input.
+pub fn truncate_str_safe(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        s
+    } else {
+        let mut end = max_bytes;
+        while !s.is_char_boundary(end) && end > 0 {
+            end -= 1;
+        }
+        &s[..end]
+    }
+}
+
 /// Truncate a string to `max_len` bytes, appending `suffix` if truncation occurs.
 ///
 /// The final string is at most `max_len` bytes (the suffix is included within
@@ -35,6 +52,44 @@ pub fn truncate_with_suffix(s: &str, max_len: usize, suffix: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn truncate_str_safe_short_enough() {
+        assert_eq!(truncate_str_safe("hello", 10), "hello");
+        assert_eq!(truncate_str_safe("hello", 5), "hello");
+    }
+
+    #[test]
+    fn truncate_str_safe_truncates_ascii() {
+        assert_eq!(truncate_str_safe("hello world", 5), "hello");
+        assert_eq!(truncate_str_safe("abcdef", 3), "abc");
+    }
+
+    #[test]
+    fn truncate_str_safe_respects_utf8_boundaries() {
+        // "é" is 2 bytes in UTF-8: 6 chars = 12 bytes. Cutting at 7 bytes
+        // would split a char, so we back up to 6.
+        let input = "éééééé";
+        let result = truncate_str_safe(input, 7);
+        assert!(result.len() <= 7);
+        assert!(result.is_char_boundary(result.len()));
+        assert_eq!(result, "ééé");
+    }
+
+    #[test]
+    fn truncate_str_safe_empty_and_zero_budget() {
+        assert_eq!(truncate_str_safe("", 5), "");
+        assert_eq!(truncate_str_safe("hello", 0), "");
+        assert_eq!(truncate_str_safe("", 0), "");
+    }
+
+    #[test]
+    fn truncate_str_safe_multibyte_boundary_split() {
+        // "αβγδε" -- each char 2 bytes = 10 bytes total. max_bytes=3 splits
+        // β (bytes 2-3), so we back up to byte 2 -> "α".
+        let input = "αβγδε";
+        assert_eq!(truncate_str_safe(input, 3), "α");
+    }
 
     #[test]
     fn no_truncation_when_short_enough() {

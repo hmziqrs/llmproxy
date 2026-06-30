@@ -185,12 +185,11 @@ pub fn decode_request(req: ChatCompletionRequest) -> Result<CoreRequest, Protoco
                 });
             }
             "tool" => {
-                // OpenAI tool messages lack an explicit is_error field; we default
-                // to false. Some OpenAI-compatible providers support optional
-                // 'status' or 'is_error' fields on tool messages, but ChatMessage
-                // does not capture unknown fields (it lacks #[serde(flatten)]).
-                // Adding a flattened extra Map to ChatMessage would enable this.
-                let is_error = false;
+                // OpenAI tool messages carry an optional `is_error` flag (some
+                // providers spell it `status`, handled via a serde alias on
+                // ChatMessage). Default to false when absent, matching the
+                // Anthropic adapter's `block.is_error.unwrap_or(false)`.
+                let is_error = msg.is_error.unwrap_or(false);
                 let tool_text = msg.content_text();
                 let tool_use_id = msg.tool_call_id.ok_or_else(|| {
                     ProtocolError::InvalidRequest(
@@ -483,6 +482,7 @@ pub fn encode_response(resp: CoreResponse) -> Result<ChatCompletionResponse, Pro
         tool_call_id: None,
         cache_control: None,
         refusal: refusal_text,
+        is_error: None,
     };
 
     let usage = encode_usage(&resp.usage);
@@ -651,6 +651,7 @@ impl StreamEncoder {
                         tool_call_id: None,
                         cache_control: None,
                         refusal: None,
+                        is_error: None,
                     }),
                 }));
             }
@@ -686,6 +687,7 @@ impl StreamEncoder {
                         tool_call_id: None,
                         cache_control: None,
                         refusal: None,
+                        is_error: None,
                     }),
                 }));
             }
@@ -704,6 +706,7 @@ impl StreamEncoder {
                         tool_call_id: None,
                         cache_control: None,
                         refusal: None,
+                        is_error: None,
                     }),
                 }));
             }
@@ -731,6 +734,7 @@ impl StreamEncoder {
                         tool_call_id: None,
                         cache_control: None,
                         refusal: None,
+                        is_error: None,
                     }),
                 }));
             }
@@ -758,6 +762,7 @@ impl StreamEncoder {
                         tool_call_id: None,
                         cache_control: None,
                         refusal: None,
+                        is_error: None,
                     }),
                 }));
             }
@@ -786,6 +791,7 @@ impl StreamEncoder {
                         tool_call_id: None,
                         cache_control: None,
                         refusal: None,
+                        is_error: None,
                     }),
                 }));
 
@@ -860,6 +866,7 @@ impl StreamEncoder {
                 tool_call_id: None,
                 cache_control: None,
                 refusal: None,
+                is_error: None,
             }),
         }));
 
@@ -925,6 +932,69 @@ impl StreamEncoder {
     }
 }
 
+// ---------------------------------------------------------------------------
+// stream_error_sse_payload
+// ---------------------------------------------------------------------------
+
+/// Build the OpenAI Chat stream-error SSE payload for a [`CoreEvent::Error`].
+///
+/// [`StreamEncoder::encode_event`] deliberately returns `Err` for
+/// `CoreEvent::Error` (the OpenAI Chat wire format has no dedicated error
+/// chunk type), so the normal encode path yields no SSE event for an error.
+/// When an error is the *leading* event of a stream, dropping it silently
+/// would leave the first-byte boundary uncrossed and surface a misleading
+/// "empty stream" 502 to the client. This helper synthesizes the error as an
+/// ordinary OpenAI error-object `data:` line so it can cross the boundary as a
+/// real in-band SSE event (200 + error object + `[DONE]`), mirroring the
+/// post-first-byte `emit_stream_error` path in the server crate.
+///
+/// The `error.kind` selects the OpenAI `type` string so the client can
+/// classify the failure (e.g. `rate_limit` vs `server_error`); the sanitized
+/// `error.message()` is used verbatim (it was sanitized at
+/// [`CoreStreamError::new`] construction time in the adapter).
+///
+/// Returns the JSON string suitable for a `data: <json>` SSE line, or `None`
+/// if serialization fails (treated as a dropped event by the caller). The
+/// caller is responsible for emitting the trailing `data: [DONE]` terminator.
+pub fn stream_error_sse_payload(error: &crate::core::CoreStreamError) -> Option<String> {
+    let error_type = match error.kind {
+        crate::core::CoreStreamErrorKind::InvalidRequest => "invalid_request_error",
+        crate::core::CoreStreamErrorKind::Authentication => "authentication_error",
+        crate::core::CoreStreamErrorKind::Permission => "permission_error",
+        crate::core::CoreStreamErrorKind::RateLimit => "rate_limit_error",
+        // Upstream provider failures and internal proxy errors both surface as
+        // server-side errors on the OpenAI wire format.
+        crate::core::CoreStreamErrorKind::Upstream | crate::core::CoreStreamErrorKind::Internal => {
+            "server_error"
+        }
+    };
+    // Reuse the same typed structs as the HTTP error path so both stay
+    // consistent at compile time. Built inline (rather than via the server
+    // crate's `openai_stream_error_json_with_type`) to keep this adapter free
+    // of server/config dependencies (see the module scope guardrails).
+    #[derive(serde::Serialize)]
+    #[serde(deny_unknown_fields)]
+    struct ErrorBody {
+        error: ErrorDetail,
+    }
+    #[derive(serde::Serialize)]
+    #[serde(deny_unknown_fields)]
+    struct ErrorDetail {
+        message: String,
+        r#type: String,
+        code: serde_json::Value,
+    }
+
+    let body = ErrorBody {
+        error: ErrorDetail {
+            message: error.message().to_owned(),
+            r#type: error_type.to_owned(),
+            code: serde_json::Value::Null,
+        },
+    };
+    serde_json::to_string(&body).ok()
+}
+
 // ===========================================================================
 // Tests
 // ===========================================================================
@@ -949,6 +1019,7 @@ mod tests {
                 tool_call_id: None,
                 cache_control: None,
                 refusal: None,
+                is_error: None,
             }],
             stream: None,
             temperature: None,
@@ -1013,6 +1084,7 @@ mod tests {
                 tool_call_id: None,
                 cache_control: None,
                 refusal: None,
+                is_error: None,
             },
         );
         let core = decode_request(req).unwrap();
@@ -1046,6 +1118,7 @@ mod tests {
             tool_call_id: None,
             cache_control: None,
             refusal: None,
+            is_error: None,
         });
         let core = decode_request(req).unwrap();
         assert_eq!(core.messages[1].role, CoreRole::Assistant);
@@ -1071,6 +1144,7 @@ mod tests {
             tool_call_id: Some("call_1".into()),
             cache_control: None,
             refusal: None,
+            is_error: None,
         });
         let core = decode_request(req).unwrap();
         assert_eq!(core.messages[1].role, CoreRole::Tool);
@@ -1099,6 +1173,7 @@ mod tests {
             tool_call_id: None,
             cache_control: None,
             refusal: None,
+            is_error: None,
         });
         let core = decode_request(req).unwrap();
         match &core.messages[1].content[0] {
@@ -1198,6 +1273,7 @@ mod tests {
             tool_call_id: None,
             cache_control: None,
             refusal: None,
+            is_error: None,
         });
         req.messages.push(ChatMessage {
             role: "user".into(),
@@ -1208,6 +1284,7 @@ mod tests {
             tool_call_id: None,
             cache_control: None,
             refusal: None,
+            is_error: None,
         });
         let core = decode_request(req).unwrap();
         assert_eq!(core.messages.len(), 3);
@@ -1241,6 +1318,7 @@ mod tests {
             tool_call_id: None,
             cache_control: None,
             refusal: None,
+            is_error: None,
         });
         let err = decode_request(req).unwrap_err();
         assert!(matches!(err, ProtocolError::Decode(_)));
@@ -1292,6 +1370,7 @@ mod tests {
                     r#type: "ephemeral".into(),
                 }),
                 refusal: None,
+                is_error: None,
             },
         );
         let core = decode_request(req).unwrap();
@@ -1592,6 +1671,39 @@ mod tests {
         // error response, rather than leaking error text into content delta.
         assert!(result.is_err());
         assert!(matches!(result, Err(ProtocolError::Encode(_))));
+    }
+
+    #[test]
+    fn stream_error_sse_payload_builds_typed_error_object() {
+        // The OpenAI StreamEncoder drops CoreEvent::Error (returns Err). The
+        // route handler uses this helper to synthesize the error as an ordinary
+        // OpenAI error-object `data:` line so a *leading* error crosses the
+        // first-byte boundary instead of surfacing a misleading 502
+        // (audit LOW, stream-ids-01).
+        let payload = stream_error_sse_payload(&CoreStreamError::new(
+            CoreStreamErrorKind::RateLimit,
+            "too many requests".into(),
+        ))
+        .expect("payload serializes");
+        let json: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(json["error"]["message"], "too many requests");
+        // RateLimit maps to the OpenAI rate-limit error type.
+        assert_eq!(json["error"]["type"], "rate_limit_error");
+        assert!(json["error"]["code"].is_null());
+        // Must NOT carry Anthropic-shaped fields.
+        assert!(json.get("type").is_none() || json["type"].is_null());
+    }
+
+    #[test]
+    fn stream_error_sse_payload_upstream_is_server_error() {
+        let payload = stream_error_sse_payload(&CoreStreamError::new(
+            CoreStreamErrorKind::Upstream,
+            "provider failed".into(),
+        ))
+        .expect("payload serializes");
+        let json: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(json["error"]["type"], "server_error");
+        assert_eq!(json["error"]["message"], "provider failed");
     }
 
     #[test]
@@ -2199,6 +2311,7 @@ mod tests {
             tool_call_id: None,
             cache_control: None,
             refusal: None,
+            is_error: None,
         });
         let err = decode_request(req).unwrap_err();
         match &err {
@@ -2229,6 +2342,7 @@ mod tests {
             tool_call_id: None,
             cache_control: None,
             refusal: None,
+            is_error: None,
         });
         let err = decode_request(req).unwrap_err();
         match &err {
@@ -2262,6 +2376,7 @@ mod tests {
             tool_call_id: None,
             cache_control: None,
             refusal: None,
+            is_error: None,
         });
         let err = decode_request(req).unwrap_err();
         match &err {
@@ -2287,6 +2402,7 @@ mod tests {
             tool_call_id: None, // missing tool_call_id
             cache_control: None,
             refusal: None,
+            is_error: None,
         });
         let err = decode_request(req).unwrap_err();
         match &err {
@@ -2320,6 +2436,7 @@ mod tests {
             tool_call_id: None,
             cache_control: None,
             refusal: None,
+            is_error: None,
         });
         let core = decode_request(req).unwrap();
         match &core.messages[1].content[0] {
@@ -2333,6 +2450,114 @@ mod tests {
             }
             _ => panic!("expected ToolUse"),
         }
+    }
+
+    #[test]
+    fn tool_message_is_error_decodes_to_core() {
+        // A tool message carrying `is_error: Some(true)` must surface in the
+        // decoded CoreContent::ToolResult, mirroring the Anthropic adapter's
+        // `tool_result_with_is_error_decodes_to_core` regression test.
+        let mut req = make_openai_request();
+        req.messages.push(ChatMessage {
+            role: "tool".into(),
+            content: serde_json::Value::String("boom".into()),
+            reasoning_content: None,
+            tool_calls: vec![],
+            name: None,
+            tool_call_id: Some("call_1".into()),
+            cache_control: None,
+            refusal: None,
+            is_error: Some(true),
+        });
+        let core = decode_request(req).unwrap();
+        match &core.messages[1].content[0] {
+            CoreContent::ToolResult { is_error, .. } => assert!(is_error),
+            _ => panic!("expected ToolResult"),
+        }
+
+        // An absent `is_error` field must default to false (no semantic flip).
+        let mut req = make_openai_request();
+        req.messages.push(ChatMessage {
+            role: "tool".into(),
+            content: serde_json::Value::String("ok".into()),
+            reasoning_content: None,
+            tool_calls: vec![],
+            name: None,
+            tool_call_id: Some("call_2".into()),
+            cache_control: None,
+            refusal: None,
+            is_error: None,
+        });
+        let core = decode_request(req).unwrap();
+        match &core.messages[1].content[0] {
+            CoreContent::ToolResult { is_error, .. } => assert!(!is_error),
+            _ => panic!("expected ToolResult"),
+        }
+
+        // Some OpenAI-compatible providers spell the flag `status`; the serde
+        // alias on ChatMessage must deserialize it into `is_error`.
+        let json = serde_json::json!({
+            "model": "gpt-4o",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {
+                    "role": "tool",
+                    "content": "boom",
+                    "tool_call_id": "call_3",
+                    "status": true,
+                },
+            ],
+        });
+        let req: ChatCompletionRequest = serde_json::from_value(json).unwrap();
+        let core = decode_request(req).unwrap();
+        match &core.messages[1].content[0] {
+            CoreContent::ToolResult { is_error, .. } => assert!(is_error),
+            _ => panic!("expected ToolResult"),
+        }
+    }
+
+    #[test]
+    fn assistant_with_reasoning_tool_calls_and_text_preserves_order() {
+        // Locks the documented Thinking -> ToolUse -> Text ordering invariant
+        // (see the comment in the "assistant" arm of decode_request). The OpenAI
+        // wire format carries reasoning_content, tool_calls, and content as
+        // parallel fields with no defined ordering; a refactor of the early-read
+        // borrow-checker workaround must not silently reorder these.
+        let mut req = make_openai_request();
+        req.messages.push(ChatMessage {
+            role: "assistant".into(),
+            content: serde_json::Value::String("after thinking".into()),
+            reasoning_content: Some("let me think...".into()),
+            tool_calls: vec![ToolCall {
+                index: Some(0),
+                id: Some("call_1".into()),
+                r#type: Some("function".into()),
+                function: Some(FunctionCall {
+                    name: Some("get_weather".into()),
+                    arguments: Some("{\"city\":\"SF\"}".into()),
+                }),
+            }],
+            name: None,
+            tool_call_id: None,
+            cache_control: None,
+            refusal: None,
+            is_error: None,
+        });
+        let core = decode_request(req).unwrap();
+        let content = &core.messages[1].content;
+        assert_eq!(content.len(), 3, "expected Thinking, ToolUse, Text");
+        assert!(
+            matches!(content[0], CoreContent::Thinking { .. }),
+            "first block must be Thinking"
+        );
+        assert!(
+            matches!(content[1], CoreContent::ToolUse { .. }),
+            "second block must be ToolUse"
+        );
+        assert!(
+            matches!(content[2], CoreContent::Text { .. }),
+            "third block must be Text"
+        );
     }
 
     // -- stop field parsing tests ---------------------------------------------

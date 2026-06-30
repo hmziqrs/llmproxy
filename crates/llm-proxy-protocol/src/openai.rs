@@ -176,6 +176,10 @@ pub struct ChatMessage {
     /// the model refuses to answer).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub refusal: Option<String>,
+    /// Tool-result error flag (only meaningful when `role == "tool"`).
+    /// Some OpenAI-compatible providers use `status` instead of `is_error`.
+    #[serde(default, alias = "status", skip_serializing_if = "Option::is_none")]
+    pub is_error: Option<bool>,
 }
 
 impl ChatMessage {
@@ -552,6 +556,7 @@ mod tests {
                 tool_call_id: None,
                 cache_control: None,
                 refusal: None,
+                is_error: None,
             }),
             finish_reason: Some("stop".into()),
             delta: None,

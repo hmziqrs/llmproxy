@@ -681,6 +681,45 @@ fn coverage_matrix_all_required_client_fixtures_exist() {
 //      StreamDecoder).
 // Adding strict output.sse comparison is deferred to a future audit round.
 
+/// Tracked placeholder for the client-side streaming **decode** round-trip.
+///
+/// The client adapters in `llm_proxy_protocol::client` currently expose only a
+/// `StreamEncoder` (see `client::anthropic` and `client::openai_chat`); there
+/// is no client `StreamDecoder` analogous to the provider crate's
+/// `ProviderStreamDecoder`. So parsing of upstream `input.sse` frames into
+/// `CoreEvent`s — the path a real proxy client would exercise on
+/// partial/malformed/abruptly-truncated streams — is unimplemented and
+/// therefore untested at the protocol layer.
+///
+/// This test is kept as a tracked `#[ignore]` stub so the gap is visible in
+/// `cargo test` output (run with `--ignored` to see it) and is not forgotten
+/// when the decoder lands. When a client `StreamDecoder` is implemented,
+/// un-ignore this test and mirror the provider crate's
+/// `run_stream_decode_fixture` (see `llm-proxy-provider/tests/fixture_tests.rs`):
+///
+/// 1. Parse each `(adapter, case)` `input.sse` into SSE frames.
+/// 2. Feed the frames through the new client `StreamDecoder` and collect the
+///    emitted `CoreEvent`s.
+/// 3. Compare the decoded events' variant + fields against
+///    `core-events.json` (semantic comparison, not byte-for-byte, to allow
+///    for framing/normalization differences).
+/// 4. Add a dedicated **malformed / abrupt-truncation** case: feed a frame
+///    split mid-UTF-8 and a stream cut off before the terminal event, and
+///    assert the decoder returns a structured error rather than panicking
+///    or silently dropping the partial frame.
+#[ignore = "client StreamDecoder (input.sse -> CoreEvents) not yet implemented; see doc comment"]
+#[test]
+fn streaming_decode_round_trip() {
+    // This stub intentionally fails if run, so it cannot silently rot into a
+    // false-pass: un-ignore only after implementing the decoder.
+    panic!(
+        "client streaming decode path is unimplemented: parse input.sse through \
+         a client StreamDecoder and compare CoreEvents against core-events.json \
+         (mirror llm-proxy-provider run_stream_decode_fixture), plus a \
+         malformed/truncation case"
+    );
+}
+
 /// Verify that the core-events.json fixture can be deserialized into CoreEvent
 /// values. This is a basic validation that streaming fixtures are well-formed.
 /// Full encode/decode round-trip tests (parsing input.sse through a

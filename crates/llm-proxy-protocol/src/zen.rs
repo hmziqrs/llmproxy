@@ -138,9 +138,11 @@ pub struct ResponsesUsage {
 /// fields are silently ignored rather than causing chunk drops. The `delta`
 /// field carries incremental text for `response.output_text.delta` events.
 /// For `response.function_call_arguments.delta` events, the delta carries
-/// incremental JSON arguments for tool calls. The Responses API provider
-/// adapter emits the full `CoreEvent` tool call lifecycle
-/// (`ToolCallStart`/`ToolCallDelta`/`ToolCallStop`) for these events.
+/// incremental JSON arguments for tool calls. Parallel function calls have
+/// their argument deltas interleaved and disambiguated by `output_index`; the
+/// Responses API provider adapter tracks open blocks per `output_index` and
+/// emits the full `CoreEvent` tool call lifecycle
+/// (`ToolCallStart`/`ToolCallDelta`/`ToolCallStop`) for each.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResponsesChunk {
     /// Chunk type discriminator.
@@ -156,6 +158,17 @@ pub struct ResponsesChunk {
     pub usage: Option<ResponsesUsage>,
     /// Error object present on `response.failed` events.
     pub error: Option<serde_json::Value>,
+    /// Upstream output-item index carried on `response.output_item.added`,
+    /// `response.function_call_arguments.delta`, and
+    /// `response.function_call_arguments.done` events.
+    ///
+    /// The Responses API interleaves parallel function-call argument deltas and
+    /// disambiguates them via this index. Defaults to `None` so legacy chunks
+    /// that predate the field (and non-indexed events like `response.created`)
+    /// still parse. When absent on a function-call event the adapter falls back
+    /// to treating it as a single serial call.
+    #[serde(default)]
+    pub output_index: Option<usize>,
 }
 
 // ---------------------------------------------------------------------------
@@ -192,6 +205,11 @@ pub struct GeminiContent {
     /// Speaker role (e.g. `"user"`, `"model"`).
     pub role: String,
     /// Ordered content parts within this message.
+    ///
+    /// Defaults to an empty vec when omitted. The Gemini API may return a
+    /// candidate with no `parts` (e.g. empty content blocks), so this field is
+    /// deserialized with a default rather than treated as required.
+    #[serde(default)]
     pub parts: Vec<GeminiPart>,
 }
 
@@ -313,7 +331,14 @@ pub struct GeminiResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GeminiCandidate {
     /// The generated content.
-    pub content: GeminiContent,
+    ///
+    /// This is optional because real Gemini API responses routinely omit
+    /// `content` entirely for candidates blocked by `SAFETY`/`RECITATION` or
+    /// for prompt-feedback-only responses. A missing `content` is treated as
+    /// producing no text parts; the stop reason is derived from
+    /// `finish_reason` instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<GeminiContent>,
     /// Reason the model stopped generating (e.g. `"STOP"`).
     #[serde(rename = "finishReason")]
     pub finish_reason: Option<String>,
@@ -403,10 +428,10 @@ mod tests {
     fn gemini_response_round_trip() {
         let resp = GeminiResponse {
             candidates: vec![GeminiCandidate {
-                content: GeminiContent {
+                content: Some(GeminiContent {
                     role: "model".into(),
                     parts: vec![GeminiPart::text("hi there".into())],
-                },
+                }),
                 finish_reason: Some("STOP".into()),
             }],
             usage_metadata: Some(GeminiUsage {
@@ -454,10 +479,26 @@ mod tests {
             output: None,
             usage: None,
             error: None,
+            output_index: None,
         };
         let json = serde_json::to_string(&chunk).unwrap();
         let back: ResponsesChunk = serde_json::from_str(&json).unwrap();
         assert_eq!(back.delta.as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn responses_chunk_output_index_defaulted_when_absent() {
+        // Legacy chunks that predate `output_index` must still parse into None.
+        let json = r#"{"type":"response.created","id":"resp_1"}"#;
+        let back: ResponsesChunk = serde_json::from_str(json).unwrap();
+        assert!(back.output_index.is_none());
+    }
+
+    #[test]
+    fn responses_chunk_output_index_parsed_when_present() {
+        let json = r#"{"type":"response.output_item.added","output_index":3}"#;
+        let back: ResponsesChunk = serde_json::from_str(json).unwrap();
+        assert_eq!(back.output_index, Some(3));
     }
 
     #[test]
