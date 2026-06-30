@@ -132,18 +132,15 @@ mod tests {
         let pid_path = dir.path().join("llm-proxy.pid");
         std::fs::write(&pid_path, "0").unwrap();
 
-        // Use PidManager directly to test the zero-PID validation path.
+        // Exercise the injectable wrapper that performs the zero-PID guard
+        // (the production path used by status/stop). A PID file of "0" must be
+        // rejected rather than returned as Some(0).
         let mgr = llm_proxy_core::PidManager::new(dir.path());
-        let pid = mgr.read_pid().unwrap();
-        assert_eq!(pid, Some(0));
-
-        // The read_pid() wrapper in main should reject PID 0.
-        // We can't easily call it without setting up the global config_dir,
-        // so test the validation logic directly.
-        if let Some(p) = pid {
-            assert!(p == 0);
-            // This matches the check in read_pid(): pid == 0 should bail.
-        }
+        let result = read_pid_from(&mgr);
+        assert!(
+            result.is_err(),
+            "expected PID 0 to be rejected, got {result:?}"
+        );
     }
 
     #[test]

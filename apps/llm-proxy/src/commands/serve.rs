@@ -33,7 +33,13 @@ pub async fn cmd_serve(
     init_tracing(LogFormat::from_env());
 
     // If background mode requested, spawn self as child with --daemonize.
+    // Run the cheap, pure config checks in the parent first so a clearly-bad
+    // --config (wrong extension / unresolvable path) produces a normal error
+    // rather than a spawned-then-immediately-died daemon. Full config loading
+    // (HTTP client build, TOML parse) stays in the child.
     if background && !daemonize {
+        let path = resolve_config(config_path.as_deref());
+        validate_toml_extension(&path)?;
         return spawn_daemon(config_path, port_override);
     }
 
@@ -82,13 +88,9 @@ pub async fn cmd_serve(
         })?;
     }
 
-    // Ensure PID file is cleaned up on shutdown.
-    let cleanup = async move {
-        if let Err(e) = remove_pid() {
-            tracing::warn!(error = %e, "failed to remove PID file during shutdown");
-        }
-    };
-
+    // Ensure PID file is cleaned up on shutdown. The two removal sites below
+    // are mutually exclusive along any path (the deadline branch is followed
+    // by process::exit), so remove_pid() runs exactly once per shutdown.
     let bind_addr = state.bind_address();
     let shutdown_deadline = state.shutdown_timeout();
     let app = build_router(state);
@@ -139,13 +141,17 @@ pub async fn cmd_serve(
                 // Run PID cleanup best-effort, then exit. The deadline exists
                 // precisely to escape stuck connections, so we do not wait for
                 // them; remove_pid is fast, synchronous filesystem I/O.
-                cleanup.await;
+                if let Err(e) = remove_pid() {
+                    tracing::warn!(error = %e, "failed to remove PID file during shutdown");
+                }
                 std::process::exit(1);
             }
         }
     };
 
-    cleanup.await;
+    if let Err(e) = remove_pid() {
+        tracing::warn!(error = %e, "failed to remove PID file during shutdown");
+    }
 
     match result {
         Ok(()) => {
@@ -266,14 +272,49 @@ fn spawn_daemon(config_path: Option<PathBuf>, port_override: Option<u16>) -> Res
     let pid = child.id();
 
     // Write the PID file before detaching so callers can reliably find it.
+    //
+    // A failed write here is fatal for the background path: `cmd_stop` would
+    // print "no PID file found -- server not running" and be unable to stop
+    // the daemon, and a second `serve --background` is only guarded by the
+    // child's own create_new PID-file check (serve.rs:63) rather than this
+    // parent write. Rather than hand the user an unmanageable daemon, kill
+    // the just-spawned child and bail so they get a clear, recoverable error
+    // (audit finding app-cli:serve-daemon-pid-write-failure-orphan).
     if let Err(e) = write_pid_value(pid) {
-        tracing::warn!(error = %e, "failed to write PID file for daemon child");
+        // Best-effort cleanup: send SIGKILL so the child cannot continue, then
+        // reap it. We do not propagate a kill/reap failure over the original
+        // PID-write error -- the original cause is what the user needs to see.
+        if let Err(kill_err) = child.kill() {
+            tracing::error!(
+                error = %kill_err,
+                pid,
+                "failed to kill orphaned daemon child after PID-file write failure"
+            );
+        }
+        match child.wait() {
+            Ok(status) => {
+                tracing::info!(%status, "reaped daemon child after PID-file write failure");
+            }
+            Err(wait_err) => {
+                tracing::warn!(error = %wait_err, "failed to reap daemon child");
+            }
+        }
+        bail!(
+            "daemon child (PID {pid}) was spawned but writing its PID file failed: {e}; \
+             the child has been killed to avoid leaving an unmanageable daemon"
+        );
     }
 
     // Confirm the child is still alive before reporting success.
     std::thread::sleep(std::time::Duration::from_millis(100));
     match child.try_wait() {
         Ok(Some(status)) => {
+            // The child died before it could manage its own PID file (it only
+            // reaches its write_pid() after load_toml_state succeeds), so remove
+            // the one we wrote to avoid leaving a stale entry on disk.
+            if let Err(e) = crate::pid::remove_pid() {
+                tracing::warn!(error = %e, "failed to remove PID file after daemon child exited immediately");
+            }
             bail!(
                 "daemon child exited immediately with status {}",
                 status

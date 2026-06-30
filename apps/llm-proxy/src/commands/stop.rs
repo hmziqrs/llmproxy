@@ -13,6 +13,40 @@ use anyhow::{Result, bail};
 use crate::paths::CommandPaths;
 use crate::pid::{STOP_MAX_POLLS, STOP_POLL_INTERVAL_MS, is_process_running, read_pid_from};
 
+/// Outcome of a best-effort re-read of the PID file immediately before
+/// signaling. Used to narrow the TOCTOU / PID-reuse window in `cmd_stop`.
+///
+/// Only meaningful on Unix, where `cmd_stop` actually signals processes; gated
+/// to match its `#[cfg(unix)]` call sites so non-Unix builds do not see a
+/// dead-code warning.
+#[cfg(unix)]
+#[derive(Debug)]
+enum PidOwnership {
+    /// The PID file still holds exactly `expected`.
+    StillOurs,
+    /// The PID file now holds a different PID -- refuse to signal `expected`.
+    Changed(u32),
+    /// The PID file is gone, unreadable, or corrupt -- treat the process as no
+    /// longer owned/tracked.
+    Gone,
+}
+
+/// Re-read the PID file and classify it relative to `expected`.
+///
+/// Any error from `read_pid_from` (missing file, unreadable, corrupt contents,
+/// invalid PID) is collapsed to [`PidOwnership::Gone`] rather than propagated,
+/// because this is the *verification* read whose sole job is to decide whether
+/// it is still safe to signal `expected`.
+#[cfg(unix)]
+fn classify_pid_ownership(mgr: &llm_proxy_core::PidManager, expected: u32) -> PidOwnership {
+    match read_pid_from(mgr) {
+        Ok(Some(current)) if current == expected => PidOwnership::StillOurs,
+        Ok(Some(other)) => PidOwnership::Changed(other),
+        Ok(None) => PidOwnership::Gone,
+        Err(_) => PidOwnership::Gone,
+    }
+}
+
 /// Run the `stop` command against the given paths using the production poll
 /// cadence ([`STOP_MAX_POLLS`] × [`STOP_POLL_INTERVAL_MS`]).
 ///
@@ -54,6 +88,43 @@ pub fn cmd_stop_with_timing(
 
             #[cfg(unix)]
             {
+                // Narrow the TOCTOU / PID-reuse window before signaling.
+                //
+                // After the initial `read_pid_from` + `is_process_running` we may
+                // have spent time doing I/O; re-read the PID file immediately
+                // before sending the signal and refuse to proceed unless the file
+                // still holds the *same* PID. If the daemon exited and cleaned up
+                // its PID file (or the file was rewritten with a different PID),
+                // we no longer own this PID and must not signal it.
+                //
+                // NOTE: this is NOT a full PID-identity check. `is_process_running`
+                // only probes existence via `kill(pid, 0)`, and this re-read only
+                // confirms the PID file still agrees with the PID we resolved. If
+                // the OS recycled the *exact* PID for an unrelated process AND the
+                // stale PID file was never updated, `stop` could still signal a
+                // bystander. A robust fix needs platform-specific identity
+                // verification (Linux `/proc/<pid>/comm`/`cmdline` or process
+                // start-time; macOS `libproc` `proc_name`), which is intentionally
+                // out of scope here to avoid pulling extra platform deps. The
+                // re-read below removes the most common races (PID file cleared on
+                // clean shutdown, or rewritten by a new `serve`).
+                match classify_pid_ownership(mgr, pid) {
+                    PidOwnership::StillOurs => { /* unchanged */ }
+                    PidOwnership::Changed(other) => {
+                        bail!(
+                            "PID file changed while stopping (was {pid}, now {other}); \
+                             refusing to signal {pid} to avoid hitting an unrelated process"
+                        );
+                    }
+                    PidOwnership::Gone => {
+                        println!(
+                            "PID file disappeared before signaling; server likely already \
+                             stopped (was PID {pid})"
+                        );
+                        return Ok(());
+                    }
+                }
+
                 // Send SIGTERM.
                 let ret = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
                 if ret != 0 {
@@ -85,6 +156,27 @@ pub fn cmd_stop_with_timing(
 
             #[cfg(unix)]
             {
+                // Re-verify ownership immediately before the forceful SIGKILL,
+                // which is the most dangerous signal: the polling loop above may
+                // have run for several seconds, during which the PID file could
+                // have been cleared or rewritten. See the SIGTERM block above for
+                // the rationale and the residual PID-reuse caveat.
+                match classify_pid_ownership(mgr, pid) {
+                    PidOwnership::StillOurs => { /* unchanged */ }
+                    PidOwnership::Changed(other) => {
+                        bail!(
+                            "PID file changed during graceful-shutdown wait \
+                             (was {pid}, now {other}); refusing to SIGKILL {pid} to \
+                             avoid hitting an unrelated process"
+                        );
+                    }
+                    PidOwnership::Gone => {
+                        // The process exited (and cleaned up its PID file) during
+                        // the wait -- no escalation needed.
+                        println!("server stopped during graceful-shutdown wait (PID {pid} gone)");
+                        return Ok(());
+                    }
+                }
                 let ret = unsafe { libc::kill(pid as i32, libc::SIGKILL) };
                 if ret != 0 {
                     let err = std::io::Error::last_os_error();

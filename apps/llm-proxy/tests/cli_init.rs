@@ -3,10 +3,46 @@
 //! Verifies file creation, content validity, permissions, and idempotency.
 
 use std::fs;
+use std::sync::Mutex;
 
+use llm_proxy_app::commands::cmd_init;
 use llm_proxy_app::defaults::{
     DEFAULT_CONFIG_TOML, DEFAULT_PROVIDER_OPENCODE_GO, DEFAULT_PROVIDER_OPENCODE_ZEN,
 };
+
+/// Serializes tests that mutate the process-global `$HOME` env var so they do
+/// not race with each other when run in parallel. Every such test must hold
+/// this lock for its whole body and restore `$HOME` before releasing it.
+static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+/// RAII guard that sets `$HOME` to `temp_home` on construction and restores the
+/// prior value on drop. Must be constructed while holding [`ENV_LOCK`].
+struct HomeGuard {
+    prior: Option<String>,
+}
+
+impl HomeGuard {
+    fn new(temp_home: &std::path::Path) -> Self {
+        // SAFETY: callers hold ENV_LOCK, so no other test mutates/reads HOME
+        // concurrently. We always restore on drop.
+        let prior = std::env::var_os("HOME").map(|v| v.to_string_lossy().into_owned());
+        // SAFETY: see above; this test is the sole mutator of HOME under the lock.
+        unsafe { std::env::set_var("HOME", temp_home) };
+        Self { prior }
+    }
+}
+
+impl Drop for HomeGuard {
+    fn drop(&mut self) {
+        // SAFETY: held under ENV_LOCK; restores the pre-test HOME value.
+        unsafe {
+            match self.prior.as_ref() {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+    }
+}
 
 #[test]
 fn init_default_toml_is_valid() {
@@ -75,13 +111,43 @@ fn init_writes_files_to_tempdir() {
     assert_eq!(zen["provider"]["name"].as_str(), Some("opencode-zen"));
 }
 
+/// `cmd_init` must refuse to overwrite an existing config and leave the file
+/// contents untouched.
+///
+/// `cmd_init` resolves its config directory via `$HOME` (see `paths::config_dir`).
+/// We point `$HOME` at a tempdir, pre-create the config file, invoke the real
+/// `cmd_init`, and assert it returns `Err` with the "already exists" message
+/// without overwriting the file. `$HOME` mutation is serialized via `ENV_LOCK`.
 #[test]
 fn init_rejects_existing_config() {
-    let dir = tempfile::tempdir().unwrap();
-    let config_path = dir.path().join("config.toml");
-    fs::write(&config_path, "existing").unwrap();
-    // The actual cmd_init() bails if the file exists — verify the condition.
-    assert!(config_path.exists());
+    let _env_guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    // cmd_init writes to $HOME/.config/llm-proxy/config.toml.
+    let config_subdir = dir.path().join(".config").join("llm-proxy");
+    fs::create_dir_all(&config_subdir).expect("create config dir");
+    let config_path = config_subdir.join("config.toml");
+    fs::write(&config_path, "existing").expect("seed existing config");
+
+    let _home = HomeGuard::new(dir.path());
+
+    // The real command must bail because the config already exists.
+    let result = cmd_init();
+    let err = result.expect_err("cmd_init should reject an existing config");
+
+    // The bail message names the config path and the "already exists" condition.
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("already exists"),
+        "error should mention the config already existing, got: {msg}"
+    );
+
+    // The existing file must NOT have been overwritten.
+    let on_disk = fs::read_to_string(&config_path).expect("read config");
+    assert_eq!(
+        on_disk, "existing",
+        "cmd_init must not overwrite an existing config"
+    );
 }
 
 #[test]

@@ -131,15 +131,63 @@ pub fn build_info() -> BuildInfo {
 /// [`LogFormat::from_env`], before the TOML config is loaded (tracing is needed
 /// during config loading itself). To control log verbosity, set `RUST_LOG`.
 pub fn init_tracing(log_format: LogFormat) {
-    use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
-    // Fallback to "info" level when RUST_LOG is not set. "info" is a known-valid
-    // filter string so parse_lossy is safe here (it never panics).
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::builder().parse_lossy("info"));
-    let registry = tracing_subscriber::registry().with(filter);
+    // Delegates to [`build_log_layer`] so the format-selection logic
+    // (`.json()` vs plain) is exercised by `build_log_layer`'s own tests and
+    // is not duplicated here. The public signature is unchanged.
+    //
+    // The filter is attached *to the boxed layer* (via `Layer::with_filter`)
+    // rather than to the registry first. `build_log_layer` returns a type-erased
+    // `Box<dyn Layer<Registry>>`; chaining `.with(filter).with(boxed_layer)`
+    // would require the erased layer to implement `Layer<Layered<EnvFilter,
+    // Registry>>`, which the `Box<dyn Layer<S>>` blanket impl does not provide
+    // (its `S` is fixed to `Registry`). Filtering the layer instead yields a
+    // concrete `Filtered<..>` type that implements `Layer<Registry>` and
+    // composes cleanly with `registry().with(...)`.
+    use tracing_subscriber::Layer;
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+    let filter = build_env_filter();
+    let layer = build_log_layer(log_format, std::io::stdout).with_filter(filter);
+    tracing_subscriber::registry().with(layer).init();
+}
+
+/// Build the [`EnvFilter`] for tracing.
+///
+/// Falls back to `"info"` when `RUST_LOG` is unset. `"info"` is a known-valid
+/// filter string, so `parse_lossy` is safe here (it never panics).
+fn build_env_filter() -> tracing_subscriber::EnvFilter {
+    use tracing_subscriber::EnvFilter;
+    EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::builder().parse_lossy("info"))
+}
+
+/// Build the tracing-subscriber fmt layer for `log_format`, writing to the sink
+/// produced by `make_writer`.
+///
+/// Extracted from [`init_tracing`] so the format selection
+/// (plain vs `.json()`) is independently testable: a test passes a buffer-backed
+/// [`MakeWriter`] here, installs the composed subscriber as the thread-local
+/// default, emits a [`tracing::event!`], and asserts on the captured bytes —
+/// without needing to call the global, process-wide `init()` (which can only
+/// run once and would race with other tests).
+///
+/// Returns a boxed, type-erased layer so callers (and tests) do not have to
+/// name the concrete `Layer` generic over the writer type.
+fn build_log_layer<W>(
+    log_format: LogFormat,
+    make_writer: W,
+) -> Box<dyn tracing_subscriber::Layer<tracing_subscriber::Registry> + Send + Sync>
+where
+    W: for<'writer> tracing_subscriber::fmt::MakeWriter<'writer> + Send + Sync + 'static,
+{
+    use tracing_subscriber::{fmt, layer::Layer};
     match log_format {
-        LogFormat::Plain => registry.with(fmt::layer()).init(),
-        LogFormat::Json => registry.with(fmt::layer().json()).init(),
+        LogFormat::Plain => Box::new(
+            fmt::layer()
+                .with_writer(make_writer)
+                .with_ansi(false)
+                .boxed(),
+        ),
+        LogFormat::Json => Box::new(fmt::layer().json().with_writer(make_writer).boxed()),
     }
 }
 
@@ -212,5 +260,160 @@ enforce = true
         let warning = catalog_enforcement_warning(&provider, directory.path());
 
         assert!(warning.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Log format tests (drive the extracted `build_log_layer` helper)
+    // -----------------------------------------------------------------------
+    //
+    // These tests install the composed subscriber as the thread-local default
+    // via `Subscriber::set_default` (a scoped guard), NOT via the global
+    // `init()`. `init()` can only run once per process and would race with
+    // other tests; `set_default` scopes the subscriber to this thread only, so
+    // a buffer `MakeWriter` captures exactly the events emitted here. This is
+    // the standard `tracing-subscriber` pattern for isolated format tests.
+
+    /// Emit a known `tracing::event!` while `subscriber` is the thread-local
+    /// default, returning the captured bytes.
+    fn capture_event_for(log_format: LogFormat) -> Vec<u8> {
+        use std::sync::{Arc, Mutex};
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        // `BufferWriter` is a tiny newtype that implements
+        // `tracing_subscriber::fmt::MakeWriter` by locking the shared buffer
+        // and returning a `MutexGuard`-backed writer. The layer clones the
+        // `BufferWriter` (cheap `Arc` clone) internally; we keep the original
+        // `Arc` to read the captured bytes after the event is emitted.
+        let layer = build_log_layer(log_format, BufferWriter(Arc::clone(&buf)));
+        // `SubscriberExt::with` must be in scope to compose the layer onto the
+        // registry. `set_default` (not the one-shot global `init`) scopes the
+        // subscriber to this thread only, so a buffer `MakeWriter` captures
+        // exactly the events emitted here and tests do not race with each other.
+        use tracing_subscriber::layer::SubscriberExt;
+        let subscriber = tracing_subscriber::registry().with(layer);
+        // Scope the subscriber to this thread only. `set_default` (from the
+        // `tracing` crate) takes the subscriber by value and returns a guard
+        // that restores the prior subscriber on drop. This avoids the global
+        // `init()` (one-shot, process-wide, would race with other tests).
+        //
+        // The fmt layer (and the subscriber+guard that own it) clones the
+        // `BufferWriter`/`Arc` internally and may outlive the `event!` call, so
+        // this helper does NOT depend on `Arc::try_unwrap` to recover the
+        // buffer (that would race the layer's drop and panic spuriously). The
+        // captured bytes are read through a shared `lock()` on the live `Arc`
+        // instead, which is correct regardless of how many clones exist.
+        {
+            let _guard = tracing::subscriber::set_default(subscriber);
+            tracing::event!(
+                target: "log_format_test",
+                tracing::Level::INFO,
+                message = "log-format-probe",
+                probe = "plain-or-json",
+            );
+        }
+        buf.lock().expect("buffer lock not poisoned").clone()
+    }
+
+    /// `MakeWriter` implementation backed by a shared, lockable byte buffer.
+    ///
+    /// `tracing_subscriber::fmt::MakeWriter` is not implemented for
+    /// `Arc<Mutex<Vec<u8>>>` directly (the `Arc<W>` blanket impl requires
+    /// `W: MakeWriter`, and `Mutex<Vec<u8>>` is not a writer), so this newtype
+    /// provides the impl explicitly. Each `make_writer` call returns a
+    /// `MutexGuard<'static>`-shaped writer that appends bytes to the shared
+    /// buffer; the `MutexGuard` is `Send` and `Sync` and lives as long as the
+    /// borrowed `Arc` (which the layer clones and holds for `'static`).
+    #[derive(Clone)]
+    struct BufferWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for BufferWriter {
+        type Writer = BufferWriterGuard<'a>;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            BufferWriterGuard(self.0.lock().expect("buffer lock not poisoned"))
+        }
+    }
+
+    /// Write handle for [`BufferWriter`], backed by a `MutexGuard` over the
+    /// shared buffer. Implements `Write` by appending directly.
+    struct BufferWriterGuard<'a>(std::sync::MutexGuard<'a, Vec<u8>>);
+
+    impl<'a> std::io::Write for BufferWriterGuard<'a> {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Minimal structural check that `line` is a single JSON object (starts with
+    /// `{`, ends with `}`). A full `serde_json` parse is intentionally avoided
+    /// to keep this test off a `serde_json` dev-dependency in the app crate; the
+    /// brace check plus key-content assertions below are sufficient to
+    /// distinguish the JSON formatter from the human-readable plain formatter.
+    fn looks_like_json_object(line: &str) -> bool {
+        let trimmed = line.trim();
+        trimmed.starts_with('{') && trimmed.ends_with('}')
+    }
+
+    #[test]
+    fn json_log_format_yields_a_json_object_line() {
+        let captured = String::from_utf8(capture_event_for(LogFormat::Json))
+            .expect("captured bytes are UTF-8");
+        assert!(
+            !captured.is_empty(),
+            "a tracing::event! must produce output under LogFormat::Json"
+        );
+        // Each non-empty line must be a single JSON object (one per event).
+        for line in captured.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            assert!(
+                looks_like_json_object(line),
+                "LogFormat::Json line must be a JSON object, got: {line}"
+            );
+        }
+        // The JSON formatter emits `level` and the `fields.message` payload as
+        // structured keys. Assert both are present to prove our `event!`
+        // reached the JSON formatter and the fields were serialized (not
+        // dropped by a future edit to `build_log_layer`).
+        assert!(
+            captured.contains("\"level\"") && captured.contains("INFO"),
+            "JSON log must carry the structured `level` field, got: {captured}"
+        );
+        assert!(
+            captured.contains("log-format-probe"),
+            "JSON log must carry the emitted message value, got: {captured}"
+        );
+    }
+
+    #[test]
+    fn plain_log_format_does_not_emit_a_json_object() {
+        let captured = String::from_utf8(capture_event_for(LogFormat::Plain))
+            .expect("captured bytes are UTF-8");
+        assert!(
+            !captured.is_empty(),
+            "a tracing::event! must produce output under LogFormat::Plain"
+        );
+        // Take the first non-empty line. Under Plain it is human-readable text
+        // like `2026-... INFO log_format_test: ...` and must NOT be a JSON
+        // object — if it were, the format selection in `build_log_layer` would
+        // be broken (Plain behaving like Json).
+        let first = captured
+            .lines()
+            .find(|line| !line.trim().is_empty())
+            .expect("at least one non-empty log line");
+        assert!(
+            !looks_like_json_object(first),
+            "Plain log line must NOT be a JSON object, got: {first}"
+        );
+        // Sanity: the probe message still reached the formatter.
+        assert!(
+            captured.contains("log-format-probe"),
+            "Plain log must still carry the emitted message, got: {captured}"
+        );
     }
 }
