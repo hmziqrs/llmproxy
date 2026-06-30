@@ -1,10 +1,11 @@
 use std::sync::Arc;
+use std::time::Instant;
 
 use axum::{
     Router,
     extract::{DefaultBodyLimit, Request, State},
     http::{HeaderName, HeaderValue, Method, StatusCode, header},
-    middleware::{Next, from_fn, from_fn_with_state},
+    middleware::{Next, from_fn_with_state},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -17,6 +18,7 @@ use tracing::info_span;
 
 use crate::middleware::{RequestId, RequestIdGenerator};
 use crate::state::AppState;
+use llm_proxy_storage::EventBus;
 
 mod chat;
 mod core_pipeline;
@@ -79,6 +81,11 @@ pub fn router(state: AppState) -> Router {
     // request and stamps it into extensions so the tracing span, the handler,
     // and the `x-request-id` header all share a single id (audit MEDIUM-1).
     let id_gen = state.request_id_gen.clone();
+    // Clone the shared event bus before `state` is moved into the router, so the
+    // error-normalisation layer can emit a `ResponseFailed` for 408/413
+    // rejections produced by the timeout/body-limit layers (audit finding: layer
+    // fallbacks emit no terminal event).
+    let event_bus = Arc::clone(&state.event_bus);
 
     // Span factory shared by both routers: it reads the id injected by the
     // outermost layer so every request span carries `request_id`, matching the
@@ -116,7 +123,7 @@ pub fn router(state: AppState) -> Router {
     // Anthropic/OpenAI-shaped JSON schema every handler uses.
     let api_middleware = ServiceBuilder::new()
         .layer(from_fn_with_state(id_gen, inject_request_id))
-        .layer(from_fn(normalize_error_responses))
+        .layer(from_fn_with_state(event_bus, normalize_error_responses))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .layer(trace)
         .layer(TimeoutLayer::with_status_code(
@@ -274,8 +281,13 @@ fn make_request_span(req: &Request) -> tracing::Span {
 /// [`error_response::route_error_response`] with the correct protocol envelope,
 /// and stamps the `x-request-id` header from extensions so the 408/413 paths
 /// match the schema every handler returns.
-async fn normalize_error_responses(req: Request, next: Next) -> Response {
+async fn normalize_error_responses(
+    State(event_bus): State<Arc<dyn EventBus>>,
+    req: Request,
+    next: Next,
+) -> Response {
     // Capture everything we need before the request is consumed by `next`.
+    let start = Instant::now();
     let protocol = protocol_for_path(req.uri().path());
     let request_id = req.extensions().get::<RequestId>().cloned();
     let response = next.run(req).await;
@@ -296,6 +308,19 @@ async fn normalize_error_responses(req: Request, next: Next) -> Response {
     } else {
         error_response::RouteError::PayloadTooLarge
     };
+
+    // Emit a `ResponseFailed` so a 408 timeout or 413 oversize-body rejection
+    // is attributable in the structured event log. These rejections are produced
+    // by the timeout/body-limit layers BELOW this one, so the request handler
+    // never runs and would otherwise leave no terminal event. `inject_request_id`
+    // (layer 1, outer) has already stamped the id, so it is present here
+    // (audit finding: layer fallbacks emit no terminal event). provider/model
+    // are unknown at this layer (pre-dispatch).
+    let id_str = request_id
+        .as_ref()
+        .map(|id| id.0.as_str())
+        .unwrap_or("layer-rejection");
+    core_pipeline::emit_response_failed(&event_bus, id_str, None, None, &error, start);
 
     let mut rewritten = error_response::route_error_response(protocol, error);
     if let Some(id) = request_id {
@@ -324,7 +349,7 @@ fn protocol_for_path(path: &str) -> error_response::ClientProtocol {
     }
 }
 
-async fn not_found(req: Request) -> impl IntoResponse {
+async fn not_found(State(state): State<AppState>, req: Request) -> impl IntoResponse {
     // Protocol-aware 404: return OpenAI-shaped errors for provider-scoped chat
     // routes and any path under /v1/chat/ (future OpenAI chat sub-routes), and
     // Anthropic-shaped errors for everything else.
@@ -338,6 +363,20 @@ async fn not_found(req: Request) -> impl IntoResponse {
     // be to maintain a route-to-protocol mapping that is consulted by the
     // fallback handler. For now, the prefix-based approach is sufficient
     // because only two protocols are mounted and their paths are disjoint.
+
+    // Capture the request id BEFORE the body is consumed so the response
+    // carries the same correlation header every handler-emitted status does.
+    // The id is injected by `inject_request_id`; for a request that bypassed
+    // that layer (e.g. a fully-unknown path reaching the top-level fallback
+    // outside the sub-router wrapping), the extension is absent and we fall
+    // back to "unknown" (audit MEDIUM-1).
+    let start = Instant::now();
+    let request_id = req
+        .extensions()
+        .get::<RequestId>()
+        .cloned()
+        .unwrap_or_else(|| RequestId("unknown".to_owned()));
+
     let path = req.uri().path().to_owned();
 
     // Drain the body to ensure the connection is cleaned up promptly.
@@ -350,8 +389,19 @@ async fn not_found(req: Request) -> impl IntoResponse {
         tracing::trace!(error = %e, "body drain in 404 handler failed");
     }
 
+    let error = error_response::RouteError::NotFound;
+    // Emit a `ResponseFailed` so a 404 is attributable in the structured event
+    // log (audit finding: layer fallbacks emit no terminal event). provider/model
+    // are None (pre-dispatch); the request id falls back to "unknown" for paths
+    // that were never assigned one.
+    core_pipeline::emit_response_failed(&state.event_bus, &request_id.0, None, None, &error, start);
+
     let protocol = protocol_for_path(&path);
-    error_response::route_error_response(protocol, error_response::RouteError::NotFound)
+    let mut response = error_response::route_error_response(protocol, error);
+    if let Ok(value) = request_id.0.parse() {
+        response.headers_mut().insert("x-request-id", value);
+    }
+    response
 }
 
 /// Protocol-aware 405 Method Not Allowed fallback (audit LOW-27).
@@ -371,7 +421,17 @@ async fn not_found(req: Request) -> impl IntoResponse {
 /// [`error_response::RouteError::MethodNotAllowed`] so the 405 body is produced
 /// by the single shared encoder every other status code uses (audit LOW-27),
 /// rather than a bespoke inline envelope.
-async fn method_not_allowed(req: Request) -> impl IntoResponse {
+async fn method_not_allowed(State(state): State<AppState>, req: Request) -> impl IntoResponse {
+    // Capture the request id BEFORE the body is consumed so the 405 response
+    // carries the same correlation header every handler-emitted status does,
+    // matching [`not_found`] (audit MEDIUM-1).
+    let start = Instant::now();
+    let request_id = req
+        .extensions()
+        .get::<RequestId>()
+        .cloned()
+        .unwrap_or_else(|| RequestId("unknown".to_owned()));
+
     let path = req.uri().path().to_owned();
 
     // Drain the body for the same connection-cleanup reason as [`not_found`].
@@ -379,8 +439,18 @@ async fn method_not_allowed(req: Request) -> impl IntoResponse {
         tracing::trace!(error = %e, "body drain in 405 handler failed");
     }
 
+    let error = error_response::RouteError::MethodNotAllowed;
+    // Emit a `ResponseFailed` so a 405 is attributable in the structured event
+    // log (audit finding: layer fallbacks emit no terminal event), mirroring
+    // [`not_found`].
+    core_pipeline::emit_response_failed(&state.event_bus, &request_id.0, None, None, &error, start);
+
     let protocol = protocol_for_path(&path);
-    error_response::route_error_response(protocol, error_response::RouteError::MethodNotAllowed)
+    let mut response = error_response::route_error_response(protocol, error);
+    if let Ok(value) = request_id.0.parse() {
+        response.headers_mut().insert("x-request-id", value);
+    }
+    response
 }
 
 #[cfg(test)]

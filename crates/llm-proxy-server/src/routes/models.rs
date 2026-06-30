@@ -5,17 +5,21 @@
 //! The response is a normalized superset model card that includes both OpenAI
 //! and Anthropic fields so either SDK can consume it.
 
+use std::sync::Arc;
+
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderValue, Response, StatusCode, header};
 use axum::response::IntoResponse;
+use llm_proxy_protocol::core::ModelRef;
 use llm_proxy_provider::ProviderError;
 use serde::Serialize;
 use tracing::warn;
 
 use crate::state::AppState;
 
-use super::error_response::{ClientProtocol, RouteError, route_error_response};
+use super::core_pipeline;
+use super::error_response::{AuthOwner, ClientProtocol, RouteError, route_error_response};
 
 // ---------------------------------------------------------------------------
 // Response types
@@ -87,13 +91,24 @@ pub(super) struct ModelsQuery {
 ///
 /// Returns the configured catalog, optionally refreshing discovery with
 /// `?refresh=live`. When no catalog is configured, returns an empty list.
-pub async fn handle_models(
+///
+/// The query string is parsed inside the handler (rather than via a
+/// `Query<ModelsQuery>` extractor) so a malformed query string -- e.g. a
+/// duplicate `?refresh=a&refresh=b`, which axum's extractor rejects with a
+/// plain-text 400 -- is mapped into the same OpenAI-shaped JSON envelope every
+/// other status on this route returns, instead of an inconsistent bare-text
+/// rejection that also lacks the `x-request-id` header.
+pub(crate) async fn handle_models(
     State(state): State<AppState>,
     Path(provider): Path<String>,
-    Query(query): Query<ModelsQuery>,
+    req: axum::extract::Request,
 ) -> Response<Body> {
-    let refresh_live = query.refresh.as_deref() == Some("live");
-    match handle_models_inner(&state, &provider, refresh_live).await {
+    // The wrapper only renders: it does NOT emit ResponseFailed. /models has no
+    // core-pipeline dispatch, so each early-gate error return inside the inner
+    // function emits exactly one ResponseFailed itself. A blanket emit here
+    // would double-count, so the wrapper stays emit-free
+    // (audit route-responsefailed-gaps regression).
+    match handle_models_inner(&state, &provider, req).await {
         Ok(response) => response,
         Err(error) => {
             warn!(error = %error, "models request failed");
@@ -102,23 +117,86 @@ pub async fn handle_models(
     }
 }
 
+/// Inner handler that returns `Result` so errors can be mapped uniformly.
+///
+/// ResponseFailed emission discipline (audit route-responsefailed-gaps): /models
+/// has no core-pipeline dispatch, so each early-gate error return emits exactly
+/// one ResponseFailed here. /models has no request-id extension (it does not
+/// pass through the inference request-id middleware), so a stable sentinel
+/// ("models") correlates the event to this endpoint; the provider path segment
+/// is carried in the event. model is None because /models lists all models and
+/// is not bound to a single ModelRef.
 async fn handle_models_inner(
     state: &AppState,
     provider_name: &str,
-    refresh_live: bool,
+    req: axum::extract::Request,
 ) -> Result<Response<Body>, RouteError> {
-    super::core_pipeline::validate_provider_name(provider_name)?;
+    let start = std::time::Instant::now();
+    let event_bus = Arc::clone(&state.event_bus);
+    let request_id = "models";
+    // Surface the axum QueryRejection (a plain-text 400) through the shared
+    // JSON envelope so malformed-query responses are consistent with the rest
+    // of the API. Parsed inside the handler (not via a Query extractor) so the
+    // rejection is mapped into RouteError and emits one ResponseFailed.
+    let query = Query::<ModelsQuery>::try_from_uri(req.uri())
+        .map(|query| query.0)
+        .map_err(|rejection| {
+            warn!(error = %rejection, "malformed query string on /v1/models");
+            RouteError::InvalidRequest("malformed query string".to_owned())
+        })
+        .inspect_err(|e| {
+            core_pipeline::emit_response_failed(
+                &event_bus,
+                request_id,
+                Some(provider_name),
+                None::<&ModelRef>,
+                e,
+                start,
+            )
+        })?;
+    let refresh_live = query.refresh.as_deref() == Some("live");
+
+    core_pipeline::validate_provider_name(provider_name).inspect_err(|e| {
+        core_pipeline::emit_response_failed(
+            &event_bus,
+            request_id,
+            Some(provider_name),
+            None::<&ModelRef>,
+            e,
+            start,
+        )
+    })?;
     // Look up the provider. Returns 404 if not found.
     let provider = state
         .providers()
         .get(provider_name)
-        .ok_or_else(|| RouteError::UnknownProvider(provider_name.to_owned()))?;
+        .ok_or_else(|| RouteError::UnknownProvider(provider_name.to_owned()))
+        .inspect_err(|e| {
+            core_pipeline::emit_response_failed(
+                &event_bus,
+                request_id,
+                Some(provider_name),
+                None::<&ModelRef>,
+                e,
+                start,
+            )
+        })?;
 
     let entries = state
         .model_catalogs()
         .catalog(provider, refresh_live)
         .await
-        .map_err(map_catalog_error)?;
+        .map_err(map_catalog_error)
+        .inspect_err(|e| {
+            core_pipeline::emit_response_failed(
+                &event_bus,
+                request_id,
+                Some(provider_name),
+                None::<&ModelRef>,
+                e,
+                start,
+            )
+        })?;
 
     // Build model cards from static entries.
     // `entries` is fully owned (returned by value), so derive the pagination
@@ -179,20 +257,22 @@ fn map_catalog_error(error: ProviderError) -> RouteError {
             RouteError::Upstream {
                 status: status_code,
                 body,
+                auth_owner: AuthOwner::Operator,
             }
         }
-        ProviderError::Http {
-            message: _,
-            timeout: true,
-        } => RouteError::UpstreamTimeout("upstream request timed out".to_owned()),
+        ProviderError::Http { timeout: true, .. } => {
+            RouteError::UpstreamTimeout("upstream request timed out".to_owned())
+        }
         ProviderError::Http {
             message,
             timeout: false,
+            ..
         } => {
             let sanitized = super::core_pipeline::sanitize_upstream_error_body(&message);
             RouteError::Upstream {
                 status: StatusCode::BAD_GATEWAY,
                 body: sanitized,
+                auth_owner: AuthOwner::Operator,
             }
         }
         ProviderError::Serialize(_)
@@ -219,6 +299,23 @@ mod tests {
         StaticModelCatalogEntry,
     };
     use std::collections::HashMap;
+
+    /// Build a GET request for the models endpoint with an optional query
+    /// suffix. Used so the in-handler query parser exercised by unit tests
+    /// receives a real `axum::extract::Request` (the `Query` extractor reads
+    /// the URI).
+    fn models_request(query: &str) -> axum::extract::Request {
+        let uri = if query.is_empty() {
+            "/v1/models".to_owned()
+        } else {
+            format!("/v1/models?{query}")
+        };
+        axum::http::Request::builder()
+            .method("GET")
+            .uri(uri)
+            .body(Body::empty())
+            .expect("request")
+    }
 
     /// Build a minimal AppState with a provider that has a static catalog.
     fn build_state_with_catalog() -> AppState {
@@ -336,7 +433,7 @@ mod tests {
     #[tokio::test]
     async fn models_with_catalog_returns_entries() {
         let state = build_state_with_catalog();
-        let response = handle_models_inner(&state, "test-provider", false)
+        let response = handle_models_inner(&state, "test-provider", models_request(""))
             .await
             .expect("response");
         assert_eq!(response.status(), StatusCode::OK);
@@ -372,7 +469,7 @@ mod tests {
     #[tokio::test]
     async fn models_without_catalog_returns_empty_list() {
         let state = build_state_without_catalog();
-        let response = handle_models_inner(&state, "no-catalog", false)
+        let response = handle_models_inner(&state, "no-catalog", models_request(""))
             .await
             .expect("response");
         assert_eq!(response.status(), StatusCode::OK);
@@ -392,7 +489,7 @@ mod tests {
     #[tokio::test]
     async fn models_unknown_provider_returns_404() {
         let state = build_state_with_catalog();
-        let result = handle_models_inner(&state, "nonexistent", false).await;
+        let result = handle_models_inner(&state, "nonexistent", models_request("")).await;
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(matches!(err, RouteError::UnknownProvider(_)));
@@ -427,7 +524,7 @@ mod tests {
     #[tokio::test]
     async fn model_card_has_no_credentials() {
         let state = build_state_with_catalog();
-        let response = handle_models_inner(&state, "test-provider", false)
+        let response = handle_models_inner(&state, "test-provider", models_request(""))
             .await
             .expect("response");
 

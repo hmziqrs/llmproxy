@@ -8,6 +8,8 @@
 //! Architecture boundary: route handlers do not perform scenario detection,
 //! endpoint classification, fallback routing, or provider-specific streaming.
 
+use std::sync::Arc;
+
 use axum::Json;
 use axum::body::Body;
 use axum::extract::{Extension, Path, State};
@@ -27,7 +29,7 @@ use super::error_response::{ClientProtocol, RouteError, route_error_response};
 ///
 /// Accepts an OpenAI-format [`ChatCompletionRequest`], decodes it through the
 /// core pipeline, and returns an OpenAI-shaped response.
-pub async fn handle_chat_completions(
+pub(crate) async fn handle_chat_completions(
     State(state): State<AppState>,
     Path(provider): Path<String>,
     Extension(req_id): Extension<RequestId>,
@@ -35,6 +37,13 @@ pub async fn handle_chat_completions(
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response<Body> {
+    // The wrapper only renders: it does NOT emit ResponseFailed. Each EARLY-GATE
+    // error return inside the inner function emits exactly one ResponseFailed
+    // itself (the sites before the core pipeline dispatch), and the core pipeline
+    // emits its own single ResponseFailed for failures that occur inside it. A
+    // blanket emit here would double-count every pipeline failure (the pipeline
+    // emits AND returns Err via `?`), so the wrapper must stay emit-free
+    // (audit route-responsefailed-gaps regression).
     match handle_chat_completions_inner(state, req_id, provider, connect_info, headers, body).await
     {
         Ok(response) => response,
@@ -46,6 +55,12 @@ pub async fn handle_chat_completions(
 }
 
 /// Inner handler that returns `Result` so errors can be mapped uniformly.
+///
+/// ResponseFailed emission discipline (audit route-responsefailed-gaps):
+/// every EARLY-GATE error return (the sites BEFORE the core pipeline dispatch)
+/// emits exactly one ResponseFailed here. Failures INSIDE the core pipeline
+/// emit their own single ResponseFailed internally and return Err, which this
+/// function propagates without re-emitting. The outer wrapper renders only.
 async fn handle_chat_completions_inner(
     state: AppState,
     req_id: RequestId,
@@ -54,24 +69,49 @@ async fn handle_chat_completions_inner(
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<Response<Body>, RouteError> {
+    let start = std::time::Instant::now();
+    let event_bus = Arc::clone(&state.event_bus);
+    // The request id is consumed by prepare_request below; snapshot it once so
+    // every early-gate emit references the same id.
+    let request_id = req_id.0.clone();
     // Input validation gates, ordered cheapest-first to avoid charging
     // rate-limit/dedup budget for malformed requests. Mirrors the ordering
     // established in `token_count.rs`: provider name -> existence ->
     // content-type -> rate-limit/dedup -> JSON parse.
-    core_pipeline::validate_provider_name(&provider)?;
+    core_pipeline::validate_provider_name(&provider).inspect_err(|e| {
+        core_pipeline::emit_response_failed(
+            &event_bus,
+            &request_id,
+            Some(provider.as_str()),
+            None,
+            e,
+            start,
+        )
+    })?;
     if state.providers().get(&provider).is_none() {
+        // Unknown-provider early gate: emit exactly one ResponseFailed before
+        // returning. provider is known from the path (audit route-responsefailed-gaps).
         let err = RouteError::UnknownProvider(provider.clone());
         core_pipeline::emit_response_failed(
-            &state.event_bus,
-            &req_id.0,
+            &event_bus,
+            &request_id,
             Some(provider.as_str()),
             None,
             &err,
-            std::time::Instant::now(),
+            start,
         );
         return Err(err);
     }
-    core_pipeline::validate_json_content_type(&headers)?;
+    core_pipeline::validate_json_content_type(&headers).inspect_err(|e| {
+        core_pipeline::emit_response_failed(
+            &event_bus,
+            &request_id,
+            Some(provider.as_str()),
+            None,
+            e,
+            start,
+        )
+    })?;
 
     let request_path = format!("/providers/{provider}/v1/chat/completions");
     let ctx = core_pipeline::prepare_request(
@@ -81,7 +121,17 @@ async fn handle_chat_completions_inner(
         connect_info.as_ref(),
         &body,
         &request_path,
-    )?;
+    )
+    .inspect_err(|e| {
+        core_pipeline::emit_response_failed(
+            &event_bus,
+            &request_id,
+            Some(provider.as_str()),
+            None,
+            e,
+            start,
+        )
+    })?;
 
     // Parse the OpenAI ChatCompletionRequest via axum's `Json` helper so the
     // `JsonRejection` taxonomy (syntax vs data error) is preserved and mapped
@@ -89,14 +139,36 @@ async fn handle_chat_completions_inner(
     // "invalid JSON" string.
     let req: ChatCompletionRequest = match Json::<ChatCompletionRequest>::from_bytes(&body) {
         Ok(Json(value)) => value,
-        Err(rejection) => return Err(json_rejection_to_route_error(rejection)),
+        Err(rejection) => {
+            let err = json_rejection_to_route_error(rejection);
+            core_pipeline::emit_response_failed(
+                &event_bus,
+                &request_id,
+                Some(provider.as_str()),
+                None,
+                &err,
+                start,
+            );
+            return Err(err);
+        }
     };
 
     // Decode the OpenAI Chat request into a core request.
     // Note: ChatCompletionRequest does not have a separate validate() method
     // (unlike the Anthropic handler). All validation is performed inside
     // decode_request: it checks for non-empty model and non-empty messages.
-    let core = openai_chat::decode_request(req).map_err(core_pipeline::protocol_error_to_route)?;
+    let core = openai_chat::decode_request(req)
+        .map_err(core_pipeline::protocol_error_to_route)
+        .inspect_err(|e| {
+            core_pipeline::emit_response_failed(
+                &event_bus,
+                &request_id,
+                Some(provider.as_str()),
+                None,
+                e,
+                start,
+            )
+        })?;
 
     let is_streaming = core.stream;
     info!(

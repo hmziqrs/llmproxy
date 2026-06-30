@@ -20,6 +20,7 @@ use axum::{
     response::sse::{Event, KeepAlive, Sse},
     routing::post,
 };
+use futures::FutureExt;
 use llm_proxy_core::{
     AppConfig, AuthStyle, ProviderAdapterConfig, ProviderConfig, ProviderRegistry, ServerConfig,
 };
@@ -48,6 +49,40 @@ async fn wait_for_ready(addr: std::net::SocketAddr) {
         }
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
+}
+
+/// Spawn a mock axum server on `listener`, returning immediately while the
+/// server runs in the background.
+///
+/// Unlike a bare `tokio::spawn(async move { axum::serve(..).await })` whose
+/// `JoinHandle` is dropped (silently swallowing any panic in the mock server
+/// task — audit `testing-audit:mock-server-joinhandle-swallow`), this wrapper
+/// catches a panic in the serve future, prints it to stderr, and aborts the
+/// process. A mock-handler bug therefore surfaces loudly as a test failure
+/// instead of the connection just closing mid-stream with no diagnostic.
+fn spawn_mock_serve(listener: tokio::net::TcpListener, app: Router) {
+    tokio::spawn(async move {
+        // std::panic::catch_unwind requires UnwindSafe; the router/listener
+        // capture is fine for a mock that owns them exclusively.
+        let result = std::panic::AssertUnwindSafe(axum::serve(listener, app).into_future())
+            .catch_unwind()
+            .await;
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => eprintln!("mock axum::serve error: {e}"),
+            Err(panic) => {
+                // Surface the panic payload, then abort so the test binary fails
+                // rather than continuing with a dead mock.
+                let msg = panic
+                    .downcast_ref::<String>()
+                    .map(|s| s.as_str())
+                    .or_else(|| panic.downcast_ref::<&'static str>().copied())
+                    .unwrap_or("<non-string panic>");
+                eprintln!("mock server task panicked: {msg}");
+                std::process::abort();
+            }
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -143,6 +178,7 @@ fn state_with_provider(
     protocol: &str,
     adapter_name: &str,
     _model_name: &str,
+    pricing: HashMap<llm_proxy_core::ModelId, llm_proxy_core::ModelPricing>,
 ) -> AppState {
     // Build routes based on protocol so the provider-based routing can resolve.
     let routes = match protocol {
@@ -181,7 +217,7 @@ fn state_with_provider(
         model_aliases: HashMap::new(),
         discovery: None,
         catalog: None,
-        pricing: Default::default(),
+        pricing,
     };
 
     let registry = ProviderRegistry::from_providers(vec![provider]).expect("registry");
@@ -223,12 +259,34 @@ fn state_with_anthropic_provider(mock_endpoint: &str) -> AppState {
         "anthropic_messages",
         "messages",
         "claude-sonnet-4-6",
+        HashMap::new(),
+    )
+}
+
+/// Convenience: AppState with an Anthropic provider and a pricing table for the
+/// upstream model, so cost computation is exercised end-to-end.
+fn state_with_anthropic_provider_priced(
+    mock_endpoint: &str,
+    pricing: HashMap<llm_proxy_core::ModelId, llm_proxy_core::ModelPricing>,
+) -> AppState {
+    state_with_provider(
+        mock_endpoint,
+        "anthropic_messages",
+        "messages",
+        "claude-sonnet-4-6",
+        pricing,
     )
 }
 
 /// Convenience: AppState with an OpenAI Chat provider.
 fn state_with_openai_chat_provider(mock_endpoint: &str) -> AppState {
-    state_with_provider(mock_endpoint, "openai_chat_completions", "chat", "gpt-4o")
+    state_with_provider(
+        mock_endpoint,
+        "openai_chat_completions",
+        "chat",
+        "gpt-4o",
+        HashMap::new(),
+    )
 }
 
 /// Convenience: AppState with an OpenAI Responses provider.
@@ -238,6 +296,7 @@ fn state_with_openai_responses_provider(mock_endpoint: &str) -> AppState {
         "openai_responses",
         "responses",
         "gpt-4o-responses",
+        HashMap::new(),
     )
 }
 
@@ -248,6 +307,7 @@ fn state_with_gemini_provider(mock_endpoint: &str) -> AppState {
         "gemini_generate_content",
         "gemini",
         "gemini-2.5-pro",
+        HashMap::new(),
     )
 }
 
@@ -268,7 +328,7 @@ async fn spawn_mock_server(response_body: Vec<u8>, content_type: &str) -> String
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    spawn_mock_serve(listener, app);
     wait_for_ready(addr).await;
     format!("http://{}/providers/mock-provider/v1/messages", addr)
 }
@@ -331,7 +391,7 @@ async fn spawn_mock_anthropic_stream() -> String {
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    spawn_mock_serve(listener, app);
     wait_for_ready(addr).await;
     format!("http://{}/providers/mock-provider/v1/messages", addr)
 }
@@ -362,7 +422,7 @@ async fn spawn_mock_openai_chat_stream() -> String {
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    spawn_mock_serve(listener, app);
     wait_for_ready(addr).await;
     format!("http://{}/providers/mock-provider/v1/messages", addr)
 }
@@ -397,7 +457,7 @@ async fn spawn_mock_openai_responses_stream() -> String {
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    spawn_mock_serve(listener, app);
     wait_for_ready(addr).await;
     format!("http://{}/providers/mock-provider/v1/messages", addr)
 }
@@ -422,7 +482,7 @@ async fn spawn_mock_gemini_stream() -> String {
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    spawn_mock_serve(listener, app);
     wait_for_ready(addr).await;
     format!("http://{}/providers/mock-provider/v1/messages", addr)
 }
@@ -443,13 +503,19 @@ async fn spawn_mock_500() -> String {
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    spawn_mock_serve(listener, app);
     wait_for_ready(addr).await;
     format!("http://{}/providers/mock-provider/v1/messages", addr)
 }
 
-/// Spawn a mock server that returns a malformed SSE stream (invalid JSON in
-/// an SSE event).
+/// Spawn a mock server that returns an SSE stream where a valid
+/// `content_block_delta` carrying the marker text `"good-delta"` is followed by
+/// a malformed JSON event, then a final `message_stop`.
+///
+/// The Anthropic provider adapter silently skips the malformed frame (returns
+/// `Ok(vec![])`), so the valid delta BEFORE it is delivered and the stream
+/// completes normally. The marker text lets tests assert that valid events
+/// survive a skipped malformed frame (audit `duplicate-malformed-stream-tests`).
 async fn spawn_mock_malformed_stream() -> String {
     let app = Router::new().route(
         "/{*path}",
@@ -458,10 +524,20 @@ async fn spawn_mock_malformed_stream() -> String {
                 Event::default()
                     .event("message_start")
                     .data(r#"{"type":"message_start","message":{"id":"msg_mock","type":"message","role":"assistant","content":[],"model":"claude-sonnet-4-6","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":0}}}"#),
-                // Malformed event: invalid JSON
+                // A valid delta carrying a marker so tests can assert it is delivered.
+                Event::default()
+                    .event("content_block_start")
+                    .data(r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#),
+                Event::default()
+                    .event("content_block_delta")
+                    .data(r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"good-delta"}}"#),
+                // Malformed event: invalid JSON, silently skipped by the adapter.
                 Event::default()
                     .event("content_block_delta")
                     .data("this is not valid json {{{"),
+                Event::default()
+                    .event("message_stop")
+                    .data(r#"{"type":"message_stop"}"#),
             ];
             let stream = futures::stream::iter(events.into_iter().map(Ok::<_, std::convert::Infallible>));
             let sse = Sse::new(stream).keep_alive(KeepAlive::default());
@@ -474,7 +550,47 @@ async fn spawn_mock_malformed_stream() -> String {
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    spawn_mock_serve(listener, app);
+    wait_for_ready(addr).await;
+    format!("http://{}/providers/mock-provider/v1/messages", addr)
+}
+
+/// Spawn a mock server that returns a genuine Anthropic `type: error` event
+/// mid-stream after a valid `message_start`.
+///
+/// Unlike `spawn_mock_malformed_stream` (whose malformed JSON is silently
+/// skipped), this drives the real in-band error path: the Anthropic adapter maps
+/// `event: error` to `CoreEvent::Error`, which the client encoder surfaces as an
+/// `event: error` SSE frame (audit `in-band-error-event-path-untested`).
+async fn spawn_mock_in_band_error_stream() -> String {
+    let app = Router::new().route(
+        "/{*path}",
+        post(|| async move {
+            let events = vec![
+                Event::default()
+                    .event("message_start")
+                    .data(r#"{"type":"message_start","message":{"id":"msg_err","type":"message","role":"assistant","content":[],"model":"claude-sonnet-4-6","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":0}}}"#),
+                // A genuine protocol-level error event the decoder maps to
+                // CoreEvent::Error (anthropic.rs "error" arm).
+                Event::default()
+                    .event("error")
+                    .data(r#"{"type":"error","error":{"type":"overloaded_error","message":"Too many requests"}}"#),
+                Event::default()
+                    .event("message_stop")
+                    .data(r#"{"type":"message_stop"}"#),
+            ];
+            let stream = futures::stream::iter(events.into_iter().map(Ok::<_, std::convert::Infallible>));
+            let sse = Sse::new(stream).keep_alive(KeepAlive::default());
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "text/event-stream")],
+                sse.into_response(),
+            )
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    spawn_mock_serve(listener, app);
     wait_for_ready(addr).await;
     format!("http://{}/providers/mock-provider/v1/messages", addr)
 }
@@ -506,7 +622,7 @@ async fn spawn_mock_disconnect_stream() -> String {
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    spawn_mock_serve(listener, app);
     wait_for_ready(addr).await;
     format!("http://{}/providers/mock-provider/v1/messages", addr)
 }
@@ -532,7 +648,7 @@ async fn spawn_mock_with_request_tracker(response_body: Vec<u8>) -> (String, Arc
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    spawn_mock_serve(listener, app);
     wait_for_ready(addr).await;
     (
         format!("http://{}/providers/mock-provider/v1/messages", addr),
@@ -566,7 +682,7 @@ async fn spawn_mock_with_body_capture(
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    spawn_mock_serve(listener, app);
     wait_for_ready(addr).await;
     (
         format!("http://{}/providers/mock-provider/v1/messages", addr),
@@ -933,6 +1049,50 @@ async fn stream_openai_chat_provider_surfaces_upstream_message_id() {
     );
 }
 
+/// The OpenAI Chat streaming path must populate
+/// `ResponseCompleted.upstream_message_id` on the event bus. The OpenAI Chat
+/// client encoder ignores `CoreEvent::MessageStart`'s id (it uses only the id
+/// passed at construction), so the upstream id reaches the response solely via
+/// the buffer-first-event extraction. The SSE-body test above checks the wire;
+/// this guards the persistence sink, which is a distinct surface (plan Test
+/// Plan: "Stream request emits ResponseCompleted with the real
+/// upstream_message_id from Step 1" -- the OpenAI path was uncovered).
+#[tokio::test]
+async fn event_bus_records_openai_chat_stream_upstream_message_id() {
+    use std::sync::Arc;
+
+    use llm_proxy_storage::{ProxyEvent, RecordingBus};
+
+    let mock_url = spawn_mock_openai_chat_stream().await;
+    let bus = Arc::new(RecordingBus::new());
+    let state = state_with_openai_chat_provider(&mock_url).with_event_bus(bus.clone());
+    let app = build_router(state);
+
+    let body = make_messages_body("gpt-4o", true);
+    let resp = app.oneshot(messages_request(&body)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    // Drain the SSE body so the spawned task runs to completion and emits the
+    // stream ResponseCompleted (it fires at the end of the task).
+    let _ = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+
+    let events = bus.snapshot();
+    let completed = events
+        .iter()
+        .find_map(|e| match e {
+            ProxyEvent::ResponseCompleted(c) => Some(c),
+            _ => None,
+        })
+        .expect("ResponseCompleted emitted for OpenAI Chat stream");
+    // The OpenAI stream mock seeds every chunk with id "chatcmpl-stream".
+    assert_eq!(
+        completed.upstream_message_id.as_deref(),
+        Some("chatcmpl-stream"),
+        "OpenAI Chat stream must capture the real upstream chunk id on the event bus"
+    );
+}
+
 /// A successful non-stream request emits `RequestReceived` then
 /// `ResponseCompleted` on the event bus, with the provider-reported usage and
 /// upstream message id on the completed event, and no api-key leakage.
@@ -967,6 +1127,13 @@ async fn event_bus_records_request_received_and_response_completed() {
             assert_eq!(rc.upstream_message_id.as_deref(), Some("msg_mock123"));
             assert_eq!(rc.usage.input_tokens, 10);
             assert_eq!(rc.usage.output_tokens, 5);
+            // No pricing configured for this provider -> cost must be None (the
+            // "no pricing -> Cost = None" contract from the plan's Test Plan).
+            assert!(
+                rc.cost.is_none(),
+                "cost must be None when no pricing is configured, got {:?}",
+                rc.cost
+            );
         }
         other => panic!("expected ResponseCompleted, got {other:?}"),
     }
@@ -976,6 +1143,86 @@ async fn event_bus_records_request_received_and_response_completed() {
     assert!(
         !json.contains("test-key") && !json.contains("sk-"),
         "event JSON must not contain api-key fragments: {json}"
+    );
+}
+
+/// When pricing IS configured for the upstream model, a successful non-stream
+/// request attaches a computed `Some(Cost)` to `ResponseCompleted` -- the
+/// end-to-end pricing->usage->cost->event wiring (audit finding: cost pipeline
+/// never exercised end-to-end).
+#[tokio::test]
+async fn priced_provider_attaches_cost_to_response_completed() {
+    use std::sync::Arc;
+
+    use llm_proxy_core::{ModelId, ModelPricing};
+    use llm_proxy_storage::{ProxyEvent, RecordingBus};
+    use rust_decimal::Decimal;
+
+    let mock_url = spawn_mock_anthropic_non_stream().await;
+    let pricing = HashMap::from([(
+        ModelId::new("claude-sonnet-4-6"),
+        ModelPricing {
+            input: "0.000003".parse::<Decimal>().unwrap(),
+            output: "0.000015".parse::<Decimal>().unwrap(),
+            ..ModelPricing::default()
+        },
+    )]);
+    let bus = Arc::new(RecordingBus::new());
+    let state =
+        state_with_anthropic_provider_priced(&mock_url, pricing).with_event_bus(bus.clone());
+    let app = build_router(state);
+
+    let body = make_messages_body("claude-sonnet-4-6", false);
+    let resp = app.oneshot(messages_request(&body)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let rc = bus
+        .snapshot()
+        .iter()
+        .find_map(|e| match e {
+            ProxyEvent::ResponseCompleted(rc) => Some(rc.clone()),
+            _ => None,
+        })
+        .expect("ResponseCompleted emitted");
+    // Mock usage is input=10, output=5.
+    //   input  = 10 * 0.000003  = 0.00003
+    //   output =  5 * 0.000015  = 0.000075
+    //   total  = 0.000105
+    let cost = rc
+        .cost
+        .expect("cost must be Some when pricing is configured");
+    assert_eq!(cost.input.normalize().to_string(), "0.00003");
+    assert_eq!(cost.output.normalize().to_string(), "0.000075");
+    assert_eq!(cost.total.normalize().to_string(), "0.000105");
+}
+
+/// The first upstream chunk may decode to MULTIPLE CoreEvents (message_start
+/// immediately followed by content_block_delta). The buffered first-event
+/// replay must emit ALL of them exactly once -- none lost, none duplicated
+/// (plan requirement; audit finding: multi-event first-frame test missing).
+#[tokio::test]
+async fn stream_multi_event_first_frame_emits_all_without_loss_or_duplication() {
+    let body = anthropic_sse_body("msg_multi", "");
+    let mock_url = spawn_mock_server(body, "text/event-stream").await;
+    let text = collect_anthropic_stream_body(&mock_url).await;
+    assert_eq!(
+        text.matches("event: message_start").count(),
+        1,
+        "message_start must appear exactly once: {text}"
+    );
+    assert_eq!(
+        text.matches("event: content_block_delta").count(),
+        1,
+        "content_block_delta must appear exactly once (no loss/duplication): {text}"
+    );
+    assert_eq!(
+        text.matches("event: message_stop").count(),
+        1,
+        "message_stop must appear exactly once: {text}"
+    );
+    assert!(
+        text.contains("msg_multi"),
+        "real upstream id must surface: {text}"
     );
 }
 
@@ -1402,15 +1649,16 @@ async fn stream_error_before_first_byte_returns_http_502() {
     );
 }
 
-/// stream_error_after_first_byte_emits_anthropic_error_event_then_terminates
-///
-/// Note: The Anthropic adapter's decode_frame silently skips malformed JSON
-/// events (returns Ok(vec![])), so a malformed SSE frame does NOT trigger
-/// the in-band error path. The stream completes normally. This test verifies
-/// that the stream does not panic or crash on malformed data, and that the
-/// valid events before the malformed one are delivered.
+/// A malformed SSE data frame is silently skipped by the Anthropic provider
+/// adapter (`decode_frame` returns `Ok(vec![])` on bad JSON), so it does NOT
+/// drive the in-band error path. This test verifies the distinct condition that
+/// a VALID delta delivered BEFORE the malformed frame survives to the client,
+/// and that the stream completes gracefully with `message_stop` rather than
+/// panicking. The genuine in-band error path is covered separately by
+/// `in_band_upstream_error_emits_anthropic_error_event`
+/// (audit `duplicate-malformed-stream-tests`).
 #[tokio::test]
-async fn stream_error_after_first_byte_emits_error_event() {
+async fn malformed_frame_is_skipped_and_valid_events_delivered() {
     let mock_url = spawn_mock_malformed_stream().await;
     let state = state_with_anthropic_provider(&mock_url);
     let app = build_router(state);
@@ -1429,6 +1677,13 @@ async fn stream_error_after_first_byte_emits_error_event() {
     assert!(
         text.contains("event: message_start"),
         "stream should start with message_start"
+    );
+
+    // The valid delta BEFORE the malformed frame must be delivered to the
+    // client (it carries the marker text from spawn_mock_malformed_stream).
+    assert!(
+        text.contains("good-delta"),
+        "valid events before a malformed frame must be delivered, got: {text}"
     );
 
     // The stream should complete with a message_stop (the malformed frame is
@@ -1473,14 +1728,18 @@ async fn upstream_disconnect_completes_with_synthetic_terminal() {
     );
 }
 
-/// malformed stream frame returns Anthropic-shaped error
+/// A genuine in-band upstream error surfaces as an Anthropic-shaped
+/// `event: error` frame to the client.
 ///
-/// The Anthropic adapter silently skips malformed JSON events, so the stream
-/// completes normally. This test verifies the stream does not panic or produce
-/// garbage output.
+/// Distinct from `malformed_frame_is_skipped_and_valid_events_delivered`
+/// (which verifies a malformed JSON frame is skipped): here the mock emits a
+/// real protocol-level Anthropic `event: error`, which the provider decoder
+/// maps to `CoreEvent::Error` and the client encoder forwards as an
+/// `event: error` SSE frame (audit `in-band-error-event-path-untested`,
+/// `duplicate-malformed-stream-tests`).
 #[tokio::test]
-async fn malformed_stream_frame_is_handled_gracefully() {
-    let mock_url = spawn_mock_malformed_stream().await;
+async fn in_band_upstream_error_emits_anthropic_error_event() {
+    let mock_url = spawn_mock_in_band_error_stream().await;
     let state = state_with_anthropic_provider(&mock_url);
     let app = build_router(state);
 
@@ -1498,10 +1757,174 @@ async fn malformed_stream_frame_is_handled_gracefully() {
         text.contains("event: message_start"),
         "stream should start with message_start"
     );
-    // Stream should complete normally (malformed frame silently skipped).
+
+    // The in-band error must surface as an Anthropic `event: error` frame.
     assert!(
-        text.contains("event: message_stop"),
-        "stream should end with message_stop"
+        text.contains("event: error"),
+        "in-band upstream error must emit an event: error frame, got: {text}"
+    );
+    // The error payload carries the upstream error message.
+    assert!(
+        text.contains("Too many requests"),
+        "event: error should carry the upstream error message, got: {text}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Client-disconnect / mid-stream cancellation
+// ---------------------------------------------------------------------------
+
+/// A mock upstream body stream that yields exactly one valid Anthropic SSE
+/// `message_start` frame, then parks forever (`Poll::Pending`). Its `Drop` impl
+/// records cancellation so a test can observe that the proxy tore the upstream
+/// down when the CLIENT disconnected mid-stream.
+///
+/// This is the deterministic equivalent of a "slow-dripping" upstream: no
+/// `sleep` is involved. The stream just never produces a second frame, so the
+/// only way the proxy's spawned task exits after the first byte is the
+/// `cancel.cancelled()` branch in `build_sse_output_stream` (audit
+/// `client-disconnect-cancellation-untested`).
+struct SlowDripStream {
+    /// First SSE frame to deliver; consumed on the first poll.
+    first: Option<bytes::Bytes>,
+    /// Set to `true` when this stream is dropped (i.e. the upstream connection
+    /// was torn down because the proxy cancelled its read).
+    canceled: Arc<AtomicBool>,
+}
+
+impl std::fmt::Debug for SlowDripStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SlowDripStream")
+            .field("first_pending", &self.first.is_some())
+            .field("canceled", &self.canceled)
+            .finish()
+    }
+}
+
+impl futures::Stream for SlowDripStream {
+    type Item = Result<bytes::Bytes, std::io::Error>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        if let Some(chunk) = self.first.take() {
+            std::task::Poll::Ready(Some(Ok(chunk)))
+        } else {
+            // Park forever: the proxy will keep this future alive until the
+            // client disconnects and the CancellationToken fires.
+            std::task::Poll::Pending
+        }
+    }
+}
+
+impl Drop for SlowDripStream {
+    fn drop(&mut self) {
+        self.canceled.store(true, Ordering::SeqCst);
+    }
+}
+
+/// When the client drops the response body mid-stream (after the first event),
+/// the proxy must cancel the upstream read rather than leak it.
+///
+/// This exercises the `cancel.cancelled()` branch wired via the response-body
+/// drop-guard in `build_sse_output_stream`. The proxy reads one upstream frame
+/// (crossing the first byte), the test then drops the response body, and the
+/// proxy's spawned task is expected to abort the upstream stream — observed
+/// here deterministically via the `SlowDripStream` Drop flag (no `sleep`-based
+/// polling). A bounded `tokio::time::timeout` guards against a regression that
+/// fails to propagate cancellation.
+///
+/// NOTE: this asserts upstream teardown + no panic + exactly one upstream
+/// request. It does NOT directly assert `Metrics::record_client_cancel()` (which
+/// the cancel branch also invokes) because that field is `pub(crate)` and not
+/// exposed on `AppState`; a future change that exposes a cancellation counter
+/// should add that assertion here.
+#[tokio::test]
+async fn client_disconnect_cancels_upstream_stream() {
+    use futures::StreamExt;
+
+    // Valid Anthropic message_start frame; the proxy crosses the first byte once
+    // it is decoded and the encoder emits the first client event.
+    let first_frame = bytes::Bytes::from(
+        "event: message_start\n\
+         data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_cancel\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude-sonnet-4-6\",\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":10,\"output_tokens\":0}}}\n\n"
+            .to_owned(),
+    );
+    let upstream_canceled = Arc::new(AtomicBool::new(false));
+    let request_received = Arc::new(AtomicBool::new(false));
+
+    let canceled_for_route = upstream_canceled.clone();
+    let received_for_route = request_received.clone();
+    let app = Router::new().route(
+        "/{*path}",
+        post(move || {
+            let canceled = canceled_for_route.clone();
+            let received = received_for_route.clone();
+            async move {
+                received.store(true, Ordering::SeqCst);
+                let body = SlowDripStream {
+                    first: Some(first_frame.clone()),
+                    canceled,
+                };
+                (
+                    StatusCode::OK,
+                    [(header::CONTENT_TYPE, "text/event-stream")],
+                    Body::from_stream(body).into_response(),
+                )
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    spawn_mock_serve(listener, app);
+    wait_for_ready(addr).await;
+    let mock_url = format!("http://{}/providers/mock-provider/v1/messages", addr);
+
+    let state = state_with_anthropic_provider(&mock_url);
+    let app = build_router(state);
+
+    let body = make_messages_body("claude-sonnet-4-6", true);
+    let resp = app.oneshot(messages_request(&body)).await.unwrap();
+    // The first byte crossed, so the SSE is committed as HTTP 200.
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Read exactly one chunk from the response body (the first client event),
+    // then DROP the body mid-stream — this is the client disconnect.
+    let mut stream = resp.into_body().into_data_stream();
+    let first_chunk = stream.next().await;
+    assert!(
+        first_chunk.is_some(),
+        "client should receive at least the first SSE chunk"
+    );
+    // Drop the response body future (client disconnect). The proxy's
+    // drop-guard must fire the CancellationToken and abort the upstream stream.
+    drop(stream);
+
+    // The upstream read is torn down synchronously with the body drop. Bound the
+    // wait deterministically with a timeout (not a sleep-poll loop).
+    let teardown = tokio::time::timeout(Duration::from_secs(2), async {
+        while !upstream_canceled.load(Ordering::SeqCst) {
+            // Yield to let the spawned proxy task observe the cancel and drop
+            // the upstream reqwest stream (which drops SlowDripStream).
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+
+    assert!(
+        teardown.is_ok(),
+        "upstream stream must be torn down within 2s of client disconnect \
+         (cancellation did not propagate; record_client_cancel path is broken)"
+    );
+    assert!(
+        upstream_canceled.load(Ordering::SeqCst),
+        "upstream SlowDripStream must have been dropped on client disconnect"
+    );
+    // The mock must have received exactly one upstream request.
+    assert!(
+        request_received.load(Ordering::SeqCst),
+        "mock upstream should have received the request"
     );
 }
 
@@ -2162,5 +2585,277 @@ async fn missing_content_type_on_messages_still_parses() {
         resp.status().is_client_error()
             || resp.status().is_server_error()
             || resp.status() == StatusCode::OK
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Error/status path event-log ordering (audit LOW, eventlog-03 / eventlog-04)
+// ---------------------------------------------------------------------------
+
+/// A streaming request that fails at the upstream (500) must emit
+/// `RequestReceived` BEFORE `ResponseFailed`. Before the eventlog-03 fix the
+/// streaming `RequestReceived` was emitted after `resolve_target`/`send_stream`,
+/// so an early-return produced an orphaned `ResponseFailed` with no preceding
+/// `RequestReceived`. The RequestReceived is now emitted before any upstream
+/// call, mirroring the non-stream path.
+#[tokio::test]
+async fn stream_emits_request_received_before_response_failed_on_upstream_failure() {
+    use std::sync::Arc;
+
+    use llm_proxy_storage::{ProxyEvent, RecordingBus};
+
+    let mock_url = spawn_mock_500().await;
+    let bus = Arc::new(RecordingBus::new());
+    let state = state_with_anthropic_provider(&mock_url).with_event_bus(bus.clone());
+    let app = build_router(state);
+
+    let body = make_messages_body("claude-sonnet-4-6", true);
+    let resp = app.oneshot(messages_request(&body)).await.unwrap();
+    // Drain the body so the spawned task runs to completion.
+    let _ = axum::body::to_bytes(resp.into_body(), 1024 * 1024).await;
+
+    let events = bus.snapshot();
+    let received_idx = events
+        .iter()
+        .position(|e| matches!(e, ProxyEvent::RequestReceived(_)));
+    let failed_idx = events
+        .iter()
+        .position(|e| matches!(e, ProxyEvent::ResponseFailed(_)));
+    assert!(
+        received_idx.is_some(),
+        "RequestReceived must be emitted for a failing stream"
+    );
+    assert!(
+        failed_idx.is_some(),
+        "ResponseFailed must be emitted for a failing stream"
+    );
+    assert!(
+        received_idx.unwrap() < failed_idx.unwrap(),
+        "RequestReceived must precede ResponseFailed (no orphaned failure)"
+    );
+}
+
+/// A non-stream upstream 500 emits `ResponseFailed` (not `ResponseCompleted`)
+/// and is counted as a failure -- never as a success. This guards the
+/// eventlog-04 invariant that a failure path never records success, and that
+/// the cost/ResponseCompleted path is skipped on failure.
+#[tokio::test]
+async fn non_stream_upstream_500_emits_response_failed_not_completed() {
+    use std::sync::Arc;
+
+    use llm_proxy_storage::{ProxyEvent, RecordingBus};
+
+    let mock_url = spawn_mock_500().await;
+    let bus = Arc::new(RecordingBus::new());
+    let state = state_with_anthropic_provider(&mock_url).with_event_bus(bus.clone());
+    let app = build_router(state);
+
+    let body = make_messages_body("claude-sonnet-4-6", false);
+    let resp = app.oneshot(messages_request(&body)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+
+    let events = bus.snapshot();
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, ProxyEvent::ResponseCompleted(_))),
+        "a failed non-stream request must not emit ResponseCompleted"
+    );
+    let failed = events
+        .iter()
+        .find_map(|e| match e {
+            ProxyEvent::ResponseFailed(f) => Some(f),
+            _ => None,
+        })
+        .expect("ResponseFailed emitted for upstream 500");
+    assert_eq!(failed.http_status, 502);
+}
+
+// ===========================================================================
+// stream-ids-01: leading CoreEvent::Error on the OpenAI streaming path
+// ===========================================================================
+
+/// A provider whose `chat_completions` route is served by an Anthropic-speaking
+/// adapter. The client hits `/v1/chat/completions` (so `client_protocol` is
+/// `OpenAiChat`), while the upstream speaks the Anthropic Messages protocol.
+/// This is the only configuration where a leading upstream `error` event can
+/// surface as a leading `CoreEvent::Error` on the OpenAI client path: the
+/// Anthropic adapter decodes the upstream `error` SSE frame into
+/// `CoreEvent::Error`, and the OpenAI client encoder drops it (returns `Err`),
+/// which is exactly the case the stream-ids-01 synthesis handles.
+fn state_with_openai_chat_client_anthropic_upstream(mock_endpoint: &str) -> AppState {
+    let provider = ProviderConfig {
+        name: "mock-provider".to_owned(),
+        api_key: secrecy::SecretString::from("test-key"),
+        auth_style: AuthStyle::Bearer,
+        passthrough_auth: false,
+        adapters: {
+            let mut m = HashMap::new();
+            m.insert(
+                "messages".to_owned(),
+                ProviderAdapterConfig {
+                    protocol: "anthropic_messages".to_owned(),
+                    endpoint: mock_endpoint.to_owned(),
+                    headers: std::sync::Arc::new(HashMap::new()),
+                },
+            );
+            m
+        },
+        routes: llm_proxy_core::ProviderRoutesConfig {
+            messages: None,
+            chat_completions: Some("messages".to_owned()),
+        },
+        model_aliases: HashMap::new(),
+        discovery: None,
+        catalog: None,
+        pricing: Default::default(),
+    };
+
+    let registry = ProviderRegistry::from_providers(vec![provider]).expect("registry");
+    let app_config = AppConfig {
+        server: ServerConfig {
+            bind: "127.0.0.1:3456".parse().unwrap(),
+            request_timeout: Duration::from_secs(300),
+            shutdown_timeout: Duration::from_secs(30),
+            log_level: "info".to_owned(),
+            hot_reload: false,
+            allowed_origins: None,
+            server_name: "test-proxy".to_owned(),
+            rate_limit_rpm: 100,
+            trust_forwarded_headers: false,
+            dedup_window: Duration::from_millis(500),
+            log_format: Default::default(),
+        },
+    };
+    AppState::new(
+        app_config,
+        registry,
+        ProviderAdapterRegistry::builtin(),
+        ProxyClient::new(),
+        BuildInfo {
+            name: "test",
+            version: "0.0.0",
+            target: "test",
+            git_sha: "test",
+        },
+    )
+}
+
+/// Spawn a mock upstream whose FIRST (and only) SSE frame is an Anthropic
+/// `error` event. No preceding `message_start` is emitted, so the first decoded
+/// `CoreEvent` is `CoreEvent::Error`.
+async fn spawn_mock_anthropic_leading_error_stream() -> String {
+    let app = Router::new().route(
+        "/{*path}",
+        post(|| async move {
+            let events = vec![Event::default()
+                .event("error")
+                .data(r#"{"type":"error","error":{"type":"overloaded_error","message":"Upstream overloaded"}}"#)];
+            let stream =
+                futures::stream::iter(events.into_iter().map(Ok::<_, std::convert::Infallible>));
+            let sse = Sse::new(stream).keep_alive(KeepAlive::default());
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "text/event-stream")],
+                sse.into_response(),
+            )
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    spawn_mock_serve(listener, app);
+    wait_for_ready(addr).await;
+    format!("http://{addr}/v1/messages")
+}
+
+/// Build a minimal OpenAI Chat Completions streaming request body.
+fn make_chat_completions_stream_body(model: &str) -> String {
+    json!({
+        "model": model,
+        "messages": [{ "role": "user", "content": "hello" }],
+        "stream": true
+    })
+    .to_string()
+}
+
+/// Build a POST request to the OpenAI Chat Completions client route.
+fn chat_completions_stream_request(body: &str) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri("/providers/mock-provider/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_owned()))
+        .unwrap()
+}
+
+/// `stream-ids-01`: when the FIRST decoded upstream event on an OpenAI Chat
+/// STREAMING request (`ClientProtocol::OpenAiChat`) is an error -- with no
+/// preceding valid event -- the client must receive HTTP 200 with an in-band
+/// SSE error chunk, NOT a 502 "empty stream" body. The replay loop synthesizes
+/// the OpenAI error-object `data:` line plus the `data: [DONE]` terminator so
+/// the error crosses the first-byte boundary as a real in-band event.
+#[tokio::test]
+async fn stream_openai_chat_leading_error_returns_200_in_band_sse_error() {
+    let mock_url = spawn_mock_anthropic_leading_error_stream().await;
+    let state = state_with_openai_chat_client_anthropic_upstream(&mock_url);
+    let app = build_router(state);
+
+    let body = make_chat_completions_stream_body("claude-sonnet-4-6");
+    let resp = app
+        .oneshot(chat_completions_stream_request(&body))
+        .await
+        .unwrap();
+
+    // The leading error must cross the first-byte boundary as an in-band SSE
+    // event, committing HTTP 200 -- not surface as a pre-stream 502 "empty
+    // stream" body.
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "leading stream error must be delivered in-band at HTTP 200, not a 502"
+    );
+
+    let ct = resp
+        .headers()
+        .get("content-type")
+        .expect("content-type header")
+        .to_str()
+        .unwrap();
+    assert!(
+        ct.contains("text/event-stream"),
+        "expected SSE content-type for in-band error, got: {ct}"
+    );
+
+    let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+
+    // The in-band error must be an OpenAI-shaped error object on a `data:` line.
+    // `overloaded_error` maps to `CoreStreamErrorKind::Upstream`, which the OpenAI
+    // payload renders as `type: "server_error"`.
+    assert!(
+        text.contains("\"error\"") && text.contains("\"type\""),
+        "in-band SSE error must carry an OpenAI error object; got: {text}"
+    );
+    assert!(
+        text.contains("server_error"),
+        "an upstream/overloaded error must render as server_error; got: {text}"
+    );
+    assert!(
+        text.contains("Upstream overloaded"),
+        "the sanitized error message must be surfaced in-band; got: {text}"
+    );
+
+    // The OpenAI `[DONE]` terminator must follow the error chunk.
+    assert!(
+        text.contains("[DONE]"),
+        "the OpenAI [DONE] terminator must follow the in-band error; got: {text}"
+    );
+
+    // It must NOT be the pre-stream "empty stream" 502 JSON body.
+    assert!(
+        !text.contains("empty stream"),
+        "must not surface the misleading empty-stream 502 body; got: {text}"
     );
 }

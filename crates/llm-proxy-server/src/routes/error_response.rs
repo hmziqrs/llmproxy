@@ -13,8 +13,12 @@
 //! prevents information disclosure about the proxy's internal architecture.
 //!
 //! Upstream error bodies are sanitized by the provider error layer and further
-//! truncated here. Provider decode errors are similarly replaced with generic
-//! messages to avoid leaking upstream response fragments.
+//! truncated here. For codes that pass through to the client (400/413/429 and
+//! client-owned 401/403), the provider-specific message is replaced with a
+//! generic proxy message and the real body is logged server-side only, so the
+//! upstream's own schema never reaches the client. Provider decode errors are
+//! similarly replaced with generic messages to avoid leaking upstream response
+//! fragments.
 
 use axum::body::Body;
 use axum::http::{HeaderValue, StatusCode, header};
@@ -34,7 +38,7 @@ use serde::Serialize;
 /// by [`RouteError`] and encoded according to this protocol selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
-pub enum ClientProtocol {
+pub(super) enum ClientProtocol {
     /// Anthropic Messages API (`/v1/messages`).
     Anthropic,
     /// OpenAI Chat Completions API (`/v1/chat/completions`).
@@ -44,6 +48,32 @@ pub enum ClientProtocol {
 // ---------------------------------------------------------------------------
 // RouteError
 // ---------------------------------------------------------------------------
+
+/// Who owns the credentials used to authenticate with the upstream provider.
+///
+/// This distinguishes the two operating modes of the proxy and drives how
+/// upstream auth/permission failures (401/403) are surfaced to the client:
+///
+/// - [`AuthOwner::Operator`] (default, managed-key mode): the proxy forwards
+///   *its own* configured upstream credentials. An upstream 401/403 therefore
+///   means the *operator's* key is expired/revoked/scoped wrong -- an
+///   infrastructure problem the client cannot fix -- so it is collapsed to
+///   502 Bad Gateway (see [`map_upstream_status`]).
+/// - [`AuthOwner::Client`] (`passthrough_auth = true`): the proxy forwards the
+///   *client's* own inbound token. An upstream 401/403 is then the client's
+///   credential problem and is passed through verbatim so the client can act
+///   on it (audit LOW, passthrough-auth-401-collapse).
+///
+/// Non-auth codes (400/413/429) are always client-owned and pass through
+/// regardless of this value; 404/5xx always collapse to 502.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(super) enum AuthOwner {
+    /// The proxy's own (operator) credentials are forwarded (managed-key mode).
+    #[default]
+    Operator,
+    /// The client's own credentials are forwarded (`passthrough_auth`).
+    Client,
+}
 
 /// Internal error type for the core pipeline.
 ///
@@ -56,7 +86,7 @@ pub enum ClientProtocol {
 /// The error response encoder sanitizes these before sending them to clients.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
-pub enum RouteError {
+pub(super) enum RouteError {
     /// Bad client input (malformed JSON, missing fields).
     #[error("invalid request: {0}")]
     InvalidRequest(String),
@@ -79,6 +109,10 @@ pub enum RouteError {
         status: StatusCode,
         /// Sanitized error body.
         body: String,
+        /// Whose credentials authenticated with the upstream. Drives whether
+        /// auth/permission codes (401/403) pass through to the client
+        /// ([`AuthOwner::Client`]) or collapse to 502 ([`AuthOwner::Operator`]).
+        auth_owner: AuthOwner,
     },
     /// Upstream provider timed out.
     #[error("upstream timeout: {0}")]
@@ -175,7 +209,7 @@ struct OpenAiErrorDetail {
 ///
 /// For `ClientProtocol::Anthropic`, the response body is an Anthropic-shaped
 /// JSON envelope with `{"type":"error","error":{...}}`.
-pub fn route_error_response(protocol: ClientProtocol, error: RouteError) -> Response<Body> {
+pub(super) fn route_error_response(protocol: ClientProtocol, error: RouteError) -> Response<Body> {
     match protocol {
         ClientProtocol::Anthropic => anthropic_error_response(error),
         ClientProtocol::OpenAiChat => openai_error_response(error),
@@ -189,6 +223,21 @@ pub(crate) const INTERNAL_ERROR_CLIENT_MESSAGE: &str = "internal server error";
 /// Generic message used for provider decode error responses.
 /// The actual decode error details are logged server-side only.
 pub(crate) const PROVIDER_DECODE_CLIENT_MESSAGE: &str = "provider response decode error";
+
+/// Generic message used for upstream 4xx errors that pass through to the
+/// client. The provider's own error envelope is logged server-side only and
+/// never forwarded, so provider-specific schema (field names, model
+/// identifiers, request echoes) does not leak (audit LOW, upstream-400-body-leak).
+pub(crate) const UPSTREAM_PASSTHROUGH_CLIENT_MESSAGE: &str = "upstream rejected the request";
+
+/// Generic message used for upstream errors that collapse to 502 (every status
+/// that is not in the pass-through allowlist: 404/408/422/5xx, and
+/// operator-owned 401/403). Like the pass-through branch, the real (already
+/// key/URL-redacted) upstream body is logged server-side only and a generic
+/// message is returned, so the provider's own schema never reaches the client
+/// envelope or the persisted `ResponseFailed.message` (audit finding:
+/// 502-collapse forwarded a URL-only-redacted body carrying provider schema).
+pub(crate) const UPSTREAM_COLLAPSE_CLIENT_MESSAGE: &str = "upstream service error";
 
 /// Build an Anthropic-shaped error response.
 ///
@@ -275,7 +324,10 @@ fn openai_error_response(error: RouteError) -> Response<Body> {
 // ---------------------------------------------------------------------------
 
 /// Build an OpenAI-shaped SSE error JSON string with a custom error type.
-pub fn openai_stream_error_json_with_type(message: &str, error_type: &str) -> Option<String> {
+pub(super) fn openai_stream_error_json_with_type(
+    message: &str,
+    error_type: &str,
+) -> Option<String> {
     let body = OpenAiErrorBody {
         error: OpenAiErrorDetail {
             message: truncate_error_body(message),
@@ -284,6 +336,40 @@ pub fn openai_stream_error_json_with_type(message: &str, error_type: &str) -> Op
         },
     };
     serde_json::to_string(&body).ok()
+}
+
+/// Return the Rust variant name of a [`RouteError`].
+///
+/// The structured event-log contract documents `ResponseFailed.error_kind` as
+/// "from the `RouteError` variant name" (see the `ResponseFailed` doc in
+/// `llm-proxy-storage`), so operators querying the event log by failure class
+/// match a stable discriminant. This is deliberately distinct from the
+/// client-facing protocol error-type string returned by
+/// [`extract_error_fields`] (e.g. `"api_error"`, `"not_found_error"`): several
+/// unrelated variants share an envelope string, so the variant name is the only
+/// value that keeps `UnknownProvider`, `NotFound`, and `RateLimited`
+/// separable downstream (audit finding: error_kind not variant name).
+///
+/// Returns a `&'static str` matching the variant identifier exactly.
+pub(crate) fn route_error_variant_name(error: &RouteError) -> &'static str {
+    match error {
+        RouteError::InvalidRequest(_) => "InvalidRequest",
+        RouteError::ModelNotAllowed(_) => "ModelNotAllowed",
+        RouteError::UnknownProvider(_) => "UnknownProvider",
+        RouteError::UnsupportedRoute(_) => "UnsupportedRoute",
+        RouteError::InvalidProviderName(_) => "InvalidProviderName",
+        RouteError::Upstream { .. } => "Upstream",
+        RouteError::UpstreamTimeout(_) => "UpstreamTimeout",
+        RouteError::ProviderDecode(_) => "ProviderDecode",
+        RouteError::Internal(_) => "Internal",
+        RouteError::RateLimited => "RateLimited",
+        RouteError::Conflict => "Conflict",
+        RouteError::NotFound => "NotFound",
+        RouteError::RequestTimeout => "RequestTimeout",
+        RouteError::PayloadTooLarge => "PayloadTooLarge",
+        RouteError::MethodNotAllowed => "MethodNotAllowed",
+        RouteError::Unauthorized => "Unauthorized",
+    }
 }
 
 /// Extract the (status, error_type, message) tuple from a RouteError.
@@ -318,11 +404,27 @@ pub(crate) fn extract_error_fields(error: &RouteError) -> (StatusCode, &'static 
             "invalid_request_error",
             format!("invalid provider name: {msg}"),
         ),
-        RouteError::Upstream { status, body } => (
-            map_upstream_status(*status),
-            "api_error",
-            truncate_error_body(&sanitize_upstream_body(body)),
-        ),
+        RouteError::Upstream {
+            status,
+            body: _body,
+            auth_owner,
+        } => {
+            let mapped = map_upstream_status(*status, *auth_owner);
+            // Both branches return a generic message to the client (and to the
+            // persisted `ResponseFailed.message`), so the upstream's own schema
+            // (field names, model identifiers, request echoes) never reaches
+            // the client envelope or the event log. The real upstream body --
+            // already key/URL-redacted at construction -- is logged server-side
+            // once in `emit_response_failed`, NOT here: this function is also
+            // called from `route_error_response` on the render path, so logging
+            // here would double-warn every upstream failure.
+            let message = if mapped == *status {
+                UPSTREAM_PASSTHROUGH_CLIENT_MESSAGE
+            } else {
+                UPSTREAM_COLLAPSE_CLIENT_MESSAGE
+            };
+            (mapped, "api_error", truncate_error_body(message))
+        }
         RouteError::UpstreamTimeout(_msg) => (
             StatusCode::GATEWAY_TIMEOUT,
             "api_error",
@@ -378,25 +480,56 @@ pub(crate) fn extract_error_fields(error: &RouteError) -> (StatusCode, &'static 
 
 /// Map an upstream HTTP status to the status we return to the client.
 ///
-/// Upstream >= 400 errors become 502 Bad Gateway because they indicate a problem
-/// between the proxy and the upstream provider, not a client error. The one
-/// exception is 429 (rate limit) which we propagate as-is so clients can
-/// implement their own back-off strategies.
+/// Most upstream >= 400 errors become 502 Bad Gateway because they indicate a
+/// problem between the proxy and the upstream provider rather than a client
+/// error. A conservative allowlist of clearly-client-owned codes is passed
+/// through verbatim so the client can act on the failure:
+///   - `400 Bad Request` -- the upstream rejected the *content* of a request
+///     the proxy faithfully forwarded, which is almost always the client's
+///     responsibility.
+///   - `413 Payload Too Large` -- the upstream rejected the body size the
+///     client sent (mirrors our own `DefaultBodyLimit` 413).
+///   - `429 Too Many Requests` -- propagated so clients can implement their
+///     own back-off.
 ///
-/// Specific upstream errors (401, 403) are logged at warn level with the original
-/// status so operators can distinguish "upstream auth failure" from "upstream server
-/// crash" in logs, even though all are mapped to 502 for the client.
-fn map_upstream_status(upstream: StatusCode) -> StatusCode {
+/// Auth/permission codes (`401 Unauthorized`, `403 Forbidden`) depend on
+/// [`AuthOwner`]:
+///   - [`AuthOwner::Operator`] (managed-key mode, the default): the proxy
+///     forwards *its own* credentials, so an upstream 401/403 almost always
+///     means the *operator's* key is expired/revoked/scoped wrong -- an
+///     infrastructure problem the client cannot fix. These collapse to 502 so
+///     an operator/infrastructure issue is not misattributed to the client.
+///   - [`AuthOwner::Client`] (`passthrough_auth`): the proxy forwards the
+///     *client's* own token, so a 401/403 is the client's credential problem
+///     and passes through verbatim (audit LOW, passthrough-auth-401-collapse).
+///
+/// Other ambiguous or server-side codes (404, 408, 422, 5xx, etc.) also remain
+/// 502: they either hint at proxy/provider configuration (404 model-not-found)
+/// or are not unambiguously the client's fault, so collapsing them keeps the
+/// client contract uniform and avoids leaking provider-specific schemas. The
+/// original upstream status is always preserved in server-side logs for operators.
+///
+/// Upstream statuses that may indicate a configuration issue (401/403/404 under
+/// [`AuthOwner::Operator`]) are logged at warn level so operators can
+/// distinguish them in logs.
+fn map_upstream_status(upstream: StatusCode, auth_owner: AuthOwner) -> StatusCode {
     match upstream.as_u16() {
-        429 => StatusCode::TOO_MANY_REQUESTS,
+        // Always-client-owned codes: forward verbatim.
+        400 | 413 | 429 => upstream,
+        // Auth/permission codes pass through only when the client's own
+        // credentials were forwarded; otherwise collapse to 502 (operator-side).
+        401 | 403 if auth_owner == AuthOwner::Client => upstream,
         code => {
-            // Log specific upstream statuses that may indicate configuration issues
-            // rather than transient upstream failures, so operators can diagnose them.
+            // Auth/permission (401/403 when operator-owned) and not-found (404)
+            // statuses usually indicate an operator configuration problem
+            // (bad/expired upstream key, unknown model) rather than a transient
+            // upstream failure; log them at warn so operators can diagnose.
             if matches!(code, 401 | 403 | 404) {
                 tracing::warn!(
                     upstream_status = code,
-                    "upstream returned a status that may indicate a configuration issue \
-                     (auth failure, forbidden, or not found); mapping to 502 for client"
+                    auth_owner = ?auth_owner,
+                    "upstream returned a status that may indicate a configuration \
+                     issue (auth, forbidden, or not found); mapping to 502 for client"
                 );
             } else if code < 400 {
                 // Informational (1xx), success (2xx), or redirect (3xx) codes should
@@ -432,20 +565,6 @@ fn truncate_error_body(body: &str) -> String {
     truncate_with_suffix(body, MAX_ERROR_MESSAGE_LEN, TRUNCATED_SUFFIX)
 }
 
-/// Compiled regex for URL redaction in upstream error bodies.
-static UPSTREAM_URL_REDACT_REGEX: std::sync::LazyLock<regex::Regex> =
-    std::sync::LazyLock::new(|| {
-        regex::Regex::new(r"https?://\S+").expect("valid URL redaction regex")
-    });
-
-/// Sanitize upstream error bodies to prevent leaking hostnames, URL paths,
-/// or connection details in client responses. Redacts URL-like patterns.
-fn sanitize_upstream_body(body: &str) -> String {
-    UPSTREAM_URL_REDACT_REGEX
-        .replace_all(body, "[url-redacted]")
-        .into_owned()
-}
-
 // ===========================================================================
 // Tests
 // ===========================================================================
@@ -475,6 +594,7 @@ mod tests {
         let err = RouteError::Upstream {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             body: "upstream error".into(),
+            auth_owner: AuthOwner::Operator,
         };
         let response = route_error_response(ClientProtocol::Anthropic, err);
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
@@ -485,6 +605,7 @@ mod tests {
         let err = RouteError::Upstream {
             status: StatusCode::TOO_MANY_REQUESTS,
             body: "rate limited".into(),
+            auth_owner: AuthOwner::Operator,
         };
         let response = route_error_response(ClientProtocol::Anthropic, err);
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
@@ -575,6 +696,7 @@ mod tests {
         let err = RouteError::Upstream {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             body: "upstream error".into(),
+            auth_owner: AuthOwner::Operator,
         };
         let response = route_error_response(ClientProtocol::OpenAiChat, err);
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
@@ -585,6 +707,7 @@ mod tests {
         let err = RouteError::Upstream {
             status: StatusCode::TOO_MANY_REQUESTS,
             body: "rate limited".into(),
+            auth_owner: AuthOwner::Operator,
         };
         let response = route_error_response(ClientProtocol::OpenAiChat, err);
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
@@ -657,18 +780,85 @@ mod tests {
 
     #[tokio::test]
     async fn openai_upstream_500_body_has_correct_structure() {
+        // A 500 collapses to 502. The client must see a GENERIC message -- the
+        // upstream's own body (which may carry provider-specific schema, model
+        // identifiers, or request echoes) is logged server-side only and never
+        // reaches the client envelope (audit finding: 502-collapse message leak).
         let err = RouteError::Upstream {
             status: StatusCode::INTERNAL_SERVER_ERROR,
-            body: "upstream error".into(),
+            body: "model 'gpt-foo' is overloaded: request echoed here".into(),
+            auth_owner: AuthOwner::Operator,
         };
         let response = route_error_response(ClientProtocol::OpenAiChat, err);
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
         let body = axum::body::to_bytes(response.into_body(), 4096)
             .await
             .expect("body");
         let json: serde_json::Value = serde_json::from_slice(&body).expect("valid JSON");
         assert_eq!(json["error"]["type"], "api_error");
-        assert_eq!(json["error"]["message"], "upstream error");
+        assert_eq!(json["error"]["message"], UPSTREAM_COLLAPSE_CLIENT_MESSAGE);
         assert!(json["error"]["code"].is_null());
+        // The provider-specific schema/body must NOT reach the client.
+        let message = json["error"]["message"].as_str().unwrap();
+        assert!(!message.contains("gpt-foo"));
+        assert!(!message.contains("overloaded"));
+        assert!(!message.contains("echoed"));
+    }
+
+    #[tokio::test]
+    async fn upstream_passthrough_400_uses_generic_message() {
+        // A pass-through code (400) forwards a GENERIC message to the client so
+        // the upstream's own schema (field names, model identifiers, request
+        // echoes) never leaks. The real upstream body is logged server-side
+        // only (audit LOW, upstream-400-body-leak).
+        let err = RouteError::Upstream {
+            status: StatusCode::BAD_REQUEST,
+            body: r#"{"error":{"message":"model 'gpt-foo' does not exist","type":"invalid_request_error"}}"#.into(),
+            auth_owner: AuthOwner::Operator,
+        };
+        let response = route_error_response(ClientProtocol::OpenAiChat, err);
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .expect("body");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("valid JSON");
+        let message = json["error"]["message"].as_str().unwrap();
+        assert_eq!(message, UPSTREAM_PASSTHROUGH_CLIENT_MESSAGE);
+        // The provider-specific schema/model name must NOT reach the client.
+        assert!(!message.contains("gpt-foo"));
+        assert!(!message.contains("invalid_request_error"));
+    }
+
+    #[tokio::test]
+    async fn upstream_passthrough_401_client_uses_generic_message_and_passes_through() {
+        // Under passthrough_auth a 401 is client-owned and passes through, but
+        // the body is still the generic message (not the provider envelope).
+        let err = RouteError::Upstream {
+            status: StatusCode::UNAUTHORIZED,
+            body: "invalid api key sk-leaked".into(),
+            auth_owner: AuthOwner::Client,
+        };
+        let response = route_error_response(ClientProtocol::OpenAiChat, err);
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .expect("body");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("valid JSON");
+        let message = json["error"]["message"].as_str().unwrap();
+        assert_eq!(message, UPSTREAM_PASSTHROUGH_CLIENT_MESSAGE);
+        assert!(!message.contains("sk-leaked"));
+    }
+
+    #[tokio::test]
+    async fn upstream_401_operator_collapses_to_502() {
+        // Managed-key mode: a 401 collapses to 502 (operator's key is bad).
+        let err = RouteError::Upstream {
+            status: StatusCode::UNAUTHORIZED,
+            body: "invalid api key".into(),
+            auth_owner: AuthOwner::Operator,
+        };
+        let response = route_error_response(ClientProtocol::OpenAiChat, err);
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     }
 
     #[tokio::test]
@@ -826,36 +1016,139 @@ mod tests {
         );
     }
 
-    // -- map_upstream_status ---------------------------------------------------
+    // -- route_error_variant_name ----------------------------------------------
+
+    // The event-log `ResponseFailed.error_kind` is documented as the RouteError
+    // variant name (a stable discriminant), NOT the client-facing protocol
+    // error-type string. Pin a representative set so distinct variants that
+    // share an envelope string (e.g. UnknownProvider vs NotFound, both
+    // "not_found_error" to the client) stay separable downstream
+    // (audit finding: error_kind not variant name).
 
     #[test]
-    fn upstream_400_maps_to_502() {
+    fn route_error_variant_name_returns_variant_identifier() {
         assert_eq!(
-            map_upstream_status(StatusCode::BAD_REQUEST),
+            route_error_variant_name(&RouteError::UnknownProvider("p".into())),
+            "UnknownProvider"
+        );
+        assert_eq!(route_error_variant_name(&RouteError::NotFound), "NotFound");
+        assert_eq!(
+            route_error_variant_name(&RouteError::RateLimited),
+            "RateLimited"
+        );
+        assert_eq!(
+            route_error_variant_name(&RouteError::RequestTimeout),
+            "RequestTimeout"
+        );
+        assert_eq!(
+            route_error_variant_name(&RouteError::PayloadTooLarge),
+            "PayloadTooLarge"
+        );
+        assert_eq!(
+            route_error_variant_name(&RouteError::MethodNotAllowed),
+            "MethodNotAllowed"
+        );
+        assert_eq!(
+            route_error_variant_name(&RouteError::Upstream {
+                status: StatusCode::BAD_GATEWAY,
+                body: String::new(),
+                auth_owner: AuthOwner::Operator,
+            }),
+            "Upstream"
+        );
+        // The client-facing type string is a DIFFERENT value (proving the two
+        // are not accidentally the same source).
+        let (status, client_type, _msg) =
+            extract_error_fields(&RouteError::UnknownProvider("p".into()));
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_ne!(client_type, "UnknownProvider");
+    }
+
+    // -- map_upstream_status ---------------------------------------------------
+
+    // A conservative allowlist of clearly-client-owned upstream codes is
+    // forwarded verbatim so clients can act on their own bad request /
+    // size / rate-limit failures (audit LOW, upstream 4xx mapping). Auth
+    // codes (401/403) collapse to 502 for operator-owned credentials and pass
+    // through only for client-owned (passthrough_auth) credentials.
+
+    #[test]
+    fn upstream_400_passes_through() {
+        assert_eq!(
+            map_upstream_status(StatusCode::BAD_REQUEST, AuthOwner::Operator),
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[test]
+    fn upstream_401_operator_maps_to_502() {
+        // In managed-key mode an upstream 401 means the operator's key is bad,
+        // not the client's credentials -- collapse to 502 so the client is not
+        // misattributed an operator/infrastructure issue.
+        assert_eq!(
+            map_upstream_status(StatusCode::UNAUTHORIZED, AuthOwner::Operator),
             StatusCode::BAD_GATEWAY
         );
     }
 
     #[test]
-    fn upstream_401_maps_to_502() {
+    fn upstream_401_client_passes_through() {
+        // Under passthrough_auth the client's own token is forwarded, so an
+        // upstream 401 is the client's credential problem and passes through
+        // verbatim (audit LOW, passthrough-auth-401-collapse).
         assert_eq!(
-            map_upstream_status(StatusCode::UNAUTHORIZED),
+            map_upstream_status(StatusCode::UNAUTHORIZED, AuthOwner::Client),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[test]
+    fn upstream_403_operator_maps_to_502() {
+        assert_eq!(
+            map_upstream_status(StatusCode::FORBIDDEN, AuthOwner::Operator),
             StatusCode::BAD_GATEWAY
+        );
+    }
+
+    #[test]
+    fn upstream_403_client_passes_through() {
+        assert_eq!(
+            map_upstream_status(StatusCode::FORBIDDEN, AuthOwner::Client),
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[test]
+    fn upstream_413_passes_through() {
+        assert_eq!(
+            map_upstream_status(StatusCode::PAYLOAD_TOO_LARGE, AuthOwner::Operator),
+            StatusCode::PAYLOAD_TOO_LARGE
         );
     }
 
     #[test]
     fn upstream_429_maps_to_429() {
         assert_eq!(
-            map_upstream_status(StatusCode::TOO_MANY_REQUESTS),
+            map_upstream_status(StatusCode::TOO_MANY_REQUESTS, AuthOwner::Operator),
             StatusCode::TOO_MANY_REQUESTS
+        );
+    }
+
+    #[test]
+    fn upstream_404_maps_to_502() {
+        // Ambiguous (model-not-found vs unknown path): kept as 502 to avoid
+        // leaking provider-specific schemas; logged at warn server-side. 404 is
+        // never client-owned, so it collapses regardless of auth owner.
+        assert_eq!(
+            map_upstream_status(StatusCode::NOT_FOUND, AuthOwner::Client),
+            StatusCode::BAD_GATEWAY
         );
     }
 
     #[test]
     fn upstream_500_maps_to_502() {
         assert_eq!(
-            map_upstream_status(StatusCode::INTERNAL_SERVER_ERROR),
+            map_upstream_status(StatusCode::INTERNAL_SERVER_ERROR, AuthOwner::Operator),
             StatusCode::BAD_GATEWAY
         );
     }
@@ -951,18 +1244,27 @@ mod tests {
 
     #[tokio::test]
     async fn anthropic_upstream_500_body_has_correct_structure() {
+        // A 500 collapses to 502 with a GENERIC message; the upstream body is
+        // logged server-side only and never reaches the client (mirror of the
+        // OpenAI test; audit finding: 502-collapse message leak).
         let err = RouteError::Upstream {
             status: StatusCode::INTERNAL_SERVER_ERROR,
-            body: "upstream error".into(),
+            body: "model 'gpt-foo' is overloaded: request echoed here".into(),
+            auth_owner: AuthOwner::Operator,
         };
         let response = route_error_response(ClientProtocol::Anthropic, err);
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
         let body = axum::body::to_bytes(response.into_body(), 4096)
             .await
             .expect("body");
         let json: serde_json::Value = serde_json::from_slice(&body).expect("valid JSON");
         assert_eq!(json["type"], "error");
         assert_eq!(json["error"]["type"], "api_error");
-        assert_eq!(json["error"]["message"], "upstream error");
+        assert_eq!(json["error"]["message"], UPSTREAM_COLLAPSE_CLIENT_MESSAGE);
+        let message = json["error"]["message"].as_str().unwrap();
+        assert!(!message.contains("gpt-foo"));
+        assert!(!message.contains("overloaded"));
+        assert!(!message.contains("echoed"));
     }
 
     #[tokio::test]

@@ -384,6 +384,17 @@ where
 /// validating it parses as a legitimate [`std::net::IpAddr`]. Invalid or
 /// spoofed values are silently ignored and the connection-info fallback is
 /// used instead.
+///
+/// # Trust model
+///
+/// The **leftmost** `X-Forwarded-For` entry is trusted as the client address.
+/// This is only correct behind a **single** reverse proxy that strips or
+/// overwrites any inbound `X-Forwarded-For` before appending its own hop. With
+/// multiple untrusted hops the leftmost entry is attacker-controllable (a
+/// client may prepend arbitrary IPs), so the extracted address must not be
+/// trusted for authentication, rate-limit bypass, or audit logging. The IpAddr
+/// parse check defends against malformed garbage, not against well-formed
+/// spoofed values.
 pub fn get_client_ip(
     headers: &axum::http::HeaderMap,
     connect_info: Option<&SocketAddr>,

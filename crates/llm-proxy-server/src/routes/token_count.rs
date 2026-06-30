@@ -4,6 +4,8 @@
 //! adapter into a `CoreRequest`, and estimates the token count from the core
 //! representation.
 
+use std::sync::Arc;
+
 use axum::body::Body;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Extension, Path, State};
@@ -12,6 +14,8 @@ use axum::response::IntoResponse;
 use llm_proxy_core::MessageContent;
 use llm_proxy_protocol::anthropic::MessageRequest;
 use llm_proxy_protocol::client::anthropic;
+use llm_proxy_protocol::core::{StopReason, Usage};
+use llm_proxy_storage::{ProxyEvent, RequestReceived, ResponseCompleted};
 use serde::Serialize;
 
 use crate::middleware::{OptionalConnectInfo, RequestId};
@@ -39,13 +43,15 @@ pub(crate) struct TokenCountResponse {
 
 /// POST `/providers/{provider}/v1/messages/count_tokens`
 ///
-/// Accepts an Anthropic-format request, estimates the token count
-/// using the heuristic counter, and returns the result.
+/// Accepts an Anthropic-format request, decodes it through the Anthropic client
+/// adapter into a `CoreRequest`, and estimates the token count using the
+/// configured tokenizer: the model's own BPE tokenizer for known OpenAI models,
+/// falling back to the ~4 chars/token heuristic otherwise.
 ///
 /// This handler uses the core pipeline decode (`anthropic::decode_request`)
-/// rather than direct field access on `MessageRequest`, ensuring it works
-/// using the configured tokenizer.
-pub async fn count_tokens(
+/// rather than direct field access on `MessageRequest`, so the requested model
+/// id (`core.model.requested`) is available to select the right tokenizer.
+pub(crate) async fn count_tokens(
     State(state): State<AppState>,
     Path(provider): Path<String>,
     Extension(req_id): Extension<RequestId>,
@@ -53,6 +59,13 @@ pub async fn count_tokens(
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response<Body> {
+    let start = std::time::Instant::now();
+    // The wrapper only renders: it does NOT emit ResponseFailed. token_count
+    // has no core-pipeline dispatch, so each early-gate error return inside the
+    // inner function emits exactly one ResponseFailed itself, and the success
+    // path emits exactly one ResponseCompleted. A blanket emit here would
+    // double-count, so the wrapper stays emit-free
+    // (audit route-responsefailed-gaps regression).
     match count_tokens_inner(
         &state,
         req_id,
@@ -60,6 +73,7 @@ pub async fn count_tokens(
         connect_info.as_ref(),
         &headers,
         body,
+        start,
     )
     .await
     {
@@ -93,15 +107,36 @@ async fn count_tokens_inner(
     connect_info: Option<&std::net::SocketAddr>,
     headers: &HeaderMap,
     body: axum::body::Bytes,
+    start: std::time::Instant,
 ) -> Result<Response<Body>, RouteError> {
-    // Pre-flight: rate limit, dedup, request ID.
-    core_pipeline::validate_provider_name(provider)?;
+    // Pre-flight: rate limit, dedup, request ID. token_count has no core-pipeline
+    // dispatch, so each EARLY-GATE error return below emits exactly one
+    // ResponseFailed itself, and the success path emits exactly one
+    // ResponseCompleted (audit route-responsefailed-gaps).
+    let event_bus = Arc::clone(&state.event_bus);
+    // The request id is consumed by prepare_request below; snapshot it once so
+    // every early-gate emit references the same id.
+    let request_id = req_id.0.clone();
+    core_pipeline::validate_provider_name(provider).inspect_err(|e| {
+        core_pipeline::emit_response_failed(&event_bus, &request_id, Some(provider), None, e, start)
+    })?;
     if state.providers().get(provider).is_none() {
-        return Err(RouteError::UnknownProvider(provider.to_owned()));
+        let err = RouteError::UnknownProvider(provider.to_owned());
+        core_pipeline::emit_response_failed(
+            &event_bus,
+            &request_id,
+            Some(provider),
+            None,
+            &err,
+            start,
+        );
+        return Err(err);
     }
     // Reject non-JSON Content-Type before parsing, so a wrong media type is not
     // misreported as a JSON syntax error (audit LOW-30).
-    core_pipeline::validate_json_content_type(headers)?;
+    core_pipeline::validate_json_content_type(headers).inspect_err(|e| {
+        core_pipeline::emit_response_failed(&event_bus, &request_id, Some(provider), None, e, start)
+    })?;
     let request_path = format!("/providers/{provider}/v1/messages/count_tokens");
     let ctx = core_pipeline::prepare_request(
         state,
@@ -110,7 +145,10 @@ async fn count_tokens_inner(
         connect_info,
         &body,
         &request_path,
-    )?;
+    )
+    .inspect_err(|e| {
+        core_pipeline::emit_response_failed(&event_bus, &request_id, Some(provider), None, e, start)
+    })?;
     // Parse and validate the Anthropic MessageRequest.
     //
     // Go through `axum::Json::from_bytes` (rather than `serde_json::from_slice`)
@@ -120,18 +158,64 @@ async fn count_tokens_inner(
     let req: MessageRequest = match axum::Json::<MessageRequest>::from_bytes(&body) {
         Ok(axum::Json(value)) => value,
         Err(rejection) => {
-            return Err(RouteError::InvalidRequest(json_rejection_message(
-                &rejection,
-            )));
+            let err = RouteError::InvalidRequest(json_rejection_message(&rejection));
+            core_pipeline::emit_response_failed(
+                &event_bus,
+                &request_id,
+                Some(provider),
+                None,
+                &err,
+                start,
+            );
+            return Err(err);
         }
     };
 
     req.validate()
-        .map_err(|e| RouteError::InvalidRequest(e.to_string()))?;
+        .map_err(|e| RouteError::InvalidRequest(e.to_string()))
+        .inspect_err(|e| {
+            core_pipeline::emit_response_failed(
+                &event_bus,
+                &request_id,
+                Some(provider),
+                None,
+                e,
+                start,
+            )
+        })?;
 
     // Decode through the Anthropic client adapter to get a CoreRequest.
     // This validates the request shape and normalises it.
-    let core = anthropic::decode_request(req).map_err(core_pipeline::protocol_error_to_route)?;
+    let core = anthropic::decode_request(req)
+        .map_err(core_pipeline::protocol_error_to_route)
+        .inspect_err(|e| {
+            core_pipeline::emit_response_failed(
+                &event_bus,
+                &request_id,
+                Some(provider),
+                None,
+                e,
+                start,
+            )
+        })?;
+
+    // Emit a RequestReceived event for the token-count request. token_count is a
+    // real proxy request (it decodes client input and consumes rate-limit/dedup
+    // budget) so it is logged like any other route. route_kind/client_protocol
+    // are marked "count_tokens" / "anthropic" so consumers can distinguish it
+    // from inference requests (audit eventlog-early-gates).
+    state
+        .event_bus
+        .emit(&ProxyEvent::RequestReceived(RequestReceived {
+            request_id: ctx.request_id.clone(),
+            timestamp: time::OffsetDateTime::now_utc(),
+            provider: provider.to_owned(),
+            route_kind: "count_tokens".to_owned(),
+            client_protocol: "anthropic".to_owned(),
+            model: core.model.clone(),
+            streaming: false,
+            body_hash: super::core_pipeline::body_hash_of_bytes(&body),
+        }));
 
     // Extract text content from core messages for token counting.
     //
@@ -212,9 +296,39 @@ async fn count_tokens_inner(
         })
         .collect();
 
-    let count = state
-        .token_counter
-        .count_messages(&core.model.requested, &system_text, &messages);
+    // BPE tokenization is CPU-bound (fancy-regex driven) and the request body
+    // is attacker-controlled up to MAX_BODY_BYTES (32 MiB). Running it on the
+    // tokio worker thread stalls every other future polled on that worker for
+    // the full duration of the encode, so offload it to the blocking pool.
+    // `Counter::clone` is a cheap refcount bump; `system_text` and `messages`
+    // are already owned here and are the last use on this path.
+    let counter = state.token_counter.clone();
+    let model = core.model.requested.clone();
+    let count = tokio::task::spawn_blocking(move || {
+        counter.count_messages(&model, &system_text, &messages)
+    })
+    .await
+    .map_err(|e| RouteError::Internal(format!("token count task failed: {e}")))?;
+
+    // Emit a ResponseCompleted event. token_count performs no upstream inference
+    // so there is no provider usage, cost, or stop reason; usage is a synthetic
+    // zero with provenance SyntheticZero and stop_reason is EndTurn so the event
+    // shape stays uniform with the inference routes. The computed token estimate
+    // travels in the HTTP response body, not the event (audit eventlog-early-gates).
+    let latency = start.elapsed();
+    state
+        .event_bus
+        .emit(&ProxyEvent::ResponseCompleted(ResponseCompleted {
+            request_id: ctx.request_id.clone(),
+            timestamp: time::OffsetDateTime::now_utc(),
+            provider: provider.to_owned(),
+            upstream_message_id: None,
+            model: core.model.clone(),
+            usage: Usage::synthetic_zero(),
+            cost: None,
+            stop_reason: StopReason::EndTurn,
+            latency_ms: latency.as_millis().try_into().unwrap_or(u64::MAX),
+        }));
 
     let response = axum::Json(TokenCountResponse {
         input_tokens: count,
