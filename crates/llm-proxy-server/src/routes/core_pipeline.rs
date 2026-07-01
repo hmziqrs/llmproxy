@@ -781,7 +781,6 @@ pub(crate) async fn handle_core_once(
         err
     })?;
 
-    // Send to upstream.
     let response_bytes = state.proxy_client.send(proxy_req).await.map_err(|e| {
         let err = map_provider_error(e, passthrough_auth);
         state.metrics.record_failure();
@@ -1107,7 +1106,6 @@ pub(crate) async fn handle_core_stream(
             err
         })?;
 
-    // Create a provider stream decoder.
     let provider_decoder = adapter.new_stream_decoder(&target);
     let sse_framer = SseFramer::new();
 
@@ -1665,7 +1663,6 @@ fn build_sse_output_stream(
                 chunk = stream.next() => {
                     match chunk {
                         Some(Ok(bytes)) => {
-                            // Feed bytes through the SSE framer.
                             let frames = match ctx.sse_framer.push_chunk(&bytes) {
                                 Ok(f) => f,
                                 Err(e) => {

@@ -196,11 +196,9 @@ static GLOB_CACHE: std::sync::Mutex<Vec<(String, Regex)>> = std::sync::Mutex::ne
 /// compiled once per process.
 fn glob_matches(pattern: &str, value: &str) -> bool {
     let mut cache = GLOB_CACHE.lock().unwrap_or_else(|e| e.into_inner());
-    // Check if we already compiled this pattern.
     if let Some((_, regex)) = cache.iter().find(|(p, _)| p == pattern) {
         return regex.is_match(value);
     }
-    // Compile and cache the new pattern.
     let mut expression = String::with_capacity(pattern.len() + 2);
     expression.push('^');
     let mut literal_buf = String::new();

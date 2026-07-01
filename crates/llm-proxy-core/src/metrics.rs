@@ -616,7 +616,6 @@ mod tests {
             }));
         }
 
-        // Reader thread.
         let m_reader = Arc::clone(&m);
         let reader = thread::spawn(move || {
             for _ in 0..100 {

@@ -951,7 +951,6 @@ mod tests {
 
         let service = ModelCatalogService::new(Some(directory.clone()));
         let provider = provider("http://127.0.0.1:0/models".to_owned());
-        // load_disk_cache so the in-memory cache is populated
         service.load_disk_cache(&provider).await.unwrap();
         assert!(
             service.cache_is_fresh(&provider).await,

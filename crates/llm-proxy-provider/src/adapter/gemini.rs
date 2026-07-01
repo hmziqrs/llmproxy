@@ -294,7 +294,6 @@ impl GeminiAdapter {
                         }
                     }
                     CoreContent::ToolUse { name, input, .. } => {
-                        // Encode tool-use as a functionCall part.
                         parts.push(GeminiPart::function_call(name.clone(), Some(input.clone())));
                     }
                     CoreContent::ToolResult {
@@ -302,8 +301,6 @@ impl GeminiAdapter {
                         content: result_content,
                         is_error,
                     } => {
-                        // Encode tool-result as a functionResponse part.
-                        // Build the response payload from the result content.
                         if *is_error {
                             tracing::warn!(
                                 tool_use_id,
@@ -442,7 +439,6 @@ impl GeminiAdapter {
             }
         }
 
-        // Tools.
         let tools: Vec<GeminiTool> = if core.tools.is_empty() {
             vec![]
         } else {
@@ -466,7 +462,6 @@ impl GeminiAdapter {
             }]
         };
 
-        // Generation config.
         let generation_config = GeminiGenerationConfig {
             temperature: core.sampling.temperature,
             top_p: core.sampling.top_p,

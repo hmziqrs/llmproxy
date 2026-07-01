@@ -553,7 +553,6 @@ mod tests {
         headers.insert("x-forwarded-for", "1.2.3.4".parse().unwrap());
         let connect_info = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
 
-        // With trust_forwarded_headers = false, should use connection info.
         let ip = super::get_client_ip(&headers, Some(&connect_info), false);
         assert_eq!(
             ip, "127.0.0.1",
@@ -570,7 +569,6 @@ mod tests {
         headers.insert("x-forwarded-for", "1.2.3.4".parse().unwrap());
         let connect_info = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
 
-        // With trust_forwarded_headers = true, should use X-Forwarded-For.
         let ip = super::get_client_ip(&headers, Some(&connect_info), true);
         assert_eq!(ip, "1.2.3.4", "should use X-Forwarded-For when trust=true");
     }

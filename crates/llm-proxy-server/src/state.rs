@@ -454,7 +454,6 @@ mod tests {
         };
         let registry = ProviderRegistry::from_providers(vec![provider]).expect("registry");
         let adapter_reg = ProviderAdapterRegistry::builtin();
-        // Validate protocols against builtins
         let result = registry.validate_protocols(adapter_reg.protocol_names());
         assert!(result.is_ok(), "all protocols are builtin, got: {result:?}");
     }

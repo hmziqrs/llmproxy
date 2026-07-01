@@ -125,7 +125,6 @@ pub fn cmd_stop_with_timing(
                     }
                 }
 
-                // Send SIGTERM.
                 let ret = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
                 if ret != 0 {
                     let err = std::io::Error::last_os_error();

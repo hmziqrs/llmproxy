@@ -347,7 +347,6 @@ impl OpenAiChatAdapter {
     ) -> Result<super::ProxyRequest, ProviderError> {
         let mut messages = Vec::new();
 
-        // System messages.
         for sys_content in &core.system {
             match sys_content {
                 CoreContent::Text { text, cache } => {
@@ -379,7 +378,6 @@ impl OpenAiChatAdapter {
             }
         }
 
-        // Conversation messages.
         for msg in &core.messages {
             match msg.role {
                 CoreRole::User => {
@@ -560,7 +558,6 @@ impl OpenAiChatAdapter {
             }
         }
 
-        // Tools.
         let tools: Vec<ToolDef> = core
             .tools
             .iter()

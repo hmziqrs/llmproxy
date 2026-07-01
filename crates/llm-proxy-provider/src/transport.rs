@@ -499,7 +499,6 @@ async fn check_status(resp: reqwest::Response) -> Result<Vec<u8>, ProviderError>
 // ===========================================================================
 // Tests
 // ===========================================================================
-// ===========================================================================
 
 #[cfg(test)]
 mod tests {
@@ -580,7 +579,6 @@ mod tests {
             ));
         }
 
-        // Echo body
         let body_str = String::from_utf8_lossy(&body);
         response_parts.push(format!("body: {}", body_str));
 

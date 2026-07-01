@@ -199,7 +199,6 @@ async fn handle_messages_inner(
     // Extract the inbound client auth token (used by passthrough-auth providers).
     let inbound_auth = core_pipeline::extract_inbound_auth(&headers);
 
-    // Dispatch to streaming or non-streaming pipeline.
     if is_streaming {
         core_pipeline::handle_core_stream(
             state,

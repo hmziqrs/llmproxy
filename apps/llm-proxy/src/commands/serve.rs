@@ -43,7 +43,6 @@ pub async fn cmd_serve(
         return spawn_daemon(config_path, port_override);
     }
 
-    // Resolve config file path.
     let path = resolve_config(config_path.as_deref());
 
     validate_toml_extension(&path)?;

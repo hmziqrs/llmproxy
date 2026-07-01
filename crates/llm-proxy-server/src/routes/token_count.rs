@@ -343,7 +343,6 @@ async fn count_tokens_inner(
         axum::http::HeaderValue::from_static("application/json"),
     );
 
-    // Insert the request ID header safely.
     response.headers_mut().insert(
         "x-request-id",
         ctx.request_id
