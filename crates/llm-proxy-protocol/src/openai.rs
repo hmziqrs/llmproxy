@@ -355,6 +355,19 @@ pub struct UsageInfo {
     pub prompt_cache_miss_tokens: Option<i32>,
 }
 
+/// Deserialize `T`, treating a JSON `null` as `T::default()`. Combined with
+/// `#[serde(default)]` (which covers an absent field), this lets the
+/// [`ChatCompletionResponse`] `usage` field decode cleanly whether the provider
+/// omits it or sends `null` — both yield zero counts instead of a 502.
+fn deserialize_default_on_null<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de> + Default,
+{
+    use serde::Deserialize as _;
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
+}
+
 // ---------------------------------------------------------------------------
 // Choice
 // ---------------------------------------------------------------------------
@@ -406,12 +419,12 @@ pub struct ChatCompletionResponse {
     pub choices: Vec<Choice>,
     /// Token usage for this request.
     ///
-    /// `#[serde(default)]`: some OpenAI-compatible providers (e.g. certain
-    /// OpenRouter backends) omit `usage` entirely on 2xx responses. Without a
-    /// default the strict deserialize fails and the request surfaces as a 502
-    /// "provider response decode error"; with a default an absent `usage`
-    /// yields zero token counts and the response decodes normally.
-    #[serde(default)]
+    /// Some OpenAI-compatible providers (e.g. certain OpenRouter backends) omit
+    /// `usage` entirely or send it as `null` on 2xx responses. The
+    /// `#[serde(default)]` + `deserialize_default_on_null` combination maps both
+    /// cases to zero token counts so the response decodes normally instead of
+    /// failing into a 502 "provider response decode error".
+    #[serde(default, deserialize_with = "deserialize_default_on_null")]
     pub usage: UsageInfo,
     /// Catch-all for provider-specific response fields (e.g. `service_tier`,
     /// `system_fingerprint`) that the proxy does not model explicitly.

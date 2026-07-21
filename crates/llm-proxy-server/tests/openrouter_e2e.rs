@@ -990,6 +990,42 @@ async fn response_missing_usage_decodes_with_zero_usage() {
     );
 }
 
+/// Variant where the provider sends `"usage": null` instead of omitting the
+/// field. Must also decode with zero usage, not 502.
+#[tokio::test]
+async fn response_with_null_usage_decodes_with_zero_usage() {
+    let body = serde_json::to_vec(&json!({
+        "id": "gen-nullusage",
+        "provider": "Venice",
+        "model": "meta-llama/llama-3.2-3b-instruct:free",
+        "object": "chat.completion",
+        "created": 1719000000,
+        "choices": [{
+            "index": 0,
+            "message": { "role": "assistant", "content": "pong" },
+            "finish_reason": "stop"
+        }],
+        "usage": null
+    }))
+    .unwrap();
+
+    let mock_url = spawn_mock(body).await;
+    let app = build_router(openrouter_state(&mock_url, HashMap::new()));
+    let resp = app
+        .oneshot(anthropic_messages_request(&make_messages_body(false)))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "a 200 body with `usage: null` must decode (with zero usage), not 502"
+    );
+    let v = read_json(resp).await;
+    assert_eq!(v["type"], "message");
+    assert_eq!(v["usage"]["input_tokens"], 0);
+    assert_eq!(v["usage"]["output_tokens"], 0);
+}
+
 // ===========================================================================
 // Goal: live network validation (opt-in)
 // ===========================================================================
