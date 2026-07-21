@@ -330,7 +330,12 @@ pub struct ChatCompletionRequest {
 /// return additional usage fields (e.g. `prompt_tokens_details`) that the
 /// proxy does not model. Unknown fields are silently ignored rather than
 /// causing parse failures.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+///
+/// `Default` is derived so the [`ChatCompletionResponse`] `usage` field can use
+/// `#[serde(default)]`: some OpenAI-compatible providers omit `usage` entirely
+/// on 2xx responses, and absent usage should yield zero counts rather than a
+/// decode failure.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct UsageInfo {
     /// Tokens consumed by the prompt.
     pub prompt_tokens: i32,
@@ -400,6 +405,13 @@ pub struct ChatCompletionResponse {
     /// Ordered list of completion alternatives.
     pub choices: Vec<Choice>,
     /// Token usage for this request.
+    ///
+    /// `#[serde(default)]`: some OpenAI-compatible providers (e.g. certain
+    /// OpenRouter backends) omit `usage` entirely on 2xx responses. Without a
+    /// default the strict deserialize fails and the request surfaces as a 502
+    /// "provider response decode error"; with a default an absent `usage`
+    /// yields zero token counts and the response decodes normally.
+    #[serde(default)]
     pub usage: UsageInfo,
     /// Catch-all for provider-specific response fields (e.g. `service_tier`,
     /// `system_fingerprint`) that the proxy does not model explicitly.
