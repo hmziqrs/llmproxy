@@ -1171,10 +1171,14 @@ async fn live_openrouter_round_trip() {
     let mut ok = 0usize;
     let mut rate_limited = 0usize;
     let mut other = 0usize;
+    let mut upstream_failures = 0usize;
     let mut first_ok: Option<String> = None;
-    // (model, client-facing body) for each 502 decode failure — a real proxy
-    // bug; asserted empty at the end. Run with RUST_LOG=llm_proxy_server=debug
-    // to see the underlying serde cause (which required field failed).
+    // A 502 is only a *proxy* bug when it is a ProviderDecode
+    // ("provider response decode error"); a 502 carrying "upstream service
+    // error" is an upstream 5xx the proxy correctly collapsed (the upstream
+    // provider's fault — common with free-tier overload) and is tolerated.
+    // Asserted empty at the end; run with RUST_LOG=llm_proxy_server=debug to
+    // see the underlying serde cause of any real decode failure.
     let mut decode_failures: Vec<(String, String)> = Vec::new();
 
     for model in &candidates {
@@ -1237,20 +1241,25 @@ async fn live_openrouter_round_trip() {
         } else if status == StatusCode::TOO_MANY_REQUESTS {
             rate_limited += 1;
         } else if status == StatusCode::BAD_GATEWAY {
-            // Proxy decode failure (the proxy's fault, not the upstream's).
-            // Record and keep going so the remaining models are still exercised;
-            // asserted empty at the end. The raw serde cause is logged
-            // server-side — run with RUST_LOG=llm_proxy_server=debug to see it.
-            decode_failures.push((model.clone(), text.clone()));
+            // Distinguish the two 502 causes. Only a ProviderDecode
+            // ("provider response decode error") is the proxy's fault; an
+            // "upstream service error" 502 is an upstream 5xx the proxy
+            // correctly collapsed and is tolerated.
+            if text.contains("provider response decode error") {
+                decode_failures.push((model.clone(), text.clone()));
+            } else {
+                upstream_failures += 1;
+            }
         } else {
             other += 1;
         }
     }
 
     eprintln!(
-        "\nsummary: {} converted ok, {} rate-limited, {} other (model/auth) errors, {} decode failures (502) across {} candidates",
+        "\nsummary: {} converted ok, {} rate-limited, {} upstream failures (502, upstream's fault), {} other errors, {} decode failures (502, proxy bug) across {} candidates",
         ok,
         rate_limited,
+        upstream_failures,
         other,
         decode_failures.len(),
         candidates.len()
