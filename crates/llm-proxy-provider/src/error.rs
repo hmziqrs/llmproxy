@@ -27,6 +27,11 @@ pub enum ProviderError {
         message: String,
         /// Whether reqwest classified the failure as a timeout.
         timeout: bool,
+        /// Whether reqwest classified the failure as a redirect-policy
+        /// violation (e.g. too many redirects, or a cross-host redirect refused
+        /// by a custom policy). Redirect-policy failures are deterministic, so
+        /// [`DiscoveryClient::is_transient`] must not retry them.
+        redirect: bool,
     },
 
     /// The upstream API returned an error status code.
@@ -66,11 +71,50 @@ pub enum ProviderError {
 impl From<reqwest::Error> for ProviderError {
     fn from(error: reqwest::Error) -> Self {
         let timeout = error.is_timeout();
+        let redirect = error.is_redirect();
         Self::Http {
             message: error.without_url().to_string(),
             timeout,
+            redirect,
         }
     }
+}
+
+/// Read at most `cap` bytes of an upstream error body via a byte stream.
+///
+/// Rather than calling `Response::text()`/`bytes()` (which buffer the entire
+/// body) and truncating after the fact, this streams `bytes_stream()` and stops
+/// as soon as `cap` bytes have accumulated. A read error is rendered as a
+/// placeholder so the caller still gets a usable error body (audit
+/// transport-unbounded-error-body-read / discovery-error-body-full-read).
+///
+/// Shared by the request transport ([`crate::transport`]) and the discovery
+/// client ([`crate::discovery`]); the cap is larger than the final sanitization
+/// truncation so the most diagnostic prefix is retained for logging.
+pub(crate) async fn read_error_body_bounded(resp: reqwest::Response, cap: usize) -> String {
+    use futures::TryStreamExt;
+    let mut stream = resp.bytes_stream();
+    let mut buf: Vec<u8> = Vec::with_capacity(cap.min(2048));
+    loop {
+        match stream.try_next().await {
+            Ok(Some(bytes)) => {
+                let remaining = cap.saturating_sub(buf.len());
+                if remaining == 0 {
+                    break;
+                }
+                // Multi-byte safe: only append whole bytes up to the cap; never
+                // slice a &str at a raw byte offset.
+                let take = bytes.len().min(remaining);
+                buf.extend_from_slice(&bytes[..take]);
+                if buf.len() >= cap {
+                    break;
+                }
+            }
+            Ok(None) => break,
+            Err(error) => return format!("<failed to read error body: {error}>"),
+        }
+    }
+    String::from_utf8_lossy(&buf).into_owned()
 }
 
 /// Maximum length for upstream API error bodies stored in [`ProviderError::Api`].

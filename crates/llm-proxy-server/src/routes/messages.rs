@@ -8,6 +8,8 @@
 //! Architecture boundary: route handlers do not perform scenario detection,
 //! endpoint classification, fallback routing, or provider-specific streaming.
 
+use std::sync::Arc;
+
 use axum::Json;
 use axum::body::Body;
 use axum::extract::{Extension, Path, State};
@@ -27,7 +29,7 @@ use super::error_response::{ClientProtocol, RouteError, route_error_response};
 ///
 /// Accepts an Anthropic-format [`MessageRequest`], decodes it through the
 /// core pipeline, and returns an Anthropic-shaped response.
-pub async fn handle_messages(
+pub(crate) async fn handle_messages(
     State(state): State<AppState>,
     Path(provider): Path<String>,
     Extension(req_id): Extension<RequestId>,
@@ -35,6 +37,13 @@ pub async fn handle_messages(
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response<Body> {
+    // The wrapper only renders: it does NOT emit ResponseFailed. Each EARLY-GATE
+    // error return inside the inner function emits exactly one ResponseFailed
+    // itself (the sites before the core pipeline dispatch), and the core pipeline
+    // emits its own single ResponseFailed for failures that occur inside it. A
+    // blanket emit here would double-count every pipeline failure (the pipeline
+    // emits AND returns Err via `?`), so the wrapper must stay emit-free
+    // (audit route-responsefailed-gaps regression).
     match handle_messages_inner(state, req_id, provider, connect_info, headers, body).await {
         Ok(response) => response,
         Err(error) => {
@@ -45,6 +54,12 @@ pub async fn handle_messages(
 }
 
 /// Inner handler that returns `Result` so errors can be mapped uniformly.
+///
+/// ResponseFailed emission discipline (audit route-responsefailed-gaps):
+/// every EARLY-GATE error return (the sites BEFORE the core pipeline dispatch)
+/// emits exactly one ResponseFailed here. Failures INSIDE the core pipeline
+/// emit their own single ResponseFailed internally and return Err, which this
+/// function propagates without re-emitting. The outer wrapper renders only.
 async fn handle_messages_inner(
     state: AppState,
     req_id: RequestId,
@@ -53,28 +68,53 @@ async fn handle_messages_inner(
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<Response<Body>, RouteError> {
+    let start = std::time::Instant::now();
+    let event_bus = Arc::clone(&state.event_bus);
+    // The request id is consumed by prepare_request below; snapshot it once so
+    // every early-gate emit references the same id.
+    let request_id = req_id.0.clone();
     // Input validation gate (mirrors token_count.rs): validate the provider
     // name and confirm the provider exists BEFORE charging rate-limit/dedup
     // counters in `prepare_request`. This ensures malformed probes (bad path,
     // unknown provider) receive an immediate 400/404 without burning rate-limit
     // budget or surfacing as a misleading 429/409 (audit LOW-29).
-    core_pipeline::validate_provider_name(&provider)?;
+    core_pipeline::validate_provider_name(&provider).inspect_err(|e| {
+        core_pipeline::emit_response_failed(
+            &event_bus,
+            &request_id,
+            Some(provider.as_str()),
+            None,
+            e,
+            start,
+        )
+    })?;
     if state.providers().get(&provider).is_none() {
+        // Unknown-provider early gate: emit exactly one ResponseFailed before
+        // returning (audit route-responsefailed-gaps).
         let err = RouteError::UnknownProvider(provider.clone());
         core_pipeline::emit_response_failed(
-            &state.event_bus,
-            &req_id.0,
+            &event_bus,
+            &request_id,
             Some(provider.as_str()),
             None,
             &err,
-            std::time::Instant::now(),
+            start,
         );
         return Err(err);
     }
 
     // Reject non-JSON Content-Type before parsing, so a wrong media type is not
     // misreported as a JSON syntax error (audit LOW-30).
-    core_pipeline::validate_json_content_type(&headers)?;
+    core_pipeline::validate_json_content_type(&headers).inspect_err(|e| {
+        core_pipeline::emit_response_failed(
+            &event_bus,
+            &request_id,
+            Some(provider.as_str()),
+            None,
+            e,
+            start,
+        )
+    })?;
 
     // Pre-flight: rate limit, dedup, request ID.
     let request_path = format!("/providers/{provider}/v1/messages");
@@ -85,7 +125,17 @@ async fn handle_messages_inner(
         connect_info.as_ref(),
         &body,
         &request_path,
-    )?;
+    )
+    .inspect_err(|e| {
+        core_pipeline::emit_response_failed(
+            &event_bus,
+            &request_id,
+            Some(provider.as_str()),
+            None,
+            e,
+            start,
+        )
+    })?;
 
     // Parse the Anthropic MessageRequest via the axum Json helper so that
     // syntax-vs-data parse failures are distinguished into precise messages
@@ -93,17 +143,49 @@ async fn handle_messages_inner(
     // (audit LOW-28).
     let req: MessageRequest = match Json::<MessageRequest>::from_bytes(&body) {
         Ok(json) => json.0,
-        Err(rejection) => return Err(json_rejection_to_route_error(rejection)),
+        Err(rejection) => {
+            let err = json_rejection_to_route_error(rejection);
+            core_pipeline::emit_response_failed(
+                &event_bus,
+                &request_id,
+                Some(provider.as_str()),
+                None,
+                &err,
+                start,
+            );
+            return Err(err);
+        }
     };
 
     // Defense-in-depth: validate() checks for empty model/messages before
     // decode_request also validates the same fields. This catches issues
     // early with a clearer error message.
     req.validate()
-        .map_err(|e| RouteError::InvalidRequest(e.to_string()))?;
+        .map_err(|e| RouteError::InvalidRequest(e.to_string()))
+        .inspect_err(|e| {
+            core_pipeline::emit_response_failed(
+                &event_bus,
+                &request_id,
+                Some(provider.as_str()),
+                None,
+                e,
+                start,
+            )
+        })?;
 
     // Decode the Anthropic request into a core request.
-    let core = anthropic::decode_request(req).map_err(core_pipeline::protocol_error_to_route)?;
+    let core = anthropic::decode_request(req)
+        .map_err(core_pipeline::protocol_error_to_route)
+        .inspect_err(|e| {
+            core_pipeline::emit_response_failed(
+                &event_bus,
+                &request_id,
+                Some(provider.as_str()),
+                None,
+                e,
+                start,
+            )
+        })?;
 
     let is_streaming = core.stream;
     info!(
@@ -117,7 +199,6 @@ async fn handle_messages_inner(
     // Extract the inbound client auth token (used by passthrough-auth providers).
     let inbound_auth = core_pipeline::extract_inbound_auth(&headers);
 
-    // Dispatch to streaming or non-streaming pipeline.
     if is_streaming {
         core_pipeline::handle_core_stream(
             state,

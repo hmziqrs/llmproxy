@@ -21,7 +21,7 @@
 //! [`CoreResponse::provider_meta`], [`SamplingOptions::thinking`], and
 //! [`CoreToolChoice::Raw`].  These opaque fields use a **redacting `Debug`
 //! implementation** that shows only the JSON type and approximate size (e.g.
-//! `Object(3 keys)`, `String(42 chars)`) rather than printing values verbatim.
+//! `Object(3 keys)`, `String(42 bytes)`) rather than printing values verbatim.
 //! This is a defense-in-depth measure: adapters **must not** store secrets (API
 //! keys, bearer tokens, etc.) in any of these fields.  Strip credentials before
 //! placing data into these fields.
@@ -67,7 +67,7 @@ impl fmt::Debug for OpaqueJsonRef<'_> {
 /// with the redaction policy: a malicious payload could encode secret fragments
 /// in number values or boolean field names.
 ///
-/// Note: `String(N chars)` reveals the string length. This is an intentional
+/// Note: `String(N bytes)` reveals the string length. This is an intentional
 /// trade-off: hiding the length would make debugging harder (e.g. diagnosing
 /// empty vs populated fields). If this becomes a security concern, change to
 /// `String(_)`.
@@ -76,7 +76,7 @@ fn redact_value(val: &serde_json::Value, f: &mut fmt::Formatter<'_>) -> fmt::Res
         serde_json::Value::Null => f.write_str("Null"),
         serde_json::Value::Bool(_) => f.write_str("Bool(_)"),
         serde_json::Value::Number(_) => f.write_str("Number(_)"),
-        serde_json::Value::String(s) => write!(f, "String({} chars)", s.len()),
+        serde_json::Value::String(s) => write!(f, "String({} bytes)", s.len()),
         serde_json::Value::Array(arr) => write!(f, "Array({} items)", arr.len()),
         serde_json::Value::Object(map) => write!(f, "Object({} keys)", map.len()),
     }
@@ -443,32 +443,15 @@ pub struct CoreTool {
     pub description: Option<String>,
     /// JSON Schema describing the tool's parameters.
     ///
-    /// Adapters are responsible for validating the schema shape when
-    /// constructing a `CoreTool`, since the type system cannot enforce that
-    /// this `Value` is a valid JSON Schema object.
+    /// Tool parameter schemas must be JSON objects. The type system cannot
+    /// encode that constraint, so it is enforced on the wire decode path:
+    /// [`Deserialize`] rejects any `input_schema` that is not a JSON object
+    /// (see [`deserialize_input_schema_object`]). In-crate adapters that build
+    /// a [`CoreTool`] with the struct literal should supply a JSON object for
+    /// this field; adapters that translate an upstream schema default to an
+    /// empty object when the upstream value is absent.
+    #[serde(deserialize_with = "deserialize_input_schema_object")]
     pub input_schema: serde_json::Value,
-}
-
-impl CoreTool {
-    /// Constructs a new `CoreTool`, validating that `input_schema` is a JSON object.
-    ///
-    /// Returns `Err` if `input_schema` is not a JSON object (i.e. is null, a string,
-    /// a number, a boolean, or an array). Tool parameter schemas should always be
-    /// JSON objects.
-    pub fn new(
-        name: String,
-        description: Option<String>,
-        input_schema: serde_json::Value,
-    ) -> Result<Self, &'static str> {
-        if !input_schema.is_object() {
-            return Err("input_schema must be a JSON object");
-        }
-        Ok(Self {
-            name,
-            description,
-            input_schema,
-        })
-    }
 }
 
 impl fmt::Debug for CoreTool {
@@ -521,22 +504,51 @@ impl fmt::Debug for CoreToolChoice {
 // ---------------------------------------------------------------------------
 
 /// Sampling parameters that control generation behaviour.
+///
+/// The decode boundary (i.e. the `Deserialize` impl) enforces the universal
+/// sampling invariants so they cannot be bypassed:
+/// - `temperature`, if present, is finite and `>= 0`.
+/// - `top_p`, if present, is finite and in `[0, 1]`.
+///
+/// `max_tokens` is intentionally **not** range-checked here: a value of `0`
+/// is a legitimate sentinel for some providers (e.g. OpenAI) and the proxy
+/// forwards it for the upstream to accept or reject.  See
+/// [`SamplingOptions::max_tokens`] for details.
 #[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SamplingOptions {
     /// Sampling temperature.
     ///
-    /// Non-finite values (NaN, Infinity) are rejected at deserialization time
-    /// because `serde_json` silently converts them to `null`, causing them to
-    /// become `None` during round-trips.
-    #[serde(default, deserialize_with = "deserialize_finite_or_none")]
+    /// Must be finite and `>= 0`.  Both constraints are enforced symmetrically
+    /// on the decode path (via [`deserialize_temperature`]) and the encode path
+    /// (via [`serialize_finite_f64`]).  Non-finite values are rejected because
+    /// `serde_json` silently converts them to `null`, which would silently lose
+    /// the value during a serialize -> deserialize round-trip.
+    #[serde(
+        default,
+        serialize_with = "serialize_finite_f64",
+        deserialize_with = "deserialize_temperature"
+    )]
     pub temperature: Option<f64>,
     /// Nucleus sampling parameter.
     ///
-    /// See [`Self::temperature`] for non-finite value handling.
-    #[serde(default, deserialize_with = "deserialize_finite_or_none")]
+    /// Must be finite and in `[0, 1]`.  See [`Self::temperature`] for the
+    /// finite-value handling rationale; the bounds are enforced symmetrically
+    /// via [`deserialize_top_p`] and [`serialize_finite_f64`].
+    #[serde(
+        default,
+        serialize_with = "serialize_finite_f64",
+        deserialize_with = "deserialize_top_p"
+    )]
     pub top_p: Option<f64>,
     /// Maximum number of tokens to generate.
+    ///
+    /// Not range-checked at the core decode boundary.  The semantics of a `0`
+    /// or negative value vary by provider (Anthropic treats `<= 0` as invalid
+    /// in [`crate::anthropic`] validation; OpenAI accepts `max_tokens >= 0`),
+    /// so the proxy forwards the value and lets the upstream decide.  This
+    /// mirrors the integration-test contract that `max_tokens=0` must not
+    /// trigger an internal error.
     pub max_tokens: Option<i32>,
     /// Stop sequences.
     ///
@@ -551,27 +563,98 @@ pub struct SamplingOptions {
     /// Extended thinking configuration (provider-specific JSON).
     ///
     /// This is intentionally opaque.  Expected shapes vary by provider, e.g.
-    /// Anthropic: `{"type": "enabled", "budget_tokens": N}`.
-    /// Not a secret-bearing field by design.
+    /// Anthropic: `{"type": "enabled", "budget_tokens": N}`.  Because the field
+    /// accepts arbitrary client-supplied JSON (and a malicious payload could
+    /// embed secret fragments in field names or values), it is redacted in
+    /// [`fmt::Debug`] output via [`OpaqueJsonRef`] as a defense-in-depth
+    /// measure.  Do not place genuinely secret data here and assume it will be
+    /// printed.
     pub thinking: Option<serde_json::Value>,
 }
 
-/// Custom deserializer for `Option<f64>` that rejects NaN and Infinity.
+/// Serializes an `Option<f64>`, rejecting non-finite values (NaN, Infinity).
 ///
-/// `serde_json` silently converts non-finite floats to `null` during
-/// serialization, causing them to become `None` on round-trip.  This
-/// deserializer catches the problem at the point of ingestion instead.
-fn deserialize_finite_or_none<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
+/// This is the symmetric encode-side guard for the finite-value invariants on
+/// [`SamplingOptions::temperature`] and [`SamplingOptions::top_p`].  Without
+/// it, an in-memory-constructed `CoreRequest` (e.g. one an adapter mutated
+/// after decode) with a non-finite sampling value would serialize to `null`
+/// via `serde_json`'s default float handling and silently lose the value on
+/// any serialize -> deserialize round-trip through the proxy.
+fn serialize_finite_f64<S>(val: &Option<f64>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    match val {
+        Some(v) if !v.is_finite() => Err(serde::ser::Error::custom(format!(
+            "non-finite float value ({v}); temperature and top_p must be finite numbers"
+        ))),
+        Some(v) => serializer.serialize_some(v),
+        None => serializer.serialize_none(),
+    }
+}
+
+/// Deserializer for [`SamplingOptions::temperature`].
+///
+/// Enforces the universal sampling invariants at the point of ingestion:
+/// the value must be finite and `>= 0`.  `serde_json` silently converts
+/// non-finite floats to `null`, which would otherwise become `None` on
+/// round-trip; rejecting here keeps the invariant from being bypassed.
+fn deserialize_temperature<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
     let val: Option<f64> = Option::deserialize(deserializer)?;
     match val {
         Some(v) if !v.is_finite() => Err(serde::de::Error::custom(format!(
-            "non-finite float value ({v}); temperature and top_p must be finite numbers"
+            "non-finite temperature value ({v}); temperature must be a finite number"
+        ))),
+        Some(v) if v < 0.0 => Err(serde::de::Error::custom(format!(
+            "temperature must be >= 0, got {v}"
         ))),
         other => Ok(other),
     }
+}
+
+/// Deserializer for [`SamplingOptions::top_p`].
+///
+/// Enforces the universal sampling invariants at the point of ingestion:
+/// the value must be finite and in `[0, 1]`.  See [`deserialize_temperature`]
+/// for why finiteness is enforced here rather than left to a separate
+/// validation step.
+fn deserialize_top_p<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let val: Option<f64> = Option::deserialize(deserializer)?;
+    match val {
+        Some(v) if !v.is_finite() => Err(serde::de::Error::custom(format!(
+            "non-finite top_p value ({v}); top_p must be a finite number"
+        ))),
+        Some(v) if !(0.0..=1.0).contains(&v) => Err(serde::de::Error::custom(format!(
+            "top_p must be in [0, 1], got {v}"
+        ))),
+        other => Ok(other),
+    }
+}
+
+/// Deserializer for [`CoreTool::input_schema`] that rejects non-object values.
+///
+/// Tool parameter schemas must be JSON objects. The type system cannot encode
+/// that constraint on a [`serde_json::Value`] field, so the invariant is
+/// enforced here on the wire decode path rather than in an easy-to-bypass
+/// constructor (mirroring the [`deserialize_temperature`] / [`deserialize_top_p`]
+/// convention of baking invariants into the deserializer).
+fn deserialize_input_schema_object<'de, D>(deserializer: D) -> Result<serde_json::Value, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v = serde_json::Value::deserialize(deserializer)?;
+    if !v.is_object() {
+        return Err(serde::de::Error::custom(
+            "input_schema must be a JSON object",
+        ));
+    }
+    Ok(v)
 }
 
 /// Custom deserializer for `SamplingOptions::stop` that accepts a bare string,
@@ -631,30 +714,17 @@ pub(crate) fn json_type_name(val: &serde_json::Value) -> &'static str {
 }
 
 impl SamplingOptions {
-    /// Validate sampling parameters and return the first error, if any.
-    ///
-    /// Checks that:
-    /// - `temperature`, if present, is >= 0.
-    /// - `top_p`, if present, is in `[0, 1]`.
-    /// - `max_tokens`, if present, is > 0.
-    pub fn validate(&self) -> Result<(), String> {
-        if let Some(t) = self.temperature {
-            if t < 0.0 {
-                return Err(format!("temperature must be >= 0, got {t}"));
-            }
-        }
-        if let Some(p) = self.top_p {
-            if !(0.0..=1.0).contains(&p) {
-                return Err(format!("top_p must be in [0, 1], got {p}"));
-            }
-        }
-        if let Some(m) = self.max_tokens {
-            if m <= 0 {
-                return Err(format!("max_tokens must be > 0, got {m}"));
-            }
-        }
-        Ok(())
-    }
+    // The universal sampling invariants (temperature finite & >= 0, top_p
+    // finite & in [0, 1]) are enforced directly in the field deserializers
+    // ([`deserialize_temperature`], [`deserialize_top_p`]) so they cannot be
+    // bypassed.  `max_tokens` range validation is deliberately left to the
+    // provider adapter / upstream (see the field doc); it is not a core-decode
+    // invariant.
+    //
+    // There is intentionally no `validate()` method here: a previous version
+    // had one, but it was never wired into any request-handling path, which
+    // gave a false sense of correctness.  Baking the checks into the
+    // deserializer removes that trap.
 }
 
 impl fmt::Debug for SamplingOptions {
@@ -1142,7 +1212,11 @@ impl CoreStreamError {
     /// Returns the error message.
     ///
     /// The message was sanitized at construction time by the adapter that
-    /// created this error.
+    /// created this error. Note that the `message` field is
+    /// `#[serde(skip_serializing)]`, so values reconstructed via `Deserialize`
+    /// (e.g. after being transported between proxy components) return an empty
+    /// string here -- the message is only present on instances built directly
+    /// via [`new`](CoreStreamError::new).
     pub fn message(&self) -> &str {
         &self.message
     }
@@ -1308,6 +1382,75 @@ mod tests {
             }
             _ => panic!("expected ToolResult variant"),
         }
+    }
+
+    // The manual `Debug` impl for `CoreResponse` (unlike a derived one) is
+    // hand-maintained, so a future edit could silently drop the `cost` field
+    // from its output. Since `cost` is the only audit-relevant field surfaced
+    // for observability/pricing diagnostics, pin its presence in the `{:?}`
+    // output here.
+    #[test]
+    fn core_response_debug_includes_cost_when_present() {
+        use std::str::FromStr;
+
+        let resp = CoreResponse {
+            id: Some("resp_cost".into()),
+            model: ModelRef {
+                requested: "claude-sonnet-4-20250514".into(),
+                upstream: None,
+            },
+            content: vec![CoreContent::Text {
+                text: "hi".into(),
+                cache: None,
+            }],
+            stop_reason: StopReason::EndTurn,
+            stop_sequence: None,
+            usage: Usage::default(),
+            provider_meta: serde_json::Map::new(),
+            cost: Some(Cost {
+                // Only set `total`; the rest come from `Default` so this test is
+                // robust to field reordering/renaming of the per-component fields.
+                total: Decimal::from_str("0.003").unwrap(),
+                ..Cost::default()
+            }),
+        };
+        let debug = format!("{resp:?}");
+        // The field name must appear (manual Debug could drop it silently).
+        assert!(
+            debug.contains("cost:"),
+            "CoreResponse Debug must include the `cost` field, got: {debug}"
+        );
+        // And the value must render (Decimal Debug is non-empty), proving the
+        // field carries the `Some(Cost)` payload rather than being stubbed.
+        assert!(
+            debug.contains("0.003"),
+            "CoreResponse Debug must surface the total cost value, got: {debug}"
+        );
+    }
+
+    #[test]
+    fn core_response_debug_sensible_when_cost_absent() {
+        // When no pricing is configured, `cost` is `None`. The manual Debug
+        // must still render the field name (so the field is observable as
+        // absent, not silently elided) with a `None` value.
+        let resp = CoreResponse {
+            id: None,
+            model: ModelRef {
+                requested: "gpt-4o".into(),
+                upstream: None,
+            },
+            content: Vec::new(),
+            stop_reason: StopReason::EndTurn,
+            stop_sequence: None,
+            usage: Usage::default(),
+            provider_meta: serde_json::Map::new(),
+            cost: None,
+        };
+        let debug = format!("{resp:?}");
+        assert!(
+            debug.contains("cost: None"),
+            "CoreResponse Debug must render `cost: None` when cost is absent, got: {debug}"
+        );
     }
 
     #[test]
@@ -2231,52 +2374,66 @@ mod tests {
     }
 
     #[test]
-    fn sampling_options_negative_temperature_round_trips() {
-        let opts = SamplingOptions {
-            temperature: Some(-0.5),
-            top_p: Some(-0.1),
-            ..Default::default()
-        };
-        let json = serde_json::to_string(&opts).unwrap();
-        let back: SamplingOptions = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.temperature, Some(-0.5));
-        assert_eq!(back.top_p, Some(-0.1));
+    fn sampling_options_rejects_out_of_range_sampling_values() {
+        // temperature >= 0 and top_p in [0, 1] are enforced at the decode
+        // boundary so a client cannot smuggle them through to the upstream.
+        let bad_temp = r#"{"temperature": -0.5}"#;
+        assert!(
+            serde_json::from_str::<SamplingOptions>(bad_temp).is_err(),
+            "negative temperature should be rejected at decode time"
+        );
+        let bad_top_p_low = r#"{"top_p": -0.1}"#;
+        assert!(
+            serde_json::from_str::<SamplingOptions>(bad_top_p_low).is_err(),
+            "negative top_p should be rejected at decode time"
+        );
+        let bad_top_p_high = r#"{"top_p": 99.0}"#;
+        assert!(
+            serde_json::from_str::<SamplingOptions>(bad_top_p_high).is_err(),
+            "top_p > 1 should be rejected at decode time"
+        );
+        // max_tokens is intentionally NOT range-checked here (provider-specific
+        // semantics): a 0 or negative value must still decode successfully.
+        let zero_max = r#"{"max_tokens": 0}"#;
+        let opts: SamplingOptions =
+            serde_json::from_str(zero_max).expect("max_tokens=0 must decode");
+        assert_eq!(opts.max_tokens, Some(0));
     }
 
     #[test]
-    fn sampling_options_nan_temperature_serializes_as_null() {
-        // serde_json serializes NaN as null rather than erroring.  This means
-        // NaN silently loses data during round-trips: deserialization produces
-        // None (because Option<f64> maps JSON null to None).  This is a known
-        // limitation of serde_json's default float handling.
+    fn sampling_options_nan_temperature_is_rejected_on_serialize_and_deserialize() {
+        // The encode side guards against NaN so an in-memory-constructed value
+        // (e.g. one an adapter mutated after decode) cannot silently lose data
+        // via serde_json's NaN -> null conversion during a round-trip.
         let opts = SamplingOptions {
             temperature: Some(f64::NAN),
             ..Default::default()
         };
-        let json = serde_json::to_string(&opts).unwrap();
         assert!(
-            json.contains("null"),
-            "NaN should serialize to null: {json}"
+            serde_json::to_string(&opts).is_err(),
+            "serializing NaN temperature should error, not silently emit null"
         );
-        let back: SamplingOptions = serde_json::from_str(&json).unwrap();
-        // NaN is lost -- temperature becomes None after round-trip.
-        assert_eq!(back.temperature, None);
+        // The decode side rejects NaN at ingestion.
+        let bad = r#"{"temperature": NaN}"#;
+        // serde_json rejects bare `NaN` tokens at the lexer level already; the
+        // deserializer guard is the second line of defence for any float that
+        // parses as non-finite.
+        assert!(
+            serde_json::from_str::<SamplingOptions>(bad).is_err(),
+            "NaN temperature should not decode"
+        );
     }
 
     #[test]
-    fn sampling_options_infinity_temperature_serializes_as_null() {
-        // serde_json serializes Infinity as null, same as NaN.
+    fn sampling_options_infinity_temperature_is_rejected_on_serialize() {
         let opts = SamplingOptions {
             temperature: Some(f64::INFINITY),
             ..Default::default()
         };
-        let json = serde_json::to_string(&opts).unwrap();
         assert!(
-            json.contains("null"),
-            "Infinity should serialize to null: {json}"
+            serde_json::to_string(&opts).is_err(),
+            "serializing Infinity temperature should error, not silently emit null"
         );
-        let back: SamplingOptions = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.temperature, None);
     }
 
     #[test]
@@ -2649,6 +2806,21 @@ mod tests {
         let json = serde_json::to_string(&tool).expect("serialize CoreTool");
         let back: CoreTool = serde_json::from_str(&json).expect("deserialize CoreTool");
         assert_eq!(tool, back);
+    }
+
+    #[test]
+    fn core_tool_rejects_non_object_input_schema_on_deserialize() {
+        let json = r#"{"name":"f","description":null,"input_schema":"not-an-object"}"#;
+        let err = serde_json::from_str::<CoreTool>(json);
+        assert!(
+            err.is_err(),
+            "deserializing a non-object input_schema should fail"
+        );
+        let msg = err.unwrap_err().to_string();
+        assert!(
+            msg.contains("input_schema must be a JSON object"),
+            "error should mention the object constraint, got: {msg}"
+        );
     }
 
     #[test]

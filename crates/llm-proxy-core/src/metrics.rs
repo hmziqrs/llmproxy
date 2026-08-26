@@ -19,7 +19,31 @@ use std::time::Duration;
 /// Maximum number of latency samples retained in the ring-buffer.
 const LATENCY_CAP: usize = 1000;
 
-/// Separator used in the composite metrics key: `"{provider}/{model}"`.
+/// Maximum number of distinct `"{provider}:{model}"` keys retained in
+/// [`Metrics::model_counts`].
+///
+/// The `model` axis is attacker-controlled (it arrives from the inbound client
+/// request and, when catalog enforcement is off -- the default --, is not
+/// canonicalized before keying). Without a cap, a client sending a unique model
+/// string per request could grow this map without bound for the lifetime of the
+/// process. Once this many distinct keys exist, any further new pair is folded
+/// into the [`MODEL_COUNTS_OVERFLOW`] aggregate bucket instead of allocating a
+/// new entry, bounding memory while still reporting the total request count.
+/// The hard bound on map size is therefore [`MODEL_COUNTS_CAP`] real keys plus
+/// at most one lazily-created overflow bucket.
+const MODEL_COUNTS_CAP: usize = 1024;
+
+/// Aggregate bucket key used once [`MODEL_COUNTS_CAP`] distinct keys have been
+/// recorded. Chosen so it cannot collide with a real `"{provider}:{model}"`
+/// key: the provider segment of a real key is URL-path-validated against
+/// `^[a-z0-9_-]+$`, so a leading `~` (not in that class) makes this key
+/// structurally unreachable from any request input. (A prior sentinel
+/// `__other__:` was collidable because `_` is a legal provider-name character,
+/// so a configured provider literally named `__other__` serving an empty model
+/// would alias the overflow bucket.)
+const MODEL_COUNTS_OVERFLOW: &str = "~overflow:";
+
+/// Separator used in the composite metrics key: `"{provider}:{model}"`.
 ///
 /// The `:` delimiter is chosen because provider names are restricted to
 /// `[a-z0-9_-]+` and model IDs cannot contain `:`, preventing key collisions.
@@ -86,13 +110,19 @@ impl Metrics {
         self.requests_success.fetch_add(1, Ordering::Relaxed);
         self.upstream_calls.fetch_add(1, Ordering::Relaxed);
 
-        // Store latency sample (ring-buffer).
-        // Recover from poison to preserve data from panicked threads.
-        let mut buf = self.latencies.lock().unwrap_or_else(|e| e.into_inner());
-        if buf.len() >= LATENCY_CAP {
-            buf.pop_front();
+        // Store latency sample (ring-buffer), then release the latencies lock
+        // before touching model_counts so the two independent maps are not
+        // serialized by a single held guard. Recover from poison to preserve
+        // data from panicked threads. Renaming the inner binding from `buf` to
+        // `latencies` avoids shadowing the thread-local `buf` in the closure
+        // below (audit LOW-9).
+        {
+            let mut latencies = self.latencies.lock().unwrap_or_else(|e| e.into_inner());
+            if latencies.len() >= LATENCY_CAP {
+                latencies.pop_front();
+            }
+            latencies.push_back(latency);
         }
-        buf.push_back(latency);
 
         // Bump per-provider-model counter.
         //
@@ -113,9 +143,16 @@ impl Metrics {
             let _ = write!(buf, "{provider}{KEY_SEPARATOR}{model}");
             if let Some(count) = map.get_mut(buf.as_str()) {
                 *count += 1;
-            } else {
+            } else if map.len() < MODEL_COUNTS_CAP {
                 // Cold path: first sighting of this pair — pay for one owned key.
                 *map.entry(buf.clone()).or_insert(0) += 1;
+            } else {
+                // The map is at capacity (defending against attacker-controlled,
+                // unbounded model strings -- see [`MODEL_COUNTS_CAP`]). Fold this
+                // and any further distinct pairs into the aggregate overflow
+                // bucket instead of allocating a new key. The bucket itself is
+                // lazily created the first time it is needed.
+                *map.entry(MODEL_COUNTS_OVERFLOW.to_owned()).or_insert(0) += 1;
             }
         });
     }
@@ -277,10 +314,11 @@ impl Snapshot {
 ///
 /// Returns [`Duration::ZERO`] for an empty slice.
 fn percentile(samples: &[Duration], pct: f64) -> Duration {
-    debug_assert!(
-        (0.0..=100.0).contains(&pct),
-        "percentile must be in 0..=100, got {pct}"
-    );
+    // Clamp the input unconditionally so an out-of-range `pct` (e.g. a caller
+    // bug passing 150.0 or a negative) cannot silently yield the wrong sample.
+    // This clamp is the hard guard that survives in both debug and release
+    // builds; `calculate_percentile_clamps_out_of_range_input` exercises it.
+    let pct = pct.clamp(0.0, 100.0);
 
     if samples.is_empty() {
         return Duration::ZERO;
@@ -546,6 +584,22 @@ mod tests {
     }
 
     #[test]
+    fn calculate_percentile_clamps_out_of_range_input() {
+        // Out-of-range `pct` must be clamped to [0, 100] rather than silently
+        // returning the wrong sample (the debug_assert compiles out in release).
+        let snap = Snapshot {
+            latencies: (0..100).map(Duration::from_millis).collect(),
+            ..Snapshot::default()
+        };
+        // pct > 100 clamps to 100 -> max sample (99ms).
+        assert_eq!(snap.calculate_percentile(150.0), Duration::from_millis(99));
+        assert_eq!(snap.calculate_percentile(100.0), Duration::from_millis(99));
+        // pct < 0 clamps to 0 -> min sample (0ms).
+        assert_eq!(snap.calculate_percentile(-42.0), Duration::from_millis(0));
+        assert_eq!(snap.calculate_percentile(0.0), Duration::from_millis(0));
+    }
+
+    #[test]
     fn get_snapshot_concurrent_with_writes() {
         use std::sync::Arc;
         use std::thread;
@@ -562,7 +616,6 @@ mod tests {
             }));
         }
 
-        // Reader thread.
         let m_reader = Arc::clone(&m);
         let reader = thread::spawn(move || {
             for _ in 0..100 {
@@ -589,5 +642,71 @@ mod tests {
         assert_eq!(snap.model_counts.len(), 2);
         assert!(snap.model_counts.contains_key("provider-a:model-x"));
         assert!(snap.model_counts.contains_key("provider-a:model-y"));
+    }
+
+    #[test]
+    fn model_counts_capped_with_overflow_bucket() {
+        // The model axis is attacker-controlled, so the distinct-key map must be
+        // bounded. Once MODEL_COUNTS_CAP distinct pairs have been recorded, any
+        // further new pair is folded into the `~overflow:` aggregate bucket
+        // instead of allocating a new entry. The bound is MODEL_COUNTS_CAP real
+        // keys plus at most one lazily-created overflow bucket.
+        let m = Metrics::new();
+
+        // Fill the map to capacity with distinct pairs.
+        for i in 0..MODEL_COUNTS_CAP {
+            m.record_success("p", &format!("model-{i}"), Duration::from_micros(i as u64));
+        }
+        let snap = m.get_snapshot();
+        assert_eq!(
+            snap.model_counts.len(),
+            MODEL_COUNTS_CAP,
+            "map should be exactly at capacity before overflow"
+        );
+        assert!(
+            !snap.model_counts.contains_key(MODEL_COUNTS_OVERFLOW),
+            "overflow bucket must not exist before capacity is reached"
+        );
+
+        // Further distinct pairs spill into the aggregate bucket. The bucket is
+        // created on first spill, so the map grows by exactly one entry.
+        m.record_success("p", "overflow-1", Duration::from_micros(0));
+        m.record_success("p", "overflow-2", Duration::from_micros(0));
+        let snap = m.get_snapshot();
+        assert_eq!(
+            snap.model_counts.len(),
+            MODEL_COUNTS_CAP + 1,
+            "only the overflow bucket may be added once capacity is reached"
+        );
+        assert_eq!(
+            snap.model_counts.get(MODEL_COUNTS_OVERFLOW),
+            Some(&2),
+            "spilled counts should accumulate in the overflow bucket"
+        );
+
+        // More distinct pairs must NOT grow the map further.
+        m.record_success("p", "overflow-3", Duration::from_micros(0));
+        let snap = m.get_snapshot();
+        assert_eq!(
+            snap.model_counts.len(),
+            MODEL_COUNTS_CAP + 1,
+            "subsequent overflow must not grow the map"
+        );
+        assert_eq!(snap.model_counts.get(MODEL_COUNTS_OVERFLOW), Some(&3));
+
+        // An already-tracked pair must still increment its own entry (hot path),
+        // not the overflow bucket.
+        m.record_success("p", "model-0", Duration::from_micros(0));
+        let snap = m.get_snapshot();
+        assert_eq!(
+            snap.model_counts.get("p:model-0"),
+            Some(&2),
+            "existing key must still be incremented after overflow began"
+        );
+        assert_eq!(
+            snap.model_counts.get(MODEL_COUNTS_OVERFLOW),
+            Some(&3),
+            "overflow bucket must not change for an existing key"
+        );
     }
 }

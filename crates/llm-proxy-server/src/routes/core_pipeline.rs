@@ -6,6 +6,7 @@
 //! `/providers/{provider}/v1/chat/completions`.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use axum::body::Body;
@@ -19,7 +20,9 @@ use llm_proxy_protocol::client::anthropic;
 use llm_proxy_protocol::client::anthropic::StreamEncoder as AnthropicStreamEncoder;
 use llm_proxy_protocol::client::openai_chat;
 use llm_proxy_protocol::client::openai_chat::StreamEncoder as OpenAiStreamEncoder;
-use llm_proxy_protocol::core::{CoreEvent, CoreRequest, Cost, ModelRef, StopReason, Usage};
+use llm_proxy_protocol::core::{
+    CoreEvent, CoreRequest, Cost, ModelRef, StopReason, Usage, UsageProvenance,
+};
 use llm_proxy_provider::adapter::{
     ProviderAdapter, ProviderAdapterTarget, ProviderProtocol, ProviderStreamDecoder,
     ProviderStreamDecoderKind,
@@ -29,14 +32,14 @@ use llm_proxy_provider::transport::ProxyRequest;
 use llm_proxy_storage::{EventBus, ProxyEvent, RequestReceived, ResponseCompleted, ResponseFailed};
 use rust_decimal::Decimal;
 use secrecy::SecretString;
-use tracing::warn;
+use tracing::{Instrument, warn};
 
 use crate::middleware::get_client_ip;
 use crate::state::AppState;
 
 use super::error_response::{
-    ClientProtocol, PROVIDER_DECODE_CLIENT_MESSAGE, RouteError, extract_error_fields,
-    openai_stream_error_json_with_type, truncate_with_suffix,
+    AuthOwner, ClientProtocol, PROVIDER_DECODE_CLIENT_MESSAGE, RouteError, extract_error_fields,
+    openai_stream_error_json_with_type, route_error_variant_name, truncate_with_suffix,
 };
 
 // ---------------------------------------------------------------------------
@@ -153,14 +156,17 @@ fn wrap_anthropic_events(
 ) -> Vec<ClientEncodedEvent> {
     events
         .into_iter()
-        .filter_map(|me| {
-            let event_type = me.r#type.clone();
-            match serde_json::to_string(&me) {
-                Ok(json) => Some(ClientEncodedEvent::Anthropic { event_type, json }),
-                Err(e) => {
-                    warn!(error = %e, phase, "failed to serialize Anthropic SSE event; dropping");
-                    None
-                }
+        .filter_map(|me| match serde_json::to_string(&me) {
+            Ok(json) => {
+                // Serialize first (borrowing &me); the borrow ends when the
+                // owned String returns, so we can move r#type out of `me`
+                // instead of cloning it on the per-token encode hot path.
+                let event_type = me.r#type;
+                Some(ClientEncodedEvent::Anthropic { event_type, json })
+            }
+            Err(e) => {
+                warn!(error = %e, phase, "failed to serialize Anthropic SSE event; dropping");
+                None
             }
         })
         .collect()
@@ -209,6 +215,11 @@ pub(crate) struct RequestContext {
     pub(crate) request_id: String,
     /// Instant when the handler was entered (for latency metrics).
     pub(crate) start: Instant,
+    /// SHA-256 of the raw client request body, for the `RequestReceived.body_hash`
+    /// correlation key. Computed in [`prepare_request`] over the raw wire bytes
+    /// (where they first arrive), per the plan's locked decision, so it is shared
+    /// across the inference routes and `/v1/messages/count_tokens`.
+    pub(crate) body_hash: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -256,6 +267,7 @@ pub(crate) fn prepare_request(
     Ok(RequestContext {
         request_id,
         start: Instant::now(),
+        body_hash: body_hash_of_bytes(body),
     })
 }
 
@@ -478,23 +490,36 @@ fn client_protocol_str(protocol: ClientProtocol) -> &'static str {
     }
 }
 
-/// Stable correlation hash for a request.
+/// Stable correlation hash of the RAW client request body, hex-encoded.
 ///
-/// Hashes the serialized normalized [`CoreRequest`] (not the raw wire body) so
-/// the hash is insensitive to client-side whitespace/formatting while still
-/// uniquely identifying identical request payloads. SHA-256 of the body itself
+/// SHA-256 of the raw wire bytes (`&[u8]`) exactly as the client sent them --
+/// matching the plan's locked decision (mvp-pre-storage.md ~L1191: "computed
+/// over the raw client `body: &[u8]`") and the `/v1/messages/count_tokens`
+/// route, so the same logical request yields the SAME `body_hash` correlation
+/// key across every route that emits a `RequestReceived`. The raw body itself
 /// is never stored -- only this digest.
-fn body_hash_of(core: &CoreRequest) -> String {
+///
+/// Shared with `token_count.rs` so the two routes agree on the correlation key
+/// (audit finding: body_hash was hashed over the normalized `CoreRequest` on the
+/// inference routes but raw bytes on token_count, breaking cross-route
+/// correlation).
+pub(crate) fn body_hash_of_bytes(body: &[u8]) -> String {
     use sha2::{Digest, Sha256};
-    let bytes = serde_json::to_vec(core).unwrap_or_default();
     let mut hasher = Sha256::new();
-    hasher.update(&bytes);
+    hasher.update(body);
     format!("{:x}", hasher.finalize())
 }
 
 /// Emit a structured `ResponseFailed` event for a route error. Borrows the
 /// error so the caller can still return it; derives HTTP status + client-facing
 /// error kind from the canonical [`extract_error_fields`] mapping.
+///
+/// When the caller does not supply a `provider` (the early-gate failure path,
+/// where the request never reached a resolved provider), the provider name is
+/// recovered from [`RouteError::UnknownProvider`] so the event still records
+/// which provider name was probed. This keeps the unknown-provider failure
+/// attributable in the event log without each early-gate caller having to
+/// thread the name through separately.
 pub(crate) fn emit_response_failed(
     event_bus: &Arc<dyn EventBus>,
     request_id: &str,
@@ -503,7 +528,35 @@ pub(crate) fn emit_response_failed(
     error: &RouteError,
     start: Instant,
 ) {
-    let (status, error_kind, message) = extract_error_fields(error);
+    let provider = provider.or(match error {
+        RouteError::UnknownProvider(name) => Some(name.as_str()),
+        _ => None,
+    });
+    let (status, _client_error_type, message) = extract_error_fields(error);
+    // Log the (already key/URL-redacted) upstream body exactly once here. This
+    // is the single canonical failure-recording site, guaranteed to run once
+    // per failure; emitting it inside `extract_error_fields` instead would
+    // double-warn because that helper is also called from `route_error_response`
+    // on the render path.
+    if let RouteError::Upstream {
+        status: upstream_status,
+        body,
+        auth_owner,
+    } = error
+    {
+        tracing::warn!(
+            upstream_status = upstream_status.as_u16(),
+            mapped_status = status.as_u16(),
+            auth_owner = ?auth_owner,
+            upstream_body = %body,
+            "upstream error mapped for the client; real body logged here only"
+        );
+    }
+    // `error_kind` records the Rust variant name (the documented event-log
+    // discriminant), NOT the client-facing protocol error-type string, so
+    // distinct variants stay separable in the event log (audit finding:
+    // error_kind not variant name).
+    let error_kind = route_error_variant_name(error);
     event_bus.emit(&ProxyEvent::ResponseFailed(ResponseFailed {
         request_id: request_id.to_owned(),
         timestamp: time::OffsetDateTime::now_utc(),
@@ -543,13 +596,19 @@ fn capture_lifecycle(ctx: &mut StreamContext, event: &CoreEvent) {
 pub(crate) fn extract_inbound_auth(headers: &HeaderMap) -> Option<SecretString> {
     if let Some(value) = headers.get(header::AUTHORIZATION) {
         if let Ok(s) = value.to_str() {
-            if let Some(rest) = s
-                .strip_prefix("Bearer ")
-                .or_else(|| s.strip_prefix("bearer "))
-            {
-                if !rest.is_empty() {
-                    return Some(SecretString::from(rest.to_owned()));
+            // The auth scheme is case-insensitive (RFC 7235): "Bearer",
+            // "bearer", "BEARER", "bEaReR" are all valid. Split on the first
+            // space to separate the scheme from the token and compare the
+            // scheme case-insensitively, rather than matching only two casings.
+            let mut parts = s.splitn(2, ' ');
+            match (parts.next(), parts.next()) {
+                (Some(scheme), Some(token)) if scheme.eq_ignore_ascii_case("bearer") => {
+                    let token = token.trim();
+                    if !token.is_empty() {
+                        return Some(SecretString::from(token.to_owned()));
+                    }
                 }
+                _ => {}
             }
         }
     }
@@ -571,14 +630,52 @@ pub(crate) fn extract_inbound_auth(headers: &HeaderMap) -> Option<SecretString> 
 /// Pure domain math. Lives in the server crate (not on the protocol [`Cost`]
 /// type) because [`Usage`] is in the protocol crate and [`ModelPricing`] in the
 /// core crate, and the server is the first crate that depends on both.
+///
+/// # Overflow safety
+///
+/// `rust_decimal`'s `*`/`+` operators PANIC on overflow. Token counts (up to
+/// ~2.1e9) multiplied by a price, then summed across five components, can
+/// exceed `Decimal`'s 96-bit range, which would panic the request handler. We
+/// use checked arithmetic and saturate to `Decimal::MAX` instead, so a bad
+/// (or just very large) price/config can never crash a cost-bearing request.
+/// Config validation also bounds prices (see `MAX_PER_TOKEN_PRICE`); the
+/// checked math here is the belt-and-suspenders guard.
+///
+/// # Rounding
+///
+/// Per the plan's locked decision 5 ("rounded to the nearest microcent on
+/// output only"), each component is rounded to 6 decimal places (a microcent
+/// of USD) after the multiply. The total is the checked sum of the rounded
+/// components, so it is always exactly their sum (no separate rounding drift).
 fn compute_cost(usage: &Usage, pricing: &ModelPricing) -> Cost {
-    let input = Decimal::from(usage.input_tokens) * pricing.input;
-    let output = Decimal::from(usage.output_tokens) * pricing.output;
-    let cache_creation =
-        Decimal::from(usage.cache_creation_input_tokens.unwrap_or(0)) * pricing.cache_creation;
-    let cache_read = Decimal::from(usage.cache_read_input_tokens.unwrap_or(0)) * pricing.cache_read;
-    let reasoning = Decimal::from(usage.reasoning_tokens.unwrap_or(0)) * pricing.reasoning;
-    let total = input + output + cache_creation + cache_read + reasoning;
+    /// Multiply a token count by a per-token price, saturating on overflow,
+    /// then round to the nearest microcent (6 dp).
+    fn priced(count: i32, price: Decimal) -> Decimal {
+        Decimal::from(count)
+            .checked_mul(price)
+            .unwrap_or(Decimal::MAX)
+            .round_dp(6)
+    }
+    /// Checked sum that saturates to `Decimal::MAX` on overflow.
+    fn sum(a: Decimal, b: Decimal) -> Decimal {
+        a.checked_add(b).unwrap_or(Decimal::MAX)
+    }
+
+    let input = priced(usage.input_tokens, pricing.input);
+    let output = priced(usage.output_tokens, pricing.output);
+    let cache_creation = priced(
+        usage.cache_creation_input_tokens.unwrap_or(0),
+        pricing.cache_creation,
+    );
+    let cache_read = priced(
+        usage.cache_read_input_tokens.unwrap_or(0),
+        pricing.cache_read,
+    );
+    let reasoning = priced(usage.reasoning_tokens.unwrap_or(0), pricing.reasoning);
+    let total = [input, output, cache_creation, cache_read, reasoning]
+        .into_iter()
+        .reduce(sum)
+        .unwrap_or(Decimal::ZERO);
     Cost {
         input,
         output,
@@ -607,6 +704,16 @@ pub(crate) async fn handle_core_once(
 
     state.metrics.record_request(false);
 
+    // Whether the client's own token is forwarded to the upstream
+    // (passthrough_auth). Captured once here so error classification
+    // (map_provider_error) can mark auth/permission failures as client-owned
+    // and pass 401/403 through verbatim instead of collapsing to 502
+    // (audit LOW, passthrough-auth-401-collapse).
+    let passthrough_auth = state
+        .providers()
+        .get(provider_name)
+        .is_some_and(|p| p.passthrough_auth);
+
     tracing::debug!(
         request_id = %ctx.request_id,
         provider = %provider_name,
@@ -626,7 +733,7 @@ pub(crate) async fn handle_core_once(
             client_protocol: client_protocol_str(client_protocol).to_owned(),
             model: core.model.clone(),
             streaming: false,
-            body_hash: body_hash_of(&core),
+            body_hash: ctx.body_hash.clone(),
         }));
 
     let (target, adapter) = resolve_target(
@@ -674,9 +781,8 @@ pub(crate) async fn handle_core_once(
         err
     })?;
 
-    // Send to upstream.
     let response_bytes = state.proxy_client.send(proxy_req).await.map_err(|e| {
-        let err = map_provider_error(e);
+        let err = map_provider_error(e, passthrough_auth);
         state.metrics.record_failure();
         emit_response_failed(
             &state.event_bus,
@@ -708,9 +814,6 @@ pub(crate) async fn handle_core_once(
 
     // Encode into the client-specific response.
     let latency = ctx.start.elapsed();
-    state
-        .metrics
-        .record_success(&target.provider_name, &target.upstream_model, latency);
 
     // Attach computed cost when pricing is configured for the (alias-resolved)
     // upstream model. The price is cloned out of the registry before the
@@ -719,7 +822,16 @@ pub(crate) async fn handle_core_once(
         .providers()
         .pricing_for(&target.provider_name, &target.upstream_model)
         .cloned();
-    let cost = pricing.map(|p| compute_cost(&core_resp.usage, &p));
+    // Only attach a cost when the usage was genuinely reported by the provider.
+    // Synthetic/Unknown usage (zero-filled because the provider omitted it)
+    // would otherwise produce a Some(zero-Cost) indistinguishable from a truly
+    // free request; leaving cost None for unprovenanced usage keeps the event
+    // honest (audit INFO, cost-on-synthetic-zero).
+    let cost = if core_resp.usage.provenance == UsageProvenance::ProviderReported {
+        pricing.map(|p| compute_cost(&core_resp.usage, &p))
+    } else {
+        None
+    };
     core_resp.cost = cost.clone();
     // Capture the ResponseCompleted payload before `core_resp` is moved into the
     // client encoder; the event is emitted AFTER a successful encode so we never
@@ -729,20 +841,76 @@ pub(crate) async fn handle_core_once(
     let resp_upstream_id = core_resp.id.clone();
     let resp_stop_reason = core_resp.stop_reason.clone();
 
+    // Client-encode failures map to Internal. They must record a failure metric
+    // AND emit a ResponseFailed event (mirroring the decode/send arms above),
+    // and must NOT be counted as a success. `record_success` is therefore
+    // deferred until AFTER this match succeeds (audit LOW, eventlog-04).
     let response_body = match client_protocol {
         ClientProtocol::Anthropic => {
-            let msg_resp = anthropic::encode_response(core_resp)
-                .map_err(|e| RouteError::Internal(format!("client encode: {e}")))?;
-            serde_json::to_vec(&msg_resp)
-                .map_err(|e| RouteError::Internal(format!("serialize: {e}")))?
+            let msg_resp = anthropic::encode_response(core_resp).map_err(|e| {
+                let err = RouteError::Internal(format!("client encode: {e}"));
+                state.metrics.record_failure();
+                emit_response_failed(
+                    &state.event_bus,
+                    &ctx.request_id,
+                    Some(provider_name),
+                    Some(&resp_model),
+                    &err,
+                    ctx.start,
+                );
+                err
+            })?;
+            serde_json::to_vec(&msg_resp).map_err(|e| {
+                let err = RouteError::Internal(format!("serialize: {e}"));
+                state.metrics.record_failure();
+                emit_response_failed(
+                    &state.event_bus,
+                    &ctx.request_id,
+                    Some(provider_name),
+                    Some(&resp_model),
+                    &err,
+                    ctx.start,
+                );
+                err
+            })?
         }
         ClientProtocol::OpenAiChat => {
-            let chat_resp = openai_chat::encode_response(core_resp)
-                .map_err(|e| RouteError::Internal(format!("client encode: {e}")))?;
-            serde_json::to_vec(&chat_resp)
-                .map_err(|e| RouteError::Internal(format!("serialize: {e}")))?
+            let chat_resp = openai_chat::encode_response(core_resp).map_err(|e| {
+                let err = RouteError::Internal(format!("client encode: {e}"));
+                state.metrics.record_failure();
+                emit_response_failed(
+                    &state.event_bus,
+                    &ctx.request_id,
+                    Some(provider_name),
+                    Some(&resp_model),
+                    &err,
+                    ctx.start,
+                );
+                err
+            })?;
+            serde_json::to_vec(&chat_resp).map_err(|e| {
+                let err = RouteError::Internal(format!("serialize: {e}"));
+                state.metrics.record_failure();
+                emit_response_failed(
+                    &state.event_bus,
+                    &ctx.request_id,
+                    Some(provider_name),
+                    Some(&resp_model),
+                    &err,
+                    ctx.start,
+                );
+                err
+            })?
         }
     };
+
+    // Client encoding succeeded: record the success metric now (after the
+    // encode match above), so an encode failure is never counted as success
+    // (audit LOW, eventlog-04). The stream path already defers this to
+    // `stream_succeeded`.
+    state
+        .metrics
+        .record_success(&target.provider_name, &target.upstream_model, latency);
 
     // Client encoding succeeded: emit the ResponseCompleted event.
     state
@@ -839,6 +1007,16 @@ pub(crate) async fn handle_core_stream(
 
     state.metrics.record_request(true);
 
+    // Whether the client's own token is forwarded to the upstream
+    // (passthrough_auth). Captured once here so error classification
+    // (map_provider_error, including inside the spawned stream task) can mark
+    // auth/permission failures as client-owned and pass 401/403 through verbatim
+    // instead of collapsing to 502 (audit LOW, passthrough-auth-401-collapse).
+    let passthrough_auth = state
+        .providers()
+        .get(provider_name)
+        .is_some_and(|p| p.passthrough_auth);
+
     tracing::debug!(
         request_id = %ctx.request_id,
         provider = %provider_name,
@@ -846,6 +1024,24 @@ pub(crate) async fn handle_core_stream(
         streaming = true,
         "processing streaming request"
     );
+
+    // Emit a structured RequestReceived event BEFORE resolve_target/send_stream
+    // so a failure in either step still has a preceding RequestReceived (the
+    // non-stream path emits at the same point). Without this, an early-return
+    // from resolve_target/send_stream would emit an orphaned ResponseFailed with
+    // no matching RequestReceived (audit LOW, eventlog-03).
+    state
+        .event_bus
+        .emit(&ProxyEvent::RequestReceived(RequestReceived {
+            request_id: ctx.request_id.clone(),
+            timestamp: time::OffsetDateTime::now_utc(),
+            provider: provider_name.to_owned(),
+            route_kind: route_kind_str(route_kind).to_owned(),
+            client_protocol: client_protocol_str(client_protocol).to_owned(),
+            model: core.model.clone(),
+            streaming: true,
+            body_hash: ctx.body_hash.clone(),
+        }));
 
     let (target, adapter) = resolve_target(
         &state,
@@ -897,7 +1093,7 @@ pub(crate) async fn handle_core_stream(
         .send_stream(proxy_req)
         .await
         .map_err(|e| {
-            let err = map_provider_error(e);
+            let err = map_provider_error(e, passthrough_auth);
             state.metrics.record_failure();
             emit_response_failed(
                 &state.event_bus,
@@ -910,7 +1106,6 @@ pub(crate) async fn handle_core_stream(
             err
         })?;
 
-    // Create a provider stream decoder.
     let provider_decoder = adapter.new_stream_decoder(&target);
     let sse_framer = SseFramer::new();
 
@@ -933,20 +1128,6 @@ pub(crate) async fn handle_core_stream(
         .cloned();
     let event_bus = Arc::clone(&state.event_bus);
 
-    // Emit a structured RequestReceived event (streaming).
-    state
-        .event_bus
-        .emit(&ProxyEvent::RequestReceived(RequestReceived {
-            request_id: request_id.clone(),
-            timestamp: time::OffsetDateTime::now_utc(),
-            provider: provider_name.to_owned(),
-            route_kind: route_kind_str(route_kind).to_owned(),
-            client_protocol: client_protocol_str(client_protocol).to_owned(),
-            model: core.model.clone(),
-            streaming: true,
-            body_hash: body_hash_of(&core),
-        }));
-
     // Capture fields needed for a stream ResponseFailed event, before `core`
     // and `ctx.start` are moved into the StreamContext below.
     let requested_model = core.model.clone();
@@ -954,6 +1135,15 @@ pub(crate) async fn handle_core_stream(
 
     // Build the output SSE stream with first-byte tracking.
     let (first_byte_tx, first_byte_rx) = tokio::sync::oneshot::channel::<FirstByteResult>();
+    // Shared "stream failure already recorded" guard. A pre-first-byte panic is
+    // observed by TWO independent watchers: this handler (the `first_byte_rx`
+    // `RecvError` path, since the panicked task drops the sender) AND the
+    // detached supervisor (the `JoinError` path). Without coordination each
+    // would emit its own `ResponseFailed` and bump the failure metric for the
+    // same request. The first watcher to run claims the flag via `swap`; the
+    // other skips. Exactly one terminal event + one failure metric per request
+    // (audit finding: stream-task panic double-ResponseFailed).
+    let failure_recorded = Arc::new(AtomicBool::new(false));
     let output_stream = build_sse_output_stream(
         byte_stream,
         StreamContext {
@@ -971,11 +1161,13 @@ pub(crate) async fn handle_core_stream(
             first_byte_tx: Some(first_byte_tx),
             first_byte_sent: false,
             pricing,
+            passthrough_auth,
             event_bus,
             pending_usage: None,
             stop_reason: None,
             upstream_message_id: None,
         },
+        Arc::clone(&failure_recorded),
     );
 
     // Wait for the first event (or a pre-stream error). This is the
@@ -986,15 +1178,19 @@ pub(crate) async fn handle_core_stream(
             "stream task exited before first event (possible panic, cancellation, or empty stream)"
                 .to_owned(),
         );
-        state.metrics.record_failure();
-        emit_response_failed(
-            &state.event_bus,
-            &request_id,
-            Some(target.provider_name.as_str()),
-            Some(&requested_model),
-            &err,
-            stream_start,
-        );
+        // Only record/emit if the supervisor has not already done so for this
+        // request (see `failure_recorded` above).
+        if !failure_recorded.swap(true, Ordering::SeqCst) {
+            state.metrics.record_failure();
+            emit_response_failed(
+                &state.event_bus,
+                &request_id,
+                Some(target.provider_name.as_str()),
+                Some(&requested_model),
+                &err,
+                stream_start,
+            );
+        }
         err
     })?;
 
@@ -1104,6 +1300,10 @@ struct StreamContext {
     first_byte_sent: bool,
     /// Per-token pricing for the resolved upstream model, for stream cost.
     pricing: Option<ModelPricing>,
+    /// Whether the client's own token was forwarded (passthrough_auth). Drives
+    /// 401/403 pass-through vs 502 collapse in in-band/pre-stream error
+    /// classification (audit LOW, passthrough-auth-401-collapse).
+    passthrough_auth: bool,
     /// Event sink handle (the task emits ResponseCompleted at stream end).
     event_bus: Arc<dyn EventBus>,
     /// Latest cumulative usage seen via `CoreEvent::UsageDelta` (replaced, not
@@ -1142,13 +1342,31 @@ impl StreamContext {
                 self.stream_metrics.metrics.record_client_cancel();
                 return false;
             }
+            // Unreachable today: `first_byte_tx` is consumed only by a
+            // successful first-event send (which sets `first_byte_sent`) or by
+            // `send_pre_stream_error`, and every `send_pre_stream_error` call
+            // site is immediately followed by a `return`/`break`. Guard it
+            // explicitly so a future refactor cannot silently drop a
+            // client-visible event while reporting success: stop the task
+            // loudly instead of dropping the event and returning `true`.
+            warn!(
+                request_id = %self.request_id,
+                "emit_event: first-byte channel already consumed but no first \
+                 byte sent; stopping stream task to avoid silently dropping an event"
+            );
+            return false;
         } else if tx.send(event).await.is_err() {
             // Channel receiver dropped -- the SSE handler task has exited
             // (client disconnect or timeout). No further events can be
             // delivered, so stop the stream task.
             //
-            // Client disconnect, not an upstream failure (audit MEDIUM-5).
+            // Client disconnect, not an upstream failure (audit MEDIUM-5). Emit
+            // a terminal `ClientCancelled` event so this `RequestReceived` is
+            // not left orphaned in the event log (audit finding: buffering vs
+            // main-loop disconnect event inconsistency -- a pre-first-byte
+            // disconnect already emits via the PreStreamError path).
             self.stream_metrics.metrics.record_client_cancel();
+            self.emit_client_cancelled();
             return false;
         }
         true
@@ -1161,6 +1379,37 @@ impl StreamContext {
         } else {
             false
         }
+    }
+
+    /// Emit a terminal `ResponseFailed` recording that the client disconnected
+    /// after the first byte (mid-stream abort).
+    ///
+    /// This closes the streaming lifecycle: every `RequestReceived` for a stream
+    /// that started gets a matching terminal event, so a client-aborted stream
+    /// is attributable instead of orphaned. `error_kind` is `"ClientCancelled"`,
+    /// distinct from genuine upstream failures, so operators can filter these
+    /// out of error-rate analysis. The HTTP status is 200 (already committed at
+    /// the first byte); the `error_kind` carries the cancellation semantics.
+    /// Idempotent callers are fine, but this is intended to be the single
+    /// terminal emit for a disconnect path.
+    fn emit_client_cancelled(&self) {
+        self.event_bus
+            .emit(&ProxyEvent::ResponseFailed(ResponseFailed {
+                request_id: self.request_id.clone(),
+                timestamp: time::OffsetDateTime::now_utc(),
+                provider: Some(self.stream_metrics.provider_name.clone()),
+                model: Some(self.core.model.clone()),
+                error_kind: "ClientCancelled".to_owned(),
+                message: "client disconnected before the stream completed".to_owned(),
+                http_status: StatusCode::OK.as_u16(),
+                latency_ms: self
+                    .stream_metrics
+                    .start
+                    .elapsed()
+                    .as_millis()
+                    .try_into()
+                    .unwrap_or(u64::MAX),
+            }));
     }
 }
 
@@ -1180,6 +1429,7 @@ fn build_sse_output_stream(
         >,
     >,
     ctx: StreamContext,
+    failure_recorded: Arc<AtomicBool>,
 ) -> BoxStream<'static, Event> {
     // SSE channel buffer size. 256 events provides ~256 KB of headroom (typical
     // SSE events are ~1 KB). If the client reads slowly and the buffer fills,
@@ -1191,7 +1441,28 @@ fn build_sse_output_stream(
     let cancel = tokio_util::sync::CancellationToken::new();
     let cancel_clone = cancel.clone();
 
-    tokio::spawn(async move {
+    // Capture the fields needed to observe a panic in the spawned stream task.
+    // CatchPanicLayer (mod.rs) wraps only the request future, not detached
+    // tasks, so a panic *after* the first byte crosses the boundary is
+    // otherwise swallowed: `tx` drops, the SSE stream ends mid-flight, and no
+    // ResponseFailed event / failure metric is recorded. We capture the
+    // JoinHandle below and supervise it so a JoinError (panic) emits a
+    // ResponseFailed event + records a failure (audit LOW, detached spawn).
+    // The span instruments the spawned future so the runtime's panic log also
+    // carries the request id.
+    let supervise_request_id = ctx.request_id.clone();
+    let supervise_event_bus = Arc::clone(&ctx.event_bus);
+    let supervise_metrics = Arc::clone(&ctx.stream_metrics.metrics);
+    let supervise_provider = ctx.stream_metrics.provider_name.clone();
+    let supervise_model = ctx.core.model.clone();
+    let supervise_start = ctx.stream_metrics.start;
+    let stream_span = tracing::info_span!(
+        "stream_task",
+        request_id = %supervise_request_id,
+    );
+
+    let stream_task = tokio::spawn(
+        async move {
         let mut stream = byte_stream;
         let mut ctx = ctx;
         let mut stream_succeeded = false;
@@ -1266,7 +1537,7 @@ fn build_sse_output_stream(
                             "upstream stream error"
                         );
                         ctx.stream_metrics.metrics.record_failure();
-                        ctx.send_pre_stream_error(map_provider_error(e));
+                        ctx.send_pre_stream_error(map_provider_error(e, ctx.passthrough_auth));
                         return;
                     }
                     None => break 'buffer,
@@ -1292,15 +1563,81 @@ fn build_sse_output_stream(
         // Replay the buffered events. The first one crosses the first-byte
         // boundary (committing HTTP 200 via the `first_byte` channel); the rest
         // flow directly to the output channel.
+        //
+        // Special case: a leading `CoreEvent::Error` on the OpenAI path. The
+        // OpenAI StreamEncoder returns `Err` for `CoreEvent::Error`, so
+        // `encode_core_event` yields no SSE event and the error would be
+        // silently dropped -- leaving `first_byte_sent` false and surfacing a
+        // misleading "empty stream" 502 (audit LOW, stream-ids-01). When that
+        // happens, synthesize the OpenAI error-object SSE event from the
+        // CoreStreamError so it crosses the boundary as a real in-band event
+        // (200 + error + [DONE]), mirroring the post-first-byte
+        // `emit_stream_error` path. Anthropic encodes `Error` fine, so this
+        // branch is OpenAI-only.
         for core_event in pending.drain(..) {
             capture_lifecycle(&mut ctx, &core_event);
-            for event in encode_core_event(&mut encoder, core_event) {
+            // Capture the error before `encode_core_event` consumes the event,
+            // so we can synthesize an SSE error frame if the OpenAI encoder
+            // drops it (it returns `Err` for `CoreEvent::Error`).
+            let leading_openai_error = if matches!(ctx.client_protocol, ClientProtocol::OpenAiChat) {
+                match &core_event {
+                    CoreEvent::Error { error } => Some(error.clone()),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            let client_events = encode_core_event(&mut encoder, core_event);
+            if client_events.is_empty() {
+                if let Some(stream_error) = leading_openai_error {
+                    if let Some(json_str) = openai_chat::stream_error_sse_payload(&stream_error) {
+                        if !ctx.emit_event(Event::default().data(json_str), &tx).await {
+                            return;
+                        }
+                        // Emit the OpenAI `[DONE]` terminator after the error.
+                        if !ctx.emit_event(openai_done_event(), &tx).await {
+                            return;
+                        }
+                        encoder.mark_finished();
+                        stream_succeeded = false;
+                        stream_errored = true;
+                        // Record the failure and emit a ResponseFailed event so
+                        // the in-band error is reflected in metrics/event-log,
+                        // mirroring the post-first-byte in-band error path. The
+                        // HTTP status is already committed as 200 (the error
+                        // crossed the boundary in-band), but the event still
+                        // classifies the failure for operators.
+                        ctx.stream_metrics.metrics.record_failure();
+                        let route_error = RouteError::ProviderDecode(
+                            stream_error.message().to_owned(),
+                        );
+                        emit_response_failed(
+                            &ctx.event_bus,
+                            &ctx.request_id,
+                            Some(ctx.stream_metrics.provider_name.as_str()),
+                            Some(&ctx.core.model),
+                            &route_error,
+                            ctx.stream_metrics.start,
+                        );
+                    }
+                    // If serialization failed there is nothing else to do for
+                    // this event; continue the replay loop.
+                    continue;
+                }
+            }
+            for event in client_events {
                 if !ctx.emit_event(event, &tx).await {
                     return;
                 }
             }
         }
 
+        // Skip the main consumption loop when the replay already terminated
+        // the stream with an in-band error (leading CoreEvent::Error on the
+        // OpenAI path). The error + [DONE] have already crossed the boundary;
+        // reading more from the upstream would only append noise after the
+        // terminal error (audit LOW, stream-ids-01).
+        if !stream_errored {
         'outer: loop {
             tokio::select! {
                 _ = cancel_clone.cancelled() => {
@@ -1313,13 +1650,19 @@ fn build_sse_output_stream(
                         ctx.send_pre_stream_error(
                             RouteError::Internal("client disconnected before first byte".to_owned()),
                         );
+                    } else {
+                        // Post-first-byte disconnect: emit a terminal
+                        // `ClientCancelled` event so the lifecycle closes
+                        // symmetrically with the pre-first-byte path (which
+                        // emits via PreStreamError). Audit finding: buffering
+                        // vs main-loop disconnect event inconsistency.
+                        ctx.emit_client_cancelled();
                     }
                     return;
                 }
                 chunk = stream.next() => {
                     match chunk {
                         Some(Ok(bytes)) => {
-                            // Feed bytes through the SSE framer.
                             let frames = match ctx.sse_framer.push_chunk(&bytes) {
                                 Ok(f) => f,
                                 Err(e) => {
@@ -1424,7 +1767,7 @@ fn build_sse_output_stream(
                             if !ctx.first_byte_sent {
                                 ctx.stream_metrics.metrics.record_failure();
                                 ctx.send_pre_stream_error(
-                                    map_provider_error(e),
+                                    map_provider_error(e, ctx.passthrough_auth),
                                 );
                             } else {
                                 // In-band stream error: run through the full
@@ -1440,15 +1783,23 @@ fn build_sse_output_stream(
                                     &sanitized,
                                 ).await;
                                 ctx.stream_metrics.metrics.record_failure();
+                                // Classify the in-band error through
+                                // `map_provider_error` (the same helper the
+                                // non-stream and pre-stream paths use) so the
+                                // ResponseFailed.http_status matches the
+                                // non-stream classification: an upstream `Api`
+                                // error preserves its real status (429/400/413
+                                // pass through; 5xx -> 502), and an in-band
+                                // reqwest timeout is attributed as an upstream
+                                // timeout (504) rather than a generic 502
+                                // (audit LOW, eventlog-inband-stream-httpstatus).
+                                let route_error = map_provider_error(e, ctx.passthrough_auth);
                                 emit_response_failed(
                                     &ctx.event_bus,
                                     &ctx.request_id,
                                     Some(ctx.stream_metrics.provider_name.as_str()),
                                     Some(&ctx.core.model),
-                                    &RouteError::Upstream {
-                                        status: StatusCode::BAD_GATEWAY,
-                                        body: sanitized.clone(),
-                                    },
+                                    &route_error,
                                     ctx.stream_metrics.start,
                                 );
                             }
@@ -1466,6 +1817,7 @@ fn build_sse_output_stream(
                 }
             }
         }
+        } // end `if !stream_errored` guard around the main consumption loop
 
         // Only run finalization when the stream completed normally (not errored)
         // AND actually produced output (first_byte_sent). An empty / never-started
@@ -1576,7 +1928,17 @@ fn build_sse_output_stream(
                 .pending_usage
                 .clone()
                 .unwrap_or_else(Usage::synthetic_zero);
-            let cost = ctx.pricing.as_ref().map(|p| compute_cost(&usage, p));
+            // Only attach a cost when the usage was genuinely reported by the
+            // provider. Synthetic/Unknown usage (the `unwrap_or_else` zero-fill
+            // when no `UsageDelta` arrived) would otherwise produce a
+            // Some(zero-Cost) indistinguishable from a truly free request;
+            // leaving cost None for unprovenanced usage keeps the event honest
+            // (audit INFO, cost-on-synthetic-zero). Mirrors handle_core_once.
+            let cost = if usage.provenance == UsageProvenance::ProviderReported {
+                ctx.pricing.as_ref().map(|p| compute_cost(&usage, p))
+            } else {
+                None
+            };
             ctx.event_bus
                 .emit(&ProxyEvent::ResponseCompleted(ResponseCompleted {
                     request_id: ctx.request_id.clone(),
@@ -1607,6 +1969,60 @@ fn build_sse_output_stream(
                 let _ = tx.send(FirstByteResult::PreStreamError(RouteError::ProviderDecode(
                     "upstream returned an empty stream with no events".to_owned(),
                 )));
+            }
+        }
+    }
+        .instrument(stream_span),
+    );
+
+    // Supervise the stream task so a panic *after* the first byte is not
+    // swallowed. Pre-first-byte panics surface to the client through the
+    // `first_byte_rx` RecvError path (mapped to RouteError::Internal in the
+    // handler); post-first-byte panics drop `tx` and silently end the stream
+    // with no event/metric. This supervisor closes that observability gap:
+    // on a JoinError it emits a ResponseFailed event and records a failure so
+    // operators can diagnose the panic (audit LOW, detached spawn). The stream
+    // task itself is not blocked -- it terminates independently and the
+    // supervisor merely observes its exit.
+    tokio::spawn(async move {
+        match stream_task.await {
+            Ok(()) => {}
+            Err(join_error) => {
+                let panicked = join_error.is_panic();
+                let err = RouteError::Internal(format!(
+                    "stream task {}",
+                    if panicked {
+                        "panicked"
+                    } else {
+                        "was cancelled"
+                    }
+                ));
+                warn!(
+                    request_id = %supervise_request_id,
+                    error = %join_error,
+                    panicked,
+                    "detached stream task did not complete cleanly"
+                );
+                // Only record/emit if the handler's `first_byte_rx` RecvError
+                // path has not already done so for this same pre-first-byte
+                // panic. The shared `failure_recorded` flag is claimed by the
+                // first watcher to run; the second skips, so a pre-first-byte
+                // panic produces exactly one `ResponseFailed` + one failure
+                // metric (audit finding: stream-task panic double-ResponseFailed).
+                // Post-first-byte panics are only ever observed here (the handler
+                // is no longer awaiting `first_byte_rx`), so the flag is still
+                // false and the supervisor emits.
+                if !failure_recorded.swap(true, Ordering::SeqCst) {
+                    supervise_metrics.record_failure();
+                    emit_response_failed(
+                        &supervise_event_bus,
+                        &supervise_request_id,
+                        Some(supervise_provider.as_str()),
+                        Some(&supervise_model),
+                        &err,
+                        supervise_start,
+                    );
+                }
             }
         }
     });
@@ -1732,7 +2148,20 @@ async fn emit_stream_error(
 ///   key-redacting sanitizer (via [`ProviderError::api`]) followed by URL
 ///   redaction and truncation, so neither API keys nor upstream hostnames/URL
 ///   paths leak to the client (audit GAP-LOW-2).
-pub(crate) fn map_provider_error(e: llm_proxy_provider::error::ProviderError) -> RouteError {
+pub(crate) fn map_provider_error(
+    e: llm_proxy_provider::error::ProviderError,
+    passthrough_auth: bool,
+) -> RouteError {
+    // Whose credentials authenticated with the upstream: under passthrough_auth
+    // the client's own token is forwarded, so auth/permission failures are
+    // client-owned; otherwise they are operator-owned. This drives whether
+    // 401/403 pass through or collapse to 502 in extract_error_fields
+    // (audit LOW, passthrough-auth-401-collapse).
+    let auth_owner = if passthrough_auth {
+        AuthOwner::Client
+    } else {
+        AuthOwner::Operator
+    };
     match &e {
         llm_proxy_provider::error::ProviderError::Api { status, body } => {
             let status_code = StatusCode::from_u16(*status).unwrap_or_else(|_| {
@@ -1745,6 +2174,7 @@ pub(crate) fn map_provider_error(e: llm_proxy_provider::error::ProviderError) ->
             RouteError::Upstream {
                 status: status_code,
                 body: body.clone(),
+                auth_owner,
             }
         }
         _ => {
@@ -1762,6 +2192,7 @@ pub(crate) fn map_provider_error(e: llm_proxy_provider::error::ProviderError) ->
             RouteError::Upstream {
                 status: StatusCode::BAD_GATEWAY,
                 body: sanitized,
+                auth_owner,
             }
         }
     }
@@ -1907,34 +2338,171 @@ mod tests {
     }
 
     #[test]
-    fn body_hash_is_stable_and_distinguishes_requests() {
-        use llm_proxy_protocol::core::{CoreRequest, ModelRef};
-        let mk = |model: &str| CoreRequest {
-            model: ModelRef {
-                requested: model.to_owned(),
-                upstream: None,
-            },
-            system: vec![],
-            messages: vec![],
-            tools: vec![],
-            tool_choice: None,
-            sampling: Default::default(),
-            stream: false,
-            metadata: Default::default(),
-            provider_hints: Default::default(),
+    fn compute_cost_rounds_to_microcent() {
+        // Per the plan's locked decision 5, cost is rounded to the nearest
+        // microcent (6 dp) on output. A price that would otherwise carry more
+        // than 6 dp (0.000001875 * 3 tokens = 0.000005625) is rounded.
+        use llm_proxy_core::ModelPricing;
+        use llm_proxy_protocol::core::Usage;
+        let usage = Usage {
+            input_tokens: 3,
+            output_tokens: 0,
+            ..Usage::default()
         };
-        let a1 = mk("gpt-4o");
-        let a2 = mk("gpt-4o");
-        let b = mk("gpt-3.5-turbo");
+        let pricing = ModelPricing {
+            input: "0.000001875".parse().unwrap(),
+            ..ModelPricing::default()
+        };
+        let cost = compute_cost(&usage, &pricing);
+        // 3 * 0.000001875 = 0.000005625 -> rounded to 6 dp -> 0.000006 (half up).
+        assert_eq!(cost.input.normalize().to_string(), "0.000006");
+        // total == input (the only nonzero component).
+        assert_eq!(cost.total.normalize().to_string(), "0.000006");
+    }
+
+    #[test]
+    fn compute_cost_saturates_on_overflow_and_never_panics() {
+        // `rust_decimal`'s `*`/`+` panic on overflow; compute_cost must use
+        // checked arithmetic so a pathological (count, price) pair saturates to
+        // Decimal::MAX instead of crashing the request. The validation bound
+        // prevents such prices from reaching compute_cost via config, but this
+        // guards the function itself against any caller.
+        use llm_proxy_core::ModelPricing;
+        use llm_proxy_protocol::core::Usage;
+        let usage = Usage {
+            input_tokens: i32::MAX,
+            output_tokens: i32::MAX,
+            reasoning_tokens: Some(i32::MAX),
+            cache_creation_input_tokens: Some(i32::MAX),
+            cache_read_input_tokens: Some(i32::MAX),
+            ..Usage::default()
+        };
+        let pricing = ModelPricing {
+            input: "999999999999999999999".parse().unwrap(),
+            output: "999999999999999999999".parse().unwrap(),
+            cache_creation: "999999999999999999999".parse().unwrap(),
+            cache_read: "999999999999999999999".parse().unwrap(),
+            reasoning: "999999999999999999999".parse().unwrap(),
+        };
+        // Must not panic.
+        let cost = compute_cost(&usage, &pricing);
+        assert_eq!(cost.input, Decimal::MAX);
+        assert_eq!(cost.total, Decimal::MAX);
+    }
+
+    /// Regression guard for the 502-collapse secret/schema leak (Cluster A) and
+    /// the value-oriented source-guard gap (finding #8). The storage crate's
+    /// source-guard only checks that secret-bearing KEY NAMES never appear as
+    /// JSON keys; it does not check that a secret VALUE is absent from the
+    /// `message` string. This test routes an upstream error carrying a
+    /// realistic API-key-shaped value through `emit_response_failed` and asserts
+    /// the secret appears NOWHERE in the serialized event JSON.
+    #[test]
+    fn emit_response_failed_redacts_secret_values_from_message() {
+        use llm_proxy_storage::RecordingBus;
+        let bus = Arc::new(RecordingBus::default());
+        let bus_dyn: Arc<dyn EventBus> = Arc::clone(&bus) as Arc<dyn EventBus>;
+        let error = RouteError::Upstream {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            body: "auth failed for key sk-ant-api03-ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcd"
+                .to_owned(),
+            auth_owner: AuthOwner::Operator,
+        };
+        emit_response_failed(
+            &bus_dyn,
+            "req-1",
+            Some("prov"),
+            None,
+            &error,
+            Instant::now(),
+        );
+        let recorded = bus
+            .events
+            .lock()
+            .expect("bus lock")
+            .iter()
+            .find_map(|e| match e {
+                ProxyEvent::ResponseFailed(f) => Some(f.clone()),
+                _ => None,
+            })
+            .expect("a ResponseFailed was emitted");
+        // error_kind is the RouteError variant name (Cluster C guard).
+        assert_eq!(recorded.error_kind, "Upstream");
+        // The secret value must not appear in the message...
+        assert!(
+            !recorded.message.contains("sk-ant-api03-"),
+            "secret prefix leaked into message: {}",
+            recorded.message
+        );
+        assert!(
+            !recorded.message.contains("ABCDEFGHIJKLMNOP"),
+            "key material leaked into message: {}",
+            recorded.message
+        );
+        // ...nor anywhere in the serialized event JSON (the storage key-name
+        // guard would miss this; this is the value-oriented guard).
+        let json = serde_json::to_string(&ProxyEvent::ResponseFailed(recorded)).unwrap();
+        assert!(
+            !json.contains("sk-ant-api03-") && !json.contains("ABCDEFGHIJKLMNOP"),
+            "secret value leaked into event JSON: {json}"
+        );
+    }
+
+    /// The passthrough-auth Authorization scheme is case-insensitive (RFC 7235):
+    /// "Bearer", "bearer", "BEARER", "bEaReR" must all be accepted. Guards the
+    /// Cluster F fix that replaced a two-casing prefix match.
+    #[test]
+    fn extract_inbound_auth_bearer_scheme_is_case_insensitive() {
+        use secrecy::ExposeSecret;
+        fn extracted_token(auth_header: &str) -> Option<String> {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::AUTHORIZATION, auth_header.parse().unwrap());
+            extract_inbound_auth(&headers).map(|s| s.expose_secret().to_string())
+        }
+        assert_eq!(extracted_token("Bearer abc123").as_deref(), Some("abc123"));
+        assert_eq!(extracted_token("bearer abc123").as_deref(), Some("abc123"));
+        assert_eq!(extracted_token("BEARER abc123").as_deref(), Some("abc123"));
+        assert_eq!(extracted_token("BeArEr abc123").as_deref(), Some("abc123"));
+        // The token itself is trimmed; surrounding spaces do not leak in.
         assert_eq!(
-            body_hash_of(&a1),
-            body_hash_of(&a2),
-            "identical requests must produce the same hash"
+            extracted_token("Bearer   abc123   ").as_deref(),
+            Some("abc123")
+        );
+        // A non-Bearer scheme is not extracted via Authorization.
+        assert_eq!(extracted_token("Basic dXNlcjpwYXNz"), None);
+        // An empty token after the scheme yields None (falls through to the
+        // x-api-key / x-goog-api-key headers, which are absent here).
+        assert_eq!(extracted_token("Bearer "), None);
+    }
+
+    #[test]
+    fn body_hash_is_stable_and_distinguishes_requests() {
+        // `body_hash` is now computed over the RAW client body bytes (per the
+        // plan's locked decision), matching the `/v1/messages/count_tokens`
+        // route, so identical raw bodies hash equally and distinct bodies
+        // differ. Two bodies that normalize to the same CoreRequest but differ
+        // in whitespace/byte order now hash differently (intentional: the
+        // correlation key tracks the raw wire payload).
+        let a1 = br#"{"model":"gpt-4o","messages":[]}"#;
+        let a2 = br#"{"model":"gpt-4o","messages":[]}"#;
+        let b = br#"{"model":"gpt-3.5-turbo","messages":[]}"#;
+        assert_eq!(
+            body_hash_of_bytes(a1),
+            body_hash_of_bytes(a2),
+            "identical raw bodies must produce the same hash"
         );
         assert_ne!(
-            body_hash_of(&a1),
-            body_hash_of(&b),
-            "different models must produce different hashes"
+            body_hash_of_bytes(a1),
+            body_hash_of_bytes(b),
+            "different raw bodies must produce different hashes"
+        );
+        // Whitespace-sensitive (raw bytes, not normalized): the same JSON with
+        // a space after the colon hashes differently.
+        let spaced = br#"{"model": "gpt-4o","messages":[]}"#;
+        assert_ne!(
+            body_hash_of_bytes(a1),
+            body_hash_of_bytes(spaced),
+            "raw-body hash must be sensitive to whitespace (it is over the wire bytes)"
         );
     }
 
@@ -2080,7 +2648,7 @@ mod tests {
     #[test]
     fn provider_api_error_maps_to_upstream() {
         let err = llm_proxy_provider::error::ProviderError::api(500, "internal error".into());
-        let route_err = map_provider_error(err);
+        let route_err = map_provider_error(err, false);
         match route_err {
             RouteError::Upstream { status, .. } => {
                 assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
@@ -2092,11 +2660,43 @@ mod tests {
     #[test]
     fn provider_http_error_maps_to_upstream_502() {
         let err = llm_proxy_provider::error::ProviderError::api(502, "bad gateway".into());
-        let route_err = map_provider_error(err);
+        let route_err = map_provider_error(err, false);
         match route_err {
-            RouteError::Upstream { status, body } => {
+            RouteError::Upstream { status, body, .. } => {
                 assert_eq!(status, StatusCode::BAD_GATEWAY);
                 assert!(body.contains("bad gateway"));
+            }
+            other => panic!("expected Upstream, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn provider_api_error_marks_client_owner_under_passthrough() {
+        // passthrough_auth=true => auth_owner is Client so 401/403 pass through.
+        let err = llm_proxy_provider::error::ProviderError::api(401, "unauthorized".into());
+        let route_err = map_provider_error(err, true);
+        match route_err {
+            RouteError::Upstream {
+                status, auth_owner, ..
+            } => {
+                assert_eq!(status, StatusCode::UNAUTHORIZED);
+                assert_eq!(auth_owner, AuthOwner::Client);
+            }
+            other => panic!("expected Upstream, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn provider_api_error_marks_operator_owner_by_default() {
+        // passthrough_auth=false => auth_owner is Operator so 401 collapses to 502.
+        let err = llm_proxy_provider::error::ProviderError::api(401, "unauthorized".into());
+        let route_err = map_provider_error(err, false);
+        match route_err {
+            RouteError::Upstream {
+                status, auth_owner, ..
+            } => {
+                assert_eq!(status, StatusCode::UNAUTHORIZED);
+                assert_eq!(auth_owner, AuthOwner::Operator);
             }
             other => panic!("expected Upstream, got: {:?}", other),
         }

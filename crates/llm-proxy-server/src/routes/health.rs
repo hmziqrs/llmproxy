@@ -26,7 +26,7 @@ pub(crate) struct HealthBody {
 /// Returns a minimal `{status, service}` body. No operational metrics are
 /// exposed: the endpoint is unauthenticated and serves as a liveness probe, so
 /// it must not leak telemetry (audit LOW-13). Query parameters are ignored.
-pub async fn health(State(state): State<AppState>) -> (StatusCode, Json<HealthBody>) {
+pub(crate) async fn health(State(state): State<AppState>) -> (StatusCode, Json<HealthBody>) {
     (
         StatusCode::OK,
         Json(HealthBody {
@@ -53,7 +53,7 @@ pub(crate) struct ReadyBody {
 /// TODO(future): Add actual readiness checks such as verifying provider
 /// catalog cache freshness, confirming at least one provider is configured,
 /// or checking downstream connectivity.
-pub async fn ready() -> (StatusCode, Json<ReadyBody>) {
+pub(crate) async fn ready() -> (StatusCode, Json<ReadyBody>) {
     (StatusCode::OK, Json(ReadyBody { status: "ready" }))
 }
 
@@ -74,7 +74,7 @@ pub(crate) struct VersionBody {
 /// rest is compile-time build info. `BuildInfo.name` (the Cargo package name)
 /// is not used here because it is a static constant that does not vary between
 /// deployments.
-pub async fn version(State(state): State<AppState>) -> (StatusCode, Json<VersionBody>) {
+pub(crate) async fn version(State(state): State<AppState>) -> (StatusCode, Json<VersionBody>) {
     let build = state.build_info();
     (
         StatusCode::OK,

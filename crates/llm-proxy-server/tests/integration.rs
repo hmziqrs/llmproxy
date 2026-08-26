@@ -2,6 +2,7 @@
 //! TOML-mode integration scenarios.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use axum::{
@@ -972,5 +973,320 @@ async fn cors_absent_when_origins_unset() {
     assert!(
         resp.headers().get("access-control-allow-origin").is_none(),
         "no allow-origin should be emitted when CORS is not configured"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Event-log coverage for early-gate failures (audit eventlog-early-gates)
+// ---------------------------------------------------------------------------
+//
+// Each inference handler emits ResponseFailed exactly once per failed request:
+// early-gate failures (unknown provider, bad content-type, rate-limit, conflict,
+// malformed JSON, decode failure) emit inside the inner function, and failures
+// INSIDE the core pipeline emit inside the pipeline (which also returns Err).
+// The outer wrapper renders only -- it must NOT re-emit, or a pipeline failure
+// would be double-counted. These tests wire a RecordingBus into AppState and
+// assert the event counts so a regression (double-emit, or a dropped early-gate)
+// is caught (audit route-responsefailed-gaps).
+
+use llm_proxy_storage::{EventBus, ProxyEvent, RecordingBus};
+
+/// Build a provider-backed AppState whose event bus is a [`RecordingBus`],
+/// returning both the state and the bus so the test can snapshot emitted
+/// events. Mirrors [`state_with_provider`] but injects the recording sink.
+fn state_with_provider_and_bus() -> (AppState, Arc<RecordingBus>) {
+    let bus = Arc::new(RecordingBus::new());
+    let state = state_with_provider().with_event_bus(Arc::clone(&bus) as Arc<dyn EventBus>);
+    (state, bus)
+}
+
+/// Count recorded events of a given variant by name ("request_received",
+/// "response_completed", "response_failed").
+fn count_events(bus: &RecordingBus, kind: &str) -> usize {
+    bus.snapshot()
+        .iter()
+        .filter(|e| {
+            matches!(
+                (e, kind),
+                (ProxyEvent::RequestReceived(_), "request_received")
+                    | (ProxyEvent::ResponseCompleted(_), "response_completed")
+                    | (ProxyEvent::ResponseFailed(_), "response_failed")
+            )
+        })
+        .count()
+}
+
+/// The single ResponseFailed emitted for a malformed-JSON early gate carries
+/// http_status 400 and is emitted exactly once (audit eventlog-early-gates).
+#[tokio::test]
+async fn malformed_json_emits_one_response_failed_with_400() {
+    let (state, bus) = state_with_provider_and_bus();
+    let app = build_router(state);
+    let req = Request::builder()
+        .method("POST")
+        .uri("/providers/mock-provider/v1/messages")
+        .header("content-type", "application/json")
+        .body(Body::from("not json at all"))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    assert_eq!(
+        count_events(&bus, "response_failed"),
+        1,
+        "malformed JSON must emit exactly one ResponseFailed"
+    );
+    // The emitted event must carry the rendered HTTP status (400).
+    let failed = bus
+        .snapshot()
+        .into_iter()
+        .filter_map(|e| match e {
+            ProxyEvent::ResponseFailed(f) => Some(f),
+            _ => None,
+        })
+        .next()
+        .expect("one ResponseFailed");
+    assert_eq!(failed.http_status, 400);
+}
+
+/// An unknown-provider request emits exactly ONE ResponseFailed (not two) after
+/// the centralized wrapper replaced the per-site UnknownProvider emit
+/// (audit eventlog-early-gates regression guard).
+#[tokio::test]
+async fn unknown_provider_emits_exactly_one_response_failed() {
+    let (state, bus) = state_with_provider_and_bus();
+    let app = build_router(state);
+    let body = json!({
+        "model": "claude-sonnet-4-6",
+        "messages": [{ "role": "user", "content": "hi" }],
+        "max_tokens": 16
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/providers/does-not-exist/v1/messages")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    assert_eq!(
+        count_events(&bus, "response_failed"),
+        1,
+        "unknown provider must emit exactly one ResponseFailed (no double-emit)"
+    );
+}
+
+/// A duplicate request within the dedup window hits the Conflict early gate and
+/// emits exactly one ResponseFailed carrying http_status 409. This covers the
+/// RateLimited/Conflict branch of the centralized emit (audit eventlog-early-gates).
+#[tokio::test]
+async fn duplicate_request_emits_one_response_failed_with_409() {
+    let (state, bus) = state_with_provider_and_bus();
+    let app = build_router(state);
+    let body = json!({
+        "model": "claude-sonnet-4-6",
+        "messages": [{ "role": "user", "content": "dedup probe" }],
+        "max_tokens": 16
+    });
+    let make_req = || {
+        Request::builder()
+            .method("POST")
+            .uri("/providers/mock-provider/v1/messages")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    };
+    // First request consumes the dedup slot (it will fail downstream at 502 and
+    // emit its own pipeline-level ResponseFailed; that is expected and distinct
+    // from the Conflict gate emission under test).
+    let _ = app.clone().oneshot(make_req()).await.unwrap();
+    // Second identical request within the dedup window is rejected as a Conflict
+    // at the prepare_request early gate, before any upstream call. That early
+    // gate emits exactly one ResponseFailed for THIS request.
+    let resp = app.oneshot(make_req()).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+
+    // Exactly one ResponseFailed carries the Conflict's 409 status: the
+    // early-gate emit fired once for the dedup rejection. (The first request's
+    // downstream failure emits a 502 ResponseFailed, which is a separate,
+    // expected event and is excluded by the status filter.)
+    let conflicts: Vec<_> = bus
+        .snapshot()
+        .into_iter()
+        .filter_map(|e| match e {
+            ProxyEvent::ResponseFailed(f) if f.http_status == 409 => Some(f),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        conflicts.len(),
+        1,
+        "dedup Conflict must emit exactly one 409 ResponseFailed"
+    );
+
+    // Direct per-request count: the first request's downstream failure must also
+    // have emitted exactly ONE ResponseFailed (no double-emit from a pipeline
+    // failure re-emitting at the wrapper). Both requests share the bus, so
+    // confirm the total ResponseFailed count is exactly 2 (one per request),
+    // not more (audit route-responsefailed-gaps regression).
+    assert_eq!(
+        count_events(&bus, "response_failed"),
+        2,
+        "two requests (one downstream failure + one dedup conflict) must emit exactly two ResponseFailed total"
+    );
+}
+
+/// token_count success emits RequestReceived + ResponseCompleted (token_count
+/// previously emitted NO events; it now logs like any other route)
+/// (audit eventlog-early-gates).
+#[tokio::test]
+async fn token_count_success_emits_request_received_and_completed() {
+    let (state, bus) = state_with_provider_and_bus();
+    let app = build_router(state);
+    let body = json!({
+        "model": "claude-sonnet-4-6",
+        "messages": [{ "role": "user", "content": "hello world" }],
+        "max_tokens": 1024
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/providers/mock-provider/v1/messages/count_tokens")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    assert_eq!(
+        count_events(&bus, "request_received"),
+        1,
+        "token_count success must emit one RequestReceived"
+    );
+    assert_eq!(
+        count_events(&bus, "response_completed"),
+        1,
+        "token_count success must emit one ResponseCompleted"
+    );
+    assert_eq!(
+        count_events(&bus, "response_failed"),
+        0,
+        "token_count success must not emit any ResponseFailed"
+    );
+}
+
+/// token_count failure emits exactly one ResponseFailed (token_count previously
+/// emitted NO events on failure) (audit eventlog-early-gates).
+#[tokio::test]
+async fn token_count_failure_emits_one_response_failed() {
+    let (state, bus) = state_with_provider_and_bus();
+    let app = build_router(state);
+    let req = Request::builder()
+        .method("POST")
+        .uri("/providers/mock-provider/v1/messages/count_tokens")
+        .header("content-type", "application/json")
+        .body(Body::from("{ broken json"))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    assert_eq!(
+        count_events(&bus, "response_failed"),
+        1,
+        "token_count failure must emit exactly one ResponseFailed"
+    );
+}
+
+/// /models emits exactly one ResponseFailed on an unknown-provider error, for
+/// consistency with the rest of the API (audit eventlog-early-gates). /models is
+/// a listing endpoint so it carries no RequestReceived/ResponseCompleted pair.
+#[tokio::test]
+async fn models_unknown_provider_emits_one_response_failed() {
+    let (state, bus) = state_with_provider_and_bus();
+    let app = build_router(state);
+    let req = Request::builder()
+        .method("GET")
+        .uri("/providers/does-not-exist/v1/models")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    assert_eq!(
+        count_events(&bus, "response_failed"),
+        1,
+        "/models unknown provider must emit exactly one ResponseFailed"
+    );
+}
+
+/// A failure INSIDE the core pipeline (unreachable upstream -> 502) emits
+/// exactly ONE ResponseFailed for the request, not two. The core pipeline emits
+/// its own ResponseFailed on the upstream failure AND returns Err; the route
+/// handler must NOT re-emit at the wrapper (regression guard for
+/// route-responsefailed-gaps). Only one request hits this bus, so the count is a
+/// direct per-request assertion.
+#[tokio::test]
+async fn upstream_failure_inside_pipeline_emits_one_response_failed() {
+    let (state, bus) = state_with_provider_and_bus();
+    let app = build_router(state);
+    let body = json!({
+        "model": "claude-sonnet-4-6",
+        "messages": [{ "role": "user", "content": "pipeline failure probe" }],
+        "max_tokens": 16
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/providers/mock-provider/v1/messages")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    // The mock provider points at an unreachable endpoint, so the request
+    // fails INSIDE the core pipeline (upstream send) and the client gets a 502
+    // (or 500 routing error), proving the failure occurred past the early gates.
+    let status = resp.status();
+    let valid_statuses = [StatusCode::BAD_GATEWAY, StatusCode::INTERNAL_SERVER_ERROR];
+    assert!(
+        valid_statuses.contains(&status),
+        "expected a pipeline-level failure (502/500), got {status}"
+    );
+
+    assert_eq!(
+        count_events(&bus, "response_failed"),
+        1,
+        "an inside-pipeline failure must emit exactly ONE ResponseFailed (no double-emit)"
+    );
+}
+
+/// Same regression guard for the OpenAI chat-completions route: an
+/// inside-pipeline failure emits exactly one ResponseFailed
+/// (audit route-responsefailed-gaps).
+#[tokio::test]
+async fn upstream_failure_inside_pipeline_chat_emits_one_response_failed() {
+    let (state, bus) = state_with_provider_and_bus();
+    let app = build_router(state);
+    let body = json!({
+        "model": "claude-sonnet-4-6",
+        "messages": [{ "role": "user", "content": "pipeline failure probe" }],
+        "max_tokens": 16
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/providers/mock-provider/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    let status = resp.status();
+    let valid_statuses = [StatusCode::BAD_GATEWAY, StatusCode::INTERNAL_SERVER_ERROR];
+    assert!(
+        valid_statuses.contains(&status),
+        "expected a pipeline-level failure (502/500), got {status}"
+    );
+
+    assert_eq!(
+        count_events(&bus, "response_failed"),
+        1,
+        "an inside-pipeline failure must emit exactly ONE ResponseFailed (no double-emit)"
     );
 }

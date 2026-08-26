@@ -24,6 +24,27 @@ use tokio::time::Sleep;
 
 use crate::error::ProviderError;
 
+/// Default time-to-first-byte (response headers) deadline for upstream requests.
+///
+/// This bounds the unprotected window between connection establishment and the
+/// receipt of response headers on both [`ProxyClient::send`] and
+/// [`ProxyClient::send_stream`]. `connect_timeout` only covers the TCP+TLS
+/// handshake, so without this an upstream that accepts the connection but never
+/// returns headers could hold the call open until the downstream tower-http
+/// timeout (~300 s) fires. The streaming *body* is left under the existing
+/// per-chunk idle timeout ([`DEFAULT_STREAM_IDLE_TIMEOUT`]); this deadline only
+/// protects the headers phase (audit transport-no-upstream-timeout).
+pub const DEFAULT_UPSTREAM_HEADERS_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Maximum number of bytes read from an upstream error body before it is passed
+/// to [`ProviderError::api`].
+///
+/// Streamed (not buffered-then-truncated) so a malicious or grossly misbehaving
+/// upstream returning a multi-gigabyte error response cannot spike transient
+/// memory (audit transport-unbounded-error-body-read). Mirrors the 2 KiB prefix
+/// cap used by the discovery client.
+pub(crate) const MAX_UPSTREAM_ERROR_BODY_BYTES: usize = 2048;
+
 // ---------------------------------------------------------------------------
 // AuthHeaders
 // ---------------------------------------------------------------------------
@@ -127,6 +148,13 @@ pub struct ProxyClient {
     /// upstream yields no body byte within this window the stream errors so a
     /// stalled provider cannot hold the connection open (audit GAP-MED-2).
     stream_idle_timeout: Duration,
+    /// Time-to-first-byte (response headers) deadline applied to every upstream
+    /// request. Bounds the unprotected window between connection establishment
+    /// and headers receipt so an upstream that accepts the connection but never
+    /// returns headers cannot hold the call open indefinitely. The streaming
+    /// *body* remains under [`Self::stream_idle_timeout`]; this deadline does
+    /// not cap a legitimate long token stream (audit transport-no-upstream-timeout).
+    upstream_headers_timeout: Duration,
 }
 
 impl Default for ProxyClient {
@@ -178,6 +206,7 @@ impl ProxyClient {
         Ok(Self {
             http,
             stream_idle_timeout: DEFAULT_STREAM_IDLE_TIMEOUT,
+            upstream_headers_timeout: DEFAULT_UPSTREAM_HEADERS_TIMEOUT,
         })
     }
 
@@ -192,24 +221,72 @@ impl ProxyClient {
         self
     }
 
+    /// Override the time-to-first-byte (response headers) deadline for upstream
+    /// requests.
+    ///
+    /// Returns the client for chaining. The default is
+    /// [`DEFAULT_UPSTREAM_HEADERS_TIMEOUT`] (60 s). This bounds the headers
+    /// receipt phase without capping the streaming body, which remains under
+    /// the per-chunk idle timeout (audit transport-no-upstream-timeout).
+    pub fn with_upstream_headers_timeout(mut self, deadline: Duration) -> Self {
+        self.upstream_headers_timeout = deadline;
+        self
+    }
+
+    /// Build the common `reqwest` request skeleton shared by [`send`](Self::send)
+    /// and [`send_stream`](Self::send_stream).
+    ///
+    /// Sets `Content-Type: application/json`, conditionally sets
+    /// `Accept: text/event-stream`, applies auth, and applies any extra headers.
+    /// The caller attaches the body (`.body(req.body)`) afterwards so ownership of
+    /// `req.body` stays with the caller.
+    fn build_request(
+        &self,
+        req: &ProxyRequest,
+        accept_event_stream: bool,
+    ) -> reqwest::RequestBuilder {
+        let mut builder = self
+            .http
+            .post(&req.url)
+            .header("Content-Type", "application/json");
+        if accept_event_stream {
+            builder = builder.header("Accept", "text/event-stream");
+        }
+        builder = apply_auth(builder, &req.auth);
+        for (name, value) in &req.extra_headers {
+            builder = builder.header(name.as_str(), value.as_str());
+        }
+        builder
+    }
+
     /// Sends a non-streaming request and returns the response body bytes.
     ///
     /// - Always sets `Content-Type: application/json`.
     /// - Does **not** set `Accept: text/event-stream`.
     /// - Returns [`ProviderError::Api`] for HTTP status >= 400.
     pub async fn send(&self, req: ProxyRequest) -> Result<Vec<u8>, ProviderError> {
-        let mut builder = self
-            .http
-            .post(&req.url)
-            .header("Content-Type", "application/json");
+        let builder = self.build_request(&req, false);
 
-        builder = apply_auth(builder, &req.auth);
-
-        for (name, value) in &req.extra_headers {
-            builder = builder.header(name.as_str(), value.as_str());
-        }
-
-        let resp = builder.body(req.body).send().await?;
+        // Bound the headers-receipt (time-to-first-byte) phase so an upstream
+        // that accepts the connection but never returns headers cannot hold the
+        // call open until the downstream tower-http timeout. The body read in
+        // `check_status` remains under the underlying read deadline; a global
+        // client `.timeout()` is intentionally avoided so legitimate long
+        // (non-streaming) generations are not killed (audit
+        // transport-no-upstream-timeout).
+        let resp =
+            tokio::time::timeout(self.upstream_headers_timeout, builder.body(req.body).send())
+                .await
+                .map_err(|_| ProviderError::Http {
+                    message: format!(
+                        "upstream request timed out waiting for response headers within \
+                 {}s (upstream headers timeout); aborting to avoid an open-ended \
+                 stall (audit transport-no-upstream-timeout)",
+                        self.upstream_headers_timeout.as_secs()
+                    ),
+                    timeout: true,
+                    redirect: false,
+                })??;
 
         check_status(resp).await
     }
@@ -237,26 +314,36 @@ impl ProxyClient {
         Pin<Box<dyn Stream<Item = Result<Bytes, ProviderError>> + Send + 'static>>,
         ProviderError,
     > {
-        let mut builder = self
-            .http
-            .post(&req.url)
-            .header("Content-Type", "application/json")
-            .header("Accept", "text/event-stream");
+        let builder = self.build_request(&req, true);
 
-        builder = apply_auth(builder, &req.auth);
-
-        for (name, value) in &req.extra_headers {
-            builder = builder.header(name.as_str(), value.as_str());
-        }
-
-        let resp = builder.body(req.body).send().await?;
+        // Bound only the headers-receipt (time-to-first-byte) phase. The
+        // streaming *body* is left under the per-chunk idle timeout applied
+        // below via `IdleTimeoutStream`; a global client `.timeout()` would
+        // wrongly kill legitimate long token streams (audit
+        // transport-no-upstream-timeout).
+        let resp =
+            tokio::time::timeout(self.upstream_headers_timeout, builder.body(req.body).send())
+                .await
+                .map_err(|_| ProviderError::Http {
+                    message: format!(
+                        "upstream stream request timed out waiting for response headers \
+                 within {}s (upstream headers timeout); aborting to avoid an \
+                 open-ended stall (audit transport-no-upstream-timeout)",
+                        self.upstream_headers_timeout.as_secs()
+                    ),
+                    timeout: true,
+                    redirect: false,
+                })??;
 
         if resp.status().as_u16() >= 400 {
             let status = resp.status().as_u16();
-            let body_text = resp
-                .text()
-                .await
-                .unwrap_or_else(|e| format!("<failed to read error body: {}>", e));
+            // Stream the error body with a small cap rather than buffering it
+            // in full via `.text()`, so a misbehaving upstream returning a huge
+            // error response cannot spike transient memory before
+            // `ProviderError::api` truncates it (audit
+            // transport-unbounded-error-body-read).
+            let body_text =
+                crate::error::read_error_body_bounded(resp, MAX_UPSTREAM_ERROR_BODY_BYTES).await;
             return Err(ProviderError::api(status, body_text));
         }
 
@@ -327,8 +414,12 @@ impl Stream for IdleTimeoutStream {
 
         match this.inner.as_mut().poll_next(cx) {
             Poll::Ready(Some(item)) => {
-                // Restart the idle window for the next chunk.
-                this.sleep = Box::pin(tokio::time::sleep(this.idle));
+                // Restart the idle window for the next chunk. Re-arm the existing
+                // `Sleep` in place to avoid a heap allocation and timer
+                // register/deregister per chunk on the streaming path.
+                this.sleep
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + this.idle);
                 Poll::Ready(Some(item))
             }
             Poll::Ready(None) => Poll::Ready(None),
@@ -343,6 +434,7 @@ impl Stream for IdleTimeoutStream {
                             this.idle.as_secs()
                         ),
                         timeout: true,
+                        redirect: false,
                     }))),
                     Poll::Pending => Poll::Pending,
                 }
@@ -392,10 +484,12 @@ fn apply_auth(mut builder: reqwest::RequestBuilder, auth: &AuthHeaders) -> reqwe
 async fn check_status(resp: reqwest::Response) -> Result<Vec<u8>, ProviderError> {
     if resp.status().as_u16() >= 400 {
         let status = resp.status().as_u16();
-        let body_text = resp
-            .text()
-            .await
-            .unwrap_or_else(|e| format!("<failed to read error body: {}>", e));
+        // Stream the error body with a small cap rather than buffering it in
+        // full via `.text()`, so a misbehaving upstream returning a huge error
+        // response cannot spike transient memory before `ProviderError::api`
+        // truncates it (audit transport-unbounded-error-body-read).
+        let body_text =
+            crate::error::read_error_body_bounded(resp, MAX_UPSTREAM_ERROR_BODY_BYTES).await;
         return Err(ProviderError::api(status, body_text));
     }
     let body = resp.bytes().await?;
@@ -485,7 +579,6 @@ mod tests {
             ));
         }
 
-        // Echo body
         let body_str = String::from_utf8_lossy(&body);
         response_parts.push(format!("body: {}", body_str));
 

@@ -45,7 +45,7 @@ pub fn decode_request(req: MessageRequest) -> Result<CoreRequest, ProtocolError>
         upstream: None,
     };
 
-    let system = decode_system(&req.system);
+    let system = decode_system(req.system);
 
     let messages = req
         .messages
@@ -102,65 +102,54 @@ pub fn decode_request(req: MessageRequest) -> Result<CoreRequest, ProtocolError>
     })
 }
 
-fn decode_system(system: &Option<serde_json::Value>) -> Vec<CoreContent> {
+fn decode_system(system: Option<serde_json::Value>) -> Vec<CoreContent> {
     match system {
         None => Vec::new(),
-        Some(value) => {
-            if let Some(s) = value.as_str() {
-                if s.is_empty() {
-                    return Vec::new();
-                }
-                return vec![CoreContent::Text {
-                    text: s.to_owned(),
-                    cache: None,
-                }];
+        Some(serde_json::Value::String(s)) => {
+            if s.is_empty() {
+                return Vec::new();
             }
-            if let Some(arr) = value.as_array() {
-                let mut result = Vec::new();
-                // Note: each array item is cloned before deserialization because
-                // `serde_json::from_value` takes ownership and the array is borrowed
-                // from the request. An alternative would be to take ownership of the
-                // entire system value, but that would change the decode_system signature.
-                for item in arr {
-                    if let Ok(block) = serde_json::from_value::<SystemContentBlock>(item.clone()) {
-                        if block.r#type == "text" {
-                            if let Some(t) = block.text {
-                                let cache = block.cache_control.map(|cc| CacheControl {
-                                    r#type: CacheControlType::from(cc.r#type),
-                                });
-                                result.push(CoreContent::Text { text: t, cache });
-                            }
-                        } else {
-                            // Non-text system blocks (e.g. future image blocks) are not
-                            // yet supported -- log a warning so they are not silently lost.
-                            // Truncate block_type to limit log output from client input.
-                            let bt = block.r#type.as_str();
-                            // Char-boundary-safe truncation: avoids panics on
-                            // multi-byte UTF-8 characters in client-supplied data.
-                            let truncated = if bt.len() > 64 {
-                                let mut end = 64;
-                                while !bt.is_char_boundary(end) && end > 0 {
-                                    end -= 1;
-                                }
-                                &bt[..end]
-                            } else {
-                                bt
-                            };
-                            tracing::warn!(
-                                block_type = truncated,
-                                "non-text system block skipped during Anthropic decode"
-                            );
+            vec![CoreContent::Text {
+                text: s,
+                cache: None,
+            }]
+        }
+        Some(serde_json::Value::Array(arr)) => {
+            let mut result = Vec::new();
+            // We own `system`, so iterate owned array items without cloning.
+            for item in arr {
+                if let Ok(block) = serde_json::from_value::<SystemContentBlock>(item) {
+                    if block.r#type == "text" {
+                        if let Some(t) = block.text {
+                            let cache = block.cache_control.map(|cc| CacheControl {
+                                r#type: CacheControlType::from(cc.r#type),
+                            });
+                            result.push(CoreContent::Text { text: t, cache });
                         }
                     } else {
+                        // Non-text system blocks (e.g. future image blocks) are not
+                        // yet supported -- log a warning so they are not silently lost.
+                        // Truncate block_type to limit log output from client input.
+                        let bt = block.r#type.as_str();
+                        // Char-boundary-safe truncation: avoids panics on
+                        // multi-byte UTF-8 characters in client-supplied data.
+                        let truncated = crate::util::truncate_str_safe(bt, 64);
                         tracing::warn!(
-                            "decode_system: skipping system array item that failed deserialization"
+                            block_type = truncated,
+                            "non-text system block skipped during Anthropic decode"
                         );
                     }
+                } else {
+                    tracing::warn!(
+                        "decode_system: skipping system array item that failed deserialization"
+                    );
                 }
-                return result;
             }
-            Vec::new()
+            result
         }
+        // Non-string, non-array system values (e.g. a bare number) cannot be
+        // represented as system content -- return empty rather than erroring.
+        _ => Vec::new(),
     }
 }
 
@@ -251,17 +240,9 @@ fn decode_content_block(block: ContentBlock) -> Result<CoreContent, ProtocolErro
                                     Ok(core) => blocks.push(core),
                                     Err(ProtocolError::Decode(msg)) => {
                                         // Char-boundary-safe truncation for log output.
-                                        let truncated = if msg.len() > 64 {
-                                            let mut end = 64;
-                                            while !msg.is_char_boundary(end) && end > 0 {
-                                                end -= 1;
-                                            }
-                                            &msg[..end]
-                                        } else {
-                                            &msg
-                                        };
+                                        let truncated = crate::util::truncate_str_safe(&msg, 64);
                                         tracing::warn!(
-                                            block_type = truncated,
+                                            decode_error = truncated,
                                             "skipping unknown block inside tool_result content array"
                                         );
                                     }
@@ -327,15 +308,7 @@ fn decode_content_block(block: ContentBlock) -> Result<CoreContent, ProtocolErro
             // an empty text block. Truncate the block_type to limit log output
             // from potentially malicious client input. Char-boundary-safe
             // truncation avoids panics on multi-byte UTF-8.
-            let truncated = if other.len() > 64 {
-                let mut end = 64;
-                while !other.is_char_boundary(end) && end > 0 {
-                    end -= 1;
-                }
-                &other[..end]
-            } else {
-                other
-            };
+            let truncated = crate::util::truncate_str_safe(other, 64);
             tracing::warn!(
                 block_type = truncated,
                 "unknown Anthropic content block type during decode"
@@ -614,6 +587,11 @@ pub struct StreamEncoder {
     started: bool,
     /// Whether the terminal message_delta + message_stop have been emitted.
     finished: bool,
+    /// Indices of text/thinking blocks that received content_block_start
+    /// but have not yet been closed. Native Anthropic always emits
+    /// content_block_stop after every block; we synthesize stops for
+    /// text/thinking at MessageStop since CoreEvent has no ContentStop.
+    open_text_blocks: Vec<usize>,
 }
 
 impl StreamEncoder {
@@ -628,6 +606,7 @@ impl StreamEncoder {
             pending_usage: None,
             started: false,
             finished: false,
+            open_text_blocks: Vec::new(),
         }
     }
 
@@ -711,6 +690,7 @@ impl StreamEncoder {
                     usage: None,
                     error: None,
                 });
+                self.open_text_blocks.push(index);
             }
 
             CoreEvent::TextDelta { index, text } => {
@@ -817,6 +797,24 @@ impl StreamEncoder {
                     cache_read_input_tokens: None,
                 });
 
+                // Close any text/thinking blocks that were opened via
+                // content_block_start but never closed. Native Anthropic
+                // emits content_block_stop for every block; without this,
+                // strict clients that pair start/stop events mis-frame the
+                // stream. Tool blocks are closed by ToolCallStop.
+                self.open_text_blocks.sort_unstable();
+                for idx in self.open_text_blocks.drain(..) {
+                    events.push(MessageEvent {
+                        r#type: "content_block_stop".to_owned(),
+                        message: None,
+                        index: Some(idx),
+                        content_block: None,
+                        delta: None,
+                        usage: None,
+                        error: None,
+                    });
+                }
+
                 events.push(MessageEvent {
                     r#type: "message_delta".to_owned(),
                     message: None,
@@ -862,13 +860,16 @@ impl StreamEncoder {
                 //
                 // Length cap: truncate the error message to 1024 characters to
                 // prevent excessively large SSE payloads from upstream errors.
+                // Char-boundary-safe truncation: avoids panics on multi-byte
+                // UTF-8 characters in upstream/provider-derived error messages
+                // (consistent with the other truncation sites in this file).
                 let msg = error.message();
                 let capped_msg = if msg.len() > 1024 {
                     tracing::warn!(
                         original_len = msg.len(),
                         "stream error message exceeds 1024 chars; truncating for client-facing SSE"
                     );
-                    msg[..1024].to_owned()
+                    crate::util::truncate_str_safe(msg, 1024).to_owned()
                 } else {
                     msg.to_owned()
                 };
@@ -1559,6 +1560,56 @@ mod tests {
     }
 
     #[test]
+    fn streaming_text_block_emits_content_block_stop() {
+        // Text/thinking blocks receive content_block_start and content_block_delta
+        // but never content_block_stop (only ToolCallStop emits one). The encoder
+        // must synthesize a stop at MessageStop, before message_delta, so strict
+        // clients that pair start/stop events do not mis-frame the stream.
+        let mut enc = StreamEncoder::new("msg_1".into(), "m".into());
+        enc.encode_event(CoreEvent::MessageStart {
+            id: None,
+            model: ModelRef {
+                requested: "m".into(),
+                upstream: None,
+            },
+        })
+        .unwrap();
+        enc.encode_event(CoreEvent::ContentStart {
+            index: 0,
+            kind: ContentKind::Text,
+        })
+        .unwrap();
+        enc.encode_event(CoreEvent::TextDelta {
+            index: 0,
+            text: "hi".into(),
+        })
+        .unwrap();
+        let stop = enc
+            .encode_event(CoreEvent::MessageStop {
+                stop_reason: StopReason::EndTurn,
+                stop_sequence: None,
+            })
+            .unwrap();
+
+        // A content_block_stop for index 0 must be present.
+        assert!(
+            stop.iter()
+                .any(|e| e.r#type == "content_block_stop" && e.index == Some(0))
+        );
+
+        // ...and it must precede the message_delta event.
+        let md = stop
+            .iter()
+            .position(|e| e.r#type == "message_delta")
+            .expect("message_delta present");
+        let cbs = stop
+            .iter()
+            .position(|e| e.r#type == "content_block_stop")
+            .expect("content_block_stop present");
+        assert!(cbs < md, "content_block_stop must precede message_delta");
+    }
+
+    #[test]
     fn streaming_usage_coalesced_with_message_stop() {
         let mut enc = StreamEncoder::new("msg_1".into(), "m".into());
 
@@ -2091,6 +2142,53 @@ mod tests {
         assert_eq!(events[0].error.as_ref().unwrap().message, secret_msg);
         // The defense-in-depth contract requires that provider adapters
         // sanitize the message before constructing CoreStreamError.
+    }
+
+    #[test]
+    fn encode_error_truncates_multibyte_message_without_panicking() {
+        // Regression: the >1024-byte branch of the CoreEvent::Error arm used to
+        // slice with `msg[..1024]`, which panics if byte 1024 lands inside a
+        // multi-byte UTF-8 code point. Build a message longer than 1024 bytes
+        // whose byte offset 1024 falls mid-code-point deterministically, then
+        // assert the encoder truncates at a char boundary instead of panicking.
+        //
+        // 1 ASCII char (1 byte) + 257 four-byte chars ('🚀') = 1 + 1028 = 1029
+        // bytes. Byte 1024 is the 3rd byte of the 257th emoji (offset 1023 in
+        // the emoji run = 3 bytes into that code point), i.e. mid-code-point.
+        let emoji = "🚀"; // U+1F680, 4 bytes in UTF-8
+        assert_eq!(emoji.len(), 4);
+        let msg: String = std::iter::once('_')
+            .chain(std::iter::repeat_n(emoji, 257).flat_map(|s| s.chars()))
+            .collect();
+        assert!(
+            msg.len() > 1024,
+            "precondition: message must exceed the cap"
+        );
+        assert!(
+            !msg.is_char_boundary(1024),
+            "precondition: byte 1024 must fall mid-code-point"
+        );
+
+        let mut enc = StreamEncoder::new("msg_1".into(), "m".into());
+        // Must not panic.
+        let events = enc
+            .encode_event(CoreEvent::Error {
+                error: CoreStreamError::new(CoreStreamErrorKind::Upstream, msg.clone()),
+            })
+            .unwrap();
+
+        let capped = &events[0].error.as_ref().unwrap().message;
+        assert!(
+            capped.len() <= 1024,
+            "truncated message must not exceed the cap"
+        );
+        // The result is a valid char boundary (and valid UTF-8 by construction).
+        assert!(
+            msg.starts_with(capped.as_str()),
+            "truncated message must be a prefix of the original"
+        );
+        // Sanity: we actually exercised the truncation branch.
+        assert!(capped.len() < msg.len());
     }
 
     #[test]

@@ -449,6 +449,12 @@ pub(crate) fn build_usage_from_openai(
 ) -> Usage {
     let cache_hit_i64 = cache_hit.unwrap_or(0) as i64;
     let cache_miss_i64 = cache_miss.unwrap_or(0) as i64;
+    // OpenAI's `prompt_tokens` is INCLUSIVE of cached tokens (both cache-hit and
+    // cache-creation/miss contributions are counted within it), whereas the core
+    // `input_tokens` field is EXCLUSIVE of cache tokens (which are reported
+    // separately via `cache_read_input_tokens` / `cache_creation_input_tokens`).
+    // Subtract the cache contributions here so the core total does not
+    // double-count them.
     let input = (prompt_tokens as i64) - cache_hit_i64 - cache_miss_i64;
     let input_tokens = i32::try_from(input.max(0)).unwrap_or(i32::MAX);
 

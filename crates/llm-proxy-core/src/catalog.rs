@@ -13,7 +13,14 @@ pub struct CatalogFileMetadata {
     pub provider: String,
     /// Catalog source, normally `live`.
     pub source: String,
-    /// RFC 3339 timestamp when the catalog was generated.
+    /// Best-effort timestamp string (normally RFC 3339) recording when the
+    /// catalog was generated.
+    ///
+    /// This is an opaque, operator-controlled cache value that is **not**
+    /// validated at parse time. Format validity is checked only where the
+    /// value is consumed (e.g. staleness comparison in `catalog_service`); a
+    /// malformed value parses to `None` there and the entry is treated as
+    /// stale. Do not rely on this field being a well-formed RFC 3339 string.
     pub generated_at: String,
     /// Discovered model entries.
     #[serde(default)]
@@ -189,11 +196,9 @@ static GLOB_CACHE: std::sync::Mutex<Vec<(String, Regex)>> = std::sync::Mutex::ne
 /// compiled once per process.
 fn glob_matches(pattern: &str, value: &str) -> bool {
     let mut cache = GLOB_CACHE.lock().unwrap_or_else(|e| e.into_inner());
-    // Check if we already compiled this pattern.
     if let Some((_, regex)) = cache.iter().find(|(p, _)| p == pattern) {
         return regex.is_match(value);
     }
-    // Compile and cache the new pattern.
     let mut expression = String::with_capacity(pattern.len() + 2);
     expression.push('^');
     let mut literal_buf = String::new();

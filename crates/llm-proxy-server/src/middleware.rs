@@ -384,6 +384,17 @@ where
 /// validating it parses as a legitimate [`std::net::IpAddr`]. Invalid or
 /// spoofed values are silently ignored and the connection-info fallback is
 /// used instead.
+///
+/// # Trust model
+///
+/// The **leftmost** `X-Forwarded-For` entry is trusted as the client address.
+/// This is only correct behind a **single** reverse proxy that strips or
+/// overwrites any inbound `X-Forwarded-For` before appending its own hop. With
+/// multiple untrusted hops the leftmost entry is attacker-controllable (a
+/// client may prepend arbitrary IPs), so the extracted address must not be
+/// trusted for authentication, rate-limit bypass, or audit logging. The IpAddr
+/// parse check defends against malformed garbage, not against well-formed
+/// spoofed values.
 pub fn get_client_ip(
     headers: &axum::http::HeaderMap,
     connect_info: Option<&SocketAddr>,
@@ -542,7 +553,6 @@ mod tests {
         headers.insert("x-forwarded-for", "1.2.3.4".parse().unwrap());
         let connect_info = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
 
-        // With trust_forwarded_headers = false, should use connection info.
         let ip = super::get_client_ip(&headers, Some(&connect_info), false);
         assert_eq!(
             ip, "127.0.0.1",
@@ -559,7 +569,6 @@ mod tests {
         headers.insert("x-forwarded-for", "1.2.3.4".parse().unwrap());
         let connect_info = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
 
-        // With trust_forwarded_headers = true, should use X-Forwarded-For.
         let ip = super::get_client_ip(&headers, Some(&connect_info), true);
         assert_eq!(ip, "1.2.3.4", "should use X-Forwarded-For when trust=true");
     }

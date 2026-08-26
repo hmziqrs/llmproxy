@@ -14,7 +14,65 @@ use tokio::sync::{Mutex as AsyncMutex, RwLock};
 #[derive(Debug, Clone)]
 struct RefreshOutcome {
     completed_at: Instant,
-    error: Option<String>,
+    /// Preserved so single-flight followers receive the same error variant
+    /// (and therefore the same HTTP status via `map_catalog_error`) as the
+    /// leader. Only the variants `map_catalog_error` discriminates on are
+    /// preserved; everything else already collapses to `RouteError::Internal`,
+    /// so storing it as `InvalidConfig` is lossless.
+    error: Option<PreservedError>,
+}
+
+/// Category-preserving snapshot of a [`ProviderError`] produced by a refresh.
+///
+/// `ProviderError` is not `Clone` (it carries a `serde_json::Error`), so the
+/// single-flight outcome cache stores this reconstruction instead of the full
+/// error. Only the variants [`map_catalog_error`](crate::routes) discriminates
+/// on are preserved by variant; all other variants map to `RouteError::Internal`
+/// regardless, so they collapse to [`ProviderError::InvalidConfig`] losslessly.
+#[derive(Debug, Clone)]
+enum PreservedError {
+    /// Original was `ProviderError::Http`.
+    Http { message: String, timeout: bool },
+    /// Original was `ProviderError::Api`.
+    Api { status: u16, body: String },
+    /// Original was any other variant; only the `Display` string is retained.
+    Other(String),
+}
+
+impl PreservedError {
+    /// Snapshot the category-relevant fields of a [`ProviderError`].
+    fn from_provider_error(error: &ProviderError) -> Self {
+        match error {
+            ProviderError::Http {
+                message, timeout, ..
+            } => Self::Http {
+                message: message.clone(),
+                timeout: *timeout,
+            },
+            ProviderError::Api { status, body } => Self::Api {
+                status: *status,
+                body: body.clone(),
+            },
+            other => Self::Other(other.to_string()),
+        }
+    }
+
+    /// Reconstruct a [`ProviderError`] that maps to the same HTTP status as the
+    /// original (the `redirect` flag is irrelevant to status mapping).
+    fn to_provider_error(&self) -> ProviderError {
+        match self {
+            Self::Http { message, timeout } => ProviderError::Http {
+                message: message.clone(),
+                timeout: *timeout,
+                redirect: false,
+            },
+            Self::Api { status, body } => ProviderError::Api {
+                status: *status,
+                body: body.clone(),
+            },
+            Self::Other(message) => ProviderError::InvalidConfig(message.clone()),
+        }
+    }
 }
 
 /// Cached, generation-tagged catalog membership index (audit LOW-9).
@@ -236,21 +294,22 @@ impl ModelCatalogService {
             .filter(|outcome| outcome.completed_at >= requested_at)
             .cloned()
         {
-            return outcome.error.map_or(Ok(()), |error| {
-                // Preserve the original error category where possible. The cached
-                // error string came from a prior ProviderError's Display output,
-                // so we wrap it as InvalidConfig to preserve the message. This is
-                // acceptable because: (a) the original error already failed once
-                // (so retry semantics are identical), and (b) the caller logs the
-                // full message at warn level before deciding whether to fall back.
-                Err(ProviderError::InvalidConfig(error))
+            return outcome.error.map_or(Ok(()), |preserved| {
+                // Reconstruct the typed error so single-flight followers receive
+                // the same error variant -- and therefore the same HTTP status
+                // via `map_catalog_error` -- as the leader (e.g. an upstream
+                // timeout stays a 504, not a 500 Internal).
+                Err(preserved.to_provider_error())
             });
         }
 
         let models = match self.discovery.discover(provider).await {
             Ok(models) => models,
             Err(error) => {
-                self.record_refresh_outcome(&provider.name, Some(error.to_string()))?;
+                self.record_refresh_outcome(
+                    &provider.name,
+                    Some(PreservedError::from_provider_error(&error)),
+                )?;
                 return Err(error);
             }
         };
@@ -258,7 +317,7 @@ impl ModelCatalogService {
             catalog: CatalogFileMetadata {
                 provider: provider.name.clone(),
                 source: "live".to_owned(),
-                generated_at: now_rfc3339(),
+                generated_at: now_rfc3339()?,
                 models,
             },
         };
@@ -279,7 +338,10 @@ impl ModelCatalogService {
                 ProviderError::InvalidConfig(format!("catalog cache write task failed: {error}"))
             })?;
             if let Err(error) = write_result {
-                self.record_refresh_outcome(&provider.name, Some(error.to_string()))?;
+                self.record_refresh_outcome(
+                    &provider.name,
+                    Some(PreservedError::from_provider_error(&error)),
+                )?;
                 return Err(error);
             }
         }
@@ -294,7 +356,7 @@ impl ModelCatalogService {
     fn record_refresh_outcome(
         &self,
         provider: &str,
-        error: Option<String>,
+        error: Option<PreservedError>,
     ) -> Result<(), ProviderError> {
         self.refresh_outcomes
             .lock()
@@ -340,12 +402,24 @@ impl ModelCatalogService {
                 "catalog provider must be a lowercase URL-safe slug".to_owned(),
             ));
         }
+        let Some(cache_dir) = &self.cache_dir else {
+            // No disk cache: nothing to load.
+            return Ok(());
+        };
+        // Fast path: if this provider's catalog is already in memory, return
+        // without taking the write lock at all, avoiding contention on the
+        // common (already-loaded) request path.
         if self.cache.read().await.contains_key(&provider.name) {
             return Ok(());
         }
-        let Some(cache_dir) = &self.cache_dir else {
-            return Ok(());
-        };
+        // Cold path: stat + read + parse OUTSIDE any lock. The write lock is
+        // global across all providers, so holding it across disk I/O would
+        // serialize every concurrent catalog()/contains_model() call for every
+        // other provider (head-of-line blocking). Two concurrent first-load
+        // callers for the same provider may both read and parse the same file;
+        // that is harmless -- the second insert overwrites byte-identical
+        // content, and the extra bump_cache_generation only forces one cheap
+        // id_index rebuild (which re-checks the generation before storing).
         let path = cache_dir.join(format!("{}.toml", provider.name));
         let metadata = match tokio::fs::symlink_metadata(&path).await {
             Ok(metadata) => metadata,
@@ -373,7 +447,16 @@ impl ModelCatalogService {
                 path.display()
             )));
         }
-        self.cache.write().await.insert(provider.name.clone(), file);
+        // Critical section: re-check (another caller may have populated it) and
+        // insert. Bump the generation after dropping the guard so it does not
+        // run under the write lock.
+        {
+            let mut cache = self.cache.write().await;
+            if cache.contains_key(&provider.name) {
+                return Ok(());
+            }
+            cache.insert(provider.name.clone(), file);
+        }
         // The discovered catalog changed; advance the generation so any cached
         // membership index is rebuilt on next access (audit LOW-9).
         self.bump_cache_generation(&provider.name);
@@ -419,10 +502,24 @@ fn invalid_cache(error: std::io::Error) -> ProviderError {
     ProviderError::InvalidConfig(format!("catalog cache I/O failed: {error}"))
 }
 
-fn now_rfc3339() -> String {
+/// Format the current UTC time as an RFC 3339 string.
+///
+/// # Errors
+///
+/// Returns an error if formatting the timestamp fails. Propagated (rather
+/// than falling back to the Unix epoch) because an epoch sentinel would make
+/// the cache perpetually stale: `cache_is_fresh` computes
+/// `now_utc() - generated_at`, and an epoch `generated_at` yields a huge
+/// positive age, forcing a network refresh on every `catalog()` request.
+/// Failing the refresh loudly is the safe direction — the caller already
+/// handles refresh failures with a stale/static fallback (audit:
+/// now-rfc3339-epoch-fallback).
+fn now_rfc3339() -> Result<String, ProviderError> {
     time::OffsetDateTime::now_utc()
         .format(&time::format_description::well_known::Rfc3339)
-        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_owned())
+        .map_err(|error| {
+            ProviderError::InvalidConfig(format!("failed to format catalog timestamp: {error}"))
+        })
 }
 
 /// Persist a catalog using a temporary file and atomic rename.
@@ -854,7 +951,6 @@ mod tests {
 
         let service = ModelCatalogService::new(Some(directory.clone()));
         let provider = provider("http://127.0.0.1:0/models".to_owned());
-        // load_disk_cache so the in-memory cache is populated
         service.load_disk_cache(&provider).await.unwrap();
         assert!(
             service.cache_is_fresh(&provider).await,

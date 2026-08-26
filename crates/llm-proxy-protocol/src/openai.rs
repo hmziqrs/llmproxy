@@ -176,6 +176,10 @@ pub struct ChatMessage {
     /// the model refuses to answer).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub refusal: Option<String>,
+    /// Tool-result error flag (only meaningful when `role == "tool"`).
+    /// Some OpenAI-compatible providers use `status` instead of `is_error`.
+    #[serde(default, alias = "status", skip_serializing_if = "Option::is_none")]
+    pub is_error: Option<bool>,
 }
 
 impl ChatMessage {
@@ -326,7 +330,12 @@ pub struct ChatCompletionRequest {
 /// return additional usage fields (e.g. `prompt_tokens_details`) that the
 /// proxy does not model. Unknown fields are silently ignored rather than
 /// causing parse failures.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+///
+/// `Default` is derived so the [`ChatCompletionResponse`] `usage` field can use
+/// `#[serde(default)]`: some OpenAI-compatible providers omit `usage` entirely
+/// on 2xx responses, and absent usage should yield zero counts rather than a
+/// decode failure.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct UsageInfo {
     /// Tokens consumed by the prompt.
     pub prompt_tokens: i32,
@@ -344,6 +353,19 @@ pub struct UsageInfo {
     /// Prompt tokens that missed the cache.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_cache_miss_tokens: Option<i32>,
+}
+
+/// Deserialize `T`, treating a JSON `null` as `T::default()`. Combined with
+/// `#[serde(default)]` (which covers an absent field), this lets the
+/// [`ChatCompletionResponse`] `usage` field decode cleanly whether the provider
+/// omits it or sends `null` — both yield zero counts instead of a 502.
+fn deserialize_default_on_null<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de> + Default,
+{
+    use serde::Deserialize as _;
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 // ---------------------------------------------------------------------------
@@ -396,6 +418,13 @@ pub struct ChatCompletionResponse {
     /// Ordered list of completion alternatives.
     pub choices: Vec<Choice>,
     /// Token usage for this request.
+    ///
+    /// Some OpenAI-compatible providers (e.g. certain OpenRouter backends) omit
+    /// `usage` entirely or send it as `null` on 2xx responses. The
+    /// `#[serde(default)]` + `deserialize_default_on_null` combination maps both
+    /// cases to zero token counts so the response decodes normally instead of
+    /// failing into a 502 "provider response decode error".
+    #[serde(default, deserialize_with = "deserialize_default_on_null")]
     pub usage: UsageInfo,
     /// Catch-all for provider-specific response fields (e.g. `service_tier`,
     /// `system_fingerprint`) that the proxy does not model explicitly.
@@ -552,6 +581,7 @@ mod tests {
                 tool_call_id: None,
                 cache_control: None,
                 refusal: None,
+                is_error: None,
             }),
             finish_reason: Some("stop".into()),
             delta: None,

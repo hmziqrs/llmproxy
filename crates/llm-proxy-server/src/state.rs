@@ -28,8 +28,10 @@ pub struct BuildInfo {
 /// Application state shared with every handler.
 ///
 /// Cheap to clone: nearly all fields are `Arc`-wrapped so cloning only bumps
-/// reference counts (the lone exception is `token_counter`, a zero-sized
-/// `Counter` stored inline). Required by axum's `State` extractor.
+/// reference counts. `token_counter` is a non-ZST `Counter` stored inline, but
+/// its lazily-loaded BPE cache is held in an inner `Arc`, so cloning `Counter`
+/// is a refcount bump and every `AppState` clone shares the same loaded BPE
+/// encodings. Required by axum's `State` extractor.
 ///
 /// # Security note
 ///
@@ -38,16 +40,23 @@ pub struct BuildInfo {
 ///
 /// The transitive redaction chain for Debug is:
 /// - `AppState` -> `app_config` field: `AppConfig` has no secrets (safe).
-/// - `AppState` -> `providers` field: `ProviderRegistry` -> `ProviderConfig`
-///   (manual Debug, redacts api_key). Safe.
-/// - `AppState` -> `provider_adapters` field: `ProviderAdapterRegistry` holds
-///   only `HashMap<ProviderProtocol, ProviderAdapter>` -- no secrets. Safe.
-/// - `AppState` -> remaining fields: `BuildInfo`, `Counter`, `Metrics`,
-///   `RateLimiter`, `RequestDeduplicator`, `RequestIdGenerator` -- none hold
-///   secrets. Safe.
+/// - `AppState` -> `providers` field: `ProviderRegistry` -> `ProviderConfig`,
+///   whose `api_key` is a `secrecy::SecretString`; `ProviderConfig` derives
+///   `Debug` and the key is redacted by `SecretString`'s own impl. Safe.
+/// - `AppState` -> `provider_adapters` field: `ProviderAdapterRegistry` ->
+///   `ProviderAdapter` types whose `api_key` is `SecretString`; the adapter
+///   config/target types keep a *manual* `Debug` that additionally redacts the
+///   endpoint query string and auth-header *values* (not just the key). Safe.
+/// - `AppState` -> remaining fields: `BuildInfo`, `proxy_client`, `Counter`,
+///   `Metrics`, `RateLimiter`, `RequestDeduplicator`, `RequestIdGenerator`,
+///   `model_catalogs`, `event_bus` -- none hold secrets. Safe.
 ///
-/// **Maintenance note:** If any of the above types gains a plain derived `Debug`
-/// that contains secrets, the redaction chain breaks silently. The test
+/// **Maintenance note:** Secret-backed fields use `secrecy::SecretString`, which
+/// redacts in `Debug`/`Display` regardless of whether the containing type
+/// derives or hand-writes `Debug`. The remaining risk is non-`SecretString`
+/// sensitive data (e.g. endpoint query strings, raw header values): those still
+/// rely on the manual `Debug` impls on the adapter config/target types. If such
+/// a field is added to a type that derives `Debug`, audit it. The test
 /// `app_state_debug_does_not_leak_api_key` provides regression coverage.
 #[derive(Clone)]
 #[non_exhaustive]
@@ -145,8 +154,11 @@ impl AppState {
         catalog_dir: Option<std::path::PathBuf>,
     ) -> Self {
         let rate_limit_rpm = app_config.server.rate_limit_rpm;
+        // A dedup window whose millis do not fit u64 (Duration::MAX) cannot
+        // meaningfully be represented; fall back to 0, which disables dedup,
+        // matching the documented "0s disables deduplication" contract.
         let dedup_window_ms =
-            u64::try_from(app_config.server.dedup_window.as_millis()).unwrap_or(u64::MAX);
+            u64::try_from(app_config.server.dedup_window.as_millis()).unwrap_or(0);
         Self {
             app_config: Arc::new(app_config),
             providers: Arc::new(providers),
@@ -442,7 +454,6 @@ mod tests {
         };
         let registry = ProviderRegistry::from_providers(vec![provider]).expect("registry");
         let adapter_reg = ProviderAdapterRegistry::builtin();
-        // Validate protocols against builtins
         let result = registry.validate_protocols(adapter_reg.protocol_names());
         assert!(result.is_ok(), "all protocols are builtin, got: {result:?}");
     }
@@ -557,9 +568,12 @@ mod tests {
             Arc::ptr_eq(&state.build, &cloned.build),
             "cloned AppState should share the same Arc<BuildInfo>"
         );
-        // NOTE: `token_counter` is an inline `Counter` (zero-sized unit struct),
-        // not `Arc<Counter>`, so there is no shared reference to compare. It is
-        // intentionally excluded from the Arc-sharing assertions above.
+        // NOTE: `token_counter` is an inline `Counter` (not `Arc<Counter>`), so
+        // there is no outer `Arc<Counter>` to compare with `Arc::ptr_eq`. It is
+        // intentionally excluded from the Arc-sharing assertions above. The
+        // loaded BPE cache is still shared: `Counter` holds its cache in an
+        // inner `Arc<Mutex<HashMap<..>>>`, so this `cloned` state reuses the
+        // same loaded encodings as the original.
     }
 
     // -- Multi-provider TOML validation --------------------------------------

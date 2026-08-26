@@ -15,6 +15,7 @@ use axum::{
     response::sse::{Event, KeepAlive, Sse},
     routing::post,
 };
+use futures::FutureExt;
 use llm_proxy_core::{
     AppConfig, AuthStyle, ProviderAdapterConfig, ProviderConfig, ProviderRegistry, ServerConfig,
 };
@@ -43,6 +44,40 @@ async fn wait_for_ready(addr: std::net::SocketAddr) {
         }
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
+}
+
+/// Spawn a mock axum server on `listener`, returning immediately while the
+/// server runs in the background.
+///
+/// Unlike a bare `tokio::spawn(async move { axum::serve(..).await })` whose
+/// `JoinHandle` is dropped (silently swallowing any panic in the mock server
+/// task — audit `testing-audit:mock-server-joinhandle-swallow`), this wrapper
+/// catches a panic in the serve future, prints it to stderr, and aborts the
+/// process. A mock-handler bug therefore surfaces loudly as a test failure
+/// instead of the connection just closing mid-stream with no diagnostic.
+fn spawn_mock_serve(listener: tokio::net::TcpListener, app: Router) {
+    tokio::spawn(async move {
+        // std::panic::catch_unwind requires UnwindSafe; the router/listener
+        // capture is fine for a mock that owns them exclusively.
+        let result = std::panic::AssertUnwindSafe(axum::serve(listener, app).into_future())
+            .catch_unwind()
+            .await;
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => eprintln!("mock axum::serve error: {e}"),
+            Err(panic) => {
+                // Surface the panic payload, then abort so the test binary fails
+                // rather than continuing with a dead mock.
+                let msg = panic
+                    .downcast_ref::<String>()
+                    .map(|s| s.as_str())
+                    .or_else(|| panic.downcast_ref::<&'static str>().copied())
+                    .unwrap_or("<non-string panic>");
+                eprintln!("mock server task panicked: {msg}");
+                std::process::abort();
+            }
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -230,7 +265,7 @@ async fn spawn_mock_server(response_body: Vec<u8>, content_type: &str) -> String
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    spawn_mock_serve(listener, app);
     wait_for_ready(addr).await;
     format!(
         "http://{}/providers/mock-provider/v1/chat/completions",
@@ -263,7 +298,7 @@ async fn spawn_hanging_mock() -> String {
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    spawn_mock_serve(listener, app);
     wait_for_ready(addr).await;
     format!("http://{addr}/providers/mock-provider/v1/chat/completions")
 }
@@ -294,7 +329,7 @@ async fn spawn_mock_openai_chat_stream() -> String {
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    spawn_mock_serve(listener, app);
     wait_for_ready(addr).await;
     format!(
         "http://{}/providers/mock-provider/v1/chat/completions",
@@ -318,7 +353,7 @@ async fn spawn_mock_500() -> String {
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    spawn_mock_serve(listener, app);
     wait_for_ready(addr).await;
     format!(
         "http://{}/providers/mock-provider/v1/chat/completions",
@@ -351,7 +386,7 @@ async fn spawn_mock_with_body_capture(
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    spawn_mock_serve(listener, app);
     wait_for_ready(addr).await;
     (
         format!(
@@ -958,7 +993,7 @@ async fn streaming_tool_call_maps_to_delta_tool_calls() {
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    spawn_mock_serve(listener, app);
     wait_for_ready(addr).await;
     let mock_url = format!("http://{}/providers/mock-provider/v1/messages", addr);
 
@@ -1578,9 +1613,14 @@ async fn timeout_returns_normalised_json_408() {
     assert!(json["error"]["code"].is_null());
 }
 
-/// streaming error after first byte emits in-band OpenAI-shaped error event + [DONE]
+/// A malformed SSE data frame is silently skipped by the Anthropic provider
+/// adapter (it returns `Ok(vec![])` on bad JSON, see `decode_frame`), so it does
+/// NOT drive the in-band error path. This test verifies the stream still
+/// completes gracefully (`[DONE]`) when a mid-stream frame is unparseable, and
+/// that the valid events around it are delivered. For a genuine in-band error
+/// assertion see `in_band_stream_error_emits_openai_error_chunk`.
 #[tokio::test]
-async fn stream_error_after_first_byte_emits_error_event() {
+async fn malformed_frame_is_skipped_and_stream_completes() {
     // Spawn a mock that sends one valid chunk then an invalid/malformed SSE event.
     let app = Router::new().route(
         "/{*path}",
@@ -1594,7 +1634,7 @@ async fn stream_error_after_first_byte_emits_error_event() {
                 Event::default()
                     .event("content_block_delta")
                     .data(r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}"#),
-                // Then send a malformed event that will cause a provider decode error.
+                // Then send a malformed event that the Anthropic adapter skips.
                 Event::default()
                     .event("content_block_delta")
                     .data(r#"this is not valid JSON for the provider decoder"#),
@@ -1610,7 +1650,7 @@ async fn stream_error_after_first_byte_emits_error_event() {
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    spawn_mock_serve(listener, app);
     wait_for_ready(addr).await;
     let mock_url = format!("http://{}/providers/mock-provider/v1/messages", addr);
 
@@ -1631,10 +1671,100 @@ async fn stream_error_after_first_byte_emits_error_event() {
         .unwrap();
     let text = String::from_utf8(bytes.to_vec()).unwrap();
 
-    // The stream should end with [DONE] even after an error.
+    // The malformed frame is skipped, so the stream completes with [DONE].
     assert!(
         text.contains("[DONE]"),
-        "stream must end with [DONE] after error, got: {text}"
+        "stream must end with [DONE] even when a frame is skipped, got: {text}"
+    );
+}
+
+/// A genuine in-band (post-first-byte) error emits an OpenAI-shaped error chunk
+/// followed by `[DONE]`.
+///
+/// Drives the real error path (audit `in-band-error-event-path-untested`):
+/// after a valid `message_start` crosses the first byte (committing HTTP 200),
+/// the mock sends a chunk that the SSE framer rejects — a "data:" line whose
+/// payload is invalid UTF-8 (a lone `0xFF` byte). `SseFramer::push_chunk`
+/// returns `Err(ProviderError::Utf8)` for that line, which is the
+/// post-first-byte framing-error branch in `build_sse_output_stream`; for an
+/// OpenAI Chat client that branch calls `emit_stream_error`, emitting an OpenAI
+/// error JSON chunk (`server_error`) and then terminating with `[DONE]`.
+///
+/// This is deterministic regardless of how reqwest buffers the body: invalid
+/// UTF-8 inside a drained line is a hard framer error, not silently tolerated
+/// like malformed JSON (which the Anthropic adapter skips) and not sensitive to
+/// chunk boundaries like an over-long line.
+#[tokio::test]
+async fn in_band_stream_error_emits_openai_error_chunk() {
+    use bytes::Bytes;
+
+    // A valid Anthropic message_start frame (terminated by a blank line) so the
+    // first byte crosses and HTTP 200 is committed.
+    let first_frame = Bytes::from(
+        "event: message_start\n\
+         data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_err\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude-sonnet-4-6\",\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":10,\"output_tokens\":0}}}\n\n"
+            .to_owned(),
+    );
+    // A second chunk whose "data:" line payload is invalid UTF-8 (a lone
+    // continuation byte `0xFF`), terminated by a blank line so the framer
+    // drains it and hits `str::from_utf8` -> Err.
+    let bad_frame = Bytes::from(vec![b'd', b'a', b't', b'a', b':', b' ', 0xFF, b'\n', b'\n']);
+
+    let app = Router::new().route(
+        "/{*path}",
+        post(move || {
+            let first = first_frame.clone();
+            let bad = bad_frame.clone();
+            async move {
+                // Yield the valid frame, then the malformed-UTF-8 frame. The
+                // proxy's SSE framer reports the second as Err once the first
+                // byte has crossed, deterministically driving the in-band
+                // error path.
+                let body_stream = futures::stream::iter(vec![
+                    Ok::<Bytes, std::convert::Infallible>(first),
+                    Ok::<Bytes, std::convert::Infallible>(bad),
+                ]);
+                (
+                    StatusCode::OK,
+                    [(header::CONTENT_TYPE, "text/event-stream")],
+                    Body::from_stream(body_stream).into_response(),
+                )
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    spawn_mock_serve(listener, app);
+    wait_for_ready(addr).await;
+    let mock_url = format!("http://{}/providers/mock-provider/v1/messages", addr);
+
+    let state = state_with_anthropic_provider(&mock_url);
+    let app = build_router(state);
+
+    let body = json!({
+        "model": "claude-sonnet-4-6",
+        "messages": [{ "role": "user", "content": "hello" }],
+        "stream": true
+    });
+    let resp = app.oneshot(chat_request(&body.to_string())).await.unwrap();
+    // The first byte was sent successfully, so HTTP status should be 200.
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+
+    // The in-band error must surface as an OpenAI-shaped error chunk with the
+    // `server_error` type (set by emit_stream_error for OpenAI Chat).
+    assert!(
+        text.contains("\"type\":\"server_error\""),
+        "in-band error must emit an OpenAI error chunk, got: {text}"
+    );
+    // ...and the stream must still terminate with [DONE].
+    assert!(
+        text.contains("[DONE]"),
+        "stream must end with [DONE] after the in-band error, got: {text}"
     );
 }
 
@@ -1665,7 +1795,7 @@ async fn upstream_disconnect_completes_with_synthetic_terminal() {
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    spawn_mock_serve(listener, app);
     wait_for_ready(addr).await;
     let mock_url = format!("http://{}/providers/mock-provider/v1/messages", addr);
 

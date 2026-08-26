@@ -8,6 +8,8 @@
 //! ResponsesChunk stream -> CoreEvent stream
 //! ```
 
+use std::collections::HashMap;
+
 use llm_proxy_protocol::core::{
     ContentKind, CoreContent, CoreEvent, CoreRequest, CoreResponse, CoreRole, CoreToolChoice,
     ModelRef, StopReason, Usage, UsageProvenance,
@@ -45,8 +47,11 @@ pub struct ResponsesAdapter;
 ///   `response.output_item.added` with `function_call` (tool use)
 /// - `TextDelta` -- on `response.output_text.delta`
 /// - `ToolCallStart` -- on `response.output_item.added` with `function_call`
+///   (one per upstream `output_index`, supporting parallel calls)
 /// - `ToolCallDelta` -- on `response.function_call_arguments.delta`
-/// - `ToolCallStop` -- on `response.function_call_arguments.done`
+///   (routed to the open block matching the chunk's `output_index`)
+/// - `ToolCallStop` -- on `response.function_call_arguments.done`; any blocks
+///   still open are closed on `response.completed`/`response.done`/`finish()`
 /// - `UsageDelta` -- on `response.completed` or `response.done` with usage
 /// - `MessageStop` -- on `response.completed` or `response.done`
 /// - `Error` -- on `response.failed`
@@ -59,8 +64,12 @@ pub struct ResponsesStreamDecoder {
     started: bool,
     content_index: usize,
     content_started: bool,
-    /// Whether a ToolCallStart has been emitted for the current function call.
-    tool_call_started: bool,
+    /// Open tool-call blocks keyed by the upstream `output_index`, mapping to
+    /// the core `content_index` assigned when the block started. The Responses
+    /// API interleaves parallel function-call argument deltas and
+    /// disambiguates them via `output_index`, so the decoder must track one
+    /// block per concurrent call rather than a single open call.
+    tool_blocks: HashMap<usize, usize>,
     /// Whether any tool call was seen during this stream.
     saw_tool_call: bool,
     stop_sent: bool,
@@ -110,11 +119,13 @@ impl ProviderStreamDecoder for ResponsesStreamDecoder {
                                 }
                             }
                         } else if output.r#type == "function_call" {
-                            // Emit ToolCallStart for new function calls.
+                            // Emit ToolCallStart for new function calls. Parallel
+                            // calls are disambiguated by `output_index`; the
+                            // decoder tracks one open block per concurrent call.
                             self.saw_tool_call = true;
-                            if !self.tool_call_started {
+                            let oi = chunk.output_index.unwrap_or(0);
+                            if !self.tool_blocks.contains_key(&oi) {
                                 self.close_content_if_open();
-                                self.tool_call_started = true;
                                 let call_id = output.call_id.clone().unwrap_or_else(|| {
                                     tracing::warn!(
                                         "Responses: function_call output missing call_id"
@@ -125,8 +136,11 @@ impl ProviderStreamDecoder for ResponsesStreamDecoder {
                                     tracing::warn!("Responses: function_call output missing name");
                                     "<unknown_tool>".to_owned()
                                 });
+                                let block_idx = self.content_index;
+                                self.tool_blocks.insert(oi, block_idx);
+                                self.content_index += 1;
                                 events.push(CoreEvent::ToolCallStart {
-                                    index: self.content_index,
+                                    index: block_idx,
                                     id: call_id,
                                     name,
                                 });
@@ -161,55 +175,65 @@ impl ProviderStreamDecoder for ResponsesStreamDecoder {
             "response.function_call_arguments.delta" => {
                 if let Some(ref delta) = chunk.delta {
                     if !delta.is_empty() {
-                        // If no ToolCallStart was emitted yet (e.g. missed
-                        // response.output_item.added), emit one now.
-                        if !self.tool_call_started {
+                        let oi = chunk.output_index.unwrap_or(0);
+                        // If no block is open for this output_index (e.g. a
+                        // missed response.output_item.added event), synthesize a
+                        // start keyed by it before routing the delta.
+                        if !self.tool_blocks.contains_key(&oi) {
                             self.close_content_if_open();
-                            self.tool_call_started = true;
-                            let synthetic_id =
-                                format!("__responses_missing_{}__", self.content_index);
+                            let block_idx = self.content_index;
+                            let synthetic_id = format!("__responses_missing_{block_idx}__");
                             tracing::warn!(
                                 synthetic_id = synthetic_id,
+                                output_index = oi,
                                 "Responses: emitting synthetic ToolCallStart \
                                  (no prior response.output_item.added event)"
                             );
+                            self.tool_blocks.insert(oi, block_idx);
+                            self.content_index += 1;
                             events.push(CoreEvent::ToolCallStart {
-                                index: self.content_index,
+                                index: block_idx,
                                 id: synthetic_id,
-                                name: String::new(),
+                                name: "<missing_function_name>".to_owned(),
                             });
                         }
+                        let block_idx = self.tool_blocks[&oi];
                         events.push(CoreEvent::ToolCallDelta {
-                            index: self.content_index,
+                            index: block_idx,
                             args_delta: delta.clone(),
                         });
                     }
                 }
             }
             "response.function_call_arguments.done" => {
-                // If ToolCallStart was never emitted, emit one now before stop.
-                if !self.tool_call_started {
+                let oi = chunk.output_index.unwrap_or(0);
+                // If no block is open for this output_index (e.g. a missed
+                // response.output_item.added event), emit a synthetic start so
+                // the stop has a matching ToolCallStart, then close it.
+                if !self.tool_blocks.contains_key(&oi) {
                     self.close_content_if_open();
-                    let synthetic_id = format!("__responses_missing_{}__", self.content_index);
+                    let block_idx = self.content_index;
+                    let synthetic_id = format!("__responses_missing_{block_idx}__");
                     tracing::warn!(
                         synthetic_id = synthetic_id,
+                        output_index = oi,
                         "Responses: emitting synthetic ToolCallStart at arguments.done \
                          (no prior response.output_item.added event)"
                     );
+                    self.tool_blocks.insert(oi, block_idx);
+                    self.content_index += 1;
                     events.push(CoreEvent::ToolCallStart {
-                        index: self.content_index,
+                        index: block_idx,
                         id: synthetic_id,
-                        name: String::new(),
+                        name: "<missing_function_name>".to_owned(),
                     });
                 }
-                events.push(CoreEvent::ToolCallStop {
-                    index: self.content_index,
-                });
-                self.tool_call_started = false;
-                self.content_index += 1;
+                let block_idx = self.tool_blocks.remove(&oi).expect("entry just ensured");
+                events.push(CoreEvent::ToolCallStop { index: block_idx });
             }
             "response.completed" => {
                 self.close_content_if_open();
+                self.close_tool_blocks(&mut events);
 
                 // Extract usage.
                 if let Some(ref usage) = chunk.usage {
@@ -233,6 +257,7 @@ impl ProviderStreamDecoder for ResponsesStreamDecoder {
             }
             "response.done" => {
                 self.close_content_if_open();
+                self.close_tool_blocks(&mut events);
 
                 if let Some(ref usage) = chunk.usage {
                     events.push(CoreEvent::UsageDelta {
@@ -302,6 +327,13 @@ impl ProviderStreamDecoder for ResponsesStreamDecoder {
 
         self.close_content_if_open();
 
+        // Flush any unclosed tool calls (e.g. a stream that emitted
+        // ToolCallStart/arguments.delta but ended without arguments.done or
+        // response.completed), so downstream consumers receive a balanced
+        // ToolCallStart/ToolCallStop pair. Mirrors the Gemini/OpenAI-chat
+        // decoders' unclosed-tool-block handling in finish().
+        self.close_tool_blocks(&mut events);
+
         if !self.stop_sent {
             self.stop_sent = true;
             let stop_reason = if self.saw_tool_call {
@@ -325,6 +357,19 @@ impl ResponsesStreamDecoder {
             self.content_started = false;
             self.content_index += 1;
         }
+    }
+
+    /// Emit `ToolCallStop` for every still-open tool block (sorted by
+    /// `content_index` for a deterministic, ascending close order) and clear
+    /// the map. Mirrors the Gemini/OpenAI-chat decoders' `close_tool_blocks`
+    /// so every `ToolCallStart` is guaranteed a matching `ToolCallStop`.
+    fn close_tool_blocks(&mut self, events: &mut Vec<CoreEvent>) {
+        let mut indices: Vec<_> = self.tool_blocks.values().copied().collect();
+        indices.sort_unstable();
+        for idx in indices {
+            events.push(CoreEvent::ToolCallStop { index: idx });
+        }
+        self.tool_blocks.clear();
     }
 
     /// Infer the stop reason from output items and whether a tool call was seen.
@@ -405,7 +450,6 @@ impl ResponsesAdapter {
 
             // Build content from all supported types, not just text.
             let mut text_parts = Vec::new();
-            let mut has_function_call_output = false;
 
             for c in &msg.content {
                 match c {
@@ -456,7 +500,6 @@ impl ResponsesAdapter {
                                 "arguments": arguments,
                             })),
                         });
-                        has_function_call_output = true;
                     }
                     CoreContent::ToolResult {
                         tool_use_id,
@@ -486,7 +529,6 @@ impl ResponsesAdapter {
                                 "output": result_text,
                             })),
                         });
-                        has_function_call_output = true;
                     }
                     _ => {
                         tracing::warn!(
@@ -498,10 +540,13 @@ impl ResponsesAdapter {
                 }
             }
 
-            // Add a text message input if there was text content and no
-            // function_call/function_call_output was emitted (to avoid
-            // duplicating role entries that already carry tool data).
-            if !text_parts.is_empty() && !has_function_call_output {
+            // Flush any remaining text content as a separate same-role input
+            // item. Trailing text after a tool block (e.g. an assistant message
+            // shaped [ToolUse, Text] or [ToolResult, Text]) must be preserved,
+            // and the Responses API permits multiple input items with the same
+            // role, so flush unconditionally rather than gating on the absence
+            // of function_call/function_call_output.
+            if !text_parts.is_empty() {
                 let text: String = text_parts.join("");
                 input.push(ResponsesInput {
                     role: role.to_owned(),
@@ -704,7 +749,7 @@ impl ResponsesAdapter {
             started: false,
             content_index: 0,
             content_started: false,
-            tool_call_started: false,
+            tool_blocks: HashMap::new(),
             saw_tool_call: false,
             stop_sent: false,
         }
@@ -1106,6 +1151,98 @@ mod tests {
                 .any(|e| matches!(e, CoreEvent::MessageStop { .. })),
             "expected MessageStop with ToolUse"
         );
+    }
+
+    #[test]
+    fn stream_parallel_tool_calls_partitioned_by_output_index() {
+        // The Responses API interleaves parallel function-call argument deltas
+        // and disambiguates them via `output_index`. The decoder must emit two
+        // distinct ToolCallStart events with different indices and route each
+        // delta to the correct content_index so the two argument streams are
+        // partitioned rather than merged into one invalid JSON blob.
+        let target = make_target();
+        let adapter = ResponsesAdapter;
+        let mut decoder = adapter.new_stream_decoder(&target);
+
+        let frames = vec![
+            make_frame(r#"{"type":"response.created","id":"resp_1"}"#),
+            // First parallel call (output_index 0).
+            make_frame(
+                r#"{"type":"response.output_item.added","output_index":0,"output":[{"type":"function_call","call_id":"call_a","name":"get_weather"}]}"#,
+            ),
+            // Second parallel call (output_index 1) before the first completes.
+            make_frame(
+                r#"{"type":"response.output_item.added","output_index":1,"output":[{"type":"function_call","call_id":"call_b","name":"get_time"}]}"#,
+            ),
+            // Interleaved argument deltas.
+            make_frame(
+                r#"{"type":"response.function_call_arguments.delta","output_index":0,"delta":"{\"city\":"}"#,
+            ),
+            make_frame(
+                r#"{"type":"response.function_call_arguments.delta","output_index":1,"delta":"{\"tz\":"}"#,
+            ),
+            make_frame(
+                r#"{"type":"response.function_call_arguments.delta","output_index":0,"delta":"\"SF\"}"}"#,
+            ),
+            make_frame(
+                r#"{"type":"response.function_call_arguments.delta","output_index":1,"delta":"\"UTC\"}"}"#,
+            ),
+            // Close the two calls out of arrival order (call_b first).
+            make_frame(r#"{"type":"response.function_call_arguments.done","output_index":1}"#),
+            make_frame(r#"{"type":"response.function_call_arguments.done","output_index":0}"#),
+            make_frame(
+                r#"{"type":"response.completed","usage":{"input_tokens":40,"output_tokens":20}}"#,
+            ),
+        ];
+
+        let mut all_events = Vec::new();
+        for frame in &frames {
+            all_events.extend(decoder.decode_frame(frame).unwrap());
+        }
+
+        // Two distinct ToolCallStart events with different indices.
+        let starts: Vec<_> = all_events
+            .iter()
+            .filter_map(|e| match e {
+                CoreEvent::ToolCallStart { index, id, name } => {
+                    Some((*index, id.clone(), name.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(starts.len(), 2, "expected two ToolCallStart events");
+        let indices: Vec<_> = starts.iter().map(|(i, _, _)| *i).collect();
+        assert_eq!(indices, vec![0, 1], "expected distinct ascending indices");
+
+        // The argument deltas must be partitioned per content_index, not merged.
+        let mut args_by_index: std::collections::HashMap<usize, String> =
+            std::collections::HashMap::new();
+        for e in &all_events {
+            if let CoreEvent::ToolCallDelta { index, args_delta } = e {
+                *args_by_index.entry(*index).or_default() += args_delta;
+            }
+        }
+        assert_eq!(
+            args_by_index.get(&0).unwrap(),
+            r#"{"city":"SF"}"#,
+            "output_index 0 args must be partitioned"
+        );
+        assert_eq!(
+            args_by_index.get(&1).unwrap(),
+            r#"{"tz":"UTC"}"#,
+            "output_index 1 args must be partitioned"
+        );
+
+        // Each started block gets a matching stop.
+        let stops: Vec<_> = all_events
+            .iter()
+            .filter_map(|e| match e {
+                CoreEvent::ToolCallStop { index } => Some(*index),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(stops.len(), 2, "expected two ToolCallStop events");
+        assert!(stops.contains(&0) && stops.contains(&1));
     }
 
     #[test]

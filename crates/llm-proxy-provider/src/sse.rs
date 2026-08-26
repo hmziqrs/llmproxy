@@ -69,6 +69,12 @@ pub struct SseFramer {
     /// separators are negligible against `max_buffer_bytes`). Reset whenever a
     /// frame is taken.
     current_data_bytes: usize,
+    /// Whether a leading UTF-8 BOM (U+FEFF, bytes `EF BB BF`) has been stripped
+    /// from the start of the stream. The WHATWG SSE spec mandates stripping one
+    /// leading BOM; without it a first line of `\u{FEFF}data: ...` parses the
+    /// field as `\u{FEFF}data`, matches no known field, and is silently
+    /// dropped, losing the first frame (audit sse-no-bom-strip).
+    bom_checked: bool,
 }
 
 impl SseFramer {
@@ -90,6 +96,7 @@ impl SseFramer {
             current_id: None,
             current_data_lines: Vec::new(),
             current_data_bytes: 0,
+            bom_checked: false,
         }
     }
 
@@ -103,6 +110,32 @@ impl SseFramer {
     /// `max_buffer_bytes` (a misbehaving upstream dribbling non-newline bytes).
     pub fn push_chunk(&mut self, chunk: &[u8]) -> Result<Vec<SseFrame>, ProviderError> {
         self.buffer.extend_from_slice(chunk);
+
+        // Strip a single leading UTF-8 BOM (U+FEFF, bytes `EF BB BF`) once at
+        // the start of the stream, per the WHATWG SSE spec. A deferred
+        // decision is needed when the buffer holds only a *prefix* of the BOM
+        // (e.g. just `EF`): we cannot yet tell whether it is the start of a BOM
+        // or the first byte of real content, so we wait for more bytes. As soon
+        // as a non-matching byte arrives (or the full BOM is present) the
+        // decision is final and `bom_checked` is set so this never runs again
+        // (audit sse-no-bom-strip).
+        if !self.bom_checked {
+            const BOM: &[u8; 3] = &[0xEF, 0xBB, 0xBF];
+            if self.buffer.starts_with(BOM) {
+                // Full BOM present at the very start: strip it.
+                self.buffer.drain(..BOM.len());
+            }
+            // Decide whether the leading bytes can still grow into a BOM. If
+            // the buffer is a strict prefix of the BOM (and nothing more),
+            // defer: wait for the next chunk to disambiguate. Otherwise the
+            // leading byte(s) cannot be a BOM, so the check is final.
+            let still_prefix = (1..BOM.len())
+                .any(|n| self.buffer.len() == n && BOM.starts_with(&self.buffer[..n]));
+            if !still_prefix {
+                self.bom_checked = true;
+            }
+        }
+
         if self.buffer.len() > self.max_buffer_bytes {
             return Err(ProviderError::SseFraming(format!(
                 "SSE input exceeded the {}-byte line buffer without a newline \
@@ -730,6 +763,60 @@ mod tests {
     fn sse_framer_default_cap_is_one_mebibyte() {
         // Sanity: the public default matches the documented constant.
         assert_eq!(DEFAULT_MAX_BUFFER_BYTES, 1024 * 1024);
+    }
+
+    // -----------------------------------------------------------------------
+    // Leading UTF-8 BOM stripping (audit sse-no-bom-strip)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn sse_framer_strips_single_leading_bom() {
+        // U+FEFF as UTF-8 is EF BB BF. A BOM-prefixed first data line must
+        // parse the field as `data`, not `\u{FEFF}data`.
+        let mut framer = SseFramer::new();
+        let mut input = vec![0xEF, 0xBB, 0xBF];
+        input.extend_from_slice(b"data: hello\n\n");
+        let frames = framer.push_chunk(&input).unwrap();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].data, "hello");
+    }
+
+    #[test]
+    fn sse_framer_strips_bom_split_across_chunks() {
+        // The BOM arrives split across two chunks; the first data line must
+        // still parse correctly.
+        let mut framer = SseFramer::new();
+        let frames = framer.push_chunk(&[0xEF, 0xBB]).unwrap();
+        assert!(frames.is_empty(), "no complete frame yet");
+        let mut second = vec![0xBF];
+        second.extend_from_slice(b"data: hello\n\n");
+        let frames = framer.push_chunk(&second).unwrap();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].data, "hello");
+    }
+
+    #[test]
+    fn sse_framer_strips_only_one_bom() {
+        // Only one leading BOM is stripped; a second BOM in-stream is content
+        // that survives into the data field (it is valid UTF-8).
+        let mut framer = SseFramer::new();
+        let mut input = vec![0xEF, 0xBB, 0xBF];
+        // "data: \u{FEFF}hello\n\n" — the BOM inside the data value is kept.
+        input.extend_from_slice(b"data: ");
+        input.extend_from_slice(&[0xEF, 0xBB, 0xBF]);
+        input.extend_from_slice(b"hello\n\n");
+        let frames = framer.push_chunk(&input).unwrap();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].data, "\u{FEFF}hello");
+    }
+
+    #[test]
+    fn sse_framer_no_bom_preserves_leading_content() {
+        // No BOM present: the first byte is real content and must survive.
+        let mut framer = SseFramer::new();
+        let frames = framer.push_chunk(b"data: hello\n\n").unwrap();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].data, "hello");
     }
 
     // -----------------------------------------------------------------------

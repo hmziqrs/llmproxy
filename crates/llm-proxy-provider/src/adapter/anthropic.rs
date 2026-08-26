@@ -48,6 +48,14 @@ fn json_object(val: &mut serde_json::Value) -> &mut serde_json::Map<String, serd
 // names that were actually rewritten.  Only names carrying this sentinel are
 // decoded during desanitization, which prevents false-positive decoding of
 // tool names that naturally contain `_0xHH_` patterns (e.g. `parse_0xff_value`).
+//
+// NOTE: The `__llmp_` sentinel is NOT collision-safe against tool names that
+// literally start with `__llmp_` (e.g. an original tool named
+// `__llmp_foo_0x2e_bar`).  Such a name would be falsely treated as encoded and
+// decoded back incorrectly.  This is accepted as a negligible-probability edge
+// case: real tool names virtually never start with a double-underscore reserved
+// prefix, and the only consequence is a mangled name on round-trip, not a
+// security issue.
 
 // Anthropic `tool_use_id` must match `^[A-Za-z0-9_]{0,256}$`.
 // SAFETY: The regex pattern is a compile-time constant that is syntactically
@@ -139,6 +147,14 @@ fn sanitize_tool_name(name: &str) -> (String, bool) {
 /// tool names that happen to contain `_0x` naturally (e.g. `parse_0xff_value`).
 /// Only names that carry the `__llmp_` sentinel are decoded; names without it
 /// are returned as-is, preventing false-positive decoding.
+///
+/// # Collision edge case (accepted)
+///
+/// The `__llmp_` sentinel is NOT collision-safe against tool names that
+/// literally start with `__llmp_`.  An original name such as
+/// `__llmp_foo_0x2e_bar` would be misinterpreted as encoded and decoded back
+/// incorrectly.  This is accepted as a negligible-probability edge case; real
+/// tool names virtually never start with this reserved double-underscore prefix.
 fn desanitize_tool_name(name: &str) -> std::borrow::Cow<'_, str> {
     const SENTINEL: &str = "__llmp_";
 
@@ -264,7 +280,6 @@ impl AnthropicAdapter {
 pub struct AnthropicStreamDecoder {
     model_ref: ModelRef,
     started: bool,
-    current_block_index: Option<usize>,
     current_block_kind: ContentKind,
     tool_blocks: Vec<usize>,
     /// Tracks which tool blocks have already received a `ToolCallStop` via
@@ -310,7 +325,6 @@ impl ProviderStreamDecoder for AnthropicStreamDecoder {
             }
             "content_block_start" => {
                 let idx = event.index.unwrap_or(0);
-                self.current_block_index = Some(idx);
 
                 if let Some(ref block) = event.content_block {
                     match block.r#type.as_str() {
@@ -423,7 +437,6 @@ impl ProviderStreamDecoder for AnthropicStreamDecoder {
                         );
                     }
                 }
-                self.current_block_index = None;
                 self.current_block_kind = ContentKind::Text;
             }
             "message_delta" => {
@@ -845,7 +858,6 @@ impl AnthropicAdapter {
         AnthropicStreamDecoder {
             model_ref: response_model_ref(target),
             started: false,
-            current_block_index: None,
             current_block_kind: ContentKind::Text,
             tool_blocks: Vec::new(),
             tool_blocks_closed: Vec::new(),
