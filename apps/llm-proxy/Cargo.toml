@@ -4,6 +4,11 @@ version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+description = "Multi-command CLI and daemon for the provider-scoped LLM proxy server."
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [lib]
 name = "llm_proxy_app"
@@ -24,7 +29,6 @@ llm-proxy-provider = { path = "../../crates/llm-proxy-provider" }
 anyhow = { workspace = true }
 axum = { workspace = true }
 clap = { workspace = true }
-serde = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

@@ -130,7 +130,7 @@ pub fn build_info() -> BuildInfo {
 /// format is read from the `RUST_LOG_FORMAT` env var at init via
 /// [`LogFormat::from_env`], before the TOML config is loaded (tracing is needed
 /// during config loading itself). To control log verbosity, set `RUST_LOG`.
-pub fn init_tracing(log_format: LogFormat) {
+pub fn init_tracing(log_format: &LogFormat) {
     // Delegates to [`build_log_layer`] so the format-selection logic
     // (`.json()` vs plain) is exercised by `build_log_layer`'s own tests and
     // is not duplicated here. The public signature is unchanged.
@@ -173,7 +173,7 @@ fn build_env_filter() -> tracing_subscriber::EnvFilter {
 /// Returns a boxed, type-erased layer so callers (and tests) do not have to
 /// name the concrete `Layer` generic over the writer type.
 fn build_log_layer<W>(
-    log_format: LogFormat,
+    log_format: &LogFormat,
     make_writer: W,
 ) -> Box<dyn tracing_subscriber::Layer<tracing_subscriber::Registry> + Send + Sync>
 where
@@ -275,7 +275,7 @@ enforce = true
 
     /// Emit a known `tracing::event!` while `subscriber` is the thread-local
     /// default, returning the captured bytes.
-    fn capture_event_for(log_format: LogFormat) -> Vec<u8> {
+    fn capture_event_for(log_format: &LogFormat) -> Vec<u8> {
         use std::sync::{Arc, Mutex};
         let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
         // `BufferWriter` is a tiny newtype that implements
@@ -360,7 +360,7 @@ enforce = true
 
     #[test]
     fn json_log_format_yields_a_json_object_line() {
-        let captured = String::from_utf8(capture_event_for(LogFormat::Json))
+        let captured = String::from_utf8(capture_event_for(&LogFormat::Json))
             .expect("captured bytes are UTF-8");
         assert!(
             !captured.is_empty(),
@@ -392,7 +392,7 @@ enforce = true
 
     #[test]
     fn plain_log_format_does_not_emit_a_json_object() {
-        let captured = String::from_utf8(capture_event_for(LogFormat::Plain))
+        let captured = String::from_utf8(capture_event_for(&LogFormat::Plain))
             .expect("captured bytes are UTF-8");
         assert!(
             !captured.is_empty(),

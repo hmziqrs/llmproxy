@@ -104,66 +104,30 @@ impl ProviderStreamDecoder for ResponsesStreamDecoder {
                 }
             }
             "response.output_item.added" => {
-                if let Some(ref outputs) = chunk.output {
-                    for output in outputs {
-                        if output.r#type == "message" {
-                            if let Some(ref content_blocks) = output.content {
-                                for content in content_blocks {
-                                    if content.r#type == "output_text" && !self.content_started {
-                                        self.content_started = true;
-                                        events.push(CoreEvent::ContentStart {
-                                            index: self.content_index,
-                                            kind: ContentKind::Text,
-                                        });
-                                    }
-                                }
-                            }
-                        } else if output.r#type == "function_call" {
-                            // Emit ToolCallStart for new function calls. Parallel
-                            // calls are disambiguated by `output_index`; the
-                            // decoder tracks one open block per concurrent call.
-                            self.saw_tool_call = true;
-                            let oi = chunk.output_index.unwrap_or(0);
-                            if !self.tool_blocks.contains_key(&oi) {
-                                self.close_content_if_open();
-                                let call_id = output.call_id.clone().unwrap_or_else(|| {
-                                    tracing::warn!(
-                                        "Responses: function_call output missing call_id"
-                                    );
-                                    "<unknown_tool_id>".to_owned()
-                                });
-                                let name = output.name.clone().unwrap_or_else(|| {
-                                    tracing::warn!("Responses: function_call output missing name");
-                                    "<unknown_tool>".to_owned()
-                                });
-                                let block_idx = self.content_index;
-                                self.tool_blocks.insert(oi, block_idx);
-                                self.content_index += 1;
-                                events.push(CoreEvent::ToolCallStart {
-                                    index: block_idx,
-                                    id: call_id,
-                                    name,
-                                });
-                            }
-                        }
+                let oi = chunk.output_index.unwrap_or(0);
+                for output in chunk.output.iter().flatten() {
+                    if output.r#type == "message" {
+                        self.start_text_block_if_needed(output, &mut events);
+                    } else if output.r#type == "function_call" {
+                        self.start_function_call(oi, output, &mut events);
                     }
                 }
             }
             "response.output_text.delta" => {
-                if let Some(ref delta) = chunk.delta {
-                    if !delta.is_empty() {
-                        if !self.content_started {
-                            self.content_started = true;
-                            events.push(CoreEvent::ContentStart {
-                                index: self.content_index,
-                                kind: ContentKind::Text,
-                            });
-                        }
-                        events.push(CoreEvent::TextDelta {
+                if let Some(ref delta) = chunk.delta
+                    && !delta.is_empty()
+                {
+                    if !self.content_started {
+                        self.content_started = true;
+                        events.push(CoreEvent::ContentStart {
                             index: self.content_index,
-                            text: delta.clone(),
+                            kind: ContentKind::Text,
                         });
                     }
+                    events.push(CoreEvent::TextDelta {
+                        index: self.content_index,
+                        text: delta.clone(),
+                    });
                 }
             }
             "response.output_text.done" => {
@@ -173,36 +137,22 @@ impl ProviderStreamDecoder for ResponsesStreamDecoder {
                 }
             }
             "response.function_call_arguments.delta" => {
-                if let Some(ref delta) = chunk.delta {
-                    if !delta.is_empty() {
-                        let oi = chunk.output_index.unwrap_or(0);
-                        // If no block is open for this output_index (e.g. a
-                        // missed response.output_item.added event), synthesize a
-                        // start keyed by it before routing the delta.
-                        if !self.tool_blocks.contains_key(&oi) {
-                            self.close_content_if_open();
-                            let block_idx = self.content_index;
-                            let synthetic_id = format!("__responses_missing_{block_idx}__");
-                            tracing::warn!(
-                                synthetic_id = synthetic_id,
-                                output_index = oi,
-                                "Responses: emitting synthetic ToolCallStart \
-                                 (no prior response.output_item.added event)"
-                            );
-                            self.tool_blocks.insert(oi, block_idx);
-                            self.content_index += 1;
-                            events.push(CoreEvent::ToolCallStart {
-                                index: block_idx,
-                                id: synthetic_id,
-                                name: "<missing_function_name>".to_owned(),
-                            });
-                        }
-                        let block_idx = self.tool_blocks[&oi];
-                        events.push(CoreEvent::ToolCallDelta {
-                            index: block_idx,
-                            args_delta: delta.clone(),
-                        });
-                    }
+                if let Some(ref delta) = chunk.delta
+                    && !delta.is_empty()
+                {
+                    let oi = chunk.output_index.unwrap_or(0);
+                    // If no block is open for this output_index (e.g. a missed
+                    // response.output_item.added event), synthesize a start
+                    // keyed by it before routing the delta.
+                    let block_idx = self.ensure_tool_block(
+                        oi,
+                        "no prior response.output_item.added event",
+                        &mut events,
+                    );
+                    events.push(CoreEvent::ToolCallDelta {
+                        index: block_idx,
+                        args_delta: delta.clone(),
+                    });
                 }
             }
             "response.function_call_arguments.done" => {
@@ -210,26 +160,14 @@ impl ProviderStreamDecoder for ResponsesStreamDecoder {
                 // If no block is open for this output_index (e.g. a missed
                 // response.output_item.added event), emit a synthetic start so
                 // the stop has a matching ToolCallStart, then close it.
-                if !self.tool_blocks.contains_key(&oi) {
-                    self.close_content_if_open();
-                    let block_idx = self.content_index;
-                    let synthetic_id = format!("__responses_missing_{block_idx}__");
-                    tracing::warn!(
-                        synthetic_id = synthetic_id,
-                        output_index = oi,
-                        "Responses: emitting synthetic ToolCallStart at arguments.done \
-                         (no prior response.output_item.added event)"
-                    );
-                    self.tool_blocks.insert(oi, block_idx);
-                    self.content_index += 1;
-                    events.push(CoreEvent::ToolCallStart {
-                        index: block_idx,
-                        id: synthetic_id,
-                        name: "<missing_function_name>".to_owned(),
-                    });
+                self.ensure_tool_block(
+                    oi,
+                    "no prior response.output_item.added event before arguments.done",
+                    &mut events,
+                );
+                if let Some(block_idx) = self.tool_blocks.remove(&oi) {
+                    events.push(CoreEvent::ToolCallStop { index: block_idx });
                 }
-                let block_idx = self.tool_blocks.remove(&oi).expect("entry just ensured");
-                events.push(CoreEvent::ToolCallStop { index: block_idx });
             }
             "response.completed" => {
                 self.close_content_if_open();
@@ -363,6 +301,94 @@ impl ResponsesStreamDecoder {
     /// `content_index` for a deterministic, ascending close order) and clear
     /// the map. Mirrors the Gemini/OpenAI-chat decoders' `close_tool_blocks`
     /// so every `ToolCallStart` is guaranteed a matching `ToolCallStop`.
+    /// Opens a text content block when a `message` output first carries
+    /// `output_text` and none is currently open.
+    fn start_text_block_if_needed(
+        &mut self,
+        output: &ResponsesOutput,
+        events: &mut Vec<CoreEvent>,
+    ) {
+        if self.content_started {
+            return;
+        }
+        let has_text = output
+            .content
+            .iter()
+            .flatten()
+            .any(|content| content.r#type == "output_text");
+        if has_text {
+            self.content_started = true;
+            events.push(CoreEvent::ContentStart {
+                index: self.content_index,
+                kind: ContentKind::Text,
+            });
+        }
+    }
+
+    /// Opens a tool-call block for `oi` unless one is already open.
+    ///
+    /// Parallel calls are disambiguated by the upstream `output_index`, so one
+    /// block is tracked per concurrent call.
+    fn start_function_call(
+        &mut self,
+        oi: usize,
+        output: &ResponsesOutput,
+        events: &mut Vec<CoreEvent>,
+    ) {
+        self.saw_tool_call = true;
+        if self.tool_blocks.contains_key(&oi) {
+            return;
+        }
+        self.close_content_if_open();
+        let call_id = output.call_id.clone().unwrap_or_else(|| {
+            tracing::warn!("Responses: function_call output missing call_id");
+            "<unknown_tool_id>".to_owned()
+        });
+        let name = output.name.clone().unwrap_or_else(|| {
+            tracing::warn!("Responses: function_call output missing name");
+            "<unknown_tool>".to_owned()
+        });
+        let block_idx = self.content_index;
+        self.tool_blocks.insert(oi, block_idx);
+        self.content_index += 1;
+        events.push(CoreEvent::ToolCallStart {
+            index: block_idx,
+            id: call_id,
+            name,
+        });
+    }
+
+    /// Returns the content index of the tool block for `oi`, synthesizing a
+    /// `ToolCallStart` (logged with `warn_message`) when the upstream never sent
+    /// a `response.output_item.added` for it.
+    fn ensure_tool_block(
+        &mut self,
+        oi: usize,
+        warn_message: &'static str,
+        events: &mut Vec<CoreEvent>,
+    ) -> usize {
+        if let Some(&block_idx) = self.tool_blocks.get(&oi) {
+            return block_idx;
+        }
+        self.close_content_if_open();
+        let block_idx = self.content_index;
+        let synthetic_id = format!("__responses_missing_{block_idx}__");
+        tracing::warn!(
+            synthetic_id = synthetic_id,
+            output_index = oi,
+            reason = warn_message,
+            "Responses: emitting synthetic ToolCallStart"
+        );
+        self.tool_blocks.insert(oi, block_idx);
+        self.content_index += 1;
+        events.push(CoreEvent::ToolCallStart {
+            index: block_idx,
+            id: synthetic_id,
+            name: "<missing_function_name>".to_owned(),
+        });
+        block_idx
+    }
+
     fn close_tool_blocks(&mut self, events: &mut Vec<CoreEvent>) {
         let mut indices: Vec<_> = self.tool_blocks.values().copied().collect();
         indices.sort_unstable();
@@ -393,6 +419,118 @@ impl ResponsesStreamDecoder {
 // ---------------------------------------------------------------------------
 // ResponsesAdapter impl
 // ---------------------------------------------------------------------------
+
+/// Folds one core content block into the Responses input item list.
+///
+/// Text accumulates in `text_parts` so consecutive text blocks collapse into a
+/// single input item; a tool block flushes that buffer first so a message never
+/// emits duplicate role entries.
+fn encode_content_item<'a>(
+    c: &'a CoreContent,
+    role: &str,
+    text_parts: &mut Vec<&'a str>,
+    input: &mut Vec<ResponsesInput>,
+) {
+    match c {
+        CoreContent::Text { text, cache } => {
+            if cache.is_some() {
+                tracing::warn!("Responses: cache_control is not supported, dropping cache marker");
+            }
+            if !text.is_empty() {
+                text_parts.push(text.as_str());
+            }
+        }
+        CoreContent::ToolUse {
+            id,
+            name,
+            input: tool_input,
+        } => {
+            // Flush pending text as its own input item first.
+            if !text_parts.is_empty() {
+                input.push(ResponsesInput {
+                    role: role.to_owned(),
+                    content: Some(serde_json::Value::String(text_parts.join(""))),
+                });
+                text_parts.clear();
+            }
+
+            // The Responses API represents prior tool calls as input items with
+            // type "function_call".
+            let arguments = serde_json::to_string(tool_input).unwrap_or_else(|e| {
+                tracing::warn!(
+                    error = %e,
+                    "Responses: failed to serialize tool input, falling back to empty object"
+                );
+                "{}".to_owned()
+            });
+            input.push(ResponsesInput {
+                role: role.to_owned(),
+                content: Some(serde_json::json!({
+                    "type": "function_call",
+                    "call_id": id.clone(),
+                    "name": name.clone(),
+                    "arguments": arguments,
+                })),
+            });
+        }
+        CoreContent::ToolResult {
+            tool_use_id,
+            content: result_content,
+            ..
+        } => {
+            let result_text: String = result_content
+                .iter()
+                .filter_map(|rc| match rc {
+                    CoreContent::Text { text, .. } => Some(text.as_str()),
+                    other => {
+                        tracing::warn!(
+                            ?other,
+                            tool_use_id,
+                            "Responses: dropping non-text content block in ToolResult encoding"
+                        );
+                        None
+                    }
+                })
+                .collect();
+            input.push(ResponsesInput {
+                role: role.to_owned(),
+                content: Some(serde_json::json!({
+                    "type": "function_call_output",
+                    "call_id": tool_use_id,
+                    "output": result_text,
+                })),
+            });
+        }
+        _ => {
+            tracing::warn!(
+                role,
+                ?c,
+                "dropping unsupported content block during Responses encode"
+            );
+        }
+    }
+}
+
+/// Collects the text of every content block on a `message` output.
+///
+/// Unknown block types still contribute their `text` field, if any, rather than
+/// being dropped silently.
+fn push_message_text(output: &ResponsesOutput, content: &mut Vec<CoreContent>) {
+    for block in output.content.iter().flatten() {
+        if block.r#type != "output_text" {
+            tracing::warn!(
+                block_type = block.r#type,
+                "Responses: unknown content block type in message output, extracting text if present"
+            );
+        }
+        if let Some(ref text) = block.text {
+            content.push(CoreContent::Text {
+                text: text.clone(),
+                cache: None,
+            });
+        }
+    }
+}
 
 impl ResponsesAdapter {
     /// Encode a core request into a Responses API request.
@@ -452,92 +590,7 @@ impl ResponsesAdapter {
             let mut text_parts = Vec::new();
 
             for c in &msg.content {
-                match c {
-                    CoreContent::Text { text, cache } => {
-                        if cache.is_some() {
-                            tracing::warn!(
-                                "Responses: cache_control is not supported, dropping cache marker"
-                            );
-                        }
-                        if !text.is_empty() {
-                            text_parts.push(text.as_str());
-                        }
-                    }
-                    CoreContent::ToolUse {
-                        id,
-                        name,
-                        input: tool_input,
-                    } => {
-                        // If there was text content before this tool use, emit it
-                        // as a separate input item first to avoid duplicate role
-                        // entries in a single input item.
-                        if !text_parts.is_empty() {
-                            let text: String = text_parts.join("");
-                            input.push(ResponsesInput {
-                                role: role.to_owned(),
-                                content: Some(serde_json::Value::String(text)),
-                            });
-                            text_parts.clear();
-                        }
-
-                        // Encode ToolUse as a function_call output item for the
-                        // Responses API format (used when replaying prior turns).
-                        // The Responses API represents prior tool calls as input
-                        // items with type "function_call".
-                        let call_id = id.clone();
-                        let fn_name = name.clone();
-                        let arguments =
-                            serde_json::to_string(tool_input).unwrap_or_else(|e| {
-                                tracing::warn!(error = %e, "Responses: failed to serialize tool input, falling back to empty object");
-                                "{}".to_owned()
-                            });
-                        input.push(ResponsesInput {
-                            role: role.to_owned(),
-                            content: Some(serde_json::json!({
-                                "type": "function_call",
-                                "call_id": call_id,
-                                "name": fn_name,
-                                "arguments": arguments,
-                            })),
-                        });
-                    }
-                    CoreContent::ToolResult {
-                        tool_use_id,
-                        content: result_content,
-                        ..
-                    } => {
-                        // Encode ToolResult as a function_call_output item.
-                        let result_text: String = result_content
-                            .iter()
-                            .filter_map(|rc| match rc {
-                                CoreContent::Text { text, .. } => Some(text.as_str()),
-                                other => {
-                                    tracing::warn!(
-                                        ?other,
-                                        tool_use_id,
-                                        "Responses: dropping non-text content block in ToolResult encoding"
-                                    );
-                                    None
-                                }
-                            })
-                            .collect();
-                        input.push(ResponsesInput {
-                            role: role.to_owned(),
-                            content: Some(serde_json::json!({
-                                "type": "function_call_output",
-                                "call_id": tool_use_id,
-                                "output": result_text,
-                            })),
-                        });
-                    }
-                    _ => {
-                        tracing::warn!(
-                            role,
-                            ?c,
-                            "dropping unsupported content block during Responses encode"
-                        );
-                    }
-                }
+                encode_content_item(c, role, &mut text_parts, &mut input);
             }
 
             // Flush any remaining text content as a separate same-role input
@@ -659,32 +712,7 @@ impl ResponsesAdapter {
         for output in &resp.output {
             match output.r#type.as_str() {
                 "message" => {
-                    if let Some(ref content_blocks) = output.content {
-                        for block in content_blocks {
-                            match block.r#type.as_str() {
-                                "output_text" => {
-                                    if let Some(ref text) = block.text {
-                                        content.push(CoreContent::Text {
-                                            text: text.clone(),
-                                            cache: None,
-                                        });
-                                    }
-                                }
-                                _ => {
-                                    tracing::warn!(
-                                        block_type = block.r#type,
-                                        "Responses: unknown content block type in message output, extracting text if present"
-                                    );
-                                    if let Some(ref text) = block.text {
-                                        content.push(CoreContent::Text {
-                                            text: text.clone(),
-                                            cache: None,
-                                        });
-                                    }
-                                }
-                            }
-                        }
-                    }
+                    push_message_text(output, &mut content);
                 }
                 "function_call" => {
                     let input = output
@@ -781,7 +809,7 @@ mod tests {
     use super::*;
     use llm_proxy_core::AuthStyle;
     use llm_proxy_protocol::core::{CoreMessage, CoreTool, SamplingOptions};
-    use llm_proxy_protocol::zen::{ResponsesContent, ResponsesOutput};
+    use llm_proxy_protocol::zen::ResponsesContent;
 
     fn make_target() -> ProviderAdapterTarget {
         ProviderAdapterTarget {
@@ -1223,13 +1251,11 @@ mod tests {
             }
         }
         assert_eq!(
-            args_by_index.get(&0).unwrap(),
-            r#"{"city":"SF"}"#,
+            &args_by_index[&0], r#"{"city":"SF"}"#,
             "output_index 0 args must be partitioned"
         );
         assert_eq!(
-            args_by_index.get(&1).unwrap(),
-            r#"{"tz":"UTC"}"#,
+            &args_by_index[&1], r#"{"tz":"UTC"}"#,
             "output_index 1 args must be partitioned"
         );
 
@@ -1390,13 +1416,10 @@ mod tests {
         let msg_stop = all_events
             .iter()
             .find(|e| matches!(e, CoreEvent::MessageStop { .. }));
-        assert!(msg_stop.is_some());
-        match msg_stop.unwrap() {
-            CoreEvent::MessageStop { stop_reason, .. } => {
-                assert_eq!(*stop_reason, StopReason::ToolUse);
-            }
-            _ => unreachable!(),
-        }
+        let Some(CoreEvent::MessageStop { stop_reason, .. }) = msg_stop else {
+            panic!("expected a MessageStop event");
+        };
+        assert_eq!(*stop_reason, StopReason::ToolUse);
     }
 
     #[test]
@@ -1434,17 +1457,14 @@ mod tests {
         let msg_stop = all_events
             .iter()
             .find(|e| matches!(e, CoreEvent::MessageStop { .. }));
-        assert!(msg_stop.is_some());
-        match msg_stop.unwrap() {
-            CoreEvent::MessageStop { stop_reason, .. } => {
-                assert_eq!(
-                    *stop_reason,
-                    StopReason::ToolUse,
-                    "finish() should infer ToolUse when saw_tool_call is true"
-                );
-            }
-            _ => unreachable!(),
-        }
+        let Some(CoreEvent::MessageStop { stop_reason, .. }) = msg_stop else {
+            panic!("expected a MessageStop event");
+        };
+        assert_eq!(
+            *stop_reason,
+            StopReason::ToolUse,
+            "finish() should infer ToolUse when saw_tool_call is true"
+        );
     }
 
     #[test]

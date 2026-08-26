@@ -186,7 +186,10 @@ impl ProxyClient {
     /// the build — surfacing the change for review instead of leaving a silent,
     /// inert `#[allow]`. `#[expect]` does not emit the lint as a warning; it
     /// only errors when the lint does not fire.
-    #[expect(clippy::expect_used)]
+    #[expect(
+        clippy::expect_used,
+        reason = "documented infallible-in-practice constructor; try_new is the fallible alternative"
+    )]
     pub fn new() -> Self {
         Self::try_new().expect("failed to build reqwest client with default configuration")
     }
@@ -277,11 +280,11 @@ impl ProxyClient {
         let resp =
             tokio::time::timeout(self.upstream_headers_timeout, builder.body(req.body).send())
                 .await
-                .map_err(|_| ProviderError::Http {
+                .map_err(|elapsed| ProviderError::Http {
                     message: format!(
                         "upstream request timed out waiting for response headers within \
-                 {}s (upstream headers timeout); aborting to avoid an open-ended \
-                 stall (audit transport-no-upstream-timeout)",
+                 {}s (upstream headers timeout): {elapsed}; aborting to avoid an \
+                 open-ended stall (audit transport-no-upstream-timeout)",
                         self.upstream_headers_timeout.as_secs()
                     ),
                     timeout: true,
@@ -324,11 +327,11 @@ impl ProxyClient {
         let resp =
             tokio::time::timeout(self.upstream_headers_timeout, builder.body(req.body).send())
                 .await
-                .map_err(|_| ProviderError::Http {
+                .map_err(|elapsed| ProviderError::Http {
                     message: format!(
                         "upstream stream request timed out waiting for response headers \
-                 within {}s (upstream headers timeout); aborting to avoid an \
-                 open-ended stall (audit transport-no-upstream-timeout)",
+                 within {}s (upstream headers timeout): {elapsed}; aborting to avoid \
+                 an open-ended stall (audit transport-no-upstream-timeout)",
                         self.upstream_headers_timeout.as_secs()
                     ),
                     timeout: true,
@@ -1096,41 +1099,48 @@ mod tests {
         );
     }
 
+    /// Streams data slowly so a test can drop the response mid-stream.
+    ///
+    /// Each chunk sent bumps the shared counter, so the test can observe that
+    /// the upstream stops producing once the consumer goes away.
+    async fn slow_handler(
+        axum::extract::State(counter): axum::extract::State<
+            std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        >,
+    ) -> axum::response::Response {
+        use std::sync::Arc;
+        use std::sync::atomic::Ordering;
+
+        let stream = futures::stream::unfold(0u32, move |i| {
+            let counter = Arc::clone(&counter);
+            async move {
+                if i >= 100 {
+                    return None;
+                }
+                counter.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                let chunk = format!("data: chunk {i}\n\n");
+                Some((
+                    Ok::<_, std::convert::Infallible>(bytes::Bytes::from(chunk)),
+                    i + 1,
+                ))
+            }
+        });
+        (
+            StatusCode::OK,
+            [("Content-Type", "text/event-stream")],
+            Body::from_stream(stream),
+        )
+            .into_response()
+    }
+
     #[tokio::test]
     async fn dropping_stream_aborts_upstream() {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         let counter = Arc::new(AtomicUsize::new(0));
-        let counter_clone = counter.clone();
-
-        // A proper handler function that sends data slowly so we can drop mid-stream.
-        async fn slow_handler(
-            axum::extract::State(counter): axum::extract::State<Arc<AtomicUsize>>,
-        ) -> axum::response::Response {
-            let stream = futures::stream::unfold(0u32, move |i| {
-                let counter = counter.clone();
-                async move {
-                    if i >= 100 {
-                        None
-                    } else {
-                        counter.fetch_add(1, Ordering::SeqCst);
-                        tokio::time::sleep(Duration::from_millis(10)).await;
-                        let chunk = format!("data: chunk {}\n\n", i);
-                        Some((
-                            Ok::<_, std::convert::Infallible>(bytes::Bytes::from(chunk)),
-                            i + 1,
-                        ))
-                    }
-                }
-            });
-            (
-                StatusCode::OK,
-                [("Content-Type", "text/event-stream")],
-                Body::from_stream(stream),
-            )
-                .into_response()
-        }
+        let counter_clone = Arc::clone(&counter);
 
         let app = Router::new()
             .route("/test", post(slow_handler))

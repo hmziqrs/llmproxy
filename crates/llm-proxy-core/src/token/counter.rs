@@ -321,7 +321,7 @@ mod tests {
         );
         // 8 CJK characters: 8/4 = 2 tokens.
         let cjk_8: String =
-            "\u{4F60}\u{597D}\u{4E16}\u{754C}\u{4F60}\u{597D}\u{4E16}\u{754C}".to_string();
+            "\u{4F60}\u{597D}\u{4E16}\u{754C}\u{4F60}\u{597D}\u{4E16}\u{754C}".to_owned();
         assert_eq!(counter.count_tokens(HEURISTIC_MODEL, &cjk_8), 2);
     }
 
@@ -415,20 +415,20 @@ mod tests {
         use tiktoken_rs::ChatCompletionRequestMessage;
         vec![
             ChatCompletionRequestMessage {
-                role: "system".to_string(),
-                content: Some("You are a helpful assistant that only speaks French.".to_string()),
+                role: "system".to_owned(),
+                content: Some("You are a helpful assistant that only speaks French.".to_owned()),
                 name: None,
                 function_call: None,
             },
             ChatCompletionRequestMessage {
-                role: "user".to_string(),
-                content: Some("Hello, how are you?".to_string()),
+                role: "user".to_owned(),
+                content: Some("Hello, how are you?".to_owned()),
                 name: None,
                 function_call: None,
             },
             ChatCompletionRequestMessage {
-                role: "assistant".to_string(),
-                content: Some("Parlez-vous francais?".to_string()),
+                role: "assistant".to_owned(),
+                content: Some("Parlez-vous francais?".to_owned()),
                 name: None,
                 function_call: None,
             },
@@ -457,8 +457,8 @@ mod tests {
         with_system.insert(
             0,
             tiktoken_rs::ChatCompletionRequestMessage {
-                role: "system".to_string(),
-                content: Some(GOLDEN_SYSTEM.to_string()),
+                role: "system".to_owned(),
+                content: Some(GOLDEN_SYSTEM.to_owned()),
                 name: None,
                 function_call: None,
             },
@@ -491,8 +491,8 @@ mod tests {
         with_system.insert(
             0,
             tiktoken_rs::ChatCompletionRequestMessage {
-                role: "system".to_string(),
-                content: Some(GOLDEN_SYSTEM.to_string()),
+                role: "system".to_owned(),
+                content: Some(GOLDEN_SYSTEM.to_owned()),
                 name: None,
                 function_call: None,
             },
@@ -537,7 +537,7 @@ mod tests {
         let s = format!("{counter:?}");
         assert!(s.contains("bpe+heuristic"), "debug output: {s}");
         // Cloned counter is independently usable.
-        let _ = format!("{cloned:?}");
+        assert!(format!("{cloned:?}").contains("bpe+heuristic"));
     }
 
     #[test]

@@ -23,8 +23,8 @@ use crate::anthropic::{
 use crate::client::ProtocolError;
 use crate::core::{
     CacheControl, CacheControlType, ContentKind, CoreContent, CoreEvent, CoreMessage, CoreRequest,
-    CoreResponse, CoreRole, CoreStreamErrorKind, CoreTool, CoreToolChoice, ModelRef, ProviderHints,
-    RequestMetadata, SamplingOptions, StopReason, Usage,
+    CoreResponse, CoreRole, CoreStreamError, CoreStreamErrorKind, CoreTool, CoreToolChoice,
+    ModelRef, ProviderHints, RequestMetadata, SamplingOptions, StopReason, Usage,
 };
 
 // ---------------------------------------------------------------------------
@@ -49,7 +49,7 @@ pub fn decode_request(req: MessageRequest) -> Result<CoreRequest, ProtocolError>
 
     let messages = req
         .messages
-        .into_iter()
+        .iter()
         .map(decode_message)
         .collect::<Result<Vec<_>, _>>()?;
 
@@ -118,31 +118,31 @@ fn decode_system(system: Option<serde_json::Value>) -> Vec<CoreContent> {
             let mut result = Vec::new();
             // We own `system`, so iterate owned array items without cloning.
             for item in arr {
-                if let Ok(block) = serde_json::from_value::<SystemContentBlock>(item) {
-                    if block.r#type == "text" {
-                        if let Some(t) = block.text {
-                            let cache = block.cache_control.map(|cc| CacheControl {
-                                r#type: CacheControlType::from(cc.r#type),
-                            });
-                            result.push(CoreContent::Text { text: t, cache });
-                        }
-                    } else {
-                        // Non-text system blocks (e.g. future image blocks) are not
-                        // yet supported -- log a warning so they are not silently lost.
-                        // Truncate block_type to limit log output from client input.
-                        let bt = block.r#type.as_str();
-                        // Char-boundary-safe truncation: avoids panics on
-                        // multi-byte UTF-8 characters in client-supplied data.
-                        let truncated = crate::util::truncate_str_safe(bt, 64);
-                        tracing::warn!(
-                            block_type = truncated,
-                            "non-text system block skipped during Anthropic decode"
-                        );
-                    }
-                } else {
+                let Ok(block) = serde_json::from_value::<SystemContentBlock>(item) else {
                     tracing::warn!(
                         "decode_system: skipping system array item that failed deserialization"
                     );
+                    continue;
+                };
+                if block.r#type != "text" {
+                    // Non-text system blocks (e.g. future image blocks) are not
+                    // yet supported -- log a warning so they are not silently lost.
+                    // Truncate block_type to limit log output from client input.
+                    let bt = block.r#type.as_str();
+                    // Char-boundary-safe truncation: avoids panics on
+                    // multi-byte UTF-8 characters in client-supplied data.
+                    let truncated = crate::util::truncate_str_safe(bt, 64);
+                    tracing::warn!(
+                        block_type = truncated,
+                        "non-text system block skipped during Anthropic decode"
+                    );
+                    continue;
+                }
+                if let Some(t) = block.text {
+                    let cache = block.cache_control.map(|cc| CacheControl {
+                        r#type: CacheControlType::from(cc.r#type),
+                    });
+                    result.push(CoreContent::Text { text: t, cache });
                 }
             }
             result
@@ -153,7 +153,7 @@ fn decode_system(system: Option<serde_json::Value>) -> Vec<CoreContent> {
     }
 }
 
-fn decode_message(msg: Message) -> Result<CoreMessage, ProtocolError> {
+fn decode_message(msg: &Message) -> Result<CoreMessage, ProtocolError> {
     let role = match msg.role.as_str() {
         "user" => CoreRole::User,
         "assistant" => CoreRole::Assistant,
@@ -169,6 +169,92 @@ fn decode_message(msg: Message) -> Result<CoreMessage, ProtocolError> {
     }
 
     Ok(CoreMessage { role, content })
+}
+
+/// Decodes the `content` array of a `tool_result` block.
+///
+/// Inner blocks that fail to deserialize, or whose type is unknown, are logged
+/// and skipped rather than failing the whole `tool_result`. If nothing survives
+/// decoding, an empty text block is synthesized so the tool result is not lost.
+fn decode_tool_result_blocks(arr: &[serde_json::Value]) -> Result<Vec<CoreContent>, ProtocolError> {
+    let mut blocks = Vec::with_capacity(arr.len());
+    for item in arr {
+        let Ok(cb) = serde_json::from_value::<crate::anthropic::ContentBlock>(item.clone()) else {
+            continue;
+        };
+        // Recursively decode each inner block. Errors from unknown block types
+        // are logged and skipped rather than failing the entire tool_result decode.
+        match decode_content_block(cb) {
+            Ok(core) => blocks.push(core),
+            Err(ProtocolError::Decode(msg)) => {
+                // Char-boundary-safe truncation for log output.
+                let truncated = crate::util::truncate_str_safe(&msg, 64);
+                tracing::warn!(
+                    decode_error = truncated,
+                    "skipping unknown block inside tool_result content array"
+                );
+            }
+            Err(other) => return Err(other),
+        }
+    }
+    if blocks.is_empty() {
+        tracing::warn!(
+            "tool_result: all inner content blocks failed to parse; \
+             synthesizing empty text block"
+        );
+        blocks.push(CoreContent::Text {
+            text: String::new(),
+            cache: None,
+        });
+    }
+    Ok(blocks)
+}
+
+/// Decodes a single `tool_result` content block.
+fn decode_tool_result_block(block: ContentBlock) -> Result<CoreContent, ProtocolError> {
+    let is_error = block.is_error.unwrap_or(false);
+    let inner_content = if let Some(ref content_val) = block.content {
+        match content_val {
+            // Plain string content.
+            serde_json::Value::String(s) => {
+                vec![CoreContent::Text {
+                    text: s.clone(),
+                    cache: None,
+                }]
+            }
+            // Array of content blocks -- iterate and decode each one.
+            serde_json::Value::Array(arr) => decode_tool_result_blocks(arr)?,
+            // Fallback: try text_content() for any other shape.
+            _ => {
+                let text = block.text_content();
+                if text.is_empty() {
+                    vec![]
+                } else {
+                    vec![CoreContent::Text { text, cache: None }]
+                }
+            }
+        }
+    } else {
+        // No content field -- fall back to text_content() which checks
+        // the deprecated output field.
+        let text = block.text_content();
+        if text.is_empty() {
+            vec![]
+        } else {
+            vec![CoreContent::Text { text, cache: None }]
+        }
+    };
+    let tool_use_id = block.tool_use_id.unwrap_or_default();
+    if tool_use_id.is_empty() {
+        return Err(ProtocolError::Decode(
+            "tool_result block missing required 'tool_use_id' field".into(),
+        ));
+    }
+    Ok(CoreContent::ToolResult {
+        tool_use_id,
+        content: inner_content,
+        is_error,
+    })
 }
 
 fn decode_content_block(block: ContentBlock) -> Result<CoreContent, ProtocolError> {
@@ -215,86 +301,7 @@ fn decode_content_block(block: ContentBlock) -> Result<CoreContent, ProtocolErro
                     .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new())),
             })
         }
-        "tool_result" => {
-            let is_error = block.is_error.unwrap_or(false);
-            let inner_content = if let Some(ref content_val) = block.content {
-                match content_val {
-                    // Plain string content.
-                    serde_json::Value::String(s) => {
-                        vec![CoreContent::Text {
-                            text: s.clone(),
-                            cache: None,
-                        }]
-                    }
-                    // Array of content blocks -- iterate and decode each one.
-                    serde_json::Value::Array(arr) => {
-                        let mut blocks = Vec::with_capacity(arr.len());
-                        for item in arr {
-                            if let Ok(cb) = serde_json::from_value::<crate::anthropic::ContentBlock>(
-                                item.clone(),
-                            ) {
-                                // Recursively decode each inner block. Errors from
-                                // unknown block types are logged and skipped rather
-                                // than failing the entire tool_result decode.
-                                match decode_content_block(cb) {
-                                    Ok(core) => blocks.push(core),
-                                    Err(ProtocolError::Decode(msg)) => {
-                                        // Char-boundary-safe truncation for log output.
-                                        let truncated = crate::util::truncate_str_safe(&msg, 64);
-                                        tracing::warn!(
-                                            decode_error = truncated,
-                                            "skipping unknown block inside tool_result content array"
-                                        );
-                                    }
-                                    Err(other) => return Err(other),
-                                }
-                            }
-                        }
-                        if blocks.is_empty() {
-                            tracing::warn!(
-                                "tool_result: all inner content blocks failed to parse; \
-                                 synthesizing empty text block"
-                            );
-                            vec![CoreContent::Text {
-                                text: String::new(),
-                                cache: None,
-                            }]
-                        } else {
-                            blocks
-                        }
-                    }
-                    // Fallback: try text_content() for any other shape.
-                    _ => {
-                        let text = block.text_content();
-                        if text.is_empty() {
-                            vec![]
-                        } else {
-                            vec![CoreContent::Text { text, cache: None }]
-                        }
-                    }
-                }
-            } else {
-                // No content field -- fall back to text_content() which checks
-                // the deprecated output field.
-                let text = block.text_content();
-                if text.is_empty() {
-                    vec![]
-                } else {
-                    vec![CoreContent::Text { text, cache: None }]
-                }
-            };
-            let tool_use_id = block.tool_use_id.unwrap_or_default();
-            if tool_use_id.is_empty() {
-                return Err(ProtocolError::Decode(
-                    "tool_result block missing required 'tool_use_id' field".into(),
-                ));
-            }
-            Ok(CoreContent::ToolResult {
-                tool_use_id,
-                content: inner_content,
-                is_error,
-            })
-        }
+        "tool_result" => decode_tool_result_block(block),
         "thinking" => Ok(CoreContent::Thinking {
             text: block.thinking.unwrap_or_default(),
             signature: block.signature,
@@ -564,6 +571,77 @@ fn encode_usage(usage: &Usage) -> anthropic::Usage {
     }
 }
 
+/// Builds the `content_block` payload for a `content_block_start` event.
+///
+/// Returns `None` for kinds that must not produce a `content_block_start`:
+/// `ToolUse` is emitted by `ToolCallStart`, which carries the actual id/name,
+/// and the remaining kinds are unsupported.
+fn encode_content_start_block(index: usize, kind: ContentKind) -> Option<ContentBlock> {
+    match kind {
+        ContentKind::Text => Some(ContentBlock::new_text(String::new())),
+        ContentKind::Thinking => Some(ContentBlock::new_thinking(String::new())),
+        ContentKind::ToolUse => {
+            tracing::trace!(
+                index,
+                "ContentStart ToolUse skipped; ToolCallStart will emit content_block_start"
+            );
+            None
+        }
+        other => {
+            // ContentStart for unsupported kinds (Image, Document, Audio,
+            // Video, ToolResult, Refusal) -- skip entirely rather than
+            // emitting a misleading text block start.
+            tracing::warn!(
+                kind = ?other,
+                "unsupported ContentKind in Anthropic stream encode; skipping content_block_start"
+            );
+            None
+        }
+    }
+}
+
+/// Builds a client-facing `error` SSE event.
+///
+/// Defense-in-depth note: the error message flows directly into the
+/// client-facing SSE event. Sanitization of secrets happens at
+/// `CoreStreamError::new()` construction time in the provider adapter. If a
+/// provider adapter accidentally passes an unsanitized message, it will be
+/// visible to the client here.
+///
+/// Trust boundary: client adapters trust that provider adapters have sanitized
+/// the message. A regression test (`encode_error_does_not_leak_secret_in_message`)
+/// verifies that a `CoreStreamError` containing a secret-like string propagates
+/// verbatim -- the defense must be at construction time, not here.
+fn encode_error_event(error: &CoreStreamError) -> MessageEvent {
+    // Length cap: truncate the error message to 1024 characters to prevent
+    // excessively large SSE payloads from upstream errors. Char-boundary-safe
+    // truncation avoids panics on multi-byte UTF-8 characters in
+    // upstream/provider-derived error messages (consistent with the other
+    // truncation sites in this file).
+    let msg = error.message();
+    let capped_msg = if msg.len() > 1024 {
+        tracing::warn!(
+            original_len = msg.len(),
+            "stream error message exceeds 1024 chars; truncating for client-facing SSE"
+        );
+        crate::util::truncate_str_safe(msg, 1024).to_owned()
+    } else {
+        msg.to_owned()
+    };
+    MessageEvent {
+        r#type: "error".to_owned(),
+        message: None,
+        index: None,
+        content_block: None,
+        delta: None,
+        usage: None,
+        error: Some(ApiError {
+            r#type: encode_error_kind(&error.kind),
+            message: capped_msg,
+        }),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // StreamEncoder
 // ---------------------------------------------------------------------------
@@ -610,6 +688,102 @@ impl StreamEncoder {
         }
     }
 
+    /// Records the stream's id/model and builds the `message_start` event.
+    fn encode_message_start(&mut self, id: Option<String>, model: String) -> MessageEvent {
+        if let Some(id) = id {
+            self.msg_id = id;
+        }
+        self.model = model;
+        self.started = true;
+
+        MessageEvent {
+            r#type: "message_start".to_owned(),
+            message: Some(MessageResponse {
+                id: self.msg_id.clone(),
+                r#type: "message".to_owned(),
+                role: "assistant".to_owned(),
+                content: vec![],
+                model: self.model.clone(),
+                stop_reason: None,
+                stop_sequence: None,
+                usage: anthropic::Usage {
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    cache_creation_input_tokens: None,
+                    cache_read_input_tokens: None,
+                },
+            }),
+            index: None,
+            content_block: None,
+            delta: None,
+            usage: None,
+            error: None,
+        }
+    }
+
+    /// Emits the terminal `message_delta` + `message_stop` pair, first closing
+    /// any text/thinking blocks that were opened but never closed.
+    ///
+    /// Native Anthropic emits `content_block_stop` for every block; without the
+    /// synthesized stops, strict clients that pair start/stop events mis-frame
+    /// the stream. Tool blocks are closed by `ToolCallStop`.
+    fn encode_message_stop(
+        &mut self,
+        stop_reason: StopReason,
+        stop_sequence: Option<String>,
+        events: &mut Vec<MessageEvent>,
+    ) {
+        let anth_stop = encode_stop_reason(stop_reason);
+        let usage = self.pending_usage.take().unwrap_or(anthropic::Usage {
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_input_tokens: None,
+            cache_read_input_tokens: None,
+        });
+
+        self.open_text_blocks.sort_unstable();
+        for idx in self.open_text_blocks.drain(..) {
+            events.push(MessageEvent {
+                r#type: "content_block_stop".to_owned(),
+                message: None,
+                index: Some(idx),
+                content_block: None,
+                delta: None,
+                usage: None,
+                error: None,
+            });
+        }
+
+        events.push(MessageEvent {
+            r#type: "message_delta".to_owned(),
+            message: None,
+            index: None,
+            content_block: None,
+            delta: Some(Delta {
+                r#type: None,
+                text: None,
+                thinking: None,
+                partial_json: None,
+                stop_reason: Some(anth_stop),
+                stop_sequence,
+            }),
+            usage: Some(usage),
+            error: None,
+        });
+
+        events.push(MessageEvent {
+            r#type: "message_stop".to_owned(),
+            message: None,
+            index: None,
+            content_block: None,
+            delta: None,
+            usage: None,
+            error: None,
+        });
+
+        self.finished = true;
+    }
+
     /// Encode a single [`CoreEvent`] into zero or more Anthropic [`MessageEvent`]s.
     pub fn encode_event(&mut self, event: CoreEvent) -> Result<Vec<MessageEvent>, ProtocolError> {
         if self.finished {
@@ -624,62 +798,13 @@ impl StreamEncoder {
 
         match event {
             CoreEvent::MessageStart { id, model } => {
-                if let Some(id) = id {
-                    self.msg_id = id;
-                }
-                self.model = model.requested;
-                self.started = true;
-
-                events.push(MessageEvent {
-                    r#type: "message_start".to_owned(),
-                    message: Some(MessageResponse {
-                        id: self.msg_id.clone(),
-                        r#type: "message".to_owned(),
-                        role: "assistant".to_owned(),
-                        content: vec![],
-                        model: self.model.clone(),
-                        stop_reason: None,
-                        stop_sequence: None,
-                        usage: anthropic::Usage {
-                            input_tokens: 0,
-                            output_tokens: 0,
-                            cache_creation_input_tokens: None,
-                            cache_read_input_tokens: None,
-                        },
-                    }),
-                    index: None,
-                    content_block: None,
-                    delta: None,
-                    usage: None,
-                    error: None,
-                });
+                events.push(self.encode_message_start(id, model.requested));
             }
 
             CoreEvent::ContentStart { index, kind } => {
-                let block = match kind {
-                    ContentKind::Text => ContentBlock::new_text(String::new()),
-                    ContentKind::Thinking => ContentBlock::new_thinking(String::new()),
-                    // ToolUse start is handled by ToolCallStart, which carries the
-                    // actual id/name.  Emitting content_block_start here would
-                    // produce a duplicate when ToolCallStart follows.
-                    ContentKind::ToolUse => {
-                        tracing::trace!(
-                            index,
-                            "ContentStart ToolUse skipped; ToolCallStart will emit content_block_start"
-                        );
-                        return Ok(events);
-                    }
-                    other => {
-                        // ContentStart for unsupported kinds (Image, Document,
-                        // Audio, Video, ToolResult, Refusal) -- skip entirely
-                        // rather than emitting a misleading text block start.
-                        tracing::warn!(
-                            kind = ?other,
-                            "unsupported ContentKind in Anthropic stream encode; skipping content_block_start"
-                        );
-                        // Return early with no events for this unsupported kind.
-                        return Ok(events);
-                    }
+                let Some(block) = encode_content_start_block(index, kind) else {
+                    // Unsupported or duplicate-producing kind: emit nothing.
+                    return Ok(events);
                 };
                 events.push(MessageEvent {
                     r#type: "content_block_start".to_owned(),
@@ -787,104 +912,11 @@ impl StreamEncoder {
                 stop_reason,
                 stop_sequence,
             } => {
-                // Emit a single message_delta with both usage and stop fields,
-                // then a message_stop.
-                let anth_stop = encode_stop_reason(stop_reason);
-                let usage = self.pending_usage.take().unwrap_or(anthropic::Usage {
-                    input_tokens: 0,
-                    output_tokens: 0,
-                    cache_creation_input_tokens: None,
-                    cache_read_input_tokens: None,
-                });
-
-                // Close any text/thinking blocks that were opened via
-                // content_block_start but never closed. Native Anthropic
-                // emits content_block_stop for every block; without this,
-                // strict clients that pair start/stop events mis-frame the
-                // stream. Tool blocks are closed by ToolCallStop.
-                self.open_text_blocks.sort_unstable();
-                for idx in self.open_text_blocks.drain(..) {
-                    events.push(MessageEvent {
-                        r#type: "content_block_stop".to_owned(),
-                        message: None,
-                        index: Some(idx),
-                        content_block: None,
-                        delta: None,
-                        usage: None,
-                        error: None,
-                    });
-                }
-
-                events.push(MessageEvent {
-                    r#type: "message_delta".to_owned(),
-                    message: None,
-                    index: None,
-                    content_block: None,
-                    delta: Some(Delta {
-                        r#type: None,
-                        text: None,
-                        thinking: None,
-                        partial_json: None,
-                        stop_reason: Some(anth_stop),
-                        stop_sequence,
-                    }),
-                    usage: Some(usage),
-                    error: None,
-                });
-
-                events.push(MessageEvent {
-                    r#type: "message_stop".to_owned(),
-                    message: None,
-                    index: None,
-                    content_block: None,
-                    delta: None,
-                    usage: None,
-                    error: None,
-                });
-
-                self.finished = true;
+                self.encode_message_stop(stop_reason, stop_sequence, &mut events);
             }
 
             CoreEvent::Error { error } => {
-                // Defense-in-depth note: the error message flows directly into
-                // the client-facing SSE event. Sanitization of secrets happens
-                // at CoreStreamError::new() construction time in the provider
-                // adapter. If a provider adapter accidentally passes an
-                // unsanitized message, it will be visible to the client here.
-                //
-                // Trust boundary: client adapters trust that provider adapters
-                // have sanitized the message. A regression test
-                // (encode_error_does_not_leak_secret_in_message) verifies that
-                // a CoreStreamError containing a secret-like string propagates
-                // verbatim -- the defense must be at construction time, not here.
-                //
-                // Length cap: truncate the error message to 1024 characters to
-                // prevent excessively large SSE payloads from upstream errors.
-                // Char-boundary-safe truncation: avoids panics on multi-byte
-                // UTF-8 characters in upstream/provider-derived error messages
-                // (consistent with the other truncation sites in this file).
-                let msg = error.message();
-                let capped_msg = if msg.len() > 1024 {
-                    tracing::warn!(
-                        original_len = msg.len(),
-                        "stream error message exceeds 1024 chars; truncating for client-facing SSE"
-                    );
-                    crate::util::truncate_str_safe(msg, 1024).to_owned()
-                } else {
-                    msg.to_owned()
-                };
-                events.push(MessageEvent {
-                    r#type: "error".to_owned(),
-                    message: None,
-                    index: None,
-                    content_block: None,
-                    delta: None,
-                    usage: None,
-                    error: Some(ApiError {
-                        r#type: encode_error_kind(&error.kind),
-                        message: capped_msg,
-                    }),
-                });
+                events.push(encode_error_event(&error));
             }
 
             CoreEvent::Ping => {
@@ -992,7 +1024,7 @@ fn encode_error_kind(kind: &CoreStreamErrorKind) -> String {
 mod tests {
     use super::*;
     use crate::anthropic::Tool;
-    use crate::core::{CoreStreamError, UsageProvenance};
+    use crate::core::UsageProvenance;
 
     // -- helpers ------------------------------------------------------------
 

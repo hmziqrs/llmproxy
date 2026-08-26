@@ -275,20 +275,21 @@ impl ModelCatalogService {
     async fn refresh(&self, provider: &ProviderConfig) -> Result<(), ProviderError> {
         let requested_at = Instant::now();
         let lock = {
-            let mut locks = self.refresh_locks.lock().map_err(|_| {
-                ProviderError::InvalidConfig("catalog refresh lock is poisoned".to_owned())
+            let mut locks = self.refresh_locks.lock().map_err(|error| {
+                ProviderError::InvalidConfig(format!("catalog refresh lock is poisoned: {error}"))
             })?;
-            locks
-                .entry(provider.name.clone())
-                .or_insert_with(|| Arc::new(AsyncMutex::new(())))
-                .clone()
+            Arc::clone(
+                locks
+                    .entry(provider.name.clone())
+                    .or_insert_with(|| Arc::new(AsyncMutex::new(()))),
+            )
         };
         let _guard = lock.lock().await;
         if let Some(outcome) = self
             .refresh_outcomes
             .lock()
-            .map_err(|_| {
-                ProviderError::InvalidConfig("catalog refresh state is poisoned".to_owned())
+            .map_err(|error| {
+                ProviderError::InvalidConfig(format!("catalog refresh state is poisoned: {error}"))
             })?
             .get(&provider.name)
             .filter(|outcome| outcome.completed_at >= requested_at)
@@ -360,8 +361,8 @@ impl ModelCatalogService {
     ) -> Result<(), ProviderError> {
         self.refresh_outcomes
             .lock()
-            .map_err(|_| {
-                ProviderError::InvalidConfig("catalog refresh state is poisoned".to_owned())
+            .map_err(|error| {
+                ProviderError::InvalidConfig(format!("catalog refresh state is poisoned: {error}"))
             })?
             .insert(
                 provider.to_owned(),
@@ -424,7 +425,7 @@ impl ModelCatalogService {
         let metadata = match tokio::fs::symlink_metadata(&path).await {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => return Err(invalid_cache(error)),
+            Err(error) => return Err(invalid_cache(&error)),
         };
         if metadata.file_type().is_symlink() || !metadata.is_file() {
             return Err(ProviderError::InvalidConfig(format!(
@@ -434,7 +435,7 @@ impl ModelCatalogService {
         }
         let raw = tokio::fs::read_to_string(&path)
             .await
-            .map_err(invalid_cache)?;
+            .map_err(|error| invalid_cache(&error))?;
         let file: CatalogFile = toml::from_str(&raw).map_err(|error| {
             ProviderError::InvalidConfig(format!(
                 "failed to parse catalog cache {}: {error}",
@@ -498,7 +499,7 @@ fn model_id_present(ids: &HashSet<String>, upstream_model: &str, protocol: &str)
     ids.contains(upstream_model)
 }
 
-fn invalid_cache(error: std::io::Error) -> ProviderError {
+fn invalid_cache(error: &std::io::Error) -> ProviderError {
     ProviderError::InvalidConfig(format!("catalog cache I/O failed: {error}"))
 }
 
@@ -533,8 +534,8 @@ pub fn write_catalog_atomic(cache_dir: &Path, file: &CatalogFile) -> Result<(), 
             "catalog provider must be a lowercase URL-safe slug".to_owned(),
         ));
     }
-    std::fs::create_dir_all(cache_dir).map_err(invalid_cache)?;
-    let metadata = std::fs::symlink_metadata(cache_dir).map_err(invalid_cache)?;
+    std::fs::create_dir_all(cache_dir).map_err(|error| invalid_cache(&error))?;
+    let metadata = std::fs::symlink_metadata(cache_dir).map_err(|error| invalid_cache(&error))?;
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
         return Err(ProviderError::InvalidConfig(format!(
             "catalog cache directory must be a non-symlink directory: {}",
@@ -543,7 +544,8 @@ pub fn write_catalog_atomic(cache_dir: &Path, file: &CatalogFile) -> Result<(), 
     }
     let destination = cache_dir.join(format!("{}.toml", file.catalog.provider));
     if destination.exists() {
-        let metadata = std::fs::symlink_metadata(&destination).map_err(invalid_cache)?;
+        let metadata =
+            std::fs::symlink_metadata(&destination).map_err(|error| invalid_cache(&error))?;
         if metadata.file_type().is_symlink() || !metadata.is_file() {
             return Err(ProviderError::InvalidConfig(format!(
                 "catalog destination is not a regular file: {}",
@@ -565,13 +567,17 @@ pub fn write_catalog_atomic(cache_dir: &Path, file: &CatalogFile) -> Result<(), 
             .write(true)
             .create_new(true)
             .open(&temporary)
-            .map_err(invalid_cache)?;
-        output.write_all(body.as_bytes()).map_err(invalid_cache)?;
-        output.sync_all().map_err(invalid_cache)?;
-        std::fs::rename(&temporary, &destination).map_err(invalid_cache)
+            .map_err(|error| invalid_cache(&error))?;
+        output
+            .write_all(body.as_bytes())
+            .map_err(|error| invalid_cache(&error))?;
+        output.sync_all().map_err(|error| invalid_cache(&error))?;
+        std::fs::rename(&temporary, &destination).map_err(|error| invalid_cache(&error))
     })();
-    if write_result.is_err() {
-        let _ = std::fs::remove_file(&temporary);
+    if write_result.is_err()
+        && let Err(error) = std::fs::remove_file(&temporary)
+    {
+        tracing::warn!(path = %temporary.display(), %error, "failed to remove temporary catalog cache file");
     }
     write_result?;
     Ok(())
@@ -596,7 +602,6 @@ impl Default for ModelCatalogService {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
@@ -667,7 +672,7 @@ mod tests {
         let count = Arc::new(AtomicUsize::new(0));
         let app = Router::new()
             .route("/models", get(failing_models))
-            .with_state(count.clone());
+            .with_state(Arc::clone(&count));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -704,16 +709,18 @@ mod tests {
         let barrier = Arc::new(tokio::sync::Barrier::new(8));
         let mut tasks = Vec::new();
         for _ in 0..8 {
-            let provider = provider.clone();
-            let service = service.clone();
-            let barrier = barrier.clone();
+            let provider = Arc::clone(&provider);
+            let service = Arc::clone(&service);
+            let barrier = Arc::clone(&barrier);
             tasks.push(tokio::spawn(async move {
                 barrier.wait().await;
                 service.catalog(&provider, true).await
             }));
         }
         for task in tasks {
-            assert!(task.await.unwrap().is_err());
+            task.await
+                .unwrap()
+                .expect_err("every single-flight follower should observe the refresh failure");
         }
         // GAP-LOW-4: discovery retries transient (5xx/transport) failures up to
         // `MAX_TRANSIENT_RETRIES` times after the first attempt, so a
@@ -763,7 +770,7 @@ mod tests {
 
         let result = service.catalog(&provider, true).await;
 
-        assert!(result.is_err());
+        result.expect_err("catalog refresh should fail when the endpoint persistently errors");
         // GAP-LOW-4: discovery retries transient (5xx/transport) failures up to
         // `MAX_TRANSIENT_RETRIES` times after the first attempt, so a
         // persistently-failing endpoint is probed `1 + MAX_TRANSIENT_RETRIES`
@@ -1057,12 +1064,12 @@ mod tests {
             .join(",");
         let body = format!("{{\"object\":\"list\",\"data\":[{models_json}]}}");
         let body_clone = body.clone();
-        let count_clone = count.clone();
+        let count_clone = Arc::clone(&count);
         let app = Router::new().route(
             "/models",
             get(move || {
                 let b = body_clone.clone();
-                let c = count_clone.clone();
+                let c = Arc::clone(&count_clone);
                 async move {
                     c.fetch_add(1, Ordering::SeqCst);
                     (
@@ -1089,9 +1096,9 @@ mod tests {
         let barrier = Arc::new(tokio::sync::Barrier::new(6));
         let mut tasks = Vec::new();
         for _ in 0..6 {
-            let provider = provider.clone();
-            let service = service.clone();
-            let barrier = barrier.clone();
+            let provider = Arc::clone(&provider);
+            let service = Arc::clone(&service);
+            let barrier = Arc::clone(&barrier);
             tasks.push(tokio::spawn(async move {
                 barrier.wait().await;
                 service.catalog(&provider, true).await

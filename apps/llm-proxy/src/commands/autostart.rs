@@ -2,7 +2,7 @@
 //!
 //! Manages auto-start on login: enable, disable, and status.
 
-use std::path::PathBuf;
+use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 
@@ -25,7 +25,7 @@ use crate::platform::format_plist;
 /// `EnvironmentVariables`, `StartInterval`, …) being silently rewritten on the
 /// next `enable` (audit GAP-MED-4).
 pub fn cmd_autostart_enable(
-    config_path: Option<PathBuf>,
+    config_path: Option<&Path>,
     port: Option<u16>,
     force: bool,
 ) -> Result<()> {
@@ -38,14 +38,14 @@ pub fn cmd_autostart_enable(
     // acceptable here because these are display-only strings that are XML-escaped
     // by format_plist(). Non-UTF-8 paths are rare and the lossy replacement is
     // sufficient for auto-start purposes.
-    let mut args = vec![exe.to_string_lossy().to_string(), "serve".to_string()];
+    let mut args = vec![exe.to_string_lossy().to_string(), "serve".to_owned()];
 
-    if let Some(ref p) = config_path {
-        args.push("--config".to_string());
+    if let Some(p) = config_path {
+        args.push("--config".to_owned());
         args.push(p.to_string_lossy().to_string());
     }
     if let Some(p) = port {
-        args.push("--port".to_string());
+        args.push("--port".to_owned());
         args.push(p.to_string());
     }
 

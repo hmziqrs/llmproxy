@@ -162,8 +162,16 @@ impl PidManager {
     pub fn is_process_running(pid: u32) -> bool {
         #[cfg(unix)]
         {
-            // SAFETY: kill(pid, 0) just checks if the process exists; it does
-            // not send a signal on any Unix platform.
+            #[expect(
+                unsafe_code,
+                reason = "libc::kill has no safe wrapper in std; the SAFETY note below states the invariant"
+            )]
+            // SAFETY: `kill` is a plain syscall wrapper that dereferences no
+            // pointers and touches no memory owned by this process, so it is
+            // sound for every `pid`/`sig` pair. Signal 0 additionally performs
+            // only the existence/permission check without delivering a signal,
+            // so no process state is mutated. The only observable effect is the
+            // return value and `errno`, both read immediately below.
             let ret = unsafe { libc::kill(pid as i32, 0) };
             if ret == 0 {
                 true

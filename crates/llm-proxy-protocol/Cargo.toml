@@ -4,6 +4,11 @@ version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+description = "Wire-format types for the Anthropic, OpenAI, and Gemini APIs plus the normalised core protocol."
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [lints]
 workspace = true

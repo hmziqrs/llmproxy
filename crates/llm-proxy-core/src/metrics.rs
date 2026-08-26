@@ -139,8 +139,9 @@ impl Metrics {
         KEY_BUF.with(|buf| {
             let mut buf = buf.borrow_mut();
             buf.clear();
-            use std::fmt::Write;
-            let _ = write!(buf, "{provider}{KEY_SEPARATOR}{model}");
+            buf.push_str(provider);
+            buf.push_str(KEY_SEPARATOR);
+            buf.push_str(model);
             if let Some(count) = map.get_mut(buf.as_str()) {
                 *count += 1;
             } else if map.len() < MODEL_COUNTS_CAP {
@@ -331,6 +332,10 @@ fn percentile(samples: &[Duration], pct: f64) -> Duration {
     // Nearest-rank (exclusive) method: rank = pct/100 * (n + 1), 1-based.
     let rank = (pct / 100.0) * (n as f64 + 1.0);
     // Convert to 0-based index, clamped to valid range.
+    #[expect(
+        clippy::cast_sign_loss,
+        reason = "`pct` is clamped to 0.0..=100.0 and `n >= 1`, so `rank = pct/100 * (n+1)` is always >= 0.0 and the cast cannot lose a sign"
+    )]
     let idx = (rank.floor() as usize).saturating_sub(1).min(n - 1);
     sorted[idx]
 }
@@ -497,6 +502,21 @@ mod tests {
         use std::sync::Arc;
         use std::thread;
 
+        fn record_one(m: &Metrics, i: u64) {
+            m.record_request(i % 2 == 0);
+            if i % 3 == 0 {
+                m.record_success("p", "model-a", Duration::from_micros(i));
+            } else {
+                m.record_failure();
+            }
+            if i % 10 == 0 {
+                m.record_rate_limited();
+            }
+            if i % 7 == 0 {
+                m.record_deduplicated();
+            }
+        }
+
         let m = Arc::new(Metrics::new());
         let mut handles = vec![];
 
@@ -504,18 +524,7 @@ mod tests {
             let m = Arc::clone(&m);
             handles.push(thread::spawn(move || {
                 for i in 0..500 {
-                    m.record_request(i % 2 == 0);
-                    if i % 3 == 0 {
-                        m.record_success("p", "model-a", Duration::from_micros(i));
-                    } else {
-                        m.record_failure();
-                    }
-                    if i % 10 == 0 {
-                        m.record_rate_limited();
-                    }
-                    if i % 7 == 0 {
-                        m.record_deduplicated();
-                    }
+                    record_one(&m, i);
                 }
             }));
         }

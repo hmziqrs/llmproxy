@@ -112,7 +112,7 @@ pub(crate) async fn handle_models(
         Ok(response) => response,
         Err(error) => {
             warn!(error = %error, "models request failed");
-            route_error_response(ClientProtocol::OpenAiChat, error)
+            route_error_response(ClientProtocol::OpenAiChat, &error)
         }
     }
 }
@@ -293,7 +293,6 @@ fn map_catalog_error(error: ProviderError) -> RouteError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::http::StatusCode;
     use llm_proxy_core::{
         AuthStyle, ProviderCatalogConfig, ProviderConfig, ProviderRouteKind, ProviderRoutesConfig,
         StaticModelCatalogEntry,

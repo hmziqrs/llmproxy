@@ -2185,7 +2185,6 @@ dependencies = [
  "llm-proxy-core",
  "llm-proxy-provider",
  "llm-proxy-server",
- "serde",
  "socket2",
  "tempfile",
  "time",
@@ -2204,7 +2203,6 @@ version = "0.1.0"
 name = "llm-proxy-core"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "humantime-serde",
  "libc",
  "regex",
@@ -2214,7 +2212,6 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tiktoken-rs",
- "tokio",
  "toml",
  "tracing",
 ]
@@ -2244,7 +2241,6 @@ dependencies = [
  "regex",
  "reqwest",
  "secrecy",
- "serde",
  "serde_json",
  "thiserror",
  "tokio",
@@ -2264,7 +2260,6 @@ dependencies = [
  "llm-proxy-provider",
  "llm-proxy-storage",
  "regex",
- "reqwest",
  "rust_decimal",
  "secrecy",
  "serde",

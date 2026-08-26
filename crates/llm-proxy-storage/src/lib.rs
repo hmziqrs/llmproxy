@@ -198,7 +198,7 @@ impl EventBus for RecordingBus {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use llm_proxy_protocol::core::{Usage, UsageProvenance};
+    use llm_proxy_protocol::core::UsageProvenance;
 
     fn sample_request_received() -> RequestReceived {
         RequestReceived {

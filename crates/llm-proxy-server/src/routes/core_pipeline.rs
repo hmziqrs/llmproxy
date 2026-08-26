@@ -782,7 +782,7 @@ pub(crate) async fn handle_core_once(
     })?;
 
     let response_bytes = state.proxy_client.send(proxy_req).await.map_err(|e| {
-        let err = map_provider_error(e, passthrough_auth);
+        let err = map_provider_error(&e, passthrough_auth);
         state.metrics.record_failure();
         emit_response_failed(
             &state.event_bus,
@@ -1093,7 +1093,7 @@ pub(crate) async fn handle_core_stream(
         .send_stream(proxy_req)
         .await
         .map_err(|e| {
-            let err = map_provider_error(e, passthrough_auth);
+            let err = map_provider_error(&e, passthrough_auth);
             state.metrics.record_failure();
             emit_response_failed(
                 &state.event_bus,
@@ -1173,11 +1173,10 @@ pub(crate) async fn handle_core_stream(
     // Wait for the first event (or a pre-stream error). This is the
     // first_byte_sent boundary: errors before this point become HTTP
     // errors; errors after this point become in-band SSE error events.
-    let first_event = first_byte_rx.await.map_err(|_| {
-        let err = RouteError::Internal(
-            "stream task exited before first event (possible panic, cancellation, or empty stream)"
-                .to_owned(),
-        );
+    let first_event = first_byte_rx.await.map_err(|error| {
+        let err = RouteError::Internal(format!(
+            "stream task exited before first event ({error}: possible panic, cancellation, or empty stream)"
+        ));
         // Only record/emit if the supervisor has not already done so for this
         // request (see `failure_recorded` above).
         if !failure_recorded.swap(true, Ordering::SeqCst) {
@@ -1413,6 +1412,94 @@ impl StreamContext {
     }
 }
 
+/// Emit the core events produced by a finalization step.
+///
+/// Returns `false` when the client disconnected, in which case the caller must
+/// abandon the stream task.
+async fn emit_finalization_events(
+    ctx: &mut StreamContext,
+    encoder: &mut ClientStreamEncoder,
+    tx: &tokio::sync::mpsc::Sender<Event>,
+    core_events: Vec<CoreEvent>,
+) -> bool {
+    for core_event in core_events {
+        capture_lifecycle(ctx, &core_event);
+        for event in encode_core_event(encoder, core_event) {
+            if !ctx.emit_event(event, tx).await {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Flush any trailing partial SSE frame left in the framer and emit the events
+/// it decodes to.
+///
+/// Returns `false` when the client disconnected, in which case the caller must
+/// abandon the stream task.
+async fn finalize_sse_framer(
+    ctx: &mut StreamContext,
+    encoder: &mut ClientStreamEncoder,
+    tx: &tokio::sync::mpsc::Sender<Event>,
+) -> bool {
+    let trailing_frames = match ctx.sse_framer.finish() {
+        Ok(frames) => frames,
+        Err(e) => {
+            warn!(
+                request_id = %ctx.request_id,
+                error = %e,
+                "SSE framer finish error"
+            );
+            return true;
+        }
+    };
+    for frame in &trailing_frames {
+        let core_events = match ctx.provider_decoder.decode_frame(frame) {
+            Ok(events) => events,
+            Err(e) => {
+                warn!(
+                    request_id = %ctx.request_id,
+                    error = %e,
+                    "provider decode error on trailing frame"
+                );
+                break;
+            }
+        };
+        if !emit_finalization_events(ctx, encoder, tx, core_events).await {
+            return false;
+        }
+    }
+    true
+}
+
+/// Emit the client encoder's trailing events, plus the OpenAI `[DONE]`
+/// terminator when the client protocol requires it.
+///
+/// Returns `false` when the client disconnected, in which case the caller must
+/// abandon the stream task.
+async fn emit_encoder_finish(
+    ctx: &mut StreamContext,
+    tx: &tokio::sync::mpsc::Sender<Event>,
+    final_encoded_events: Vec<ClientEncodedEvent>,
+) -> bool {
+    for encoded in final_encoded_events {
+        let event = client_event_to_sse(encoded);
+        if !ctx.emit_event(event, tx).await {
+            return false;
+        }
+    }
+
+    // For OpenAI Chat, emit the [DONE] terminator after all chunks.
+    if matches!(ctx.client_protocol, ClientProtocol::OpenAiChat)
+        && !ctx.emit_event(openai_done_event(), tx).await
+    {
+        return false;
+    }
+
+    true
+}
+
 /// Build a stream that converts provider byte chunks into client SSE events.
 ///
 /// The `first_byte_tx` channel is used to signal the first-byte boundary:
@@ -1537,7 +1624,7 @@ fn build_sse_output_stream(
                             "upstream stream error"
                         );
                         ctx.stream_metrics.metrics.record_failure();
-                        ctx.send_pre_stream_error(map_provider_error(e, ctx.passthrough_auth));
+                        ctx.send_pre_stream_error(map_provider_error(&e, ctx.passthrough_auth));
                         return;
                     }
                     None => break 'buffer,
@@ -1588,42 +1675,41 @@ fn build_sse_output_stream(
                 None
             };
             let client_events = encode_core_event(&mut encoder, core_event);
-            if client_events.is_empty() {
-                if let Some(stream_error) = leading_openai_error {
-                    if let Some(json_str) = openai_chat::stream_error_sse_payload(&stream_error) {
-                        if !ctx.emit_event(Event::default().data(json_str), &tx).await {
-                            return;
-                        }
-                        // Emit the OpenAI `[DONE]` terminator after the error.
-                        if !ctx.emit_event(openai_done_event(), &tx).await {
-                            return;
-                        }
-                        encoder.mark_finished();
-                        stream_succeeded = false;
-                        stream_errored = true;
-                        // Record the failure and emit a ResponseFailed event so
-                        // the in-band error is reflected in metrics/event-log,
-                        // mirroring the post-first-byte in-band error path. The
-                        // HTTP status is already committed as 200 (the error
-                        // crossed the boundary in-band), but the event still
-                        // classifies the failure for operators.
-                        ctx.stream_metrics.metrics.record_failure();
-                        let route_error = RouteError::ProviderDecode(
-                            stream_error.message().to_owned(),
-                        );
-                        emit_response_failed(
-                            &ctx.event_bus,
-                            &ctx.request_id,
-                            Some(ctx.stream_metrics.provider_name.as_str()),
-                            Some(&ctx.core.model),
-                            &route_error,
-                            ctx.stream_metrics.start,
-                        );
-                    }
-                    // If serialization failed there is nothing else to do for
-                    // this event; continue the replay loop.
+            if client_events.is_empty()
+                && let Some(stream_error) = leading_openai_error
+            {
+                // If serialization failed there is nothing else to do for
+                // this event; continue the replay loop.
+                let Some(json_str) = openai_chat::stream_error_sse_payload(&stream_error) else {
                     continue;
+                };
+                if !ctx.emit_event(Event::default().data(json_str), &tx).await {
+                    return;
                 }
+                // Emit the OpenAI `[DONE]` terminator after the error.
+                if !ctx.emit_event(openai_done_event(), &tx).await {
+                    return;
+                }
+                encoder.mark_finished();
+                stream_succeeded = false;
+                stream_errored = true;
+                // Record the failure and emit a ResponseFailed event so
+                // the in-band error is reflected in metrics/event-log,
+                // mirroring the post-first-byte in-band error path. The
+                // HTTP status is already committed as 200 (the error
+                // crossed the boundary in-band), but the event still
+                // classifies the failure for operators.
+                ctx.stream_metrics.metrics.record_failure();
+                let route_error = RouteError::ProviderDecode(stream_error.message().to_owned());
+                emit_response_failed(
+                    &ctx.event_bus,
+                    &ctx.request_id,
+                    Some(ctx.stream_metrics.provider_name.as_str()),
+                    Some(&ctx.core.model),
+                    &route_error,
+                    ctx.stream_metrics.start,
+                );
+                continue;
             }
             for event in client_events {
                 if !ctx.emit_event(event, &tx).await {
@@ -1767,7 +1853,7 @@ fn build_sse_output_stream(
                             if !ctx.first_byte_sent {
                                 ctx.stream_metrics.metrics.record_failure();
                                 ctx.send_pre_stream_error(
-                                    map_provider_error(e, ctx.passthrough_auth),
+                                    map_provider_error(&e, ctx.passthrough_auth),
                                 );
                             } else {
                                 // In-band stream error: run through the full
@@ -1793,7 +1879,7 @@ fn build_sse_output_stream(
                                 // reqwest timeout is attributed as an upstream
                                 // timeout (504) rather than a generic 502
                                 // (audit LOW, eventlog-inband-stream-httpstatus).
-                                let route_error = map_provider_error(e, ctx.passthrough_auth);
+                                let route_error = map_provider_error(&e, ctx.passthrough_auth);
                                 emit_response_failed(
                                     &ctx.event_bus,
                                     &ctx.request_id,
@@ -1828,51 +1914,15 @@ fn build_sse_output_stream(
         if !stream_errored && ctx.first_byte_sent {
             // Finalize: call sse_framer.finish() first to flush any trailing partial
             // SSE frame that arrived without a terminating blank line.
-            match ctx.sse_framer.finish() {
-                Ok(trailing_frames) => {
-                    for frame in &trailing_frames {
-                        let core_events = match ctx.provider_decoder.decode_frame(frame) {
-                            Ok(events) => events,
-                            Err(e) => {
-                                warn!(
-                                    request_id = %ctx.request_id,
-                                    error = %e,
-                                    "provider decode error on trailing frame"
-                                );
-                                break;
-                            }
-                        };
-                        for core_event in core_events {
-                            capture_lifecycle(&mut ctx, &core_event);
-                            let client_events = encode_core_event(&mut encoder, core_event);
-                            for event in client_events {
-                                if !ctx.emit_event(event, &tx).await {
-                                    return;
-                                }
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    warn!(
-                        request_id = %ctx.request_id,
-                        error = %e,
-                        "SSE framer finish error"
-                    );
-                }
+            if !finalize_sse_framer(&mut ctx, &mut encoder, &tx).await {
+                return;
             }
 
             // Then finalize: call provider decoder finish() to emit any remaining events.
             match ctx.provider_decoder.finish() {
                 Ok(final_events) => {
-                    for core_event in final_events {
-                        capture_lifecycle(&mut ctx, &core_event);
-                        let client_events = encode_core_event(&mut encoder, core_event);
-                        for event in client_events {
-                            if !ctx.emit_event(event, &tx).await {
-                                return;
-                            }
-                        }
+                    if !emit_finalization_events(&mut ctx, &mut encoder, &tx, final_events).await {
+                        return;
                     }
                 }
                 Err(e) => {
@@ -1887,21 +1937,9 @@ fn build_sse_output_stream(
             // Emit any remaining client encoder events (synthetic terminal if needed).
             match encoder.finish() {
                 Ok(final_encoded_events) => {
-                    for encoded in final_encoded_events {
-                        let event = client_event_to_sse(encoded);
-                        if !ctx.emit_event(event, &tx).await {
-                            return;
-                        }
+                    if !emit_encoder_finish(&mut ctx, &tx, final_encoded_events).await {
+                        return;
                     }
-
-                    // For OpenAI Chat, emit the [DONE] terminator after all chunks.
-                    if matches!(ctx.client_protocol, ClientProtocol::OpenAiChat) {
-                        let done_event = openai_done_event();
-                        if !ctx.emit_event(done_event, &tx).await {
-                            return;
-                        }
-                    }
-
                     stream_succeeded = true;
                 }
                 Err(e) => {
@@ -1964,12 +2002,15 @@ fn build_sse_output_stream(
         // The handler will return this as a 502 Bad Gateway to the client.
         // This is preferable to silently dropping the channel (which produces
         // a misleading "stream task panicked" error).
-        if !ctx.first_byte_sent {
-            if let Some(tx) = ctx.first_byte_tx.take() {
-                let _ = tx.send(FirstByteResult::PreStreamError(RouteError::ProviderDecode(
+        if !ctx.first_byte_sent
+            && let Some(tx) = ctx.first_byte_tx.take()
+            && tx
+                .send(FirstByteResult::PreStreamError(RouteError::ProviderDecode(
                     "upstream returned an empty stream with no events".to_owned(),
-                )));
-            }
+                )))
+                .is_err()
+        {
+            tracing::debug!("client disconnected before the empty-stream error could be reported");
         }
     }
         .instrument(stream_span),
@@ -2110,8 +2151,10 @@ async fn emit_stream_error(
         // Use "server_error" as the error type to match the HTTP 500 path's
         // convention in openai_error_response, since in-band stream errors are
         // always upstream/internal issues.
-        if let Some(json_str) = openai_stream_error_json_with_type(message, "server_error") {
-            let _ = tx.send(Event::default().data(json_str)).await;
+        if let Some(json_str) = openai_stream_error_json_with_type(message, "server_error")
+            && tx.send(Event::default().data(json_str)).await.is_err()
+        {
+            return;
         }
     } else {
         for event in events {
@@ -2149,7 +2192,7 @@ async fn emit_stream_error(
 ///   redaction and truncation, so neither API keys nor upstream hostnames/URL
 ///   paths leak to the client (audit GAP-LOW-2).
 pub(crate) fn map_provider_error(
-    e: llm_proxy_provider::error::ProviderError,
+    e: &llm_proxy_provider::error::ProviderError,
     passthrough_auth: bool,
 ) -> RouteError {
     // Whose credentials authenticated with the upstream: under passthrough_auth
@@ -2162,7 +2205,7 @@ pub(crate) fn map_provider_error(
     } else {
         AuthOwner::Operator
     };
-    match &e {
+    match e {
         llm_proxy_provider::error::ProviderError::Api { status, body } => {
             let status_code = StatusCode::from_u16(*status).unwrap_or_else(|_| {
                 warn!(
@@ -2457,7 +2500,7 @@ mod tests {
         fn extracted_token(auth_header: &str) -> Option<String> {
             let mut headers = HeaderMap::new();
             headers.insert(header::AUTHORIZATION, auth_header.parse().unwrap());
-            extract_inbound_auth(&headers).map(|s| s.expose_secret().to_string())
+            extract_inbound_auth(&headers).map(|s| s.expose_secret().to_owned())
         }
         assert_eq!(extracted_token("Bearer abc123").as_deref(), Some("abc123"));
         assert_eq!(extracted_token("bearer abc123").as_deref(), Some("abc123"));
@@ -2574,28 +2617,24 @@ mod tests {
         let headers = HeaderMap::new();
         let address = "127.0.0.1:12345".parse().unwrap();
 
-        assert!(
-            prepare_request(
-                &state,
-                "req-test".to_owned(),
-                &headers,
-                Some(&address),
-                b"one",
-                "/test"
-            )
-            .is_ok()
-        );
-        assert!(
-            prepare_request(
-                &state,
-                "req-test".to_owned(),
-                &headers,
-                Some(&address),
-                b"two",
-                "/test"
-            )
-            .is_ok()
-        );
+        prepare_request(
+            &state,
+            "req-test".to_owned(),
+            &headers,
+            Some(&address),
+            b"one",
+            "/test",
+        )
+        .expect("request under the rate limit should be admitted");
+        prepare_request(
+            &state,
+            "req-test".to_owned(),
+            &headers,
+            Some(&address),
+            b"two",
+            "/test",
+        )
+        .expect("request under the rate limit should be admitted");
     }
 
     #[test]
@@ -2607,17 +2646,15 @@ mod tests {
         let mut second_headers = HeaderMap::new();
         second_headers.insert("x-forwarded-for", "203.0.113.2".parse().unwrap());
 
-        assert!(
-            prepare_request(
-                &state,
-                "req-test".to_owned(),
-                &first_headers,
-                Some(&address),
-                b"one",
-                "/test"
-            )
-            .is_ok()
-        );
+        prepare_request(
+            &state,
+            "req-test".to_owned(),
+            &first_headers,
+            Some(&address),
+            b"one",
+            "/test",
+        )
+        .expect("request under the rate limit should be admitted");
         assert!(matches!(
             prepare_request(
                 &state,
@@ -2648,7 +2685,7 @@ mod tests {
     #[test]
     fn provider_api_error_maps_to_upstream() {
         let err = llm_proxy_provider::error::ProviderError::api(500, "internal error".into());
-        let route_err = map_provider_error(err, false);
+        let route_err = map_provider_error(&err, false);
         match route_err {
             RouteError::Upstream { status, .. } => {
                 assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
@@ -2660,7 +2697,7 @@ mod tests {
     #[test]
     fn provider_http_error_maps_to_upstream_502() {
         let err = llm_proxy_provider::error::ProviderError::api(502, "bad gateway".into());
-        let route_err = map_provider_error(err, false);
+        let route_err = map_provider_error(&err, false);
         match route_err {
             RouteError::Upstream { status, body, .. } => {
                 assert_eq!(status, StatusCode::BAD_GATEWAY);
@@ -2674,7 +2711,7 @@ mod tests {
     fn provider_api_error_marks_client_owner_under_passthrough() {
         // passthrough_auth=true => auth_owner is Client so 401/403 pass through.
         let err = llm_proxy_provider::error::ProviderError::api(401, "unauthorized".into());
-        let route_err = map_provider_error(err, true);
+        let route_err = map_provider_error(&err, true);
         match route_err {
             RouteError::Upstream {
                 status, auth_owner, ..
@@ -2690,7 +2727,7 @@ mod tests {
     fn provider_api_error_marks_operator_owner_by_default() {
         // passthrough_auth=false => auth_owner is Operator so 401 collapses to 502.
         let err = llm_proxy_provider::error::ProviderError::api(401, "unauthorized".into());
-        let route_err = map_provider_error(err, false);
+        let route_err = map_provider_error(&err, false);
         match route_err {
             RouteError::Upstream {
                 status, auth_owner, ..

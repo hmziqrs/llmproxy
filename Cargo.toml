@@ -14,6 +14,10 @@ members = [
 edition = "2024"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/freeoxide/llmproxy"
+readme = "README.md"
+keywords = ["llm", "proxy", "openai", "anthropic", "ai"]
+categories = ["web-programming::http-server", "api-bindings"]
 
 [workspace.dependencies]
 # Internal
@@ -26,7 +30,6 @@ tokio-util = { version = "0.7", features = ["rt"] }
 
 # Web
 axum = { version = "0.8", features = ["macros", "json"] }
-axum-serde = { version = "0.9", features = ["sonic"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["trace", "timeout"] }
 
@@ -70,11 +73,89 @@ uuid = { version = "1", features = ["v4"] }
 rust_2018_idioms = { level = "warn", priority = -3 }
 future-incompatible = { level = "warn", priority = -2 }
 nonstandard_style = { level = "deny", priority = -1 }
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+unused_must_use = "deny"
 missing_debug_implementations = "warn"
 missing_docs = "warn"
+unreachable_pub = "warn"
+redundant_imports = "warn"
+redundant_lifetimes = "warn"
+unused_lifetimes = "warn"
+trivial_numeric_casts = "warn"
+ambiguous_negative_literals = "warn"
 
 [workspace.lints.clippy]
-all = { level = "warn", priority = -1 }
+# Groups. priority = -1 makes the individual keys below override them.
+all   = { level = "warn", priority = -1 }
+cargo = { level = "warn", priority = -1 }
+
+# 1. Suppression escape hatch
+allow_attributes = "warn"
+allow_attributes_without_reason = "warn"
+
+# 2. Unfinished / debug leftovers
+dbg_macro = "warn"
+todo = "warn"
+unimplemented = "warn"
+unreachable = "warn"
+
+# 3. Panic paths
+unwrap_used = "warn"
+panic = "warn"
+panic_in_result_fn = "warn"
+unwrap_in_result = "warn"
+get_unwrap = "warn"
+unchecked_time_subtraction = "warn"
+
+# 4. Silently swallowed errors and futures
+let_underscore_future = "deny"
+let_underscore_must_use = "warn"
+unused_result_ok = "warn"
+map_err_ignore = "warn"
+assertions_on_result_states = "warn"
+
+# 5. Clone / ownership slop
+redundant_clone = "warn"
+clone_on_ref_ptr = "warn"
+implicit_clone = "warn"
+needless_pass_by_value = "warn"
+needless_pass_by_ref_mut = "warn"
+str_to_string = "warn"
+inefficient_to_string = "warn"
+
+# 6. Async hazards
+await_holding_lock = "warn"
+await_holding_refcell_ref = "warn"
+large_futures = "warn"
+rc_mutex = "warn"
+
+# 7. Unsafe hygiene
+undocumented_unsafe_blocks = "warn"
+multiple_unsafe_ops_per_block = "warn"
+unnecessary_safety_comment = "warn"
+unnecessary_safety_doc = "warn"
+mem_forget = "warn"
+
+# 8. Numeric correctness
+float_cmp = "warn"
+float_cmp_const = "warn"
+lossy_float_literal = "warn"
+cast_sign_loss = "warn"
+invalid_upcast_comparisons = "warn"
+
+# 9. Structure
+excessive_nesting = "warn"
+too_many_lines = "warn"
+ignore_without_reason = "warn"
+tests_outside_test_module = "warn"
+
+# 10. High-false-positive opt-outs
+# Duplicate versions come from transitive dependencies we do not control;
+# the only fix is upstream, so flagging it here is pure noise.
+multiple_crate_versions = "allow"
+type_complexity = "allow"
+literal_string_with_formatting_args = "allow"
 
 [profile.release]
 lto = "thin"

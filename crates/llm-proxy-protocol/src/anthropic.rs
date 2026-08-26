@@ -64,35 +64,27 @@ impl MessageRequest {
     /// ```
     #[must_use]
     pub fn system_text(&self) -> String {
-        match &self.system {
-            None => String::new(),
-            Some(value) => {
-                // Try plain string first.
-                if let Some(s) = value.as_str() {
-                    return s.to_owned();
-                }
-                // Try array of SystemContentBlock.
-                if let Some(arr) = value.as_array() {
-                    let mut parts: Vec<String> = Vec::new();
-                    for item in arr {
-                        if let Ok(block) =
-                            serde_json::from_value::<SystemContentBlock>(item.clone())
-                        {
-                            if block.r#type == "text" {
-                                if let Some(t) = block.text {
-                                    parts.push(t);
-                                }
-                            }
-                        }
-                    }
-                    if !parts.is_empty() {
-                        return parts.join("\n");
-                    }
-                }
-                // Fallback: raw JSON string.
-                value.to_string()
+        let Some(value) = &self.system else {
+            return String::new();
+        };
+        // Try plain string first.
+        if let Some(s) = value.as_str() {
+            return s.to_owned();
+        }
+        // Try array of SystemContentBlock.
+        if let Some(arr) = value.as_array() {
+            let parts: Vec<String> = arr
+                .iter()
+                .filter_map(|item| serde_json::from_value::<SystemContentBlock>(item.clone()).ok())
+                .filter(|block| block.r#type == "text")
+                .filter_map(|block| block.text)
+                .collect();
+            if !parts.is_empty() {
+                return parts.join("\n");
             }
         }
+        // Fallback: raw JSON string.
+        value.to_string()
     }
 
     /// Validates that required fields are present.
@@ -491,16 +483,12 @@ impl ContentBlock {
                 return s.to_owned();
             }
             if let Some(arr) = val.as_array() {
-                let mut text = String::new();
-                for item in arr {
-                    if let Some(obj) = item.as_object() {
-                        if obj.get("type").and_then(|v| v.as_str()) == Some("text") {
-                            if let Some(t) = obj.get("text").and_then(|v| v.as_str()) {
-                                text.push_str(t);
-                            }
-                        }
-                    }
-                }
+                let text: String = arr
+                    .iter()
+                    .filter_map(serde_json::Value::as_object)
+                    .filter(|obj| obj.get("type").and_then(|v| v.as_str()) == Some("text"))
+                    .filter_map(|obj| obj.get("text").and_then(|v| v.as_str()))
+                    .collect();
                 if !text.is_empty() {
                     return text;
                 }
@@ -519,6 +507,73 @@ impl ContentBlock {
         }
         String::new()
     }
+}
+
+/// Serializes an unknown / future content block type by emitting every non-`None`
+/// field.
+///
+/// This clones every field to construct an intermediate `AllFields` struct.
+/// The clone cost is acceptable because (a) unknown block types are rare,
+/// and (b) the approach keeps the Serialize impl maintainable by leveraging
+/// derive rather than a manual `SerializeMap` that conditionally includes
+/// each field.
+fn serialize_unknown_block<S>(block: &ContentBlock, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    #[derive(Serialize)]
+    struct AllFields {
+        #[serde(rename = "type")]
+        r#type: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        text: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tool_use_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        input: Option<serde_json::Value>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        output: Option<serde_json::Value>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        content: Option<serde_json::Value>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        is_error: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        thinking: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        signature: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        source: Option<ImageSource>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<CacheControl>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        data: Option<String>,
+    }
+
+    #[expect(
+        deprecated,
+        reason = "AllFields debug aid mirrors the deprecated `output` field"
+    )]
+    let all = AllFields {
+        r#type: block.r#type.clone(),
+        text: block.text.clone(),
+        id: block.id.clone(),
+        tool_use_id: block.tool_use_id.clone(),
+        name: block.name.clone(),
+        input: block.input.clone(),
+        output: block.output.clone(),
+        content: block.content.clone(),
+        is_error: block.is_error,
+        thinking: block.thinking.clone(),
+        signature: block.signature.clone(),
+        source: block.source.clone(),
+        cache_control: block.cache_control.clone(),
+        data: block.data.clone(),
+    };
+    all.serialize(serializer)
 }
 
 /// Custom [`Serialize`] for [`ContentBlock`] that emits only the fields
@@ -599,68 +654,7 @@ impl Serialize for ContentBlock {
                 )?;
                 map.end()
             }
-            // Unknown / future block types: serialize all non-None fields.
-            //
-            // This clones every field to construct an intermediate `AllFields` struct.
-            // The clone cost is acceptable because (a) unknown block types are rare,
-            // and (b) the approach keeps the Serialize impl maintainable by leveraging
-            // derive rather than a manual `SerializeMap` that conditionally includes
-            // each field.
-            _ => {
-                #[derive(Serialize)]
-                struct AllFields {
-                    #[serde(rename = "type")]
-                    r#type: String,
-                    #[serde(skip_serializing_if = "Option::is_none")]
-                    text: Option<String>,
-                    #[serde(skip_serializing_if = "Option::is_none")]
-                    id: Option<String>,
-                    #[serde(skip_serializing_if = "Option::is_none")]
-                    tool_use_id: Option<String>,
-                    #[serde(skip_serializing_if = "Option::is_none")]
-                    name: Option<String>,
-                    #[serde(skip_serializing_if = "Option::is_none")]
-                    input: Option<serde_json::Value>,
-                    #[serde(skip_serializing_if = "Option::is_none")]
-                    output: Option<serde_json::Value>,
-                    #[serde(skip_serializing_if = "Option::is_none")]
-                    content: Option<serde_json::Value>,
-                    #[serde(skip_serializing_if = "Option::is_none")]
-                    is_error: Option<bool>,
-                    #[serde(skip_serializing_if = "Option::is_none")]
-                    thinking: Option<String>,
-                    #[serde(skip_serializing_if = "Option::is_none")]
-                    signature: Option<String>,
-                    #[serde(skip_serializing_if = "Option::is_none")]
-                    source: Option<ImageSource>,
-                    #[serde(skip_serializing_if = "Option::is_none")]
-                    cache_control: Option<CacheControl>,
-                    #[serde(skip_serializing_if = "Option::is_none")]
-                    data: Option<String>,
-                }
-
-                #[expect(
-                    deprecated,
-                    reason = "AllFields debug aid mirrors the deprecated `output` field"
-                )]
-                let all = AllFields {
-                    r#type: self.r#type.clone(),
-                    text: self.text.clone(),
-                    id: self.id.clone(),
-                    tool_use_id: self.tool_use_id.clone(),
-                    name: self.name.clone(),
-                    input: self.input.clone(),
-                    output: self.output.clone(),
-                    content: self.content.clone(),
-                    is_error: self.is_error,
-                    thinking: self.thinking.clone(),
-                    signature: self.signature.clone(),
-                    source: self.source.clone(),
-                    cache_control: self.cache_control.clone(),
-                    data: self.data.clone(),
-                };
-                all.serialize(serializer)
-            }
+            _ => serialize_unknown_block(self, serializer),
         }
     }
 }
@@ -1018,7 +1012,7 @@ mod tests {
             thinking: None,
             tool_choice: None,
         };
-        assert!(req.validate().is_ok());
+        req.validate().expect("request should validate");
     }
 
     #[test]

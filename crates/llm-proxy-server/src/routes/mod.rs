@@ -80,7 +80,7 @@ pub fn router(state: AppState) -> Router {
     // router. The outermost `inject_request_id` layer generates one id per
     // request and stamps it into extensions so the tracing span, the handler,
     // and the `x-request-id` header all share a single id (audit MEDIUM-1).
-    let id_gen = state.request_id_gen.clone();
+    let id_gen = Arc::clone(&state.request_id_gen);
     // Clone the shared event bus before `state` is moved into the router, so the
     // error-normalisation layer can emit a `ResponseFailed` for 408/413
     // rejections produced by the timeout/body-limit layers (audit finding: layer
@@ -99,7 +99,7 @@ pub fn router(state: AppState) -> Router {
         .route("/version", get(version))
         .layer(
             ServiceBuilder::new()
-                .layer(from_fn_with_state(id_gen.clone(), inject_request_id))
+                .layer(from_fn_with_state(Arc::clone(&id_gen), inject_request_id))
                 .layer(trace.clone()),
         );
 
@@ -322,7 +322,7 @@ async fn normalize_error_responses(
         .unwrap_or("layer-rejection");
     core_pipeline::emit_response_failed(&event_bus, id_str, None, None, &error, start);
 
-    let mut rewritten = error_response::route_error_response(protocol, error);
+    let mut rewritten = error_response::route_error_response(protocol, &error);
     if let Some(id) = request_id {
         if let Ok(value) = id.0.parse() {
             rewritten.headers_mut().insert("x-request-id", value);
@@ -397,7 +397,7 @@ async fn not_found(State(state): State<AppState>, req: Request) -> impl IntoResp
     core_pipeline::emit_response_failed(&state.event_bus, &request_id.0, None, None, &error, start);
 
     let protocol = protocol_for_path(&path);
-    let mut response = error_response::route_error_response(protocol, error);
+    let mut response = error_response::route_error_response(protocol, &error);
     if let Ok(value) = request_id.0.parse() {
         response.headers_mut().insert("x-request-id", value);
     }
@@ -446,7 +446,7 @@ async fn method_not_allowed(State(state): State<AppState>, req: Request) -> impl
     core_pipeline::emit_response_failed(&state.event_bus, &request_id.0, None, None, &error, start);
 
     let protocol = protocol_for_path(&path);
-    let mut response = error_response::route_error_response(protocol, error);
+    let mut response = error_response::route_error_response(protocol, &error);
     if let Ok(value) = request_id.0.parse() {
         response.headers_mut().insert("x-request-id", value);
     }

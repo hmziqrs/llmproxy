@@ -157,23 +157,7 @@ impl SseFramer {
             // Process any complete lines first (up to the last newline).
             // This avoids UTF-8 decode failures from partial multi-byte
             // sequences that may appear after the last newline.
-            if let Some(last_nl) = self.buffer.iter().rposition(|&b| b == b'\n') {
-                // Drain complete lines through the last newline.
-                let complete = self.buffer[..last_nl + 1].to_vec();
-                self.buffer.drain(..last_nl + 1);
-                // Complete lines ending at a newline boundary are valid UTF-8.
-                let text = str::from_utf8(&complete).map_err(ProviderError::from)?;
-                for line in text.lines() {
-                    let trimmed = line.trim_end_matches('\r');
-                    if trimmed.is_empty() {
-                        if let Some(frame) = self.take_current_frame() {
-                            frames.push(frame);
-                        }
-                    } else {
-                        self.process_line(trimmed)?;
-                    }
-                }
-            }
+            self.flush_complete_lines(&mut frames)?;
 
             // Handle any remaining bytes after the last newline (no trailing newline).
             if !self.buffer.is_empty() {
@@ -193,6 +177,30 @@ impl SseFramer {
     // -----------------------------------------------------------------------
     // Internal
     // -----------------------------------------------------------------------
+
+    /// Drains the buffer through its last newline, emitting any frames it
+    /// completes.
+    ///
+    /// Stopping at a newline boundary keeps a multi-byte UTF-8 character that
+    /// straddles two chunks intact.
+    fn flush_complete_lines(&mut self, frames: &mut Vec<SseFrame>) -> Result<(), ProviderError> {
+        let Some(last_nl) = self.buffer.iter().rposition(|&b| b == b'\n') else {
+            return Ok(());
+        };
+        let complete = self.buffer[..last_nl + 1].to_vec();
+        self.buffer.drain(..last_nl + 1);
+        // Complete lines ending at a newline boundary are valid UTF-8.
+        let text = str::from_utf8(&complete).map_err(ProviderError::from)?;
+        for line in text.lines() {
+            let trimmed = line.trim_end_matches('\r');
+            if !trimmed.is_empty() {
+                self.process_line(trimmed)?;
+            } else if let Some(frame) = self.take_current_frame() {
+                frames.push(frame);
+            }
+        }
+        Ok(())
+    }
 
     /// Parse as many complete lines as possible from the buffer.
     ///

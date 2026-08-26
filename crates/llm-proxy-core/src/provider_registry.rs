@@ -477,7 +477,7 @@ const MAX_ADAPTERS_IN_ERROR: usize = 5;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{AuthStyle, ProviderAdapterConfig, ProviderCatalogConfig, ProviderRoutesConfig};
+    use crate::{ProviderAdapterConfig, ProviderCatalogConfig, ProviderRoutesConfig};
 
     #[test]
     fn provider_route_resolves_alias_and_redacts_secrets() {

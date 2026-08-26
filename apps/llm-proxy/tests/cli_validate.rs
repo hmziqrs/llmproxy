@@ -5,44 +5,48 @@
 //! accept/reject matrix is exercised as per-case unit tests in
 //! `src/config_validation.rs` (see LOW-20).
 
-use llm_proxy_app::commands::cmd_validate;
-use llm_proxy_app::defaults::DEFAULT_CONFIG_TOML;
+#[cfg(test)]
+mod tests {
 
-#[test]
-fn validate_accepts_default_config() {
-    let dir = tempfile::tempdir().unwrap();
-    let config = dir.path().join("config.toml");
-    std::fs::write(&config, DEFAULT_CONFIG_TOML).unwrap();
+    use llm_proxy_app::commands::cmd_validate;
+    use llm_proxy_app::defaults::DEFAULT_CONFIG_TOML;
 
-    let result = cmd_validate(Some(config));
-    assert!(
-        result.is_ok(),
-        "default config should validate: {:?}",
-        result
-    );
-}
+    #[test]
+    fn validate_accepts_default_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        std::fs::write(&config, DEFAULT_CONFIG_TOML).unwrap();
 
-#[test]
-fn validate_rejects_invalid_toml() {
-    let dir = tempfile::tempdir().unwrap();
-    let config = dir.path().join("bad.toml");
-    std::fs::write(&config, "not valid toml {{{{").unwrap();
+        let result = cmd_validate(Some(&config));
+        assert!(
+            result.is_ok(),
+            "default config should validate: {:?}",
+            result
+        );
+    }
 
-    let result = cmd_validate(Some(config));
-    assert!(result.is_err(), "malformed TOML should fail");
-}
+    #[test]
+    fn validate_rejects_invalid_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("bad.toml");
+        std::fs::write(&config, "not valid toml {{{{").unwrap();
 
-#[test]
-fn validate_rejects_json_extension() {
-    let dir = tempfile::tempdir().unwrap();
-    let config = dir.path().join("config.json");
-    std::fs::write(&config, "{}").unwrap();
+        let result = cmd_validate(Some(&config));
+        assert!(result.is_err(), "malformed TOML should fail");
+    }
 
-    let result = cmd_validate(Some(config));
-    assert!(result.is_err());
-    let msg = result.unwrap_err().to_string();
-    assert!(
-        msg.contains("unsupported") || msg.contains("extension"),
-        "error should mention unsupported extension: {msg}"
-    );
+    #[test]
+    fn validate_rejects_json_extension() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.json");
+        std::fs::write(&config, "{}").unwrap();
+
+        let result = cmd_validate(Some(&config));
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("unsupported") || msg.contains("extension"),
+            "error should mention unsupported extension: {msg}"
+        );
+    }
 }
