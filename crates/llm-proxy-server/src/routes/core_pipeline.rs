@@ -492,12 +492,10 @@ fn client_protocol_str(protocol: ClientProtocol) -> &'static str {
 
 /// Stable correlation hash of the RAW client request body, hex-encoded.
 ///
-/// SHA-256 of the raw wire bytes (`&[u8]`) exactly as the client sent them --
-/// matching the plan's locked decision (mvp-pre-storage.md ~L1191: "computed
-/// over the raw client `body: &[u8]`") and the `/v1/messages/count_tokens`
-/// route, so the same logical request yields the SAME `body_hash` correlation
-/// key across every route that emits a `RequestReceived`. The raw body itself
-/// is never stored -- only this digest.
+/// SHA-256 of the raw wire bytes (`&[u8]`) exactly as the client sent them. The
+/// `/v1/messages/count_tokens` route uses the same input, so a request has the
+/// same `body_hash` correlation key across every route that emits a
+/// `RequestReceived`. The raw body itself is never stored -- only this digest.
 ///
 /// Shared with `token_count.rs` so the two routes agree on the correlation key
 /// (audit finding: body_hash was hashed over the normalized `CoreRequest` on the
@@ -2520,12 +2518,11 @@ mod tests {
 
     #[test]
     fn body_hash_is_stable_and_distinguishes_requests() {
-        // `body_hash` is now computed over the RAW client body bytes (per the
-        // plan's locked decision), matching the `/v1/messages/count_tokens`
-        // route, so identical raw bodies hash equally and distinct bodies
-        // differ. Two bodies that normalize to the same CoreRequest but differ
-        // in whitespace/byte order now hash differently (intentional: the
-        // correlation key tracks the raw wire payload).
+        // `body_hash` is computed over the raw client body bytes, matching the
+        // `/v1/messages/count_tokens` route, so identical raw bodies hash
+        // equally and distinct bodies differ. Two bodies that normalize to the
+        // same CoreRequest but differ in whitespace/byte order hash differently
+        // because the correlation key tracks the raw wire payload.
         let a1 = br#"{"model":"gpt-4o","messages":[]}"#;
         let a2 = br#"{"model":"gpt-4o","messages":[]}"#;
         let b = br#"{"model":"gpt-3.5-turbo","messages":[]}"#;

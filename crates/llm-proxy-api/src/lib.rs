@@ -1,11 +1,8 @@
 //! llm-proxy-api: public API surface for the LLM proxy.
 //!
-//! This crate is intentionally empty in v1. It will contain the
-//! HTTP handler layer, request/response types, and middleware once
-//! the protocol-normalization and protocol-mini designs land.
-//!
-//! See `docs/protocol-normalization.md` and `docs/protocol-mini.md`
-//! for the planned API contract.
+//! This crate is intentionally empty in v1. It reserves the namespace for a
+//! future public HTTP API layer. See `docs/protocol.md` for the implemented
+//! protocol boundaries.
 
 /// Placeholder module to reserve the public API namespace.
 ///
