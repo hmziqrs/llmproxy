@@ -38,8 +38,11 @@ POST /providers/{provider}/v1/messages/count_tokens
 GET  /providers/{provider}/v1/models
 ~~~
 
-See `docs/remodel-proxy.md` and the files under `providers/` for configuration
+See `config.toml.example` and the files under `providers/` for configuration
 examples.
+
+See the [protocol design](docs/protocol.md) and
+[research index](docs/research/README.md) for architecture and compatibility notes.
 
 ## References
 
