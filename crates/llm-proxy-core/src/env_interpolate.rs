@@ -10,7 +10,7 @@ use regex::Regex;
 /// Shared across all callers so the regex is compiled at most once per process.
 /// Uses `LazyLock` for idiomatic one-time initialization.
 static ENV_VAR_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
-    // SAFETY: this regex is a compile-time constant that is syntactically valid.
+    // INVARIANT: this regex is a compile-time constant that is syntactically valid.
     // Failure here indicates a programming error in the regex literal, not a
     // runtime condition.
     Regex::new(r"\$\{([A-Za-z0-9_]+)\}").expect("env var regex is valid")

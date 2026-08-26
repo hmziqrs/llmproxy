@@ -49,7 +49,7 @@ pub(crate) async fn handle_chat_completions(
         Ok(response) => response,
         Err(error) => {
             warn!(error = %error, "request failed");
-            route_error_response(ClientProtocol::OpenAiChat, error)
+            route_error_response(ClientProtocol::OpenAiChat, &error)
         }
     }
 }
@@ -74,44 +74,32 @@ async fn handle_chat_completions_inner(
     // The request id is consumed by prepare_request below; snapshot it once so
     // every early-gate emit references the same id.
     let request_id = req_id.0.clone();
+    // Every early gate emits exactly one ResponseFailed with the same
+    // provider/request/start triple; bind it once instead of repeating the
+    // six-argument call at each gate.
+    let emit_failed = |e: &RouteError| {
+        core_pipeline::emit_response_failed(
+            &event_bus,
+            &request_id,
+            Some(provider.as_str()),
+            None,
+            e,
+            start,
+        );
+    };
     // Input validation gates, ordered cheapest-first to avoid charging
     // rate-limit/dedup budget for malformed requests. Mirrors the ordering
     // established in `token_count.rs`: provider name -> existence ->
     // content-type -> rate-limit/dedup -> JSON parse.
-    core_pipeline::validate_provider_name(&provider).inspect_err(|e| {
-        core_pipeline::emit_response_failed(
-            &event_bus,
-            &request_id,
-            Some(provider.as_str()),
-            None,
-            e,
-            start,
-        )
-    })?;
+    core_pipeline::validate_provider_name(&provider).inspect_err(&emit_failed)?;
     if state.providers().get(&provider).is_none() {
         // Unknown-provider early gate: emit exactly one ResponseFailed before
         // returning. provider is known from the path (audit route-responsefailed-gaps).
         let err = RouteError::UnknownProvider(provider.clone());
-        core_pipeline::emit_response_failed(
-            &event_bus,
-            &request_id,
-            Some(provider.as_str()),
-            None,
-            &err,
-            start,
-        );
+        emit_failed(&err);
         return Err(err);
     }
-    core_pipeline::validate_json_content_type(&headers).inspect_err(|e| {
-        core_pipeline::emit_response_failed(
-            &event_bus,
-            &request_id,
-            Some(provider.as_str()),
-            None,
-            e,
-            start,
-        )
-    })?;
+    core_pipeline::validate_json_content_type(&headers).inspect_err(&emit_failed)?;
 
     let request_path = format!("/providers/{provider}/v1/chat/completions");
     let ctx = core_pipeline::prepare_request(
@@ -122,16 +110,7 @@ async fn handle_chat_completions_inner(
         &body,
         &request_path,
     )
-    .inspect_err(|e| {
-        core_pipeline::emit_response_failed(
-            &event_bus,
-            &request_id,
-            Some(provider.as_str()),
-            None,
-            e,
-            start,
-        )
-    })?;
+    .inspect_err(&emit_failed)?;
 
     // Parse the OpenAI ChatCompletionRequest via axum's `Json` helper so the
     // `JsonRejection` taxonomy (syntax vs data error) is preserved and mapped
@@ -141,14 +120,7 @@ async fn handle_chat_completions_inner(
         Ok(Json(value)) => value,
         Err(rejection) => {
             let err = json_rejection_to_route_error(rejection);
-            core_pipeline::emit_response_failed(
-                &event_bus,
-                &request_id,
-                Some(provider.as_str()),
-                None,
-                &err,
-                start,
-            );
+            emit_failed(&err);
             return Err(err);
         }
     };
@@ -159,16 +131,7 @@ async fn handle_chat_completions_inner(
     // decode_request: it checks for non-empty model and non-empty messages.
     let core = openai_chat::decode_request(req)
         .map_err(core_pipeline::protocol_error_to_route)
-        .inspect_err(|e| {
-            core_pipeline::emit_response_failed(
-                &event_bus,
-                &request_id,
-                Some(provider.as_str()),
-                None,
-                e,
-                start,
-            )
-        })?;
+        .inspect_err(|e| emit_failed(e))?;
 
     let is_streaming = core.stream;
     info!(

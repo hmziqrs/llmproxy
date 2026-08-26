@@ -2370,7 +2370,7 @@ mod tests {
     #[test]
     fn sampling_options_stop_rejects_number() {
         let json = r#"{"stop": 42}"#;
-        assert!(serde_json::from_str::<SamplingOptions>(json).is_err());
+        serde_json::from_str::<SamplingOptions>(json).unwrap_err();
     }
 
     #[test]
@@ -2439,13 +2439,13 @@ mod tests {
     #[test]
     fn core_request_rejects_invalid_utf8_bytes() {
         let bad_bytes = b"{\"model\":{\"requested\":\"m\"},\"messages\":[],\"system\":[],\"tools\":[],\"sampling\":{},\"stream\":false,\"metadata\":{},\"provider_hints\":{},\"bad\xff_field\":1}";
-        assert!(serde_json::from_slice::<CoreRequest>(bad_bytes).is_err());
+        serde_json::from_slice::<CoreRequest>(bad_bytes).unwrap_err();
     }
 
     #[test]
     fn core_response_rejects_invalid_utf8_bytes() {
         let bad_bytes = b"{\"model\":{\"requested\":\"m\"},\"content\":[],\"stop_reason\":\"EndTurn\",\"usage\":{\"input_tokens\":0,\"output_tokens\":0},\"bad\xff_field\":1}";
-        assert!(serde_json::from_slice::<CoreResponse>(bad_bytes).is_err());
+        serde_json::from_slice::<CoreResponse>(bad_bytes).unwrap_err();
     }
 
     #[test]

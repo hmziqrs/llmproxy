@@ -198,12 +198,11 @@ impl ChatMessage {
             serde_json::Value::Array(parts) => {
                 let mut out = String::new();
                 for part in parts {
-                    if let serde_json::Value::Object(map) = part {
-                        if map.get("type").and_then(|v| v.as_str()) == Some("text") {
-                            if let Some(text) = map.get("text").and_then(|v| v.as_str()) {
-                                out.push_str(text);
-                            }
-                        }
+                    if let serde_json::Value::Object(map) = part
+                        && map.get("type").and_then(|v| v.as_str()) == Some("text")
+                        && let Some(text) = map.get("text").and_then(|v| v.as_str())
+                    {
+                        out.push_str(text);
                     }
                 }
                 out

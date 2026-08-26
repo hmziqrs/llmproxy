@@ -125,6 +125,17 @@ pub fn cmd_stop_with_timing(
                     }
                 }
 
+                #[expect(
+                    unsafe_code,
+                    reason = "libc::kill has no safe wrapper in std; pid ownership is verified immediately above"
+                )]
+                // SAFETY: `kill` is a bare syscall wrapper: it dereferences no
+                // pointers and touches no memory owned by this process, so it is
+                // sound for any `pid`/`sig` pair. The `classify_pid_ownership`
+                // check immediately above establishes that `pid` is still the
+                // one recorded in our PID file, which is what makes the
+                // graceful signal correct (not merely sound). The result and
+                // `errno` are consumed on the next line.
                 let ret = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
                 if ret != 0 {
                     let err = std::io::Error::last_os_error();
@@ -176,6 +187,17 @@ pub fn cmd_stop_with_timing(
                         return Ok(());
                     }
                 }
+                #[expect(
+                    unsafe_code,
+                    reason = "libc::kill has no safe wrapper in std; pid ownership is verified immediately above"
+                )]
+                // SAFETY: `kill` is a bare syscall wrapper: it dereferences no
+                // pointers and touches no memory owned by this process, so it is
+                // sound for any `pid`/`sig` pair. The `classify_pid_ownership`
+                // check immediately above establishes that `pid` is still the
+                // one recorded in our PID file, which is what makes the
+                // forced signal correct (not merely sound). The result and
+                // `errno` are consumed on the next line.
                 let ret = unsafe { libc::kill(pid as i32, libc::SIGKILL) };
                 if ret != 0 {
                     let err = std::io::Error::last_os_error();

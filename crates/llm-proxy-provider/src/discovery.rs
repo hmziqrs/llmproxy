@@ -434,7 +434,10 @@ impl Default for DiscoveryClient {
     /// Panics if the underlying `reqwest::Client` cannot be constructed (e.g.
     /// due to a TLS backend initialization failure). Use [`DiscoveryClient::try_new`]
     /// for a fallible constructor.
-    #[expect(clippy::expect_used)]
+    #[expect(
+        clippy::expect_used,
+        reason = "Default is infallible in practice; try_new is the fallible constructor"
+    )]
     fn default() -> Self {
         Self::try_new().expect("default discovery HTTP client configuration is valid")
     }
@@ -448,7 +451,7 @@ mod tests {
     use axum::extract::State;
     use axum::http::HeaderMap;
     use axum::routing::get;
-    use llm_proxy_core::{ProviderDiscoveryConfig, ProviderRoutesConfig};
+    use llm_proxy_core::ProviderRoutesConfig;
     use serde_json::json;
     use std::collections::HashMap;
     use std::sync::Arc;

@@ -5,12 +5,64 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
-use llm_proxy_core::{CatalogFile, CatalogFileMetadata, ProviderRegistry, merge_catalog};
+use llm_proxy_core::{
+    CatalogFile, CatalogFileMetadata, ProviderConfig, ProviderRegistry, StaticModelCatalogEntry,
+    merge_catalog,
+};
 use llm_proxy_provider::DiscoveryClient;
 use llm_proxy_server::{ModelCatalogService, write_catalog_atomic};
 
 use crate::config_validation::validate_toml_extension;
 use crate::paths::{providers_dir_for, resolve_config};
+
+/// Print the configured route adapters for a provider.
+fn print_provider_routes(provider: &ProviderConfig) {
+    let has_routes =
+        provider.routes.chat_completions.is_some() || provider.routes.messages.is_some();
+    println!("    routes:");
+    if let Some(ref adapter) = provider.routes.chat_completions {
+        println!("      chat_completions -> {adapter}");
+    }
+    if let Some(ref adapter) = provider.routes.messages {
+        println!("      messages -> {adapter}");
+    }
+    if !has_routes {
+        println!("      (none configured)");
+    }
+}
+
+/// Build the on-disk cache file for a freshly discovered catalog.
+fn discovered_catalog_file(
+    provider: &ProviderConfig,
+    discovered: Vec<StaticModelCatalogEntry>,
+) -> CatalogFile {
+    CatalogFile {
+        catalog: CatalogFileMetadata {
+            provider: provider.name.clone(),
+            source: "live".to_owned(),
+            // Rfc3339 formatting of a UTC OffsetDateTime is infallible in
+            // practice, but the time crate models it as fallible. Propagate a
+            // fallback epoch timestamp instead of panicking after a successful
+            // live fetch, mirroring catalog_service::now_rfc3339.
+            generated_at: time::OffsetDateTime::now_utc()
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_owned()),
+            models: discovered,
+        },
+    }
+}
+
+/// Print the resolved model catalog for a provider.
+fn print_model_entries(entries: &[StaticModelCatalogEntry]) {
+    println!("    models:");
+    if entries.is_empty() {
+        println!("      (none available)");
+    } else {
+        for entry in entries {
+            println!("      {}", entry.id);
+        }
+    }
+}
 
 /// Run the `models` command.
 ///
@@ -70,18 +122,7 @@ pub async fn cmd_models(
         println!("  {}:", provider.name);
 
         // Show routes.
-        let has_routes =
-            provider.routes.chat_completions.is_some() || provider.routes.messages.is_some();
-        println!("    routes:");
-        if let Some(ref adapter) = provider.routes.chat_completions {
-            println!("      chat_completions -> {adapter}");
-        }
-        if let Some(ref adapter) = provider.routes.messages {
-            println!("      messages -> {adapter}");
-        }
-        if !has_routes {
-            println!("      (none configured)");
-        }
+        print_provider_routes(provider);
 
         let catalog_config = provider.catalog.clone().unwrap_or_default();
         let entries = if live {
@@ -100,21 +141,7 @@ pub async fn cmd_models(
                     if write_catalog {
                         write_catalog_atomic(
                             &cache_dir,
-                            &CatalogFile {
-                                catalog: CatalogFileMetadata {
-                                    provider: provider.name.clone(),
-                                    source: "live".to_owned(),
-                                    // Rfc3339 formatting of a UTC OffsetDateTime is
-                                    // infallible in practice, but the time crate models it
-                                    // as fallible. Propagate a fallback epoch timestamp
-                                    // instead of panicking after a successful live fetch,
-                                    // mirroring catalog_service::now_rfc3339.
-                                    generated_at: time::OffsetDateTime::now_utc()
-                                        .format(&time::format_description::well_known::Rfc3339)
-                                        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_owned()),
-                                    models: discovered,
-                                },
-                            },
+                            &discovered_catalog_file(provider, discovered),
                         )?;
                     }
                     entries
@@ -132,14 +159,7 @@ pub async fn cmd_models(
             catalogs.catalog(provider, false).await?
         };
 
-        println!("    models:");
-        if entries.is_empty() {
-            println!("      (none available)");
-        } else {
-            for entry in entries {
-                println!("      {}", entry.id);
-            }
-        }
+        print_model_entries(&entries);
     }
 
     Ok(())

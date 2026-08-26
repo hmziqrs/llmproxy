@@ -2,7 +2,7 @@
 //!
 //! Validates TOML config and prints provider route table.
 
-use std::path::PathBuf;
+use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use llm_proxy_core::{AppConfig, ProviderRegistry, load_app_config};
@@ -16,8 +16,8 @@ use crate::state::catalog_enforcement_warning;
 ///
 /// Loads main TOML, loads provider files, validates provider adapter protocols
 /// against builtins, and prints provider route table.
-pub fn cmd_validate(config_path: Option<PathBuf>) -> Result<()> {
-    let path = resolve_config(config_path.as_deref());
+pub fn cmd_validate(config_path: Option<&Path>) -> Result<()> {
+    let path = resolve_config(config_path);
 
     // Reject JSON config and non-TOML extensions.
     validate_toml_extension(&path)?;
@@ -93,40 +93,7 @@ pub fn cmd_validate(config_path: Option<PathBuf>) -> Result<()> {
     if registry.is_empty() {
         println!("  (no providers loaded)");
     } else {
-        let mut route_errors: Vec<String> = Vec::new();
-        for provider in registry.iter() {
-            println!("{}:", provider.name);
-            let has_routes =
-                provider.routes.chat_completions.is_some() || provider.routes.messages.is_some();
-            if !has_routes {
-                println!("  (no routes configured)");
-            } else {
-                let route_entries: Vec<(&str, &String)> = provider
-                    .routes
-                    .chat_completions
-                    .as_ref()
-                    .map(|a| ("chat_completions", a))
-                    .into_iter()
-                    .chain(provider.routes.messages.as_ref().map(|a| ("messages", a)))
-                    .collect();
-
-                for (route_kind, adapter_name) in &route_entries {
-                    match provider.adapters.get(*adapter_name) {
-                        Some(adapter) => {
-                            println!("  {} -> {}/{}", route_kind, adapter_name, adapter.protocol);
-                        }
-                        None => {
-                            let msg = format!(
-                                "  {} -> ERROR: unknown adapter \"{}\"",
-                                route_kind, adapter_name
-                            );
-                            println!("{}", msg);
-                            route_errors.push(msg);
-                        }
-                    }
-                }
-            }
-        }
+        let route_errors: Vec<String> = registry.iter().flat_map(print_provider_routes).collect();
 
         if !route_errors.is_empty() {
             bail!(
@@ -154,6 +121,38 @@ pub fn cmd_validate(config_path: Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
+/// Print one provider's route table, returning one message per route whose
+/// adapter could not be resolved.
+fn print_provider_routes(provider: &llm_proxy_core::ProviderConfig) -> Vec<String> {
+    println!("{}:", provider.name);
+
+    let route_entries: Vec<(&str, &String)> = provider
+        .routes
+        .chat_completions
+        .as_ref()
+        .map(|a| ("chat_completions", a))
+        .into_iter()
+        .chain(provider.routes.messages.as_ref().map(|a| ("messages", a)))
+        .collect();
+
+    if route_entries.is_empty() {
+        println!("  (no routes configured)");
+        return Vec::new();
+    }
+
+    let mut errors = Vec::new();
+    for (route_kind, adapter_name) in route_entries {
+        if let Some(adapter) = provider.adapters.get(adapter_name) {
+            println!("  {route_kind} -> {adapter_name}/{}", adapter.protocol);
+        } else {
+            let msg = format!("  {route_kind} -> ERROR: unknown adapter \"{adapter_name}\"");
+            println!("{msg}");
+            errors.push(msg);
+        }
+    }
+    errors
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -165,8 +164,8 @@ mod tests {
         let config = dir.path().join("config.toml");
         std::fs::write(&config, DEFAULT_CONFIG_TOML).unwrap();
 
-        let result = cmd_validate(Some(config));
-        assert!(result.is_ok());
+        let result = cmd_validate(Some(&config));
+        result.unwrap();
     }
 
     #[test]
@@ -175,7 +174,7 @@ mod tests {
         let config = dir.path().join("config.toml");
         std::fs::write(&config, "not valid toml {{{{").unwrap();
 
-        let result = cmd_validate(Some(config));
+        let result = cmd_validate(Some(&config));
         assert!(result.is_err());
     }
 }

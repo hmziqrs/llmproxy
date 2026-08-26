@@ -59,8 +59,9 @@ fn unix_timestamp_secs() -> i64 {
 /// provider ever emits an index larger than `i32::MAX` we clamp it and emit a
 /// warning so the stream is not broken by an overflow panic.
 fn clamp_tool_index(index: usize) -> i32 {
-    let clamped = index.min(i32::MAX as usize) as i32;
-    if clamped as usize != index {
+    let capped = index.min(i32::MAX as usize);
+    let clamped = capped as i32;
+    if capped != index {
         tracing::warn!(
             original_index = index,
             clamped_index = clamped,
@@ -68,6 +69,21 @@ fn clamp_tool_index(index: usize) -> i32 {
         );
     }
     clamped
+}
+
+/// Parses a tool-call `arguments` JSON string, warning and yielding `None`
+/// when the provider emitted something that is not valid JSON.
+fn parse_tool_call_arguments(arguments: &str) -> Option<serde_json::Value> {
+    match serde_json::from_str::<serde_json::Value>(arguments) {
+        Ok(value) => Some(value),
+        Err(_) => {
+            tracing::warn!(
+                arguments = %arguments,
+                "malformed tool_call.function.arguments; replacing with empty object"
+            );
+            None
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -141,32 +157,18 @@ pub fn decode_request(req: ChatCompletionRequest) -> Result<CoreRequest, Protoco
                     let tc_id = tc.id.ok_or_else(|| {
                         ProtocolError::InvalidRequest("tool_call.id is required".into())
                     })?;
-                    let tc_function = tc.function;
-                    let (tc_name, tc_args) = if let Some(f) = tc_function {
-                        let name = f.name.ok_or_else(|| {
-                            ProtocolError::InvalidRequest(
-                                "tool_call.function.name is required".into(),
-                            )
-                        })?;
-                        let args: serde_json::Value = f
-                            .arguments
-                            .and_then(|a| {
-                                let parsed = serde_json::from_str::<serde_json::Value>(&a);
-                                if parsed.is_err() {
-                                    tracing::warn!(
-                                        arguments = %a,
-                                        "malformed tool_call.function.arguments; replacing with empty object"
-                                    );
-                                }
-                                parsed.ok()
-                            })
-                            .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
-                        (name, args)
-                    } else {
+                    let Some(tc_function) = tc.function else {
                         return Err(ProtocolError::InvalidRequest(
                             "tool_call.function is required".into(),
                         ));
                     };
+                    let tc_name = tc_function.name.ok_or_else(|| {
+                        ProtocolError::InvalidRequest("tool_call.function.name is required".into())
+                    })?;
+                    let tc_args: serde_json::Value = tc_function
+                        .arguments
+                        .and_then(|a| parse_tool_call_arguments(&a))
+                        .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
                     content.push(CoreContent::ToolUse {
                         id: tc_id,
                         name: tc_name,

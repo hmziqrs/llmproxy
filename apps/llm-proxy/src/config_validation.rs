@@ -43,13 +43,13 @@ mod tests {
     #[test]
     fn cmd_validate_accepts_toml_extension() {
         let result = validate_toml_extension(Path::new("config.toml"));
-        assert!(result.is_ok());
+        result.unwrap();
     }
 
     #[test]
     fn cmd_validate_accepts_uppercase_toml() {
         let result = validate_toml_extension(Path::new("config.TOML"));
-        assert!(result.is_ok());
+        result.unwrap();
     }
 
     #[test]

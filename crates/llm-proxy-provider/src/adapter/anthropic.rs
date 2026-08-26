@@ -12,8 +12,8 @@ use std::sync::LazyLock;
 
 use llm_proxy_protocol::anthropic::{MessageEvent, MessageResponse};
 use llm_proxy_protocol::core::{
-    ContentKind, CoreContent, CoreEvent, CoreRequest, CoreResponse, CoreRole, CoreToolChoice,
-    ModelRef, StopReason, UsageProvenance,
+    ContentKind, CoreContent, CoreEvent, CoreMessage, CoreRequest, CoreResponse, CoreRole,
+    CoreTool, CoreToolChoice, ModelRef, StopReason, UsageProvenance,
 };
 
 use super::{
@@ -58,8 +58,8 @@ fn json_object(val: &mut serde_json::Value) -> &mut serde_json::Map<String, serd
 // security issue.
 
 // Anthropic `tool_use_id` must match `^[A-Za-z0-9_]{0,256}$`.
-// SAFETY: The regex pattern is a compile-time constant that is syntactically
-// valid. This cannot fail at runtime.
+// NOTE: The regex pattern is a compile-time constant that is syntactically
+// valid, so compilation cannot fail at runtime.
 static INVALID_TOOL_USE_ID_CHAR: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"[^A-Za-z0-9_]").expect("valid regex"));
 
@@ -91,7 +91,7 @@ fn sanitize_tool_name(name: &str) -> (String, bool) {
             let mut buf = [0u8; 4];
             let encoded = ch.encode_utf8(&mut buf);
             for &byte in encoded.as_bytes() {
-                // SAFETY: write! to a String cannot fail (the fmt::Write
+                // NOTE: write! to a String cannot fail (the fmt::Write
                 // impl for String is infallible).
                 write!(result, "_0x{:02x}_", byte).expect("write! to String is infallible");
             }
@@ -288,6 +288,185 @@ pub struct AnthropicStreamDecoder {
     stop_sent: bool,
 }
 
+/// Returns the tool-block `field` value, or a sentinel when upstream omitted it.
+///
+/// Anthropic is expected to always send `id` and `name` on a `tool_use` block;
+/// a missing value is logged and replaced so the stream stays decodable.
+fn tool_field_or_sentinel(value: Option<&str>, field: &str, sentinel: &str) -> String {
+    match value {
+        Some(v) => v.to_owned(),
+        None => {
+            tracing::warn!(
+                field,
+                "Anthropic: tool_use block missing field, using sentinel"
+            );
+            sentinel.to_owned()
+        }
+    }
+}
+
+/// Translates a `content_block_delta` event into the matching core delta event.
+///
+/// Empty payloads are dropped: they carry no information and would otherwise
+/// surface as zero-length deltas downstream.
+fn push_content_block_delta(event: &MessageEvent, events: &mut Vec<CoreEvent>) {
+    let idx = event.index.unwrap_or(0);
+    let Some(ref delta) = event.delta else {
+        return;
+    };
+    match delta.r#type.as_deref().unwrap_or("") {
+        "text_delta" => {
+            if let Some(ref text) = delta.text
+                && !text.is_empty()
+            {
+                events.push(CoreEvent::TextDelta {
+                    index: idx,
+                    text: text.clone(),
+                });
+            }
+        }
+        "thinking_delta" => {
+            if let Some(ref text) = delta.thinking
+                && !text.is_empty()
+            {
+                events.push(CoreEvent::ThinkingDelta {
+                    index: idx,
+                    text: text.clone(),
+                });
+            }
+        }
+        "input_json_delta" => {
+            if let Some(ref partial) = delta.partial_json
+                && !partial.is_empty()
+            {
+                events.push(CoreEvent::ToolCallDelta {
+                    index: idx,
+                    args_delta: partial.clone(),
+                });
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Translates an Anthropic `error` event into a `CoreEvent::Error`.
+fn push_stream_error(event: &MessageEvent, events: &mut Vec<CoreEvent>) {
+    let Some(ref err) = event.error else {
+        return;
+    };
+    let kind = match err.r#type.as_str() {
+        "rate_limit_error" => llm_proxy_protocol::core::CoreStreamErrorKind::RateLimit,
+        "authentication_error" => llm_proxy_protocol::core::CoreStreamErrorKind::Authentication,
+        "invalid_request_error" => llm_proxy_protocol::core::CoreStreamErrorKind::InvalidRequest,
+        "permission_error" => llm_proxy_protocol::core::CoreStreamErrorKind::Permission,
+        _ => llm_proxy_protocol::core::CoreStreamErrorKind::Upstream,
+    };
+    events.push(CoreEvent::Error {
+        error: llm_proxy_protocol::core::CoreStreamError::new(kind, err.message.clone()),
+    });
+}
+
+impl AnthropicStreamDecoder {
+    /// Handles `content_block_start`, tracking the block kind and tool blocks.
+    fn push_content_block_start(&mut self, event: &MessageEvent, events: &mut Vec<CoreEvent>) {
+        let idx = event.index.unwrap_or(0);
+        let Some(ref block) = event.content_block else {
+            return;
+        };
+        match block.r#type.as_str() {
+            "thinking" => {
+                self.current_block_kind = ContentKind::Thinking;
+                events.push(CoreEvent::ContentStart {
+                    index: idx,
+                    kind: ContentKind::Thinking,
+                });
+            }
+            "tool_use" => {
+                self.current_block_kind = ContentKind::ToolUse;
+                self.tool_blocks.push(idx);
+                self.tool_blocks_closed.push(false);
+                let id = tool_field_or_sentinel(block.id.as_deref(), "id", "<unknown_tool_id>");
+                let name = tool_field_or_sentinel(block.name.as_deref(), "name", "<unknown_tool>");
+                // Reverse-map sanitized tool names back to originals,
+                // same as the non-streaming decode path.
+                let original_name = desanitize_tool_name(&name).into_owned();
+                events.push(CoreEvent::ToolCallStart {
+                    index: idx,
+                    id,
+                    name: original_name,
+                });
+            }
+            // "text", plus any unknown block type, emit a generic ContentStart.
+            _ => {
+                self.current_block_kind = ContentKind::Text;
+                events.push(CoreEvent::ContentStart {
+                    index: idx,
+                    kind: ContentKind::Text,
+                });
+            }
+        }
+    }
+
+    /// Handles `content_block_stop`, closing an open tool block.
+    fn push_content_block_stop(&mut self, event: &MessageEvent, events: &mut Vec<CoreEvent>) {
+        let idx = event.index.unwrap_or(0);
+        if self.current_block_kind == ContentKind::ToolUse {
+            events.push(CoreEvent::ToolCallStop { index: idx });
+            // Mark this tool block as closed so finish() won't re-emit.
+            let closed_slot = self
+                .tool_blocks
+                .iter()
+                .position(|&i| i == idx)
+                .and_then(|tool_idx| self.tool_blocks_closed.get_mut(tool_idx));
+            if let Some(closed) = closed_slot {
+                *closed = true;
+            } else {
+                // Index not found in tracked tool blocks -- the tool call
+                // was never opened via a content_block_start event, so
+                // there is nothing to mark as closed.  Log the mismatch
+                // for observability.
+                tracing::warn!(
+                    idx,
+                    "Anthropic: tool block index not found in content_block_stop; \
+                     skipping close since tool call was never opened"
+                );
+            }
+        }
+        self.current_block_kind = ContentKind::Text;
+    }
+
+    /// Handles `message_delta`, emitting usage before any terminal stop event.
+    fn push_message_delta(&mut self, event: &MessageEvent, events: &mut Vec<CoreEvent>) {
+        // Usage from message_delta -- emitted BEFORE MessageStop so that
+        // downstream consumers see UsageDelta before the terminal event,
+        // consistent with the plan's documented event ordering.
+        if let Some(ref usage) = event.usage {
+            events.push(CoreEvent::UsageDelta {
+                usage: build_anthropic_usage(
+                    usage.input_tokens,
+                    usage.output_tokens,
+                    usage.cache_creation_input_tokens,
+                    usage.cache_read_input_tokens,
+                ),
+            });
+        }
+        // Stop reason from message_delta -- emitted AFTER UsageDelta.
+        if let Some(ref delta) = event.delta
+            && let Some(ref reason) = delta.stop_reason
+            && !reason.is_empty()
+            && !self.stop_sent
+        {
+            self.stop_sent = true;
+            let stop_reason = map_anthropic_stop_reason(reason);
+            let stop_sequence = delta.stop_sequence.clone();
+            events.push(CoreEvent::MessageStop {
+                stop_reason,
+                stop_sequence,
+            });
+        }
+    }
+}
+
 impl ProviderStreamDecoder for AnthropicStreamDecoder {
     fn decode_frame(&mut self, frame: &SseFrame) -> Result<Vec<CoreEvent>, ProviderError> {
         let data = frame.data.trim();
@@ -310,13 +489,11 @@ impl ProviderStreamDecoder for AnthropicStreamDecoder {
             "message_start" => {
                 if !self.started {
                     self.started = true;
-                    let id = event.message.as_ref().and_then(|m| {
-                        if m.id.is_empty() {
-                            None
-                        } else {
-                            Some(m.id.clone())
-                        }
-                    });
+                    let id = event
+                        .message
+                        .as_ref()
+                        .filter(|m| !m.id.is_empty())
+                        .map(|m| m.id.clone());
                     events.push(CoreEvent::MessageStart {
                         id,
                         model: self.model_ref.clone(),
@@ -324,149 +501,16 @@ impl ProviderStreamDecoder for AnthropicStreamDecoder {
                 }
             }
             "content_block_start" => {
-                let idx = event.index.unwrap_or(0);
-
-                if let Some(ref block) = event.content_block {
-                    match block.r#type.as_str() {
-                        "text" => {
-                            self.current_block_kind = ContentKind::Text;
-                            events.push(CoreEvent::ContentStart {
-                                index: idx,
-                                kind: ContentKind::Text,
-                            });
-                        }
-                        "thinking" => {
-                            self.current_block_kind = ContentKind::Thinking;
-                            events.push(CoreEvent::ContentStart {
-                                index: idx,
-                                kind: ContentKind::Thinking,
-                            });
-                        }
-                        "tool_use" => {
-                            self.current_block_kind = ContentKind::ToolUse;
-                            self.tool_blocks.push(idx);
-                            self.tool_blocks_closed.push(false);
-                            let id = block.id.clone().unwrap_or_else(|| {
-                                tracing::warn!(
-                                    "Anthropic: tool_use block missing id, using sentinel"
-                                );
-                                "<unknown_tool_id>".to_owned()
-                            });
-                            let name = block.name.clone().unwrap_or_else(|| {
-                                tracing::warn!(
-                                    "Anthropic: tool_use block missing name, using sentinel"
-                                );
-                                "<unknown_tool>".to_owned()
-                            });
-                            // Reverse-map sanitized tool names back to originals,
-                            // same as the non-streaming decode path.
-                            let original_name = desanitize_tool_name(&name).into_owned();
-                            events.push(CoreEvent::ToolCallStart {
-                                index: idx,
-                                id,
-                                name: original_name,
-                            });
-                        }
-                        _ => {
-                            // Unknown block type; emit generic ContentStart.
-                            self.current_block_kind = ContentKind::Text;
-                            events.push(CoreEvent::ContentStart {
-                                index: idx,
-                                kind: ContentKind::Text,
-                            });
-                        }
-                    }
-                }
+                self.push_content_block_start(&event, &mut events);
             }
             "content_block_delta" => {
-                let idx = event.index.unwrap_or(0);
-                if let Some(ref delta) = event.delta {
-                    match delta.r#type.as_deref().or(Some("")) {
-                        Some("text_delta") => {
-                            if let Some(ref text) = delta.text {
-                                if !text.is_empty() {
-                                    events.push(CoreEvent::TextDelta {
-                                        index: idx,
-                                        text: text.clone(),
-                                    });
-                                }
-                            }
-                        }
-                        Some("thinking_delta") => {
-                            if let Some(ref text) = delta.thinking {
-                                if !text.is_empty() {
-                                    events.push(CoreEvent::ThinkingDelta {
-                                        index: idx,
-                                        text: text.clone(),
-                                    });
-                                }
-                            }
-                        }
-                        Some("input_json_delta") => {
-                            if let Some(ref partial) = delta.partial_json {
-                                if !partial.is_empty() {
-                                    events.push(CoreEvent::ToolCallDelta {
-                                        index: idx,
-                                        args_delta: partial.clone(),
-                                    });
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
-                }
+                push_content_block_delta(&event, &mut events);
             }
             "content_block_stop" => {
-                let idx = event.index.unwrap_or(0);
-                if self.current_block_kind == ContentKind::ToolUse {
-                    events.push(CoreEvent::ToolCallStop { index: idx });
-                    // Mark this tool block as closed so finish() won't re-emit.
-                    if let Some(tool_idx) = self.tool_blocks.iter().position(|&i| i == idx) {
-                        if tool_idx < self.tool_blocks_closed.len() {
-                            self.tool_blocks_closed[tool_idx] = true;
-                        }
-                    } else {
-                        // Index not found in tracked tool blocks -- the tool call
-                        // was never opened via a content_block_start event, so
-                        // there is nothing to mark as closed.  Log the mismatch
-                        // for observability.
-                        tracing::warn!(
-                            idx,
-                            "Anthropic: tool block index not found in content_block_stop; \
-                             skipping close since tool call was never opened"
-                        );
-                    }
-                }
-                self.current_block_kind = ContentKind::Text;
+                self.push_content_block_stop(&event, &mut events);
             }
             "message_delta" => {
-                // Usage from message_delta -- emitted BEFORE MessageStop so that
-                // downstream consumers see UsageDelta before the terminal event,
-                // consistent with the plan's documented event ordering.
-                if let Some(ref usage) = event.usage {
-                    events.push(CoreEvent::UsageDelta {
-                        usage: build_anthropic_usage(
-                            usage.input_tokens,
-                            usage.output_tokens,
-                            usage.cache_creation_input_tokens,
-                            usage.cache_read_input_tokens,
-                        ),
-                    });
-                }
-                // Stop reason from message_delta -- emitted AFTER UsageDelta.
-                if let Some(ref delta) = event.delta {
-                    if let Some(ref reason) = delta.stop_reason {
-                        if !reason.is_empty() && !self.stop_sent {
-                            self.stop_sent = true;
-                            let stop_reason = map_anthropic_stop_reason(reason);
-                            let stop_sequence = delta.stop_sequence.clone();
-                            events.push(CoreEvent::MessageStop {
-                                stop_reason,
-                                stop_sequence,
-                            });
-                        }
-                    }
-                }
+                self.push_message_delta(&event, &mut events);
             }
             "message_stop" => {
                 if !self.stop_sent {
@@ -485,29 +529,7 @@ impl ProviderStreamDecoder for AnthropicStreamDecoder {
                 events.push(CoreEvent::Ping);
             }
             "error" => {
-                if let Some(ref err) = event.error {
-                    let kind = match err.r#type.as_str() {
-                        "rate_limit_error" => {
-                            llm_proxy_protocol::core::CoreStreamErrorKind::RateLimit
-                        }
-                        "authentication_error" => {
-                            llm_proxy_protocol::core::CoreStreamErrorKind::Authentication
-                        }
-                        "invalid_request_error" => {
-                            llm_proxy_protocol::core::CoreStreamErrorKind::InvalidRequest
-                        }
-                        "permission_error" => {
-                            llm_proxy_protocol::core::CoreStreamErrorKind::Permission
-                        }
-                        _ => llm_proxy_protocol::core::CoreStreamErrorKind::Upstream,
-                    };
-                    events.push(CoreEvent::Error {
-                        error: llm_proxy_protocol::core::CoreStreamError::new(
-                            kind,
-                            err.message.clone(),
-                        ),
-                    });
-                }
+                push_stream_error(&event, &mut events);
             }
             _ => {
                 // Unknown event type; skip.
@@ -563,135 +585,10 @@ impl AnthropicAdapter {
         core: &CoreRequest,
         target: &ProviderAdapterTarget,
     ) -> Result<super::ProxyRequest, ProviderError> {
-        // System prompt -- build as JSON array of SystemContentBlock.
-        let system = if core.system.is_empty() {
-            None
-        } else {
-            let blocks: Vec<serde_json::Value> = core
-                .system
-                .iter()
-                .filter_map(|c| match c {
-                    CoreContent::Text { text, cache } => {
-                        if text.is_empty() {
-                            return None;
-                        }
-                        let mut block = serde_json::json!({
-                            "type": "text",
-                            "text": text,
-                        });
-                        if let Some(cc) = cache {
-                            json_object(&mut block).insert(
-                                "cache_control".to_owned(),
-                                serde_json::json!({"type": cc.r#type}),
-                            );
-                        }
-                        Some(block)
-                    }
-                    other => {
-                        tracing::warn!(
-                            ?other,
-                            "dropping non-Text system content block during Anthropic encode"
-                        );
-                        None
-                    }
-                })
-                .collect();
-            if blocks.is_empty() {
-                None
-            } else {
-                Some(serde_json::Value::Array(blocks))
-            }
-        };
-
-        // Messages -- build as JSON array.
-        let mut messages = Vec::new();
-        for msg in &core.messages {
-            match msg.role {
-                CoreRole::User => {
-                    let content = encode_content_blocks(&msg.content);
-                    messages.push(serde_json::json!({
-                        "role": "user",
-                        "content": content,
-                    }));
-                }
-                CoreRole::Assistant => {
-                    let content = encode_assistant_content(&msg.content);
-                    messages.push(serde_json::json!({
-                        "role": "assistant",
-                        "content": content,
-                    }));
-                }
-                CoreRole::System => {
-                    // System messages should have been extracted into the
-                    // `system` field by the client adapter.  If one reaches
-                    // here it means the client adapter did not separate it.
-                    tracing::warn!(
-                        role = "system",
-                        "Anthropic adapter received system-role message in messages; \
-                         dropping because Anthropic does not support system role in messages"
-                    );
-                }
-                CoreRole::Tool => {
-                    // Tool results come through user role in Anthropic.
-                    let content = encode_content_blocks(&msg.content);
-                    messages.push(serde_json::json!({
-                        "role": "user",
-                        "content": content,
-                    }));
-                }
-                _ => {
-                    // Handle future CoreRole variants.
-                    let content = encode_content_blocks(&msg.content);
-                    messages.push(serde_json::json!({
-                        "role": "user",
-                        "content": content,
-                    }));
-                }
-            }
-        }
-
-        // Tools -- build as JSON array with name sanitization.
-        let tools: Vec<serde_json::Value> = core
-            .tools
-            .iter()
-            .map(|t| {
-                // Coerce non-object input_schema to a default object schema.
-                let schema = if !t.input_schema.is_object() {
-                    serde_json::json!({"type": "object", "properties": {}})
-                } else {
-                    t.input_schema.clone()
-                };
-                let (sanitized_name, _changed) = sanitize_tool_name(&t.name);
-                let mut tool = serde_json::json!({
-                    "name": sanitized_name,
-                    "input_schema": schema,
-                });
-                if let Some(ref desc) = t.description {
-                    json_object(&mut tool).insert(
-                        "description".to_owned(),
-                        serde_json::Value::String(desc.clone()),
-                    );
-                }
-                tool
-            })
-            .collect();
-
-        // Tool choice.  Unknown variants are omitted (None) rather than sent as
-        // JSON null, which would cause the Anthropic API to reject the request.
-        let tool_choice = core.tool_choice.as_ref().and_then(|tc| match tc {
-            CoreToolChoice::Auto => Some(serde_json::json!({"type": "auto"})),
-            CoreToolChoice::Any => Some(serde_json::json!({"type": "any"})),
-            CoreToolChoice::None => Some(serde_json::json!({"type": "none"})),
-            CoreToolChoice::Tool { name } => {
-                let (sanitized, _) = sanitize_tool_name(name);
-                Some(serde_json::json!({
-                    "type": "tool",
-                    "name": sanitized
-                }))
-            }
-            CoreToolChoice::Raw(v) => Some(v.clone()),
-            _ => None,
-        });
+        let system = encode_system(&core.system);
+        let messages = encode_messages(&core.messages);
+        let tools = encode_tools(&core.tools);
+        let tool_choice = core.tool_choice.as_ref().and_then(encode_tool_choice);
 
         // Build the full request as JSON to avoid #[non_exhaustive] struct literal issues.
         let mut req = serde_json::json!({
@@ -718,13 +615,14 @@ impl AnthropicAdapter {
             obj.insert("top_p".to_owned(), serde_json::json!(top_p));
         }
         // Forward stop sequences.
-        if let Some(ref stop) = core.sampling.stop {
-            if !stop.is_empty() {
-                obj.insert(
-                    "stop_sequences".to_owned(),
-                    serde_json::to_value(stop).expect("Vec<String> serialization is infallible"),
-                );
-            }
+        if let Some(ref stop) = core.sampling.stop
+            && !stop.is_empty()
+        {
+            let seqs: Vec<serde_json::Value> = stop
+                .iter()
+                .map(|s| serde_json::Value::String(s.clone()))
+                .collect();
+            obj.insert("stop_sequences".to_owned(), serde_json::Value::Array(seqs));
         }
         if let Some(ref user_id) = core.metadata.user_id {
             obj.insert(
@@ -961,6 +859,152 @@ fn encode_content_blocks(content: &[CoreContent]) -> serde_json::Value {
 }
 
 /// Encode content blocks for an assistant message.
+/// Builds the Anthropic `system` field from core system content.
+///
+/// Returns `None` when there is nothing to send; non-`Text` blocks are dropped
+/// with a warning because Anthropic's system field only accepts text blocks.
+fn encode_system(system: &[CoreContent]) -> Option<serde_json::Value> {
+    if system.is_empty() {
+        return None;
+    }
+    let blocks: Vec<serde_json::Value> = system
+        .iter()
+        .filter_map(|c| match c {
+            CoreContent::Text { text, cache } => {
+                if text.is_empty() {
+                    return None;
+                }
+                let mut block = serde_json::json!({
+                    "type": "text",
+                    "text": text,
+                });
+                if let Some(cc) = cache {
+                    json_object(&mut block).insert(
+                        "cache_control".to_owned(),
+                        serde_json::json!({"type": cc.r#type}),
+                    );
+                }
+                Some(block)
+            }
+            other => {
+                tracing::warn!(
+                    ?other,
+                    "dropping non-Text system content block during Anthropic encode"
+                );
+                None
+            }
+        })
+        .collect();
+    if blocks.is_empty() {
+        None
+    } else {
+        Some(serde_json::Value::Array(blocks))
+    }
+}
+
+/// Builds the Anthropic `messages` array from core messages.
+///
+/// Anthropic has no system role inside `messages` -- a system-role message
+/// reaching here means the client adapter did not extract it, so it is dropped
+/// with a warning. Tool results and unknown future roles are sent as `user`.
+fn encode_messages(core_messages: &[CoreMessage]) -> Vec<serde_json::Value> {
+    let mut messages = Vec::with_capacity(core_messages.len());
+    for msg in core_messages {
+        match msg.role {
+            CoreRole::User => {
+                let content = encode_content_blocks(&msg.content);
+                messages.push(serde_json::json!({
+                    "role": "user",
+                    "content": content,
+                }));
+            }
+            CoreRole::Assistant => {
+                let content = encode_assistant_content(&msg.content);
+                messages.push(serde_json::json!({
+                    "role": "assistant",
+                    "content": content,
+                }));
+            }
+            CoreRole::System => {
+                // System messages should have been extracted into the
+                // `system` field by the client adapter.  If one reaches
+                // here it means the client adapter did not separate it.
+                tracing::warn!(
+                    role = "system",
+                    "Anthropic adapter received system-role message in messages; \
+                     dropping because Anthropic does not support system role in messages"
+                );
+            }
+            CoreRole::Tool => {
+                // Tool results come through user role in Anthropic.
+                let content = encode_content_blocks(&msg.content);
+                messages.push(serde_json::json!({
+                    "role": "user",
+                    "content": content,
+                }));
+            }
+            _ => {
+                // Handle future CoreRole variants.
+                let content = encode_content_blocks(&msg.content);
+                messages.push(serde_json::json!({
+                    "role": "user",
+                    "content": content,
+                }));
+            }
+        }
+    }
+    messages
+}
+
+/// Builds the Anthropic `tools` array, sanitizing tool names and coercing a
+/// non-object `input_schema` to an empty object schema.
+fn encode_tools(tools: &[CoreTool]) -> Vec<serde_json::Value> {
+    tools
+        .iter()
+        .map(|t| {
+            // Coerce non-object input_schema to a default object schema.
+            let schema = if t.input_schema.is_object() {
+                t.input_schema.clone()
+            } else {
+                serde_json::json!({"type": "object", "properties": {}})
+            };
+            let (sanitized_name, _changed) = sanitize_tool_name(&t.name);
+            let mut tool = serde_json::json!({
+                "name": sanitized_name,
+                "input_schema": schema,
+            });
+            if let Some(ref desc) = t.description {
+                json_object(&mut tool).insert(
+                    "description".to_owned(),
+                    serde_json::Value::String(desc.clone()),
+                );
+            }
+            tool
+        })
+        .collect()
+}
+
+/// Encodes the core tool choice into Anthropic's `tool_choice` field.
+///
+/// Unknown variants return `None` (the field is omitted) rather than JSON
+/// null, which the Anthropic API would reject.
+fn encode_tool_choice(tc: &CoreToolChoice) -> Option<serde_json::Value> {
+    match tc {
+        CoreToolChoice::Auto => Some(serde_json::json!({"type": "auto"})),
+        CoreToolChoice::Any => Some(serde_json::json!({"type": "any"})),
+        CoreToolChoice::None => Some(serde_json::json!({"type": "none"})),
+        CoreToolChoice::Tool { name } => {
+            let (sanitized, _) = sanitize_tool_name(name);
+            Some(serde_json::json!({
+                "type": "tool",
+                "name": sanitized
+            }))
+        }
+        CoreToolChoice::Raw(v) => Some(v.clone()),
+        _ => None,
+    }
+}
+
 fn encode_assistant_content(content: &[CoreContent]) -> serde_json::Value {
     let blocks: Vec<serde_json::Value> = content
         .iter()
@@ -1020,7 +1064,7 @@ fn encode_assistant_content(content: &[CoreContent]) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use llm_proxy_protocol::core::{CoreMessage, CoreRequest, CoreTool, SamplingOptions};
+    use llm_proxy_protocol::core::SamplingOptions;
 
     fn make_target() -> ProviderAdapterTarget {
         ProviderAdapterTarget {

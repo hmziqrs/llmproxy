@@ -25,7 +25,7 @@ async fn main() -> Result<()> {
             cmd_status(&paths)
         }
         Commands::Init => cmd_init(),
-        Commands::Validate { config } => cmd_validate(config),
+        Commands::Validate { config } => cmd_validate(config.as_deref()),
         Commands::Models {
             config,
             provider,
@@ -38,7 +38,7 @@ async fn main() -> Result<()> {
                 config,
                 port,
                 force,
-            } => cmd_autostart_enable(config, port, force),
+            } => cmd_autostart_enable(config.as_deref(), port, force),
             AutostartAction::Disable => cmd_autostart_disable(),
             AutostartAction::Status => cmd_autostart_status(),
         },

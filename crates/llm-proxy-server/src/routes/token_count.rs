@@ -80,7 +80,7 @@ pub(crate) async fn count_tokens(
         Ok(response) => response,
         Err(error) => {
             tracing::warn!(error = %error, "request failed");
-            route_error_response(ClientProtocol::Anthropic, error)
+            route_error_response(ClientProtocol::Anthropic, &error)
         }
     }
 }
@@ -89,7 +89,6 @@ pub(crate) async fn count_tokens(
 /// the distinction between a syntactically invalid JSON body and a body that is
 /// valid JSON but does not fit the target type (audit LOW-28).
 fn json_rejection_message(rejection: &JsonRejection) -> String {
-    use axum::extract::rejection::JsonRejection;
     match rejection {
         JsonRejection::JsonSyntaxError(e) => format!("invalid JSON syntax: {e}"),
         JsonRejection::JsonDataError(e) => format!("JSON body did not match expected type: {e}"),
@@ -117,26 +116,28 @@ async fn count_tokens_inner(
     // The request id is consumed by prepare_request below; snapshot it once so
     // every early-gate emit references the same id.
     let request_id = req_id.0.clone();
-    core_pipeline::validate_provider_name(provider).inspect_err(|e| {
-        core_pipeline::emit_response_failed(&event_bus, &request_id, Some(provider), None, e, start)
-    })?;
-    if state.providers().get(provider).is_none() {
-        let err = RouteError::UnknownProvider(provider.to_owned());
+    // Every early gate emits exactly one ResponseFailed with the same
+    // provider/request/start triple; bind it once instead of repeating the
+    // six-argument call at each gate.
+    let emit_failed = |e: &RouteError| {
         core_pipeline::emit_response_failed(
             &event_bus,
             &request_id,
             Some(provider),
             None,
-            &err,
+            e,
             start,
         );
+    };
+    core_pipeline::validate_provider_name(provider).inspect_err(&emit_failed)?;
+    if state.providers().get(provider).is_none() {
+        let err = RouteError::UnknownProvider(provider.to_owned());
+        emit_failed(&err);
         return Err(err);
     }
     // Reject non-JSON Content-Type before parsing, so a wrong media type is not
     // misreported as a JSON syntax error (audit LOW-30).
-    core_pipeline::validate_json_content_type(headers).inspect_err(|e| {
-        core_pipeline::emit_response_failed(&event_bus, &request_id, Some(provider), None, e, start)
-    })?;
+    core_pipeline::validate_json_content_type(headers).inspect_err(&emit_failed)?;
     let request_path = format!("/providers/{provider}/v1/messages/count_tokens");
     let ctx = core_pipeline::prepare_request(
         state,
@@ -146,9 +147,7 @@ async fn count_tokens_inner(
         &body,
         &request_path,
     )
-    .inspect_err(|e| {
-        core_pipeline::emit_response_failed(&event_bus, &request_id, Some(provider), None, e, start)
-    })?;
+    .inspect_err(&emit_failed)?;
     // Parse and validate the Anthropic MessageRequest.
     //
     // Go through `axum::Json::from_bytes` (rather than `serde_json::from_slice`)
@@ -159,45 +158,20 @@ async fn count_tokens_inner(
         Ok(axum::Json(value)) => value,
         Err(rejection) => {
             let err = RouteError::InvalidRequest(json_rejection_message(&rejection));
-            core_pipeline::emit_response_failed(
-                &event_bus,
-                &request_id,
-                Some(provider),
-                None,
-                &err,
-                start,
-            );
+            emit_failed(&err);
             return Err(err);
         }
     };
 
     req.validate()
         .map_err(|e| RouteError::InvalidRequest(e.to_string()))
-        .inspect_err(|e| {
-            core_pipeline::emit_response_failed(
-                &event_bus,
-                &request_id,
-                Some(provider),
-                None,
-                e,
-                start,
-            )
-        })?;
+        .inspect_err(&emit_failed)?;
 
     // Decode through the Anthropic client adapter to get a CoreRequest.
     // This validates the request shape and normalises it.
     let core = anthropic::decode_request(req)
         .map_err(core_pipeline::protocol_error_to_route)
-        .inspect_err(|e| {
-            core_pipeline::emit_response_failed(
-                &event_bus,
-                &request_id,
-                Some(provider),
-                None,
-                e,
-                start,
-            )
-        })?;
+        .inspect_err(&emit_failed)?;
 
     // Emit a RequestReceived event for the token-count request. token_count is a
     // real proxy request (it decodes client input and consumes rate-limit/dedup

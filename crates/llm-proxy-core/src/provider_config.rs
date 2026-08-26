@@ -330,7 +330,6 @@ fn serialize_arc_headers<S>(
 where
     S: serde::Serializer,
 {
-    use serde::Serialize;
     headers.as_ref().serialize(serializer)
 }
 
@@ -341,7 +340,6 @@ fn deserialize_arc_headers<'de, D>(
 where
     D: serde::Deserializer<'de>,
 {
-    use serde::Deserialize;
     HashMap::<String, String>::deserialize(deserializer).map(Arc::new)
 }
 
@@ -932,43 +930,70 @@ pub fn validate_provider_config(
 ) -> Result<(), ConfigValidationError> {
     let name = &provider.name;
 
-    // Provider name must be non-empty (after trimming whitespace).
+    validate_name(name)?;
+    validate_api_key(provider, name)?;
+    validate_pricing(provider, name)?;
+    validate_adapters(provider, name, known_protocols)?;
+    validate_discovery(provider, name)?;
+
+    // Both the catalog and the model aliases reject unsafe model IDs, but only
+    // when an adapter interpolates `{model}` into a Gemini endpoint URL.
+    let uses_gemini_model_template = provider.adapters.values().any(|adapter| {
+        adapter.protocol == "gemini_generate_content" && adapter.endpoint.contains("{model}")
+    });
+    validate_catalog(provider, name, uses_gemini_model_template)?;
+    validate_routes(provider, name)?;
+    validate_model_aliases(provider, name, uses_gemini_model_template)?;
+
+    Ok(())
+}
+
+/// Provider name must be non-empty and a URL-safe slug of at most 64 chars.
+fn validate_name(name: &str) -> Result<(), ConfigValidationError> {
     if name.trim().is_empty() {
         return Err(ConfigValidationError::EmptyProviderName);
     }
 
-    // Provider name must be a URL-safe slug with a maximum length of 64 characters.
     static PROVIDER_NAME_SLUG: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
         regex::Regex::new(r"^[a-z0-9_-]{1,64}$").expect("valid provider name slug regex")
     });
     if !PROVIDER_NAME_SLUG.is_match(name) {
         return Err(ConfigValidationError::InvalidProviderNameFormat {
-            provider: name.clone(),
+            provider: name.to_owned(),
         });
     }
+    Ok(())
+}
 
-    // api_key checks (skipped for passthrough auth -- the upstream credential
-    // comes from the inbound client request, so the configured api_key may be
-    // empty or unset).
-    if !provider.passthrough_auth {
-        if let Some(var) = find_unresolved_env_var(provider.api_key.expose_secret()) {
-            return Err(ConfigValidationError::UnresolvedEnvVar {
-                provider: name.clone(),
-                var,
-            });
-        }
-        if provider.api_key.expose_secret().trim().is_empty() {
-            return Err(ConfigValidationError::EmptyApiKey {
-                provider: name.clone(),
-            });
-        }
+/// Checks the configured API key.
+///
+/// Skipped entirely for passthrough auth: the upstream credential comes from
+/// the inbound client request, so the configured key may be empty or unset.
+fn validate_api_key(provider: &ProviderConfig, name: &str) -> Result<(), ConfigValidationError> {
+    if provider.passthrough_auth {
+        return Ok(());
     }
+    if let Some(var) = find_unresolved_env_var(provider.api_key.expose_secret()) {
+        return Err(ConfigValidationError::UnresolvedEnvVar {
+            provider: name.to_owned(),
+            var,
+        });
+    }
+    if provider.api_key.expose_secret().trim().is_empty() {
+        return Err(ConfigValidationError::EmptyApiKey {
+            provider: name.to_owned(),
+        });
+    }
+    Ok(())
+}
 
-    // Pricing validation: keys non-empty, prices non-negative.
+/// Pricing keys must be non-empty and every price must be non-negative and
+/// within the per-token upper bound.
+fn validate_pricing(provider: &ProviderConfig, name: &str) -> Result<(), ConfigValidationError> {
     for (model_id, pricing) in &provider.pricing {
         if model_id.as_str().is_empty() {
             return Err(ConfigValidationError::InvalidPricing {
-                provider: name.clone(),
+                provider: name.to_owned(),
                 model: model_id.as_str().to_owned(),
                 message: "pricing key is empty".to_owned(),
             });
@@ -982,7 +1007,7 @@ pub fn validate_provider_config(
         ] {
             if value < Decimal::ZERO {
                 return Err(ConfigValidationError::InvalidPricing {
-                    provider: name.clone(),
+                    provider: name.to_owned(),
                     model: model_id.as_str().to_owned(),
                     message: format!("negative {field} price"),
                 });
@@ -997,7 +1022,7 @@ pub fn validate_provider_config(
             let max_price = max_per_token_price();
             if value > max_price {
                 return Err(ConfigValidationError::InvalidPricing {
-                    provider: name.clone(),
+                    provider: name.to_owned(),
                     model: model_id.as_str().to_owned(),
                     message: format!(
                         "{field} price {value} exceeds the ${max_price}/token upper \
@@ -1008,157 +1033,177 @@ pub fn validate_provider_config(
             }
         }
     }
+    Ok(())
+}
 
-    // Adapter validation.
+/// Every adapter needs a name, a protocol, and an HTTP(S) endpoint, plus
+/// header checks. Non-HTTP schemes are rejected to prevent SSRF via crafted
+/// endpoints.
+fn validate_adapters(
+    provider: &ProviderConfig,
+    name: &str,
+    known_protocols: Option<&[&str]>,
+) -> Result<(), ConfigValidationError> {
     for (adapter_name, adapter_cfg) in &provider.adapters {
         if adapter_name.trim().is_empty() {
             return Err(ConfigValidationError::EmptyAdapterName {
-                provider: name.clone(),
+                provider: name.to_owned(),
             });
         }
         if adapter_cfg.protocol.trim().is_empty() {
             return Err(ConfigValidationError::EmptyProtocol {
-                provider: name.clone(),
+                provider: name.to_owned(),
                 adapter: adapter_name.clone(),
             });
         }
         if adapter_cfg.endpoint.trim().is_empty() {
             return Err(ConfigValidationError::EmptyEndpoint {
-                provider: name.clone(),
+                provider: name.to_owned(),
                 adapter: adapter_name.clone(),
             });
         }
-        // Reject non-HTTP(S) URL schemes to prevent SSRF via crafted endpoints.
-        let endpoint_trimmed = adapter_cfg.endpoint.trim();
-        let has_valid_scheme = has_valid_http_scheme(endpoint_trimmed);
-        if !has_valid_scheme {
+        if !has_valid_http_scheme(adapter_cfg.endpoint.trim()) {
             return Err(ConfigValidationError::InvalidEndpointScheme {
-                provider: name.clone(),
+                provider: name.to_owned(),
                 adapter: adapter_name.clone(),
                 endpoint: adapter_cfg.endpoint.clone(),
             });
         }
-        if let Some(known) = known_protocols {
-            if !known.contains(&adapter_cfg.protocol.as_str()) {
-                return Err(ConfigValidationError::UnknownProtocol {
-                    provider: name.clone(),
-                    adapter: adapter_name.clone(),
-                    protocol: adapter_cfg.protocol.clone(),
-                });
-            }
+        if let Some(known) = known_protocols
+            && !known.contains(&adapter_cfg.protocol.as_str())
+        {
+            return Err(ConfigValidationError::UnknownProtocol {
+                provider: name.to_owned(),
+                adapter: adapter_name.clone(),
+                protocol: adapter_cfg.protocol.clone(),
+            });
         }
 
-        // Validate adapter static headers.
         validate_headers(&adapter_cfg.headers, name, adapter_name)?;
     }
+    Ok(())
+}
 
-    if let Some(discovery) = &provider.discovery {
-        let endpoint = discovery.endpoint.trim();
-        if endpoint.is_empty() {
-            return Err(ConfigValidationError::EmptyEndpoint {
-                provider: name.clone(),
-                adapter: "discovery".to_owned(),
+/// Discovery, when configured, needs an HTTP(S) endpoint, valid headers, and
+/// non-zero limits.
+fn validate_discovery(provider: &ProviderConfig, name: &str) -> Result<(), ConfigValidationError> {
+    let Some(discovery) = &provider.discovery else {
+        return Ok(());
+    };
+    let endpoint = discovery.endpoint.trim();
+    if endpoint.is_empty() {
+        return Err(ConfigValidationError::EmptyEndpoint {
+            provider: name.to_owned(),
+            adapter: "discovery".to_owned(),
+        });
+    }
+    if !has_valid_http_scheme(endpoint) {
+        return Err(ConfigValidationError::InvalidEndpointScheme {
+            provider: name.to_owned(),
+            adapter: "discovery".to_owned(),
+            endpoint: discovery.endpoint.clone(),
+        });
+    }
+    validate_headers(&discovery.headers, name, "discovery")?;
+    for (limit, value) in [
+        ("max_pages", discovery.max_pages),
+        ("max_models", discovery.max_models),
+        ("max_response_bytes", discovery.max_response_bytes),
+    ] {
+        if value == 0 {
+            return Err(ConfigValidationError::InvalidDiscoveryLimit {
+                provider: name.to_owned(),
+                limit,
             });
         }
-        if !has_valid_http_scheme(endpoint) {
-            return Err(ConfigValidationError::InvalidEndpointScheme {
-                provider: name.clone(),
-                adapter: "discovery".to_owned(),
-                endpoint: discovery.endpoint.clone(),
+    }
+    Ok(())
+}
+
+/// Catalog entries need a non-empty ID, and a Gemini-safe one when an adapter
+/// interpolates the model into its endpoint URL.
+fn validate_catalog(
+    provider: &ProviderConfig,
+    name: &str,
+    uses_gemini_model_template: bool,
+) -> Result<(), ConfigValidationError> {
+    let Some(catalog) = &provider.catalog else {
+        return Ok(());
+    };
+    for entry in &catalog.models {
+        if entry.id.trim().is_empty() {
+            return Err(ConfigValidationError::EmptyCatalogEntryId {
+                provider: name.to_owned(),
             });
         }
-        validate_headers(&discovery.headers, name, "discovery")?;
-        for (limit, value) in [
-            ("max_pages", discovery.max_pages),
-            ("max_models", discovery.max_models),
-            ("max_response_bytes", discovery.max_response_bytes),
-        ] {
-            if value == 0 {
-                return Err(ConfigValidationError::InvalidDiscoveryLimit {
-                    provider: name.clone(),
-                    limit,
-                });
-            }
+        if uses_gemini_model_template && !is_safe_gemini_model_id(&entry.id) {
+            return Err(ConfigValidationError::UnsafeGeminiModelId {
+                provider: name.to_owned(),
+                location: "catalog entry",
+                model: entry.id.clone(),
+            });
         }
     }
+    Ok(())
+}
 
-    // Catalog model entry validation.
-    let uses_gemini_model_template = provider.adapters.values().any(|adapter| {
-        adapter.protocol == "gemini_generate_content" && adapter.endpoint.contains("{model}")
-    });
-    if let Some(catalog) = &provider.catalog {
-        for entry in &catalog.models {
-            if entry.id.trim().is_empty() {
-                return Err(ConfigValidationError::EmptyCatalogEntryId {
-                    provider: name.clone(),
-                });
-            }
-            if uses_gemini_model_template && !is_safe_gemini_model_id(&entry.id) {
-                return Err(ConfigValidationError::UnsafeGeminiModelId {
-                    provider: name.clone(),
-                    location: "catalog entry",
-                    model: entry.id.clone(),
-                });
-            }
-        }
-    }
-
-    // Route adapter cross-reference validation.
-    if let Some(ref adapter_name) = provider.routes.chat_completions {
+/// Each configured route must name a non-empty adapter that actually exists.
+fn validate_routes(provider: &ProviderConfig, name: &str) -> Result<(), ConfigValidationError> {
+    for (route_kind, adapter_name) in [
+        (
+            "chat_completions",
+            provider.routes.chat_completions.as_ref(),
+        ),
+        ("messages", provider.routes.messages.as_ref()),
+    ] {
+        let Some(adapter_name) = adapter_name else {
+            continue;
+        };
         let aname = adapter_name.trim();
         if aname.is_empty() {
             return Err(ConfigValidationError::EmptyRouteAdapterName {
-                provider: name.clone(),
-                route_kind: "chat_completions".to_owned(),
+                provider: name.to_owned(),
+                route_kind: route_kind.to_owned(),
             });
         }
         if !provider.adapters.contains_key(aname) {
             return Err(ConfigValidationError::UnknownRouteAdapter {
-                provider: name.clone(),
-                route_kind: "chat_completions".to_owned(),
+                provider: name.to_owned(),
+                route_kind: route_kind.to_owned(),
                 adapter: aname.to_owned(),
             });
         }
     }
-    if let Some(ref adapter_name) = provider.routes.messages {
-        let aname = adapter_name.trim();
-        if aname.is_empty() {
-            return Err(ConfigValidationError::EmptyRouteAdapterName {
-                provider: name.clone(),
-                route_kind: "messages".to_owned(),
-            });
-        }
-        if !provider.adapters.contains_key(aname) {
-            return Err(ConfigValidationError::UnknownRouteAdapter {
-                provider: name.clone(),
-                route_kind: "messages".to_owned(),
-                adapter: aname.to_owned(),
-            });
-        }
-    }
+    Ok(())
+}
 
-    // Model alias validation.
+/// Alias keys and targets must be non-empty, and targets Gemini-safe when an
+/// adapter interpolates the model into its endpoint URL.
+fn validate_model_aliases(
+    provider: &ProviderConfig,
+    name: &str,
+    uses_gemini_model_template: bool,
+) -> Result<(), ConfigValidationError> {
     for (alias_key, alias_target) in &provider.model_aliases {
         if alias_key.trim().is_empty() {
             return Err(ConfigValidationError::EmptyModelAliasKey {
-                provider: name.clone(),
+                provider: name.to_owned(),
             });
         }
         if alias_target.trim().is_empty() {
             return Err(ConfigValidationError::EmptyModelAliasTarget {
-                provider: name.clone(),
+                provider: name.to_owned(),
                 alias: alias_key.clone(),
             });
         }
         if uses_gemini_model_template && !is_safe_gemini_model_id(alias_target) {
             return Err(ConfigValidationError::UnsafeGeminiModelId {
-                provider: name.clone(),
+                provider: name.to_owned(),
                 location: "model alias target",
                 model: alias_target.clone(),
             });
         }
     }
-
     Ok(())
 }
 
@@ -1456,7 +1501,7 @@ mod tests {
         let result = toml::from_str::<AppConfig>(
             "[server]\nbind = '127.0.0.1:3456'\n[models]\nfoo = { provider = 'bar' }\n",
         );
-        assert!(result.is_err());
+        result.unwrap_err();
     }
 
     #[test]
@@ -1636,7 +1681,7 @@ chat_completion = "chat"
 "#,
         );
 
-        assert!(result.is_err());
+        result.unwrap_err();
     }
 
     #[test]
@@ -1866,7 +1911,7 @@ id = "models/gemini-2.5-pro"
         )
         .expect("provider config");
 
-        assert!(validate_provider_config(&provider.provider, None).is_ok());
+        validate_provider_config(&provider.provider, None).unwrap();
     }
 
     // -- Adapter header CRLF validation ---------------------------------------
@@ -2067,7 +2112,7 @@ endpoint = "https://example.com/v1"
         // Should not fail on name validation (will fail on empty api_key
         // if key is empty, but our key is "key").
         // Actually no adapters/routes means it passes.
-        assert!(validate_provider_config(&provider, None).is_ok());
+        validate_provider_config(&provider, None).unwrap();
     }
 
     // -- Pricing / cost ------------------------------------------------------
@@ -2112,7 +2157,7 @@ auth_style = "bearer"
 [provider.pricing."gpt-4o"]
 input = 0.0000025
 "#;
-        assert!(toml::from_str::<ProviderFile>(raw).is_err());
+        toml::from_str::<ProviderFile>(raw).unwrap_err();
     }
 
     #[test]
@@ -2220,7 +2265,7 @@ input = 0.0000025
                 },
             )]),
         };
-        assert!(validate_provider_config(&provider, None).is_ok());
+        validate_provider_config(&provider, None).unwrap();
     }
 
     #[test]

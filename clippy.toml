@@ -1,0 +1,14 @@
+# Test escapes. Every one of these defaults to `false`, so they must be
+# set explicitly or tests will drown in warnings.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-indexing-slicing-in-tests = true
+allow-panic-in-tests = true
+allow-dbg-in-tests = false
+
+# excessive_nesting is a NO-OP without this. Default threshold is 0.
+excessive-nesting-threshold = 5
+too-many-lines-threshold = 100
+too-many-arguments-threshold = 6
+
+msrv = "1.85"

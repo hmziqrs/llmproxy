@@ -162,77 +162,11 @@ impl ProviderStreamDecoder for OpenAiChatStreamDecoder {
         }
 
         // Handle tool call deltas.
-        if let Some(ref delta) = choice.delta {
-            if !delta.tool_calls.is_empty() {
-                self.close_content_if_open();
-
-                for tc in &delta.tool_calls {
-                    // The wire `index` is `Option<i32>`; negative values are
-                    // semantically meaningless but a malformed/malicious chunk
-                    // could carry one.  An unchecked `as usize` would wrap
-                    // (e.g. `-1` -> `usize::MAX`), producing phantom tool blocks
-                    // with huge indices.  Validate before casting: negatives
-                    // fall back to 0 and are logged.
-                    let oi = tc
-                        .index
-                        .and_then(|i| usize::try_from(i).ok())
-                        .unwrap_or_else(|| {
-                            if tc.index.map(|i| i < 0).unwrap_or(false) {
-                                tracing::warn!(
-                                    raw_index = tc.index,
-                                    "OpenAI: negative tool_call index, clamping to 0"
-                                );
-                            }
-                            0
-                        });
-
-                    // New tool call?
-                    if !self.tool_blocks.contains_key(&oi) {
-                        let func_name = tc
-                            .function
-                            .as_ref()
-                            .and_then(|f| f.name.as_deref())
-                            .unwrap_or("");
-                        if func_name.is_empty() {
-                            tracing::warn!(
-                                index = oi,
-                                "OpenAI: tool_call without function name, skipping tool call"
-                            );
-                            continue;
-                        }
-
-                        let tool_id = tc
-                            .id
-                            .clone()
-                            .unwrap_or_else(|| format!("toolu_{}", uuid::Uuid::new_v4()));
-
-                        let block_idx = self.content_index;
-                        self.tool_blocks.insert(oi, block_idx);
-
-                        events.push(CoreEvent::ToolCallStart {
-                            index: block_idx,
-                            id: tool_id,
-                            name: func_name.to_owned(),
-                        });
-
-                        self.content_index += 1;
-                    }
-
-                    // Argument delta.
-                    if let Some(ref func) = tc.function {
-                        if let Some(ref args) = func.arguments {
-                            if !args.is_empty() {
-                                if let Some(&block_idx) = self.tool_blocks.get(&oi) {
-                                    events.push(CoreEvent::ToolCallDelta {
-                                        index: block_idx,
-                                        args_delta: args.clone(),
-                                    });
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+        if let Some(ref delta) = choice.delta
+            && !delta.tool_calls.is_empty()
+        {
+            self.close_content_if_open();
+            self.push_tool_call_deltas(&delta.tool_calls, &mut events);
         }
 
         // Handle finish reason.
@@ -325,7 +259,78 @@ impl OpenAiChatStreamDecoder {
         }
     }
 
-    fn close_tool_blocks(&mut self, events: &mut Vec<CoreEvent>) {
+    /// Translates a chunk's `tool_calls` array into core tool-call events.
+    ///
+    /// Opens a block the first time an upstream index is seen and routes
+    /// argument fragments to the block that index owns, so parallel calls stay
+    /// separated.
+    fn push_tool_call_deltas(&mut self, tool_calls: &[ToolCall], events: &mut Vec<CoreEvent>) {
+        for tc in tool_calls {
+            // The wire `index` is `Option<i32>`; negative values are
+            // semantically meaningless but a malformed/malicious chunk could
+            // carry one.  An unchecked `as usize` would wrap (e.g. `-1` ->
+            // `usize::MAX`), producing phantom tool blocks with huge indices.
+            // Validate before casting: negatives fall back to 0 and are logged.
+            let oi = tc
+                .index
+                .and_then(|i| usize::try_from(i).ok())
+                .unwrap_or_else(|| {
+                    if tc.index.is_some_and(|i| i < 0) {
+                        tracing::warn!(
+                            raw_index = tc.index,
+                            "OpenAI: negative tool_call index, clamping to 0"
+                        );
+                    }
+                    0
+                });
+
+            // New tool call?
+            if !self.tool_blocks.contains_key(&oi) {
+                let func_name = tc
+                    .function
+                    .as_ref()
+                    .and_then(|f| f.name.as_deref())
+                    .unwrap_or("");
+                if func_name.is_empty() {
+                    tracing::warn!(
+                        index = oi,
+                        "OpenAI: tool_call without function name, skipping tool call"
+                    );
+                    continue;
+                }
+
+                let tool_id = tc
+                    .id
+                    .clone()
+                    .unwrap_or_else(|| format!("toolu_{}", uuid::Uuid::new_v4()));
+
+                let block_idx = self.content_index;
+                self.tool_blocks.insert(oi, block_idx);
+
+                events.push(CoreEvent::ToolCallStart {
+                    index: block_idx,
+                    id: tool_id,
+                    name: func_name.to_owned(),
+                });
+
+                self.content_index += 1;
+            }
+
+            // Argument delta.
+            if let Some(ref func) = tc.function
+                && let Some(ref args) = func.arguments
+                && !args.is_empty()
+                && let Some(&block_idx) = self.tool_blocks.get(&oi)
+            {
+                events.push(CoreEvent::ToolCallDelta {
+                    index: block_idx,
+                    args_delta: args.clone(),
+                });
+            }
+        }
+    }
+
+    fn close_tool_blocks(&self, events: &mut Vec<CoreEvent>) {
         let mut indices: Vec<_> = self.tool_blocks.values().copied().collect();
         indices.sort();
         for idx in indices {
@@ -337,6 +342,72 @@ impl OpenAiChatStreamDecoder {
 // ---------------------------------------------------------------------------
 // OpenAiChatAdapter impl
 // ---------------------------------------------------------------------------
+
+/// Folds one assistant content block into the outgoing tool calls / reasoning.
+///
+/// Blocks the Chat Completions schema cannot carry are dropped with a warning.
+fn encode_assistant_content(
+    content: &CoreContent,
+    tool_calls: &mut Vec<ToolCall>,
+    reasoning_content: &mut Option<String>,
+) {
+    match content {
+        CoreContent::Thinking { text, .. } => {
+            if !text.is_empty() {
+                match reasoning_content {
+                    Some(existing) => existing.push_str(text),
+                    None => *reasoning_content = Some(text.clone()),
+                }
+            }
+        }
+        CoreContent::ToolUse { id, name, input } => {
+            let arguments = serde_json::to_string(input).unwrap_or_else(|_| "{}".to_owned());
+            tool_calls.push(ToolCall {
+                index: None,
+                id: (!id.is_empty()).then(|| id.clone()),
+                r#type: Some("function".to_owned()),
+                function: Some(FunctionCall {
+                    name: (!name.is_empty()).then(|| name.clone()),
+                    arguments: Some(arguments),
+                }),
+            });
+        }
+        other => {
+            tracing::warn!(
+                ?other,
+                "OpenAI Chat: dropping unsupported content block in assistant message encoding"
+            );
+        }
+    }
+}
+
+/// Appends one `role: "tool"` message per tool result in `content`.
+///
+/// Chat Completions carries tool results as standalone messages rather than as
+/// content blocks on the user turn.
+fn push_tool_result_messages(content: &[CoreContent], messages: &mut Vec<ChatMessage>) {
+    for c in content {
+        let CoreContent::ToolResult {
+            tool_use_id,
+            content: result_content,
+            ..
+        } = c
+        else {
+            continue;
+        };
+        messages.push(ChatMessage {
+            role: "tool".to_owned(),
+            content: serde_json::Value::String(collect_text(result_content)),
+            reasoning_content: None,
+            tool_calls: Vec::new(),
+            name: None,
+            tool_call_id: Some(tool_use_id.clone()),
+            cache_control: None,
+            refusal: None,
+            is_error: None,
+        });
+    }
+}
 
 impl OpenAiChatAdapter {
     /// Encode a core request into an OpenAI Chat Completions request.
@@ -397,27 +468,7 @@ impl OpenAiChatAdapter {
                     }
 
                     // Tool results become separate tool messages.
-                    for content in &msg.content {
-                        if let CoreContent::ToolResult {
-                            tool_use_id,
-                            content: result_content,
-                            ..
-                        } = content
-                        {
-                            let result_text = collect_text(result_content);
-                            messages.push(ChatMessage {
-                                role: "tool".to_owned(),
-                                content: serde_json::Value::String(result_text),
-                                reasoning_content: None,
-                                tool_calls: Vec::new(),
-                                name: None,
-                                tool_call_id: Some(tool_use_id.clone()),
-                                cache_control: None,
-                                refusal: None,
-                                is_error: None,
-                            });
-                        }
-                    }
+                    push_tool_result_messages(&msg.content, &mut messages);
                 }
                 CoreRole::Assistant => {
                     let text = collect_text(&msg.content);
@@ -425,47 +476,7 @@ impl OpenAiChatAdapter {
                     let mut reasoning_content: Option<String> = None;
 
                     for content in &msg.content {
-                        match content {
-                            CoreContent::Thinking { text, .. } => {
-                                if !text.is_empty() {
-                                    reasoning_content = Some(
-                                        reasoning_content
-                                            .map(|mut r| {
-                                                r.push_str(text);
-                                                r
-                                            })
-                                            .unwrap_or_else(|| text.clone()),
-                                    );
-                                }
-                            }
-                            CoreContent::ToolUse { id, name, input } => {
-                                let arguments = serde_json::to_string(input)
-                                    .unwrap_or_else(|_| "{}".to_owned());
-                                tool_calls.push(ToolCall {
-                                    index: None,
-                                    id: if id.is_empty() {
-                                        None
-                                    } else {
-                                        Some(id.clone())
-                                    },
-                                    r#type: Some("function".to_owned()),
-                                    function: Some(FunctionCall {
-                                        name: if name.is_empty() {
-                                            None
-                                        } else {
-                                            Some(name.clone())
-                                        },
-                                        arguments: Some(arguments),
-                                    }),
-                                });
-                            }
-                            other => {
-                                tracing::warn!(
-                                    ?other,
-                                    "OpenAI Chat: dropping unsupported content block in assistant message encoding"
-                                );
-                            }
-                        }
+                        encode_assistant_content(content, &mut tool_calls, &mut reasoning_content);
                     }
 
                     // When an assistant turn carries only tool calls (no text),
@@ -814,9 +825,7 @@ fn collect_text(content: &[CoreContent]) -> String {
 mod tests {
     use super::*;
     use llm_proxy_core::AuthStyle;
-    use llm_proxy_protocol::core::{
-        CoreMessage, CoreRequest, CoreRole, CoreTool, CoreToolChoice, ModelRef, SamplingOptions,
-    };
+    use llm_proxy_protocol::core::{CoreMessage, CoreTool, SamplingOptions};
     use llm_proxy_protocol::openai::{Choice, UsageInfo};
 
     fn make_target() -> ProviderAdapterTarget {

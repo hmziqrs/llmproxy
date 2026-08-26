@@ -27,7 +27,6 @@ pub static TEST_ENV_LOCK: Mutex<()> = Mutex::new(());
 /// Acquire via [`TestEnvLock::acquire`]. The lock is released when this value
 /// is dropped. This is a test utility for serialising environment-variable-mutating
 /// tests to prevent race conditions.
-#[allow(dead_code)]
 #[derive(Debug)]
 pub struct TestEnvLock {
     _guard: std::sync::MutexGuard<'static, ()>,
@@ -76,7 +75,6 @@ impl TestEnvLock {
 /// restore-on-drop run unsynchronised against concurrent env access. If such
 /// a use case is needed, restructure the guard to own the `MutexGuard` (see
 /// the TODO in `Drop` below) so the compiler enforces the invariant.
-#[allow(dead_code)]
 #[derive(Debug)]
 pub struct EnvVarGuard {
     key: String,
@@ -86,7 +84,7 @@ pub struct EnvVarGuard {
 impl EnvVarGuard {
     /// Set an environment variable, saving the previous value for restoration.
     ///
-    /// # Safety
+    /// # Lock discipline
     ///
     /// Caller must ensure exclusive access to the process environment (e.g.
     /// by holding `TestEnvLock`), and must drop the returned guard before
@@ -94,6 +92,15 @@ impl EnvVarGuard {
     /// "Lock discipline" note.
     pub fn set(key: &str, value: &str) -> Self {
         let original = std::env::var(key).ok();
+        #[expect(
+            unsafe_code,
+            reason = "std::env::set_var is unsafe since edition 2024; the fn-level Safety contract requires the caller to hold TestEnvLock"
+        )]
+        // SAFETY: `set_var` is sound only while no other thread reads or writes the
+        // process environment. Every caller in this crate holds `TEST_ENV_LOCK`
+        // (via `TestEnvLock::acquire`) for the whole lifetime of the returned
+        // guard, so this thread has exclusive access to the environment for the
+        // duration of the call.
         unsafe {
             std::env::set_var(key, value);
         }
@@ -105,7 +112,7 @@ impl EnvVarGuard {
 
     /// Remove an environment variable, saving the previous value for restoration.
     ///
-    /// # Safety
+    /// # Lock discipline
     ///
     /// Caller must ensure exclusive access to the process environment (e.g.
     /// by holding `TestEnvLock`), and must drop the returned guard before
@@ -113,6 +120,15 @@ impl EnvVarGuard {
     /// "Lock discipline" note.
     pub fn remove(key: &str) -> Self {
         let original = std::env::var(key).ok();
+        #[expect(
+            unsafe_code,
+            reason = "std::env::remove_var is unsafe since edition 2024; the fn-level Safety contract requires the caller to hold TestEnvLock"
+        )]
+        // SAFETY: `remove_var` is sound only while no other thread reads or
+        // writes the process environment. Every caller in this crate holds
+        // `TEST_ENV_LOCK` (via `TestEnvLock::acquire`) for the whole lifetime of
+        // the returned guard, so this thread has exclusive access to the
+        // environment for the duration of the call.
         unsafe {
             std::env::remove_var(key);
         }
@@ -140,11 +156,22 @@ impl EnvVarGuard {
 /// requires updating every call site in `env_interpolate` and
 /// `provider_config` tests and is deferred to a dedicated refactor.
 impl Drop for EnvVarGuard {
+    #[expect(
+        unsafe_code,
+        reason = "restores the env var via the same unsafe set_var/remove_var as the constructors; runs while TestEnvLock is still held per the Safety note above"
+    )]
     fn drop(&mut self) {
         match &self.original {
+            // SAFETY: restoring the saved value runs while the `TestEnvLock`
+            // that authorised the corresponding `set`/`remove` is still held
+            // (guaranteed by reverse drop order at every call site), so no
+            // other thread can be reading or writing the environment here.
             Some(val) => unsafe {
                 std::env::set_var(&self.key, val);
             },
+            // SAFETY: same invariant as the `Some` arm above — the guard is
+            // always dropped before the `TestEnvLock` it was created under, so
+            // this thread has exclusive access to the environment.
             None => unsafe {
                 std::env::remove_var(&self.key);
             },

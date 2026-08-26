@@ -4,6 +4,11 @@ version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+description = "Request/response event types and the EventBus trait implemented by llm-proxy persistence backends."
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [lints]
 workspace = true
@@ -16,8 +21,7 @@ test-utils = []
 [dependencies]
 llm-proxy-protocol = { path = "../llm-proxy-protocol" }
 serde = { workspace = true }
-serde_json = { workspace = true }
 time = { workspace = true }
 
 [dev-dependencies]
-# serde_json is already a regular dep; reused by the in-crate tests above.
+serde_json = { workspace = true }

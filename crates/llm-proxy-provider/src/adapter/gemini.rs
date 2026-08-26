@@ -19,8 +19,8 @@ use llm_proxy_protocol::core::{
     Usage, UsageProvenance,
 };
 use llm_proxy_protocol::zen::{
-    GeminiFunctionDeclaration, GeminiGenerationConfig, GeminiPart, GeminiRequest, GeminiResponse,
-    GeminiStreamChunk, GeminiTool, GeminiUsage,
+    GeminiFunctionCall, GeminiFunctionDeclaration, GeminiGenerationConfig, GeminiPart,
+    GeminiRequest, GeminiResponse, GeminiStreamChunk, GeminiTool, GeminiUsage,
 };
 
 use super::{
@@ -121,57 +121,15 @@ impl ProviderStreamDecoder for GeminiStreamDecoder {
             .map(|c| c.parts.as_slice())
             .unwrap_or(&[]);
         for part in parts {
-            if let Some(ref text) = part.text {
-                if !text.is_empty() {
-                    if !self.content_started {
-                        self.content_started = true;
-                        events.push(CoreEvent::ContentStart {
-                            index: self.content_index,
-                            kind: ContentKind::Text,
-                        });
-                    }
-                    events.push(CoreEvent::TextDelta {
-                        index: self.content_index,
-                        text: text.clone(),
-                    });
-                }
+            if let Some(ref text) = part.text
+                && !text.is_empty()
+            {
+                self.push_text_delta(text, &mut events);
             }
 
             // Handle function call parts.
             if let Some(ref function_call) = part.function_call {
-                self.close_content_if_open();
-
-                let block_idx = self.content_index;
-                self.tool_blocks.push(block_idx);
-                self.tool_blocks_closed.push(false);
-
-                events.push(CoreEvent::ToolCallStart {
-                    index: block_idx,
-                    id: format!("gemini_call_{}", self.tool_id_counter),
-                    name: function_call.name.clone(),
-                });
-                self.tool_id_counter += 1;
-
-                if let Some(ref args) = function_call.args {
-                    let args_str =
-                        serde_json::to_string(args).unwrap_or_else(|e| {
-                            tracing::warn!(error = %e, "Gemini: failed to serialize function_call args, falling back to empty object");
-                            "{}".to_owned()
-                        });
-                    if args_str != "null" {
-                        events.push(CoreEvent::ToolCallDelta {
-                            index: block_idx,
-                            args_delta: args_str,
-                        });
-                    }
-                }
-
-                events.push(CoreEvent::ToolCallStop { index: block_idx });
-                // Mark this tool block as closed so finish() does not emit a duplicate.
-                if let Some(last) = self.tool_blocks_closed.last_mut() {
-                    *last = true;
-                }
-                self.content_index += 1;
+                self.push_function_call(function_call, &mut events);
             }
         }
 
@@ -236,6 +194,67 @@ impl ProviderStreamDecoder for GeminiStreamDecoder {
 }
 
 impl GeminiStreamDecoder {
+    /// Emits a text delta, opening a text content block first if none is open.
+    fn push_text_delta(&mut self, text: &str, events: &mut Vec<CoreEvent>) {
+        if !self.content_started {
+            self.content_started = true;
+            events.push(CoreEvent::ContentStart {
+                index: self.content_index,
+                kind: ContentKind::Text,
+            });
+        }
+        events.push(CoreEvent::TextDelta {
+            index: self.content_index,
+            text: text.to_owned(),
+        });
+    }
+
+    /// Emits the start/delta/stop triple for one Gemini `functionCall` part.
+    ///
+    /// Gemini delivers function calls whole rather than as argument deltas, so
+    /// the block is opened and closed within this call.
+    fn push_function_call(
+        &mut self,
+        function_call: &GeminiFunctionCall,
+        events: &mut Vec<CoreEvent>,
+    ) {
+        self.close_content_if_open();
+
+        let block_idx = self.content_index;
+        self.tool_blocks.push(block_idx);
+        self.tool_blocks_closed.push(false);
+
+        events.push(CoreEvent::ToolCallStart {
+            index: block_idx,
+            id: format!("gemini_call_{}", self.tool_id_counter),
+            name: function_call.name.clone(),
+        });
+        self.tool_id_counter += 1;
+
+        if let Some(ref args) = function_call.args {
+            let args_str = serde_json::to_string(args).unwrap_or_else(|e| {
+                tracing::warn!(
+                    error = %e,
+                    "Gemini: failed to serialize function_call args, falling back to empty object"
+                );
+                "{}".to_owned()
+            });
+            if args_str != "null" {
+                events.push(CoreEvent::ToolCallDelta {
+                    index: block_idx,
+                    args_delta: args_str,
+                });
+            }
+        }
+
+        events.push(CoreEvent::ToolCallStop { index: block_idx });
+        // Mark this tool block as closed so finish() does not emit a duplicate.
+        if let Some(last) = self.tool_blocks_closed.last_mut() {
+            *last = true;
+        }
+        self.content_index += 1;
+    }
+
     fn close_content_if_open(&mut self) {
         if self.content_started {
             self.content_started = false;
@@ -247,6 +266,97 @@ impl GeminiStreamDecoder {
 // ---------------------------------------------------------------------------
 // GeminiAdapter impl
 // ---------------------------------------------------------------------------
+
+/// Encodes one core content block into zero or more Gemini parts.
+///
+/// Content Gemini cannot represent is dropped with a warning; an unresolvable
+/// `tool_use_id` is an error because a guessed function name is rejected
+/// upstream with an opaque 400.
+fn encode_content_part(
+    c: &CoreContent,
+    tool_name_map: &HashMap<String, String>,
+    parts: &mut Vec<GeminiPart>,
+) -> Result<(), ProviderError> {
+    match c {
+        CoreContent::Text { text, cache } => {
+            if cache.is_some() {
+                tracing::warn!("Gemini: cache_control is not supported, dropping cache marker");
+            }
+            if !text.is_empty() {
+                parts.push(GeminiPart::text(text.clone()));
+            }
+        }
+        CoreContent::ToolUse { name, input, .. } => {
+            parts.push(GeminiPart::function_call(name.clone(), Some(input.clone())));
+        }
+        CoreContent::ToolResult {
+            tool_use_id,
+            content: result_content,
+            is_error,
+        } => {
+            if *is_error {
+                tracing::warn!(
+                    tool_use_id,
+                    "Gemini: is_error flag in ToolResult is not representable in Gemini wire format and will be dropped"
+                );
+            }
+            let response_val = encode_tool_result_payload(tool_use_id, result_content);
+
+            // The name field must match the function name from the original
+            // call.  Gemini uses it to correlate the response with the function
+            // declaration, and the map was built from the ToolUse blocks in the
+            // conversation history.
+            let Some(fn_name) = tool_name_map.get(tool_use_id) else {
+                // The lookup missed because the ToolUse block is absent from the
+                // request being encoded (truncated/pruned history) or the id is
+                // foreign (e.g. an Anthropic `toolu_...` id round-tripping
+                // through Gemini). Guessing a name only ever produced an invalid
+                // one that Gemini rejects with a confusing 400, so return a
+                // clear error instead.
+                return Err(ProviderError::InvalidConfig(format!(
+                    "Gemini: cannot resolve function name for tool_use_id \
+                     \"{tool_use_id}\"; the corresponding ToolUse block was \
+                     not found in the conversation history"
+                )));
+            };
+            parts.push(GeminiPart::function_response(fn_name.clone(), response_val));
+        }
+        _ => {
+            tracing::warn!(
+                ?c,
+                "Gemini: dropping unsupported content type in message encoding"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Flattens tool-result content into Gemini's string-only `functionResponse`.
+///
+/// Non-text blocks are dropped with a warning: the wire format carries a single
+/// string `result`.
+fn encode_tool_result_payload(
+    tool_use_id: &str,
+    result_content: &[CoreContent],
+) -> serde_json::Value {
+    if result_content.is_empty() {
+        return serde_json::json!({"result": ""});
+    }
+    let texts: Vec<&str> = result_content
+        .iter()
+        .filter_map(|rc| match rc {
+            CoreContent::Text { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    if texts.len() != result_content.len() {
+        tracing::warn!(
+            tool_use_id,
+            "Gemini: dropping non-text content in tool result"
+        );
+    }
+    serde_json::json!({"result": texts.join("\n")})
+}
 
 impl GeminiAdapter {
     /// Encode a core request into a Gemini GenerateContent request.
@@ -282,87 +392,7 @@ impl GeminiAdapter {
 
             let mut parts: Vec<GeminiPart> = Vec::new();
             for c in &msg.content {
-                match c {
-                    CoreContent::Text { text, cache } => {
-                        if cache.is_some() {
-                            tracing::warn!(
-                                "Gemini: cache_control is not supported, dropping cache marker"
-                            );
-                        }
-                        if !text.is_empty() {
-                            parts.push(GeminiPart::text(text.clone()));
-                        }
-                    }
-                    CoreContent::ToolUse { name, input, .. } => {
-                        parts.push(GeminiPart::function_call(name.clone(), Some(input.clone())));
-                    }
-                    CoreContent::ToolResult {
-                        tool_use_id,
-                        content: result_content,
-                        is_error,
-                    } => {
-                        if *is_error {
-                            tracing::warn!(
-                                tool_use_id,
-                                "Gemini: is_error flag in ToolResult is not representable in Gemini wire format and will be dropped"
-                            );
-                        }
-                        let response_val: serde_json::Value = if result_content.is_empty() {
-                            serde_json::json!({"result": ""})
-                        } else {
-                            let texts: Vec<&str> = result_content
-                                .iter()
-                                .filter_map(|rc| match rc {
-                                    CoreContent::Text { text, .. } => Some(text.as_str()),
-                                    _ => None,
-                                })
-                                .collect();
-                            if texts.len() != result_content.len() {
-                                // Mixed content; non-text blocks are dropped (Gemini's
-                                // functionResponse can only carry a string `result`).
-                                tracing::warn!(
-                                    tool_use_id,
-                                    "Gemini: dropping non-text content in tool result"
-                                );
-                            }
-                            serde_json::json!({"result": texts.join("\n")})
-                        };
-
-                        // The name field must match the function name from the
-                        // original call.  Gemini uses it to correlate the
-                        // response with the function declaration.  We look up
-                        // the function name by searching for the ToolUse content
-                        // block that has a matching tool_use_id in prior messages.
-                        let fn_name = match tool_name_map.get(tool_use_id) {
-                            Some(name) => name.clone(),
-                            None => {
-                                // The lookup missed because the ToolUse block is
-                                // absent from the request being encoded (truncated/
-                                // pruned history) or the id is foreign (e.g. an
-                                // Anthropic `toolu_...` id round-tripping through
-                                // Gemini). The previous heuristic stripped a
-                                // `gemini_call_` prefix, but that only ever
-                                // produced an invalid function name (a bare number
-                                // or a raw foreign id) that Gemini rejects with a
-                                // confusing 400, and the happy-path ids are already
-                                // covered by the map above. Return a clear error
-                                // instead of shipping a guessed name.
-                                return Err(ProviderError::InvalidConfig(format!(
-                                    "Gemini: cannot resolve function name for tool_use_id \
-                                     \"{tool_use_id}\"; the corresponding ToolUse block was \
-                                     not found in the conversation history"
-                                )));
-                            }
-                        };
-                        parts.push(GeminiPart::function_response(fn_name, response_val));
-                    }
-                    _ => {
-                        tracing::warn!(
-                            ?c,
-                            "Gemini: dropping unsupported content type in message encoding"
-                        );
-                    }
-                }
+                encode_content_part(c, &tool_name_map, &mut parts)?;
             }
 
             if !parts.is_empty() {
@@ -1453,13 +1483,10 @@ mod tests {
         let msg_stop = events
             .iter()
             .find(|e| matches!(e, CoreEvent::MessageStop { .. }));
-        assert!(msg_stop.is_some());
-        match msg_stop.unwrap() {
-            CoreEvent::MessageStop { stop_reason, .. } => {
-                assert_eq!(*stop_reason, StopReason::ToolUse);
-            }
-            _ => unreachable!(),
-        }
+        let Some(CoreEvent::MessageStop { stop_reason, .. }) = msg_stop else {
+            panic!("expected a MessageStop event");
+        };
+        assert_eq!(*stop_reason, StopReason::ToolUse);
     }
 
     #[test]

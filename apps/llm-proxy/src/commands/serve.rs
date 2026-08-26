@@ -2,7 +2,7 @@
 //!
 //! Starts the proxy server in foreground or background (daemon) mode.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use axum::serve::{Listener, ListenerExt};
@@ -30,7 +30,7 @@ pub async fn cmd_serve(
     // process can log during spawn_daemon(). The daemon child reinitializes
     // its own subscriber; calling init_tracing twice is safe (the second
     // call is a no-op since the global subscriber is already set).
-    init_tracing(LogFormat::from_env());
+    init_tracing(&LogFormat::from_env());
 
     // If background mode requested, spawn self as child with --daemonize.
     // Run the cheap, pure config checks in the parent first so a clearly-bad
@@ -40,7 +40,7 @@ pub async fn cmd_serve(
     if background && !daemonize {
         let path = resolve_config(config_path.as_deref());
         validate_toml_extension(&path)?;
-        return spawn_daemon(config_path, port_override);
+        return spawn_daemon(config_path.as_deref(), port_override);
     }
 
     let path = resolve_config(config_path.as_deref());
@@ -221,12 +221,12 @@ async fn bind_listener(bind_addr: std::net::SocketAddr) -> Result<TcpListener> {
 }
 
 /// Spawn the current binary as a background daemon.
-fn spawn_daemon(config_path: Option<PathBuf>, port_override: Option<u16>) -> Result<()> {
+fn spawn_daemon(config_path: Option<&Path>, port_override: Option<u16>) -> Result<()> {
     let exe = std::env::current_exe().with_context(|| "resolving current executable")?;
     let mut cmd = std::process::Command::new(&exe);
     cmd.arg("serve").arg("--daemonize");
 
-    if let Some(ref p) = config_path {
+    if let Some(p) = config_path {
         cmd.arg("--config").arg(p);
     }
     if let Some(p) = port_override {
@@ -319,7 +319,7 @@ fn spawn_daemon(config_path: Option<PathBuf>, port_override: Option<u16>) -> Res
                 status
                     .code()
                     .map(|c| c.to_string())
-                    .unwrap_or_else(|| "signal".to_string())
+                    .unwrap_or_else(|| "signal".to_owned())
             );
         }
         Ok(None) => { /* child is running */ }

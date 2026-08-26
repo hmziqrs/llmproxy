@@ -209,7 +209,7 @@ struct OpenAiErrorDetail {
 ///
 /// For `ClientProtocol::Anthropic`, the response body is an Anthropic-shaped
 /// JSON envelope with `{"type":"error","error":{...}}`.
-pub(super) fn route_error_response(protocol: ClientProtocol, error: RouteError) -> Response<Body> {
+pub(super) fn route_error_response(protocol: ClientProtocol, error: &RouteError) -> Response<Body> {
     match protocol {
         ClientProtocol::Anthropic => anthropic_error_response(error),
         ClientProtocol::OpenAiChat => openai_error_response(error),
@@ -245,8 +245,8 @@ pub(crate) const UPSTREAM_COLLAPSE_CLIENT_MESSAGE: &str = "upstream service erro
 /// variants use generic messages in the response body to prevent information
 /// disclosure. The actual messages are available through `RouteError::Display`
 /// for server-side logging before this function is called.
-fn anthropic_error_response(error: RouteError) -> Response<Body> {
-    let (status, error_type, message) = extract_error_fields(&error);
+fn anthropic_error_response(error: &RouteError) -> Response<Body> {
+    let (status, error_type, message) = extract_error_fields(error);
 
     let body = AnthropicErrorBody {
         r#type: "error",
@@ -292,8 +292,8 @@ fn anthropic_error_response(error: RouteError) -> Response<Body> {
 /// the client that the failure is between the proxy and the upstream, not a
 /// client error. The original upstream status is preserved in server-side
 /// logs for debugging.
-fn openai_error_response(error: RouteError) -> Response<Body> {
-    let (status, error_type, message) = extract_error_fields(&error);
+fn openai_error_response(error: &RouteError) -> Response<Body> {
+    let (status, error_type, message) = extract_error_fields(error);
     // OpenAI uses "server_error" for internal errors instead of "api_error".
     let error_type = match status {
         StatusCode::INTERNAL_SERVER_ERROR => "server_error",
@@ -578,14 +578,14 @@ mod tests {
     #[test]
     fn anthropic_invalid_request_returns_400() {
         let err = RouteError::InvalidRequest("bad input".into());
-        let response = route_error_response(ClientProtocol::Anthropic, err);
+        let response = route_error_response(ClientProtocol::Anthropic, &err);
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[test]
     fn anthropic_model_not_allowed_returns_400() {
         let err = RouteError::ModelNotAllowed("gpt-99".into());
-        let response = route_error_response(ClientProtocol::Anthropic, err);
+        let response = route_error_response(ClientProtocol::Anthropic, &err);
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
@@ -596,7 +596,7 @@ mod tests {
             body: "upstream error".into(),
             auth_owner: AuthOwner::Operator,
         };
-        let response = route_error_response(ClientProtocol::Anthropic, err);
+        let response = route_error_response(ClientProtocol::Anthropic, &err);
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     }
 
@@ -607,35 +607,35 @@ mod tests {
             body: "rate limited".into(),
             auth_owner: AuthOwner::Operator,
         };
-        let response = route_error_response(ClientProtocol::Anthropic, err);
+        let response = route_error_response(ClientProtocol::Anthropic, &err);
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
     }
 
     #[test]
     fn anthropic_provider_decode_returns_502() {
         let err = RouteError::ProviderDecode("bad frame with sensitive data".into());
-        let response = route_error_response(ClientProtocol::Anthropic, err);
+        let response = route_error_response(ClientProtocol::Anthropic, &err);
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     }
 
     #[test]
     fn anthropic_internal_returns_500() {
         let err = RouteError::Internal("config missing".into());
-        let response = route_error_response(ClientProtocol::Anthropic, err);
+        let response = route_error_response(ClientProtocol::Anthropic, &err);
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     #[test]
     fn anthropic_rate_limited_returns_429() {
         let err = RouteError::RateLimited;
-        let response = route_error_response(ClientProtocol::Anthropic, err);
+        let response = route_error_response(ClientProtocol::Anthropic, &err);
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
     }
 
     #[test]
     fn anthropic_conflict_returns_409() {
         let err = RouteError::Conflict;
-        let response = route_error_response(ClientProtocol::Anthropic, err);
+        let response = route_error_response(ClientProtocol::Anthropic, &err);
         assert_eq!(response.status(), StatusCode::CONFLICT);
     }
 
@@ -644,7 +644,7 @@ mod tests {
     #[tokio::test]
     async fn internal_error_message_is_sanitized_in_response_body() {
         let err = RouteError::Internal("secret config detail: /etc/proxy.toml".into());
-        let response = route_error_response(ClientProtocol::Anthropic, err);
+        let response = route_error_response(ClientProtocol::Anthropic, &err);
         let body = axum::body::to_bytes(response.into_body(), 4096)
             .await
             .expect("body");
@@ -662,7 +662,7 @@ mod tests {
         let err = RouteError::ProviderDecode(
             "decode response: upstream returned malformed JSON with api_key=sk-ant-abc123".into(),
         );
-        let response = route_error_response(ClientProtocol::Anthropic, err);
+        let response = route_error_response(ClientProtocol::Anthropic, &err);
         let body = axum::body::to_bytes(response.into_body(), 4096)
             .await
             .expect("body");
@@ -680,14 +680,14 @@ mod tests {
     #[test]
     fn openai_invalid_request_returns_400() {
         let err = RouteError::InvalidRequest("bad input".into());
-        let response = route_error_response(ClientProtocol::OpenAiChat, err);
+        let response = route_error_response(ClientProtocol::OpenAiChat, &err);
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[test]
     fn openai_model_not_allowed_returns_400() {
         let err = RouteError::ModelNotAllowed("gpt-99".into());
-        let response = route_error_response(ClientProtocol::OpenAiChat, err);
+        let response = route_error_response(ClientProtocol::OpenAiChat, &err);
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
@@ -698,7 +698,7 @@ mod tests {
             body: "upstream error".into(),
             auth_owner: AuthOwner::Operator,
         };
-        let response = route_error_response(ClientProtocol::OpenAiChat, err);
+        let response = route_error_response(ClientProtocol::OpenAiChat, &err);
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     }
 
@@ -709,42 +709,42 @@ mod tests {
             body: "rate limited".into(),
             auth_owner: AuthOwner::Operator,
         };
-        let response = route_error_response(ClientProtocol::OpenAiChat, err);
+        let response = route_error_response(ClientProtocol::OpenAiChat, &err);
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
     }
 
     #[test]
     fn openai_provider_decode_returns_502() {
         let err = RouteError::ProviderDecode("bad frame".into());
-        let response = route_error_response(ClientProtocol::OpenAiChat, err);
+        let response = route_error_response(ClientProtocol::OpenAiChat, &err);
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     }
 
     #[test]
     fn openai_internal_returns_500() {
         let err = RouteError::Internal("config missing".into());
-        let response = route_error_response(ClientProtocol::OpenAiChat, err);
+        let response = route_error_response(ClientProtocol::OpenAiChat, &err);
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     #[test]
     fn openai_rate_limited_returns_429() {
         let err = RouteError::RateLimited;
-        let response = route_error_response(ClientProtocol::OpenAiChat, err);
+        let response = route_error_response(ClientProtocol::OpenAiChat, &err);
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
     }
 
     #[test]
     fn openai_conflict_returns_409() {
         let err = RouteError::Conflict;
-        let response = route_error_response(ClientProtocol::OpenAiChat, err);
+        let response = route_error_response(ClientProtocol::OpenAiChat, &err);
         assert_eq!(response.status(), StatusCode::CONFLICT);
     }
 
     #[tokio::test]
     async fn openai_invalid_request_body_has_correct_structure() {
         let err = RouteError::InvalidRequest("bad input".into());
-        let response = route_error_response(ClientProtocol::OpenAiChat, err);
+        let response = route_error_response(ClientProtocol::OpenAiChat, &err);
         let body = axum::body::to_bytes(response.into_body(), 4096)
             .await
             .expect("body");
@@ -763,7 +763,7 @@ mod tests {
     #[tokio::test]
     async fn openai_model_not_allowed_body_has_correct_structure() {
         let err = RouteError::ModelNotAllowed("gpt-99".into());
-        let response = route_error_response(ClientProtocol::OpenAiChat, err);
+        let response = route_error_response(ClientProtocol::OpenAiChat, &err);
         let body = axum::body::to_bytes(response.into_body(), 4096)
             .await
             .expect("body");
@@ -789,7 +789,7 @@ mod tests {
             body: "model 'gpt-foo' is overloaded: request echoed here".into(),
             auth_owner: AuthOwner::Operator,
         };
-        let response = route_error_response(ClientProtocol::OpenAiChat, err);
+        let response = route_error_response(ClientProtocol::OpenAiChat, &err);
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
         let body = axum::body::to_bytes(response.into_body(), 4096)
             .await
@@ -816,7 +816,7 @@ mod tests {
             body: r#"{"error":{"message":"model 'gpt-foo' does not exist","type":"invalid_request_error"}}"#.into(),
             auth_owner: AuthOwner::Operator,
         };
-        let response = route_error_response(ClientProtocol::OpenAiChat, err);
+        let response = route_error_response(ClientProtocol::OpenAiChat, &err);
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let body = axum::body::to_bytes(response.into_body(), 4096)
             .await
@@ -838,7 +838,7 @@ mod tests {
             body: "invalid api key sk-leaked".into(),
             auth_owner: AuthOwner::Client,
         };
-        let response = route_error_response(ClientProtocol::OpenAiChat, err);
+        let response = route_error_response(ClientProtocol::OpenAiChat, &err);
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         let body = axum::body::to_bytes(response.into_body(), 4096)
             .await
@@ -857,14 +857,14 @@ mod tests {
             body: "invalid api key".into(),
             auth_owner: AuthOwner::Operator,
         };
-        let response = route_error_response(ClientProtocol::OpenAiChat, err);
+        let response = route_error_response(ClientProtocol::OpenAiChat, &err);
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     }
 
     #[tokio::test]
     async fn openai_internal_message_is_sanitized() {
         let err = RouteError::Internal("secret config detail: /etc/proxy.toml".into());
-        let response = route_error_response(ClientProtocol::OpenAiChat, err);
+        let response = route_error_response(ClientProtocol::OpenAiChat, &err);
         let body = axum::body::to_bytes(response.into_body(), 4096)
             .await
             .expect("body");
@@ -882,7 +882,7 @@ mod tests {
         let err = RouteError::ProviderDecode(
             "decode response: upstream returned malformed JSON with api_key=sk-ant-abc123".into(),
         );
-        let response = route_error_response(ClientProtocol::OpenAiChat, err);
+        let response = route_error_response(ClientProtocol::OpenAiChat, &err);
         let body = axum::body::to_bytes(response.into_body(), 4096)
             .await
             .expect("body");
@@ -894,7 +894,7 @@ mod tests {
     #[tokio::test]
     async fn openai_rate_limited_body_has_correct_structure() {
         let err = RouteError::RateLimited;
-        let response = route_error_response(ClientProtocol::OpenAiChat, err);
+        let response = route_error_response(ClientProtocol::OpenAiChat, &err);
         let body = axum::body::to_bytes(response.into_body(), 4096)
             .await
             .expect("body");
@@ -907,7 +907,7 @@ mod tests {
     #[tokio::test]
     async fn openai_conflict_body_has_correct_structure() {
         let err = RouteError::Conflict;
-        let response = route_error_response(ClientProtocol::OpenAiChat, err);
+        let response = route_error_response(ClientProtocol::OpenAiChat, &err);
         let body = axum::body::to_bytes(response.into_body(), 4096)
             .await
             .expect("body");
@@ -925,7 +925,7 @@ mod tests {
     #[test]
     fn openai_error_has_json_content_type() {
         let err = RouteError::InvalidRequest("test".into());
-        let response = route_error_response(ClientProtocol::OpenAiChat, err);
+        let response = route_error_response(ClientProtocol::OpenAiChat, &err);
         let ct = response
             .headers()
             .get(header::CONTENT_TYPE)
@@ -937,19 +937,20 @@ mod tests {
 
     #[test]
     fn request_timeout_returns_408() {
-        let response = route_error_response(ClientProtocol::Anthropic, RouteError::RequestTimeout);
+        let response = route_error_response(ClientProtocol::Anthropic, &RouteError::RequestTimeout);
         assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
     }
 
     #[test]
     fn payload_too_large_returns_413() {
-        let response = route_error_response(ClientProtocol::Anthropic, RouteError::PayloadTooLarge);
+        let response =
+            route_error_response(ClientProtocol::Anthropic, &RouteError::PayloadTooLarge);
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     #[tokio::test]
     async fn request_timeout_anthropic_body_is_json_envelope() {
-        let response = route_error_response(ClientProtocol::Anthropic, RouteError::RequestTimeout);
+        let response = route_error_response(ClientProtocol::Anthropic, &RouteError::RequestTimeout);
         let body = axum::body::to_bytes(response.into_body(), 4096)
             .await
             .expect("body");
@@ -962,7 +963,7 @@ mod tests {
     #[tokio::test]
     async fn payload_too_large_openai_body_is_json_envelope() {
         let response =
-            route_error_response(ClientProtocol::OpenAiChat, RouteError::PayloadTooLarge);
+            route_error_response(ClientProtocol::OpenAiChat, &RouteError::PayloadTooLarge);
         let body = axum::body::to_bytes(response.into_body(), 4096)
             .await
             .expect("body");
@@ -982,14 +983,14 @@ mod tests {
     #[test]
     fn method_not_allowed_returns_405() {
         let response =
-            route_error_response(ClientProtocol::Anthropic, RouteError::MethodNotAllowed);
+            route_error_response(ClientProtocol::Anthropic, &RouteError::MethodNotAllowed);
         assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
     }
 
     #[tokio::test]
     async fn method_not_allowed_anthropic_body_is_json_envelope() {
         let response =
-            route_error_response(ClientProtocol::Anthropic, RouteError::MethodNotAllowed);
+            route_error_response(ClientProtocol::Anthropic, &RouteError::MethodNotAllowed);
         let body = axum::body::to_bytes(response.into_body(), 4096)
             .await
             .expect("body");
@@ -1002,7 +1003,7 @@ mod tests {
     #[tokio::test]
     async fn method_not_allowed_openai_body_is_json_envelope() {
         let response =
-            route_error_response(ClientProtocol::OpenAiChat, RouteError::MethodNotAllowed);
+            route_error_response(ClientProtocol::OpenAiChat, &RouteError::MethodNotAllowed);
         let body = axum::body::to_bytes(response.into_body(), 4096)
             .await
             .expect("body");
@@ -1201,7 +1202,7 @@ mod tests {
     #[test]
     fn anthropic_error_has_json_content_type() {
         let err = RouteError::InvalidRequest("test".into());
-        let response = route_error_response(ClientProtocol::Anthropic, err);
+        let response = route_error_response(ClientProtocol::Anthropic, &err);
         let ct = response
             .headers()
             .get(header::CONTENT_TYPE)
@@ -1214,7 +1215,7 @@ mod tests {
     #[tokio::test]
     async fn anthropic_invalid_request_body_has_correct_structure() {
         let err = RouteError::InvalidRequest("bad input".into());
-        let response = route_error_response(ClientProtocol::Anthropic, err);
+        let response = route_error_response(ClientProtocol::Anthropic, &err);
         let body = axum::body::to_bytes(response.into_body(), 4096)
             .await
             .expect("body");
@@ -1227,7 +1228,7 @@ mod tests {
     #[tokio::test]
     async fn anthropic_model_not_allowed_body_has_correct_structure() {
         let err = RouteError::ModelNotAllowed("gpt-99".into());
-        let response = route_error_response(ClientProtocol::Anthropic, err);
+        let response = route_error_response(ClientProtocol::Anthropic, &err);
         let body = axum::body::to_bytes(response.into_body(), 4096)
             .await
             .expect("body");
@@ -1252,7 +1253,7 @@ mod tests {
             body: "model 'gpt-foo' is overloaded: request echoed here".into(),
             auth_owner: AuthOwner::Operator,
         };
-        let response = route_error_response(ClientProtocol::Anthropic, err);
+        let response = route_error_response(ClientProtocol::Anthropic, &err);
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
         let body = axum::body::to_bytes(response.into_body(), 4096)
             .await
@@ -1270,7 +1271,7 @@ mod tests {
     #[tokio::test]
     async fn anthropic_internal_body_uses_generic_message() {
         let err = RouteError::Internal("config missing".into());
-        let response = route_error_response(ClientProtocol::Anthropic, err);
+        let response = route_error_response(ClientProtocol::Anthropic, &err);
         let body = axum::body::to_bytes(response.into_body(), 4096)
             .await
             .expect("body");
@@ -1283,7 +1284,7 @@ mod tests {
     #[tokio::test]
     async fn anthropic_rate_limited_body_has_correct_structure() {
         let err = RouteError::RateLimited;
-        let response = route_error_response(ClientProtocol::Anthropic, err);
+        let response = route_error_response(ClientProtocol::Anthropic, &err);
         let body = axum::body::to_bytes(response.into_body(), 4096)
             .await
             .expect("body");
@@ -1296,7 +1297,7 @@ mod tests {
     #[tokio::test]
     async fn anthropic_conflict_body_has_correct_structure() {
         let err = RouteError::Conflict;
-        let response = route_error_response(ClientProtocol::Anthropic, err);
+        let response = route_error_response(ClientProtocol::Anthropic, &err);
         let body = axum::body::to_bytes(response.into_body(), 4096)
             .await
             .expect("body");
